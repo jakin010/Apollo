@@ -1,0 +1,17 @@
+[package]
+name = "apollo-server"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+apollo-domain = { path = "../domain" }
+apollo-engine = { path = "../engine" }
+apollo-proto  = { path = "../proto" }
+tonic = "0.14"
+tonic-reflection = "0.14"
+async-trait = "0.1"
+tracing = { workspace = true }
+
+[features]
+# Forward GPU backends down to the inference crate.
+cuda = ["apollo-engine/cuda"]

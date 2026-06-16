@@ -1,0 +1,30 @@
+# IDE
+.fleet
+.idea
+.vscode
+.ropeproject
+
+# Dependecies
+target
+node_modules
+
+# Local
+__*
+!__init__.py
+*.local.env
+.venv
+*.log
+*egg-info
+.*.lock
+
+# database
+*.db
+*.sql
+*.sql.gz
+
+# OS
+.DS_Store
+
+# unnesecery files
+*.txt
+!requirements.txt

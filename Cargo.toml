@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain",
+    "crates/config",
+    "crates/proto",
+    "crates/storage",
+    "crates/inference",
+    "crates/media",
+    "crates/engine",
+    "crates/server",
+    "crates/client",
+    "crates/app",
+]
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+tracing = { version = "0.1" }
+tokio = { version = "1", default-features = false }
+

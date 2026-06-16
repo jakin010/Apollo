@@ -1,0 +1,29 @@
+[package]
+name = "apollo-inference"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+apollo-domain = { path = "../domain" }
+apollo-config = { path = "../config" }
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+hf-hub = "0.5"
+image = "0.25"
+serde_json = "1"
+tracing = { workspace = true }
+thiserror = "2"
+
+# Metal ships with macOS, so compile it in automatically there — no feature flag
+# required. The runtime device selector still falls back to CPU if Metal can't
+# initialize. (This dependency entry is inert on non-macOS targets.)
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.10", features = ["metal"] }
+candle-nn = { version = "0.10", features = ["metal"] }
+candle-transformers = { version = "0.10", features = ["metal"] }
+
+[features]
+# CUDA is opt-in: it needs the NVIDIA toolkit and only builds on Linux/Windows.
+# Do NOT enable it on macOS. Without it, non-macOS builds are CPU-only.
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]

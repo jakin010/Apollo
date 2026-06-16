@@ -1,0 +1,95 @@
+# Example configuration. The app exits at startup if no models are defined.
+
+[app]
+endpoint       = "0.0.0.0"
+port           = 8080
+cache_dir      = "../__local/cache/"
+max_concurrent = 20                            # global in-flight / VRAM ceiling
+
+[webhook]
+url = "https://hooks.example.com:443"          # optional; omit the section to disable and let clients poll
+
+[database]
+backend   = "sqlite"            # sqlite | postgres | surrealdb  (latter two: future)
+# retention = "30d"             # how long to keep finished tasks; omit = keep forever
+
+[database.sqlite]
+path            = "../__local/db/apollo.db"
+# wal             = true        # concurrent reads don't block
+# busy_timeout    = 5000        # ms to wait on a momentarily locked file
+# max_connections = 5
+
+# --- future backends, shown for shape ---
+# [database.postgres]
+# host = "localhost"
+# port = 5432
+# user = "apollo"
+# password = "..."
+# dbname = "apollo"
+# sslmode = "require"
+# max_connections = 10
+#
+# [database.surrealdb]
+# url = "ws://localhost:8000"
+# namespace = "apollo"
+# database  = "classifications"
+# user = "root"
+# password = "..."
+
+# ============================ strategies ============================
+# How an image-classifier is applied to a video. Named and reusable.
+# Each strategy: aggregation + early_exit toggle + step-ordered sampling methods.
+
+[strategies.representative]
+aggregation = "mean"
+early_exit  = false
+
+[[strategies.representative.sampling]]
+step   = 1
+method = "uniform"
+count  = 16
+
+[strategies.progressive_scan]
+aggregation = "max"
+early_exit  = true              # stops the moment a model's trigger fires
+
+[[strategies.progressive_scan.sampling]]
+step   = 1
+method = "iframes"              # cheapest first — keyframes, no full decode
+
+[[strategies.progressive_scan.sampling]]
+step      = 2
+method    = "scene"            # one frame per shot change
+threshold = 0.4
+
+[[strategies.progressive_scan.sampling]]
+step   = 3
+method = "fps"                 # densest — only reached if earlier steps didn't exit
+fps    = 5
+
+# ============================== models ==============================
+# Flat. `architecture` selects the candle builder. Almost everything else
+# is optional. An image-classifier with `video_strategy` set also accepts video.
+
+[models.general]
+architecture   = "vit"
+repo           = "google/vit-base-patch16-224"
+revision       = "main"
+enabled        = true
+keep_in_memory = true
+max_concurrent = 8              # GPU batch size
+timeout        = 30             # seconds, processing only (queue wait excluded)
+video_strategy = "representative"
+
+[models.nsfw]
+architecture   = "vit"
+repo           = "Falconsai/nsfw_image_detection"
+video_strategy = "progressive_scan"
+
+[models.nsfw.early_exit]        # model-side: what counts as a trigger. Absent -> no early exit.
+labels    = ["nsfw"]
+threshold = 0.85
+
+[models.action]
+architecture = "videomae"
+repo         = "MCG-NJU/videomae-base-finetuned-kinetics"

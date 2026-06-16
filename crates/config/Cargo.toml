@@ -1,0 +1,12 @@
+[package]
+name = "apollo-config"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+apollo-domain = { path = "../domain" }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+toml_edit = "0.25"
+thiserror = "2"
+dirs = "6"

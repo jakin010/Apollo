@@ -1,0 +1,15 @@
+[package]
+name = "apollo-storage"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+apollo-domain = { path = "../domain" }
+apollo-config = { path = "../config" }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+async-trait = "0.1"
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

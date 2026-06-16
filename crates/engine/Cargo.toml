@@ -1,0 +1,23 @@
+[package]
+name = "apollo-engine"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+apollo-domain    = { path = "../domain" }
+apollo-config    = { path = "../config" }
+apollo-storage   = { path = "../storage" }
+apollo-inference = { path = "../inference" }
+apollo-media     = { path = "../media" }
+candle-core = "0.10"
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
+async-trait = "0.1"
+crossbeam-channel = "0.5"
+futures = "0.3"
+tracing = { workspace = true }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+# Forward GPU backends to the inference crate.
+cuda = ["apollo-inference/cuda"]

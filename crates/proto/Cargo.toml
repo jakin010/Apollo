@@ -1,0 +1,13 @@
+[package]
+name = "apollo-proto"
+version = "0.1.0"
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
