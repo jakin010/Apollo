@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use apollo_domain::Architecture;
 use crate::defaults;
+use apollo_domain::Architecture;
 
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

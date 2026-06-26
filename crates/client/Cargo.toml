@@ -11,8 +11,8 @@ apollo-proto = { path = "../proto" }
 tonic = "0.14"
 thiserror = "2"
 # Verifies the HMAC-SHA256 signature on incoming webhook deliveries.
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 # Optional gRPC server reflection for the webhook receiver (`reflection` feature).
 tonic-reflection = { version = "0.14", optional = true }
 

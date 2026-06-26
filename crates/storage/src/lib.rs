@@ -110,8 +110,7 @@ pub trait Storage: Send + Sync {
     /// between reaching a terminal state and delivering).
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError>;
 
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize)
-        -> Result<(), StorageError>;
+    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError>;
 
     // ------------------------------ retention ----------------------------
 

@@ -23,10 +23,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
 use surrealdb::types::SurrealValue;
-use surrealdb::Surreal;
 
 use apollo_config::SurrealdbConfig;
 use apollo_domain::{
@@ -34,9 +34,9 @@ use apollo_domain::{
     TaskState,
 };
 
+use crate::Storage;
 use crate::error::StorageError;
 use crate::resume::PendingWebhook;
-use crate::Storage;
 
 type Result<T> = std::result::Result<T, StorageError>;
 
@@ -448,9 +448,7 @@ impl Storage for SurrealStorage {
     async fn steps_completed(&self, task_id: &str, item: usize, label: &str) -> Result<u32> {
         let mut resp = self
             .db
-            .query(
-                "SELECT steps_completed FROM type::record('model_result', [$tid, $idx, $label])",
-            )
+            .query("SELECT steps_completed FROM type::record('model_result', [$tid, $idx, $label])")
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
             .bind(("label", label.to_string()))
@@ -580,7 +578,11 @@ fn parse_task_state(s: &str) -> Result<TaskState> {
         "completed" => TaskState::Completed,
         "failed" => TaskState::Failed,
         "cancelled" => TaskState::Cancelled,
-        other => return Err(StorageError::Corrupt(format!("unknown task state '{other}'"))),
+        other => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown task state '{other}'"
+            )));
+        }
     })
 }
 
@@ -601,7 +603,11 @@ fn parse_item_state(s: &str) -> Result<ItemState> {
         "completed" => ItemState::Completed,
         "failed" => ItemState::Failed,
         "cancelled" => ItemState::Cancelled,
-        other => return Err(StorageError::Corrupt(format!("unknown item state '{other}'"))),
+        other => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown item state '{other}'"
+            )));
+        }
     })
 }
 
@@ -620,6 +626,10 @@ fn parse_model_state(s: &str) -> Result<ModelState> {
         "processing" => ModelState::Processing,
         "done" => ModelState::Done,
         "failed" => ModelState::Failed,
-        other => return Err(StorageError::Corrupt(format!("unknown model state '{other}'"))),
+        other => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown model state '{other}'"
+            )));
+        }
     })
 }

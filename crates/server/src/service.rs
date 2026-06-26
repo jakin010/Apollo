@@ -5,7 +5,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 
 use apollo_engine::{Engine, EngineError};
 use apollo_proto::inference_server::{Inference, InferenceServer};
@@ -71,10 +71,7 @@ impl Inference for InferenceService {
         Ok(Response::new(TaskCreated { task_id }))
     }
 
-    async fn get_task(
-        &self,
-        request: Request<GetTaskRequest>,
-    ) -> Result<Response<Task>, Status> {
+    async fn get_task(&self, request: Request<GetTaskRequest>) -> Result<Response<Task>, Status> {
         let id = request.into_inner().task_id;
         tracing::debug!(task = %id, "GetTask");
         match self.engine.get_task(&id).await.map_err(engine_to_status)? {
@@ -83,10 +80,7 @@ impl Inference for InferenceService {
         }
     }
 
-    async fn cancel_task(
-        &self,
-        request: Request<CancelRequest>,
-    ) -> Result<Response<Task>, Status> {
+    async fn cancel_task(&self, request: Request<CancelRequest>) -> Result<Response<Task>, Status> {
         let id = request.into_inner().task_id;
         tracing::info!(task = %id, "CancelTask");
         self.engine.cancel(&id).await.map_err(engine_to_status)?;
@@ -117,9 +111,9 @@ pub fn inference_service(engine: Engine) -> InferenceServer<InferenceService> {
 
 /// Build the gRPC reflection service advertising the `Inference` service (and the
 /// shared messages) only. Panics only if the compiled-in descriptor is malformed.
-fn reflection_service(
-) -> tonic_reflection::server::v1::ServerReflectionServer<impl tonic_reflection::server::v1::ServerReflection>
-{
+fn reflection_service() -> tonic_reflection::server::v1::ServerReflectionServer<
+    impl tonic_reflection::server::v1::ServerReflection,
+> {
     tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(apollo_proto::INFERENCE_DESCRIPTOR_SET)
         .build_v1()

@@ -5,10 +5,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use clap::Args;
 
-use apollo_config::{load, Config, Overrides};
+use apollo_config::{Config, Overrides, load};
 use apollo_engine::{Engine, WebhookSink};
 
 #[derive(Args)]
@@ -62,9 +62,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let addr = (config.app.endpoint.as_str(), config.app.port)
         .to_socket_addrs()
-        .with_context(|| {
-            format!("resolving {}:{}", config.app.endpoint, config.app.port)
-        })?
+        .with_context(|| format!("resolving {}:{}", config.app.endpoint, config.app.port))?
         .next()
         .ok_or_else(|| anyhow!("no address for {}:{}", config.app.endpoint, config.app.port))?;
 
@@ -104,7 +102,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 }
 
 fn init_tracing(level: &str) {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
     // RUST_LOG wins; otherwise fall back to the configured level.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     // try_init is a no-op if a subscriber is already set (e.g. in tests).

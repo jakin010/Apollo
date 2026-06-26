@@ -86,7 +86,9 @@ async fn resolve(src: &str, limits: &FetchLimits) -> Result<LocalMedia, MediaErr
             .iter()
             .any(|s| s.eq_ignore_ascii_case(scheme))
         {
-            return Err(MediaError::Http(format!("scheme '{scheme}' is not allowed")));
+            return Err(MediaError::Http(format!(
+                "scheme '{scheme}' is not allowed"
+            )));
         }
         return download(src, limits).await;
     }
@@ -98,7 +100,10 @@ fn local(path: &str) -> Result<LocalMedia, MediaError> {
     if !p.is_file() {
         return Err(MediaError::NotFound(path.to_string()));
     }
-    Ok(LocalMedia { path: p, _temp: None })
+    Ok(LocalMedia {
+        path: p,
+        _temp: None,
+    })
 }
 
 async fn download(url_str: &str, limits: &FetchLimits) -> Result<LocalMedia, MediaError> {
@@ -156,7 +161,8 @@ async fn download(url_str: &str, limits: &FetchLimits) -> Result<LocalMedia, Med
     let dir = tempfile::tempdir().map_err(|e| MediaError::Io(format!("temp dir: {e}")))?;
     let name = filename_hint(url_str).unwrap_or_else(|| "download".to_string());
     let path = dir.path().join(name);
-    std::fs::write(&path, &bytes).map_err(|e| MediaError::Io(format!("writing {:?}: {e}", path)))?;
+    std::fs::write(&path, &bytes)
+        .map_err(|e| MediaError::Io(format!("writing {:?}: {e}", path)))?;
     Ok(LocalMedia {
         path,
         _temp: Some(dir),
@@ -167,7 +173,9 @@ async fn download(url_str: &str, limits: &FetchLimits) -> Result<LocalMedia, Med
 /// vetted public socket address to pin the connection to.
 async fn vet_host(host: &str, port: u16) -> Result<SocketAddr, MediaError> {
     if host.eq_ignore_ascii_case("localhost") {
-        return Err(MediaError::Http("refusing to fetch from 'localhost'".into()));
+        return Err(MediaError::Http(
+            "refusing to fetch from 'localhost'".into(),
+        ));
     }
     let mut chosen: Option<SocketAddr> = None;
     let addrs = tokio::net::lookup_host((host, port))

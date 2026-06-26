@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 use std::path::Path;
 
 use apollo_config::{Aggregation, SamplingStep};
-use apollo_domain::{select_top, Classification, Prediction};
+use apollo_domain::{Classification, Prediction, select_top};
 
 use crate::error::MediaError;
 use crate::ffmpeg::VideoInfo;
@@ -33,7 +33,11 @@ pub async fn plan(
     // durations and variable frame rates mean a timestamp at (or fractionally
     // beyond) `duration` decodes to nothing. Clamp every sample to at least one
     // frame-duration short of the end.
-    let guard = if info.fps > 0.0 { (1.0 / info.fps).max(1e-3) } else { 0.05 };
+    let guard = if info.fps > 0.0 {
+        (1.0 / info.fps).max(1e-3)
+    } else {
+        0.05
+    };
     let max_seek = (info.duration - guard).max(0.0);
 
     let mut chosen: Vec<f64> = Vec::new();
@@ -113,18 +117,34 @@ mod tests {
     use apollo_config::SamplingKind;
 
     fn info(duration: f64, fps: f64) -> VideoInfo {
-        VideoInfo { duration, fps, frame_count: None, width: 0, height: 0 }
+        VideoInfo {
+            duration,
+            fps,
+            frame_count: None,
+            width: 0,
+            height: 0,
+        }
     }
 
     fn step(n: u32, method: SamplingKind, count: Option<u32>, fps: Option<f64>) -> SamplingStep {
-        SamplingStep { step: n, method, fps, count, nth: None, threshold: None }
+        SamplingStep {
+            step: n,
+            method,
+            fps,
+            count,
+            nth: None,
+            threshold: None,
+        }
     }
 
     fn classification(preds: &[(&str, f32)]) -> Classification {
         Classification {
             predictions: preds
                 .iter()
-                .map(|(l, s)| Prediction { label: (*l).into(), score: *s })
+                .map(|(l, s)| Prediction {
+                    label: (*l).into(),
+                    score: *s,
+                })
                 .collect(),
         }
     }

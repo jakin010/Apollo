@@ -19,7 +19,10 @@ fn url(main: impl Into<String>, fallback: Option<String>) -> Url {
 }
 
 /// An image fetched from `url`, classified by `models`.
-pub fn image(url: impl Into<String>, models: impl IntoIterator<Item = impl Into<String>>) -> InputItem {
+pub fn image(
+    url: impl Into<String>,
+    models: impl IntoIterator<Item = impl Into<String>>,
+) -> InputItem {
     InputItem {
         models: models_of(models),
         input: Some(Input::ImageUrl(self::url(url, None))),
@@ -40,7 +43,10 @@ pub fn image_with_fallback(
 
 /// A video fetched from `url`. Run image-classifiers (frame scan) or a
 /// video-classifier (whole clip) on it.
-pub fn video(url: impl Into<String>, models: impl IntoIterator<Item = impl Into<String>>) -> InputItem {
+pub fn video(
+    url: impl Into<String>,
+    models: impl IntoIterator<Item = impl Into<String>>,
+) -> InputItem {
     InputItem {
         models: models_of(models),
         input: Some(Input::VideoUrl(self::url(url, None))),
@@ -60,7 +66,10 @@ pub fn video_with_fallback(
 }
 
 /// Inline text content (future model kinds).
-pub fn text(content: impl Into<String>, models: impl IntoIterator<Item = impl Into<String>>) -> InputItem {
+pub fn text(
+    content: impl Into<String>,
+    models: impl IntoIterator<Item = impl Into<String>>,
+) -> InputItem {
     InputItem {
         models: models_of(models),
         input: Some(Input::Text(content.into())),
@@ -68,7 +77,10 @@ pub fn text(content: impl Into<String>, models: impl IntoIterator<Item = impl In
 }
 
 /// Audio fetched from `url` (future model kinds).
-pub fn audio(url: impl Into<String>, models: impl IntoIterator<Item = impl Into<String>>) -> InputItem {
+pub fn audio(
+    url: impl Into<String>,
+    models: impl IntoIterator<Item = impl Into<String>>,
+) -> InputItem {
     InputItem {
         models: models_of(models),
         input: Some(Input::AudioUrl(self::url(url, None))),

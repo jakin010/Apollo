@@ -6,7 +6,6 @@
 
 use std::collections::BTreeSet;
 
-
 use crate::error::ConfigError;
 use crate::schema::{Backend, Config, SamplingKind};
 
@@ -65,12 +64,11 @@ impl Config {
         }
 
         match self.database.backend {
-            Backend::Postgres if self.database.postgres.is_none() => errs.push(
-                "database.backend = 'postgres' but [database.postgres] is missing".into(),
-            ),
-            Backend::Surrealdb if self.database.surrealdb.is_none() => errs.push(
-                "database.backend = 'surrealdb' but [database.surrealdb] is missing".into(),
-            ),
+            Backend::Postgres if self.database.postgres.is_none() => {
+                errs.push("database.backend = 'postgres' but [database.postgres] is missing".into())
+            }
+            Backend::Surrealdb if self.database.surrealdb.is_none() => errs
+                .push("database.backend = 'surrealdb' but [database.surrealdb] is missing".into()),
             _ => {}
         }
 

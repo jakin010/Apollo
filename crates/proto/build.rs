@@ -40,8 +40,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Emit one self-contained descriptor set per service. `--include_imports`
     // folds common.proto into each, so neither set references the other service.
     let protoc = env::var_os("PROTOC").unwrap_or_else(|| OsString::from("protoc"));
-    descriptor_set(&protoc, &proto_dir, &inference, &out_dir.join("inference_descriptor.bin"))?;
-    descriptor_set(&protoc, &proto_dir, &webhook, &out_dir.join("webhook_descriptor.bin"))?;
+    descriptor_set(
+        &protoc,
+        &proto_dir,
+        &inference,
+        &out_dir.join("inference_descriptor.bin"),
+    )?;
+    descriptor_set(
+        &protoc,
+        &proto_dir,
+        &webhook,
+        &out_dir.join("webhook_descriptor.bin"),
+    )?;
 
     Ok(())
 }

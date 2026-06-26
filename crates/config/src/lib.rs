@@ -8,11 +8,11 @@
 //! - [`error`]    — [`ConfigError`]
 
 pub mod defaults;
-pub mod units;
 pub mod edit;
 pub mod error;
 pub mod load;
 pub mod schema;
+pub mod units;
 pub mod validate;
 
 #[cfg(test)]
@@ -21,7 +21,7 @@ mod tests;
 pub use error::ConfigError;
 pub use load::Overrides;
 pub use schema::{
-    Aggregation, AppConfig, Backend, Config, DatabaseConfig, EarlyExit, LimitsConfig,
-    ModelConfig, PostgresConfig, SamplingKind, SamplingStep, SqliteConfig, StrategyConfig,
-    SurrealdbConfig, WebhookConfig,
+    Aggregation, AppConfig, Backend, Config, DatabaseConfig, EarlyExit, LimitsConfig, ModelConfig,
+    PostgresConfig, SamplingKind, SamplingStep, SqliteConfig, StrategyConfig, SurrealdbConfig,
+    WebhookConfig,
 };

@@ -6,21 +6,21 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use apollo_config::{EarlyExit, ModelConfig, StrategyConfig};
 use apollo_domain::{
-    Classification, DecodedImage, Frame, Input, Item, ItemState, ModelOutput, ModelResult,
-    ModelState, Modality,
+    Classification, DecodedImage, Frame, Input, Item, ItemState, Modality, ModelOutput,
+    ModelResult, ModelState,
 };
 use apollo_media::{FrameRef, LocalMedia, VideoInfo};
 
-use crate::aggregate;
-use crate::error::{media_err, EngineError};
-use crate::worker::ModelHandle;
 use crate::Engine;
+use crate::aggregate;
+use crate::error::{EngineError, media_err};
+use crate::worker::ModelHandle;
 
 /// A fetched, decoded/probed input ready for inference.
 enum Fetched {
@@ -227,7 +227,14 @@ impl Engine {
                 // Video: an image classifier over sampled frames, each frame bounded
                 // by `timeout` (applied inside run_frame_scan).
                 self.run_frame_scan(
-                    task_id, idx, label, &handle, media.path(), info, timeout, cancel,
+                    task_id,
+                    idx,
+                    label,
+                    &handle,
+                    media.path(),
+                    info,
+                    timeout,
+                    cancel,
                 )
                 .await
             }

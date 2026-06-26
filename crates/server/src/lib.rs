@@ -15,5 +15,5 @@ mod convert;
 mod service;
 mod webhook;
 
-pub use service::{inference_service, serve, serve_with_shutdown, InferenceService};
+pub use service::{InferenceService, inference_service, serve, serve_with_shutdown};
 pub use webhook::GrpcWebhookSink;

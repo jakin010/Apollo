@@ -17,9 +17,9 @@ use apollo_domain::{
     Classification, Frame, Item, ItemState, ModelOutput, ModelResult, ModelState, Task, TaskState,
 };
 
+use crate::Storage;
 use crate::error::StorageError;
 use crate::resume::PendingWebhook;
-use crate::Storage;
 
 type Result<T> = std::result::Result<T, StorageError>;
 
@@ -191,7 +191,9 @@ impl Storage for SqliteStorage {
             for stmt in SCHEMA_V1 {
                 sqlx::query(*stmt).execute(&mut *tx).await?;
             }
-            sqlx::query("PRAGMA user_version = 1").execute(&mut *tx).await?;
+            sqlx::query("PRAGMA user_version = 1")
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
         }
         Ok(())
@@ -491,7 +493,11 @@ fn parse_task_state(s: &str) -> Result<TaskState> {
         "completed" => TaskState::Completed,
         "failed" => TaskState::Failed,
         "cancelled" => TaskState::Cancelled,
-        other => return Err(StorageError::Corrupt(format!("unknown task state '{other}'"))),
+        other => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown task state '{other}'"
+            )));
+        }
     })
 }
 
@@ -512,7 +518,11 @@ fn parse_item_state(s: &str) -> Result<ItemState> {
         "completed" => ItemState::Completed,
         "failed" => ItemState::Failed,
         "cancelled" => ItemState::Cancelled,
-        other => return Err(StorageError::Corrupt(format!("unknown item state '{other}'"))),
+        other => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown item state '{other}'"
+            )));
+        }
     })
 }
 
@@ -531,7 +541,11 @@ fn parse_model_state(s: &str) -> Result<ModelState> {
         "processing" => ModelState::Processing,
         "done" => ModelState::Done,
         "failed" => ModelState::Failed,
-        other => return Err(StorageError::Corrupt(format!("unknown model state '{other}'"))),
+        other => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown model state '{other}'"
+            )));
+        }
     })
 }
 
@@ -548,7 +562,11 @@ mod tests {
     fn temp_cfg() -> SqliteConfig {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut p = std::env::temp_dir();
-        p.push(format!("apollo-storage-test-{}-{}.db", std::process::id(), n));
+        p.push(format!(
+            "apollo-storage-test-{}-{}.db",
+            std::process::id(),
+            n
+        ));
         SqliteConfig {
             path: p.to_string_lossy().into_owned(),
             wal: true,
@@ -617,7 +635,10 @@ mod tests {
         assert!(t.items[0].results["general"].output.is_some());
 
         // Frame checkpoint + steps marker.
-        store.set_steps_completed("task-1", 0, "nsfw", 1).await.unwrap();
+        store
+            .set_steps_completed("task-1", 0, "nsfw", 1)
+            .await
+            .unwrap();
         store
             .append_frame(
                 "task-1",
@@ -636,7 +657,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(store.load_frames("task-1", 0, "nsfw").await.unwrap().len(), 1);
+        assert_eq!(
+            store.load_frames("task-1", 0, "nsfw").await.unwrap().len(),
+            1
+        );
         assert_eq!(store.steps_completed("task-1", 0, "nsfw").await.unwrap(), 1);
 
         // Resume sees the in-flight task; attempts increment.

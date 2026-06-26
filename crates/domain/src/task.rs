@@ -86,19 +86,35 @@ pub struct ModelResult {
 
 impl ModelResult {
     pub fn queued() -> Self {
-        Self { state: ModelState::Queued, output: None, error: None }
+        Self {
+            state: ModelState::Queued,
+            output: None,
+            error: None,
+        }
     }
 
     pub fn processing() -> Self {
-        Self { state: ModelState::Processing, output: None, error: None }
+        Self {
+            state: ModelState::Processing,
+            output: None,
+            error: None,
+        }
     }
 
     pub fn done(output: ModelOutput) -> Self {
-        Self { state: ModelState::Done, output: Some(output), error: None }
+        Self {
+            state: ModelState::Done,
+            output: Some(output),
+            error: None,
+        }
     }
 
     pub fn failed(error: impl Into<String>) -> Self {
-        Self { state: ModelState::Failed, output: None, error: Some(error.into()) }
+        Self {
+            state: ModelState::Failed,
+            output: None,
+            error: Some(error.into()),
+        }
     }
 }
 

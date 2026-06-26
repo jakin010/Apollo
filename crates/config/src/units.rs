@@ -48,7 +48,10 @@ mod tests {
         assert_eq!(parse_size("512mb"), Some(512 * 1024 * 1024));
         assert_eq!(parse_size("2g"), Some(2 * 1024 * 1024 * 1024));
         assert_eq!(parse_size("1024"), Some(1024));
-        assert_eq!(parse_size("1.5gb"), Some(1024 * 1024 * 1024 + 512 * 1024 * 1024));
+        assert_eq!(
+            parse_size("1.5gb"),
+            Some(1024 * 1024 * 1024 + 512 * 1024 * 1024)
+        );
         assert_eq!(parse_size("0"), None);
         assert_eq!(parse_size(""), None);
         assert_eq!(parse_size("garbage"), None);
