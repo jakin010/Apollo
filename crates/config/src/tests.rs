@@ -59,27 +59,6 @@ fn rejects_unknown_strategy_reference() {
 }
 
 #[test]
-fn rejects_video_classifier_with_strategy() {
-    let cfg = load::from_str(
-        r#"
-        [strategies.s]
-        aggregation = "mean"
-        [[strategies.s.sampling]]
-        step = 1
-        method = "uniform"
-        count = 8
-
-        [models.v]
-        architecture = "videomae"
-        repo = "a/b"
-        video_strategy = "s"
-        "#,
-    )
-    .unwrap();
-    assert!(cfg.validate().is_err());
-}
-
-#[test]
 fn rejects_sampling_missing_required_param() {
     let cfg = load::from_str(
         r#"

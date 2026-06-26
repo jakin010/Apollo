@@ -17,10 +17,19 @@ pub enum EngineError {
     #[error("incompatible input/model: {0}")]
     Incompatible(String),
 
+    #[error("unknown task '{0}'")]
+    UnknownTask(String),
+
+    #[error("overloaded: {0}")]
+    Overloaded(String),
+
+    #[error("cancelled")]
+    Cancelled,
+
     #[error("configuration error: {0}")]
     Config(String),
 
-    #[error("model '{0}' timed out")]
+    #[error("{0}")]
     Timeout(String),
 
     #[error("model worker unavailable")]

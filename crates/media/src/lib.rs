@@ -26,7 +26,7 @@ pub mod strategy;
 
 pub use decode::decode_image;
 pub use error::MediaError;
-pub use fetch::{fetch, LocalMedia};
+pub use fetch::{fetch, FetchLimits, LocalMedia};
 pub use ffmpeg::{extract_frame, extract_frames, probe, VideoInfo};
 pub use sampling::FrameRef;
 pub use strategy::{aggregate, plan, triggered, DEDUPE_TOLERANCE};

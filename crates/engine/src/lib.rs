@@ -11,18 +11,21 @@
 //! [`Engine`] is a cheap clonable handle around a shared `Inner`; cloning it does
 //! not duplicate any models or state.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use tokio::sync::Semaphore;
 
 use apollo_config::Config;
 use apollo_domain::{Input, Item, ItemState, Task, TaskState};
+use apollo_media::FetchLimits;
 use apollo_storage::Storage;
 
 mod aggregate;
 mod error;
+mod gate;
+mod memory;
 mod queue;
 mod registry;
 mod scheduler;
@@ -32,6 +35,7 @@ mod worker;
 pub use error::EngineError;
 pub use webhook::{WebhookError, WebhookSink};
 
+use crate::gate::PriorityGate;
 use registry::Registry;
 
 /// One input plus the model labels to run on it.
@@ -50,9 +54,30 @@ struct Inner {
     storage: Arc<dyn Storage>,
     config: Arc<Config>,
     registry: Registry,
-    /// Global ceiling on concurrently processing items.
-    global: Semaphore,
+    /// Priority-ordered global ceiling on concurrently processing items.
+    gate: Arc<PriorityGate>,
     webhook: Option<Arc<dyn WebhookSink>>,
+    /// SSRF / resource limits applied to remote input fetches.
+    fetch_limits: FetchLimits,
+    /// Soft resident-memory cap in bytes; `None` disables the check.
+    max_memory_bytes: Option<u64>,
+    /// Max items queued or in-flight before submissions are rejected; `0` = off.
+    max_pending: usize,
+    /// Items currently queued or processing (admission backpressure counter).
+    in_flight: AtomicUsize,
+    /// Per-task cooperative cancellation signals, keyed by task id.
+    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+/// Decrements the in-flight item counter on drop. One guard is created at the
+/// start of `run_item`, so the reservation is released on every exit path
+/// (normal, error, cancellation, or panic).
+pub(crate) struct InFlightGuard(pub(crate) Engine);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Engine {
@@ -72,18 +97,32 @@ impl Engine {
         let cache_dir = config.app.cache_dir.clone().map(PathBuf::from);
         let idle = Duration::from_secs(config.app.idle_timeout as u64);
         let registry = Registry::build(&config, device, cache_dir, idle);
-        let global = Semaphore::new(config.app.max_concurrent.max(1) as usize);
+        let gate = Arc::new(PriorityGate::new(config.app.max_concurrent.max(1) as usize));
+
+        let fetch_limits = FetchLimits {
+            allowed_schemes: config.limits.allowed_schemes.clone(),
+            block_private_ips: config.limits.block_private_ips,
+            max_download_bytes: config.limits.max_download_bytes(),
+        };
+        let max_memory_bytes = config.app.max_memory_bytes();
+        let max_pending = config.app.max_pending as usize;
 
         let engine = Engine {
             inner: Arc::new(Inner {
                 storage,
                 config,
                 registry,
-                global,
+                gate,
                 webhook,
+                fetch_limits,
+                max_memory_bytes,
+                max_pending,
+                in_flight: AtomicUsize::new(0),
+                cancels: Mutex::new(HashMap::new()),
             }),
         };
         engine.spawn_retention();
+        engine.spawn_redelivery();
         engine
     }
 
@@ -98,6 +137,18 @@ impl Engine {
             self.inner
                 .registry
                 .validate_item(&self.inner.config, &s.input, &s.models)?;
+        }
+
+        // Backpressure: shed load instead of growing memory without bound.
+        self.check_memory()?;
+        let n = submissions.len();
+        let prev = self.inner.in_flight.fetch_add(n, Ordering::SeqCst);
+        if self.inner.max_pending > 0 && prev + n > self.inner.max_pending {
+            self.inner.in_flight.fetch_sub(n, Ordering::SeqCst);
+            return Err(EngineError::Overloaded(format!(
+                "queue full ({prev} items in flight, limit {})",
+                self.inner.max_pending
+            )));
         }
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -116,7 +167,11 @@ impl Engine {
             state: TaskState::Queued,
             items,
         };
-        self.inner.storage.create_task(&task).await?;
+        if let Err(e) = self.inner.storage.create_task(&task).await {
+            // Release the reservation: no run_items will be spawned to do it.
+            self.inner.in_flight.fetch_sub(n, Ordering::SeqCst);
+            return Err(e.into());
+        }
         tracing::info!(task = %task.id, items = task.items.len(), "task submitted");
 
         let engine = self.clone();
@@ -127,5 +182,55 @@ impl Engine {
     /// Fetch a task by id (backs the `GetTask` RPC).
     pub async fn get_task(&self, id: &str) -> Result<Option<Task>, EngineError> {
         Ok(self.inner.storage.get_task(id).await?)
+    }
+
+    /// Request cooperative cancellation of a task (backs `CancelTask`). Idempotent:
+    /// a no-op returning `Ok` if the task has already finished. In-flight items
+    /// stop at the next checkpoint (between models / between sampled frames).
+    pub async fn cancel(&self, task_id: &str) -> Result<(), EngineError> {
+        let task = self
+            .inner
+            .storage
+            .get_task(task_id)
+            .await?
+            .ok_or_else(|| EngineError::UnknownTask(task_id.to_string()))?;
+        if aggregate::task_terminal(task.state) {
+            return Ok(());
+        }
+        // Set the signal, creating the token if run_task has not registered one
+        // yet (so a not-yet-started run picks it up via the same map entry).
+        {
+            let mut map = self.inner.cancels.lock().unwrap();
+            let token = map
+                .entry(task_id.to_string())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone();
+            token.store(true, Ordering::SeqCst);
+        }
+        self.inner
+            .storage
+            .set_task_state(task_id, TaskState::Cancelled)
+            .await?;
+        tracing::info!(task = %task_id, "task cancellation requested");
+        Ok(())
+    }
+
+    /// Reject new work while resident memory is over the configured soft cap.
+    fn check_memory(&self) -> Result<(), EngineError> {
+        let Some(limit) = self.inner.max_memory_bytes else {
+            return Ok(());
+        };
+        let Some(rss) = memory::current_rss_bytes() else {
+            return Ok(());
+        };
+        if rss >= limit {
+            const MIB: u64 = 1024 * 1024;
+            return Err(EngineError::Overloaded(format!(
+                "memory limit reached ({} MiB resident >= {} MiB cap)",
+                rss / MIB,
+                limit / MIB
+            )));
+        }
+        Ok(())
     }
 }

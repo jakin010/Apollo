@@ -431,7 +431,7 @@ impl Storage for SqliteStorage {
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>> {
         let rows = sqlx::query(
             "SELECT task_id, idx FROM items
-             WHERE webhook_delivered = 0 AND state IN ('completed', 'failed')",
+             WHERE webhook_delivered = 0 AND state IN ('completed', 'failed', 'cancelled')",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -459,7 +459,7 @@ impl Storage for SqliteStorage {
 
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64> {
         let res =
-            sqlx::query("DELETE FROM tasks WHERE state IN ('completed', 'failed') AND updated_at < ?")
+            sqlx::query("DELETE FROM tasks WHERE state IN ('completed', 'failed', 'cancelled') AND updated_at < ?")
                 .bind(cutoff_unix_secs)
                 .execute(&self.pool)
                 .await?;
@@ -480,6 +480,7 @@ fn task_state_str(s: TaskState) -> &'static str {
         TaskState::Processing => "processing",
         TaskState::Completed => "completed",
         TaskState::Failed => "failed",
+        TaskState::Cancelled => "cancelled",
     }
 }
 
@@ -489,6 +490,7 @@ fn parse_task_state(s: &str) -> Result<TaskState> {
         "processing" => TaskState::Processing,
         "completed" => TaskState::Completed,
         "failed" => TaskState::Failed,
+        "cancelled" => TaskState::Cancelled,
         other => return Err(StorageError::Corrupt(format!("unknown task state '{other}'"))),
     })
 }
@@ -499,6 +501,7 @@ fn item_state_str(s: ItemState) -> &'static str {
         ItemState::Processing => "processing",
         ItemState::Completed => "completed",
         ItemState::Failed => "failed",
+        ItemState::Cancelled => "cancelled",
     }
 }
 
@@ -508,6 +511,7 @@ fn parse_item_state(s: &str) -> Result<ItemState> {
         "processing" => ItemState::Processing,
         "completed" => ItemState::Completed,
         "failed" => ItemState::Failed,
+        "cancelled" => ItemState::Cancelled,
         other => return Err(StorageError::Corrupt(format!("unknown item state '{other}'"))),
     })
 }

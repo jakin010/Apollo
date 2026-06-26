@@ -17,6 +17,7 @@ futures = "0.3"
 tracing = { workspace = true }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+memory-stats = "1"
 
 [features]
 # Forward GPU backends to the inference crate.

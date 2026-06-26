@@ -75,7 +75,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let webhook = match &config.webhook {
         Some(w) => {
-            let sink = apollo_server::GrpcWebhookSink::new(&w.url)
+            let sink = apollo_server::GrpcWebhookSink::new(&w.url, w.secret.clone())
                 .context("configuring webhook client")?;
             Some(Arc::new(sink) as Arc<dyn WebhookSink>)
         }

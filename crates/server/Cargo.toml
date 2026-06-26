@@ -9,6 +9,9 @@ apollo-engine = { path = "../engine" }
 apollo-proto  = { path = "../proto" }
 tonic = "0.14"
 tonic-reflection = "0.14"
+tonic-health = "0.14"
+hmac = "0.12"
+sha2 = "0.10"
 async-trait = "0.1"
 tracing = { workspace = true }
 

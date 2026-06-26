@@ -50,6 +50,8 @@ pub enum TaskState {
     Completed,
     /// Failed before any item could run.
     Failed,
+    /// Cancelled by a client request before completing.
+    Cancelled,
 }
 
 /// Lifecycle state of one input within a task.
@@ -59,6 +61,8 @@ pub enum ItemState {
     Processing,
     Completed,
     Failed,
+    /// Cancelled by a client request before completing.
+    Cancelled,
 }
 
 /// Lifecycle state of one (item, model) unit of work.

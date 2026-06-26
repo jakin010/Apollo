@@ -1,8 +1,7 @@
 //! Serde structs mirroring the TOML config (see `config.example.toml`).
 //!
-//! `architecture` is the model discriminator (the old `kind` field was dropped);
-//! `kind` is derived from it via [`apollo_domain::Architecture::kind`]. Almost
-//! every field is optional via [`crate::defaults`].
+//! `architecture` is the model discriminator. Almost every field is optional via
+//! [`crate::defaults`].
 
 use std::collections::BTreeMap;
 
@@ -19,6 +18,8 @@ pub struct Config {
     pub app: AppConfig,
     #[serde(default)]
     pub webhook: Option<WebhookConfig>,
+    #[serde(default)]
+    pub limits: LimitsConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
     #[serde(default)]
@@ -53,6 +54,21 @@ pub struct AppConfig {
     /// built-in default in [`crate::load`].
     #[serde(default)]
     pub config_file: Option<String>,
+    /// Soft ceiling on resident process memory (e.g. `4gb`, `512mb`; `0` = off).
+    /// New work is rejected with RESOURCE_EXHAUSTED while usage is above this.
+    #[serde(default = "crate::defaults::max_memory")]
+    pub max_memory: String,
+    /// Max items queued or in-flight before submissions are rejected with
+    /// RESOURCE_EXHAUSTED (backpressure). `0` disables the limit.
+    #[serde(default = "crate::defaults::max_pending")]
+    pub max_pending: u32,
+}
+
+impl AppConfig {
+    /// `max_memory` parsed to bytes; `None` means no limit.
+    pub fn max_memory_bytes(&self) -> Option<u64> {
+        crate::units::parse_size(&self.max_memory)
+    }
 }
 
 impl Default for AppConfig {
@@ -65,6 +81,8 @@ impl Default for AppConfig {
             idle_timeout: defaults::idle_timeout(),
             log_level: defaults::log_level(),
             config_file: None,
+            max_memory: defaults::max_memory(),
+            max_pending: defaults::max_pending(),
         }
     }
 }
@@ -76,6 +94,47 @@ pub struct WebhookConfig {
     /// gRPC target; scheme selects TLS (`https`) vs plaintext (`http`). Any path
     /// component is ignored — the gRPC method path is fixed by the service.
     pub url: String,
+    /// Optional shared secret. When set, each delivery carries an
+    /// `x-apollo-webhook-signature` metadata header: lowercase-hex HMAC-SHA256 of
+    /// the protobuf-encoded payload, letting the receiver verify authenticity.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// How often (seconds) the background loop retries deliveries left pending by
+    /// a failure. `0` disables periodic redelivery (still retried on restart).
+    #[serde(default = "crate::defaults::redelivery_secs")]
+    pub redelivery_secs: u32,
+}
+
+/// Safety limits applied when fetching remote inputs (SSRF and resource guards).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// Max bytes downloaded for a single input (e.g. `512mb`; `0` = unlimited).
+    pub max_download: String,
+    /// Reject videos longer than this many seconds (`0` = unlimited).
+    pub max_video_seconds: u32,
+    /// Reject hosts resolving to private / loopback / link-local addresses.
+    pub block_private_ips: bool,
+    /// URL schemes permitted for remote fetches.
+    pub allowed_schemes: Vec<String>,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_download: defaults::max_download(),
+            max_video_seconds: defaults::max_video_seconds(),
+            block_private_ips: defaults::block_private_ips(),
+            allowed_schemes: defaults::allowed_schemes(),
+        }
+    }
+}
+
+impl LimitsConfig {
+    /// `max_download` parsed to bytes; `None` means unlimited.
+    pub fn max_download_bytes(&self) -> Option<u64> {
+        crate::units::parse_size(&self.max_download)
+    }
 }
 
 /// `[database]` — persistence backend selection plus per-backend config.
@@ -253,6 +312,10 @@ pub struct ModelConfig {
     /// Max processing seconds per (input, model); queue wait excluded.
     #[serde(default = "crate::defaults::timeout")]
     pub timeout: u32,
+    /// Scheduling priority: higher is admitted from the queue ahead of
+    /// earlier-submitted lower-priority work. Defaults to 0; may be negative.
+    #[serde(default)]
+    pub priority: i32,
     /// Opts an image-classifier into video input via the named strategy.
     #[serde(default)]
     pub video_strategy: Option<String>,

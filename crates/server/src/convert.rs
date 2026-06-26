@@ -112,6 +112,7 @@ fn task_state(s: dom::TaskState) -> pb::TaskState {
         dom::TaskState::Processing => pb::TaskState::Processing,
         dom::TaskState::Completed => pb::TaskState::Completed,
         dom::TaskState::Failed => pb::TaskState::Failed,
+        dom::TaskState::Cancelled => pb::TaskState::Cancelled,
     }
 }
 
@@ -121,6 +122,7 @@ fn item_state(s: dom::ItemState) -> pb::ItemState {
         dom::ItemState::Processing => pb::ItemState::Processing,
         dom::ItemState::Completed => pb::ItemState::Completed,
         dom::ItemState::Failed => pb::ItemState::Failed,
+        dom::ItemState::Cancelled => pb::ItemState::Cancelled,
     }
 }
 

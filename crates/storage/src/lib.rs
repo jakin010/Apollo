@@ -2,8 +2,7 @@
 //! and retention helpers.
 //!
 //! The [`Storage`] trait is the seam new backends plug into. `[database].backend`
-//! selects the implementation at startup via [`open`]. SQLite is implemented;
-//! Postgres and SurrealDB are future seams.
+//! selects the implementation at startup via [`open`]. SQLite and SurrealDB are implemented; Postgres is a future seam.
 
 use std::sync::Arc;
 
@@ -17,7 +16,7 @@ pub mod error;
 pub mod resume;
 pub mod retention;
 
-pub use backends::SqliteStorage;
+pub use backends::{SqliteStorage, SurrealStorage};
 pub use error::StorageError;
 pub use resume::PendingWebhook;
 
@@ -132,6 +131,15 @@ pub async fn open(db: &DatabaseConfig) -> Result<Arc<dyn Storage>, StorageError>
             Ok(Arc::new(store))
         }
         Backend::Postgres => Err(StorageError::UnsupportedBackend("postgres".into())),
-        Backend::Surrealdb => Err(StorageError::UnsupportedBackend("surrealdb".into())),
+        Backend::Surrealdb => {
+            let cfg = db.surrealdb.clone().ok_or_else(|| {
+                StorageError::Surreal(
+                    "backend is 'surrealdb' but [database.surrealdb] is missing".into(),
+                )
+            })?;
+            let store = SurrealStorage::connect(&cfg).await?;
+            store.migrate().await?;
+            Ok(Arc::new(store))
+        }
     }
 }

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package apollo.v1;
+
+import "common.proto";
+
+// =============================================================================
+// Webhook service — implemented by the RECEIVER, called by the apollo server.
+//
+// The apollo server is the client here, calling the receiver configured by
+// [webhook].url. Fired once per item as that item reaches a terminal state; the
+// message carries the full current Task. Delivery is at-least-once, so receivers
+// should dedupe (e.g. by Task.id + the index of the terminal item). When the
+// server is configured with a secret, each call carries an
+// `x-apollo-webhook-signature` metadata header (lowercase-hex HMAC-SHA256 of the
+// task id) so the receiver can verify authenticity.
+// =============================================================================
+
+service Webhook {
+  rpc TaskStatus (Task) returns (Ack);
+}

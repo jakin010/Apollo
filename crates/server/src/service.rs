@@ -9,7 +9,9 @@ use tonic::{transport::Server, Request, Response, Status};
 
 use apollo_engine::{Engine, EngineError};
 use apollo_proto::inference_server::{Inference, InferenceServer};
-use apollo_proto::{ClassifyBatchRequest, ClassifyRequest, GetTaskRequest, Task, TaskCreated};
+use apollo_proto::{
+    CancelRequest, ClassifyBatchRequest, ClassifyRequest, GetTaskRequest, Task, TaskCreated,
+};
 
 use crate::convert::{submission_from_proto, task_to_proto};
 
@@ -80,6 +82,19 @@ impl Inference for InferenceService {
             None => Err(Status::not_found(format!("task '{id}' not found"))),
         }
     }
+
+    async fn cancel_task(
+        &self,
+        request: Request<CancelRequest>,
+    ) -> Result<Response<Task>, Status> {
+        let id = request.into_inner().task_id;
+        tracing::info!(task = %id, "CancelTask");
+        self.engine.cancel(&id).await.map_err(engine_to_status)?;
+        match self.engine.get_task(&id).await.map_err(engine_to_status)? {
+            Some(task) => Ok(Response::new(task_to_proto(task))),
+            None => Err(Status::not_found(format!("task '{id}' not found"))),
+        }
+    }
 }
 
 /// Map engine errors to gRPC status codes. Submit-time validation failures are
@@ -89,6 +104,8 @@ fn engine_to_status(e: EngineError) -> Status {
         EngineError::UnknownModel(_) | EngineError::Incompatible(_) | EngineError::Config(_) => {
             Status::invalid_argument(e.to_string())
         }
+        EngineError::UnknownTask(_) => Status::not_found(e.to_string()),
+        EngineError::Overloaded(_) => Status::resource_exhausted(e.to_string()),
         other => Status::internal(other.to_string()),
     }
 }
@@ -98,23 +115,28 @@ pub fn inference_service(engine: Engine) -> InferenceServer<InferenceService> {
     InferenceServer::new(InferenceService::new(engine))
 }
 
-/// Build the gRPC reflection service from the descriptor set embedded in
-/// `apollo-proto`. Panics only if that compiled-in descriptor is malformed.
+/// Build the gRPC reflection service advertising the `Inference` service (and the
+/// shared messages) only. Panics only if the compiled-in descriptor is malformed.
 fn reflection_service(
 ) -> tonic_reflection::server::v1::ServerReflectionServer<impl tonic_reflection::server::v1::ServerReflection>
 {
     tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(apollo_proto::FILE_DESCRIPTOR_SET)
+        .register_encoded_file_descriptor_set(apollo_proto::INFERENCE_DESCRIPTOR_SET)
         .build_v1()
         .expect("embedded gRPC reflection descriptor must be valid")
 }
 
 /// Serve the `Inference` API (plus reflection) on `addr` until terminated.
 pub async fn serve(engine: Engine, addr: SocketAddr) -> Result<(), tonic::transport::Error> {
-    tracing::info!(%addr, "serving Inference gRPC (reflection enabled)");
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<InferenceServer<InferenceService>>()
+        .await;
+    tracing::info!(%addr, "serving Inference gRPC (reflection + health enabled)");
     Server::builder()
         .add_service(inference_service(engine))
         .add_service(reflection_service())
+        .add_service(health_service)
         .serve(addr)
         .await
 }
@@ -128,10 +150,15 @@ pub async fn serve_with_shutdown<F>(
 where
     F: Future<Output = ()>,
 {
-    tracing::info!(%addr, "serving Inference gRPC (graceful, reflection enabled)");
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<InferenceServer<InferenceService>>()
+        .await;
+    tracing::info!(%addr, "serving Inference gRPC (graceful, reflection + health enabled)");
     Server::builder()
         .add_service(inference_service(engine))
         .add_service(reflection_service())
+        .add_service(health_service)
         .serve_with_shutdown(addr, shutdown)
         .await
 }

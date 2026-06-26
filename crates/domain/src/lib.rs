@@ -9,6 +9,6 @@ pub mod result;
 pub mod task;
 
 pub use image::DecodedImage;
-pub use model::{Architecture, Modality, ModelKind};
+pub use model::{Architecture, Modality};
 pub use result::{select_top, Classification, Frame, FrameScan, ModelOutput, Prediction};
 pub use task::{Input, Item, ItemState, ModelResult, ModelState, Task, TaskState, Url};

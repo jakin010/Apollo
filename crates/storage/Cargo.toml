@@ -10,6 +10,8 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 async-trait = "0.1"
 serde_json = "1"
 thiserror = "2"
+# SurrealDB backend (remote server over ws(s)/http(s)). Pinned 3.1.x; bump for 4.x.
+surrealdb = { version = "3.1", default-features = false, features = ["protocol-ws", "protocol-http", "rustls"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

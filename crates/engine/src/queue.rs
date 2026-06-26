@@ -1,5 +1,7 @@
 //! Task submission lifecycle, startup recovery, and the retention timer.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use apollo_domain::{Task, TaskState};
@@ -40,6 +42,10 @@ impl Engine {
                 continue;
             }
             tracing::info!(task = %task.id, attempts, "resuming task");
+            // Count resumed items toward the in-flight backpressure gauge.
+            self.inner
+                .in_flight
+                .fetch_add(task.items.len(), Ordering::SeqCst);
             let engine = self.clone();
             tokio::spawn(async move { engine.run_task(task).await });
             resumed += 1;
@@ -52,22 +58,38 @@ impl Engine {
     /// once all items are terminal.
     pub(crate) async fn run_task(&self, task: Task) {
         let task_id = task.id.clone();
-        if let Err(e) = self
-            .inner
-            .storage
-            .set_task_state(&task_id, TaskState::Processing)
-            .await
-        {
-            tracing::error!(task = %task_id, error = %e, "failed to mark task processing");
-            return;
+        let n_items = task.items.len();
+
+        // Adopt the cancellation token cancel() may have already created for this
+        // task, otherwise register a fresh one.
+        let cancel = {
+            let mut map = self.inner.cancels.lock().unwrap();
+            map.entry(task_id.clone())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone()
+        };
+
+        if !cancel.load(Ordering::SeqCst) {
+            if let Err(e) = self
+                .inner
+                .storage
+                .set_task_state(&task_id, TaskState::Processing)
+                .await
+            {
+                tracing::error!(task = %task_id, error = %e, "failed to mark task processing");
+                self.inner.in_flight.fetch_sub(n_items, Ordering::SeqCst);
+                self.inner.cancels.lock().unwrap().remove(&task_id);
+                return;
+            }
         }
 
-        let mut handles = Vec::with_capacity(task.items.len());
+        let mut handles = Vec::with_capacity(n_items);
         for (idx, item) in task.items.into_iter().enumerate() {
             let engine = self.clone();
             let tid = task_id.clone();
+            let token = cancel.clone();
             handles.push(tokio::spawn(async move {
-                engine.run_item(tid, idx, item).await
+                engine.run_item(tid, idx, item, token).await
             }));
         }
         for h in handles {
@@ -76,14 +98,21 @@ impl Engine {
             }
         }
 
-        if let Err(e) = self
-            .inner
-            .storage
-            .set_task_state(&task_id, TaskState::Completed)
-            .await
-        {
-            tracing::error!(task = %task_id, error = %e, "failed to mark task completed");
+        // Cancellation wins over the item rollup; otherwise reflect the items (a
+        // backstop in case an item task panicked before it could roll up).
+        if cancel.load(Ordering::SeqCst) {
+            if let Err(e) = self
+                .inner
+                .storage
+                .set_task_state(&task_id, TaskState::Cancelled)
+                .await
+            {
+                tracing::error!(task = %task_id, error = %e, "failed to mark task cancelled");
+            }
+        } else {
+            self.rollup_task_state(&task_id).await;
         }
+        self.inner.cancels.lock().unwrap().remove(&task_id);
     }
 
     /// Start the hourly retention purge if `database.retention` parses to a window.

@@ -57,3 +57,27 @@ pub(crate) fn pg_port() -> u16 {
 pub(crate) fn pg_max_connections() -> u32 {
     10
 }
+
+// --- app memory / backpressure + fetch limits + webhook redelivery ---
+
+pub(crate) fn max_memory() -> String {
+    "4gb".to_string()
+}
+pub(crate) fn max_pending() -> u32 {
+    1024
+}
+pub(crate) fn max_download() -> String {
+    "512mb".to_string()
+}
+pub(crate) fn max_video_seconds() -> u32 {
+    3600
+}
+pub(crate) fn block_private_ips() -> bool {
+    true
+}
+pub(crate) fn allowed_schemes() -> Vec<String> {
+    vec!["http".to_string(), "https".to_string()]
+}
+pub(crate) fn redelivery_secs() -> u32 {
+    60
+}

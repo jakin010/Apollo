@@ -29,11 +29,19 @@ pub async fn plan(
     let mut ordered = steps.to_vec();
     ordered.sort_by_key(|s| s.step);
 
+    // Never seek at or past the last decodable frame: imprecise container
+    // durations and variable frame rates mean a timestamp at (or fractionally
+    // beyond) `duration` decodes to nothing. Clamp every sample to at least one
+    // frame-duration short of the end.
+    let guard = if info.fps > 0.0 { (1.0 / info.fps).max(1e-3) } else { 0.05 };
+    let max_seek = (info.duration - guard).max(0.0);
+
     let mut chosen: Vec<f64> = Vec::new();
     for step in &ordered {
         let mut times = sampling::step_timestamps(path, info, step).await?;
         times.sort_by(cmp_f64);
         for t in times {
+            let t = t.clamp(0.0, max_seek);
             if !chosen.iter().any(|&c| (c - t).abs() <= DEDUPE_TOLERANCE) {
                 chosen.push(t);
             }
@@ -151,6 +159,23 @@ mod tests {
         assert_eq!(frames.len(), 8);
         assert!((frames[0].timestamp - 2.0).abs() < 1e-9); // cheap step first
         assert!((frames[1].timestamp - 6.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn plan_never_seeks_past_last_frame() {
+        // Dense uniform sampling would otherwise place a frame essentially at the
+        // very end of the clip, where ffmpeg can decode nothing. Every planned
+        // timestamp must stay at least one frame-duration short of the end.
+        let frames = plan(
+            Path::new("unused"),
+            &info(60.0, 30.0),
+            &[step(1, SamplingKind::Uniform, Some(2000), None)],
+        )
+        .await
+        .unwrap();
+        let max_seek = 60.0 - 1.0 / 30.0;
+        assert!(!frames.is_empty());
+        assert!(frames.iter().all(|f| f.timestamp <= max_seek + 1e-9));
     }
 
     #[test]

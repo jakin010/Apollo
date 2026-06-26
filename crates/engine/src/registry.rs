@@ -8,7 +8,7 @@ use std::time::Duration;
 use candle_core::Device;
 
 use apollo_config::Config;
-use apollo_domain::{Input, Modality, ModelKind};
+use apollo_domain::{Input, Modality};
 
 use crate::error::EngineError;
 use crate::worker::{spawn_worker, ModelHandle};
@@ -52,10 +52,11 @@ impl Registry {
             if !model.enabled {
                 return Err(EngineError::Incompatible(format!("model '{label}' is disabled")));
             }
-            match (modality, model.architecture.kind()) {
-                (Modality::Image, ModelKind::ImageClassifier) => {}
-                (Modality::Video, ModelKind::VideoClassifier) => {}
-                (Modality::Video, ModelKind::ImageClassifier) => match &model.video_strategy {
+            // Every model is an image classifier: images run directly; video runs
+            // as a per-frame scan, which requires a configured video_strategy.
+            match modality {
+                Modality::Image => {}
+                Modality::Video => match &model.video_strategy {
                     Some(s) if config.strategies.contains_key(s) => {}
                     Some(s) => {
                         return Err(EngineError::Config(format!(
@@ -64,16 +65,11 @@ impl Registry {
                     }
                     None => {
                         return Err(EngineError::Incompatible(format!(
-                            "model '{label}' is an image-classifier and needs a video_strategy to accept video"
+                            "model '{label}' needs a video_strategy to accept video input"
                         )))
                     }
                 },
-                (Modality::Image, ModelKind::VideoClassifier) => {
-                    return Err(EngineError::Incompatible(format!(
-                        "video-classifier '{label}' cannot classify an image"
-                    )))
-                }
-                (Modality::Text, _) | (Modality::Audio, _) => {
+                Modality::Text | Modality::Audio => {
                     return Err(EngineError::Incompatible(format!(
                         "{modality:?} input is not supported yet"
                     )))

@@ -1,20 +1,32 @@
 # Example configuration. The app exits at startup if no models are defined.
 
 [app]
-endpoint       = "0.0.0.0"
+endpoint       = "127.0.0.1"
 port           = 8080
-cache_dir      = "../__local/cache/"
+cache_dir      = "/var/cache/apollo"           # optional
 max_concurrent = 20                            # global in-flight / VRAM ceiling
+idle_timeout   = 300                           # seconds a model stays resident while idle (unless keep_in_memory)
+max_memory     = "4gb"                          # soft resident-memory cap; new work rejected above it (0 = off)
+max_pending    = 1024                           # max queued/in-flight items before backpressure (0 = off)
 
 [webhook]
 url = "https://hooks.example.com:443"          # optional; omit the section to disable and let clients poll
+# secret          = "change-me"                 # optional shared secret; HMAC-signs each delivery (verify on the receiver)
+# redelivery_secs = 60                           # background retry interval for failed deliveries (0 = off)
+
+# Safety limits applied when fetching remote inputs (SSRF + resource guards).
+[limits]
+# max_download      = "512mb"                   # per-input download cap (0 = unlimited)
+# max_video_seconds = 3600                       # reject videos longer than this (0 = unlimited)
+# block_private_ips = true                       # refuse hosts resolving to private/loopback/link-local addresses
+# allowed_schemes   = ["http", "https"]          # URL schemes permitted for remote fetches
 
 [database]
-backend   = "sqlite"            # sqlite | postgres | surrealdb  (latter two: future)
+backend   = "sqlite"            # sqlite | postgres | surrealdb  (postgres: future)
 # retention = "30d"             # how long to keep finished tasks; omit = keep forever
 
 [database.sqlite]
-path            = "../__local/db/apollo.db"
+path            = "/var/lib/apollo/classifications.db"
 # wal             = true        # concurrent reads don't block
 # busy_timeout    = 5000        # ms to wait on a momentarily locked file
 # max_connections = 5
@@ -29,12 +41,12 @@ path            = "../__local/db/apollo.db"
 # sslmode = "require"
 # max_connections = 10
 #
-# [database.surrealdb]
-# url = "ws://localhost:8000"
+# [database.surrealdb]                  # remote SurrealDB 3.1.x over ws(s):// or http(s)://
+# url       = "ws://localhost:8000"
 # namespace = "apollo"
 # database  = "classifications"
-# user = "root"
-# password = "..."
+# user      = "root"                     # omit user/password for an unauthenticated server
+# password  = "..."
 
 # ============================ strategies ============================
 # How an image-classifier is applied to a video. Named and reusable.
@@ -90,6 +102,6 @@ video_strategy = "progressive_scan"
 labels    = ["nsfw"]
 threshold = 0.85
 
-[models.action]
-architecture = "videomae"
-repo         = "MCG-NJU/videomae-base-finetuned-kinetics"
+# Note: video is handled by running an image-classifier over sampled frames —
+# set `video_strategy` on a `vit` model (see `general`/`nsfw` above). There is no
+# separate video-model architecture.

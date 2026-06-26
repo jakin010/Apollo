@@ -6,7 +6,8 @@
 //!   [`Client::classify_batch`], [`Client::get_task`].
 //! * [`serve_webhook`] + [`WebhookHandler`] — stand up the `Webhook` receiver so
 //!   apollo can push per-item results to you. Point the apollo server's
-//!   `[webhook].url` at the address you serve on.
+//!   `[webhook].url` at the address you serve on. Enable the `reflection` feature
+//!   to expose gRPC server reflection on the receiver.
 //!
 //! All protobuf message types are re-exported here, so depending on this crate is
 //! enough — you do not need `apollo-proto` directly. Build the inputs with the
@@ -46,7 +47,7 @@ mod webhook;
 pub mod item;
 
 pub use client::{Client, ClientError};
-pub use webhook::{serve_webhook, serve_webhook_with_shutdown, WebhookHandler};
+pub use webhook::{serve_webhook, serve_webhook_with_shutdown, WebhookHandler, WebhookReceiver};
 
 // Re-export the wire types so downstreams don't need to depend on `apollo-proto`.
 pub use apollo_proto::{

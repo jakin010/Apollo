@@ -43,19 +43,32 @@ pub async fn probe(path: &Path) -> Result<VideoInfo, MediaError> {
 
 /// Extract a single frame at `timestamp` seconds, decoded to RGB8.
 pub async fn extract_frame(path: &Path, timestamp: f64) -> Result<DecodedImage, MediaError> {
+    // Primary: fast input-seek to the requested time.
+    if let Some(bytes) = grab_frame(path, &["-ss".into(), format!("{timestamp}")]).await? {
+        return decode_image(&bytes);
+    }
+    // The seek landed past the last decodable frame (imprecise duration / VFR);
+    // fall back to the file's final frame so a near-end sample still yields an
+    // image instead of failing the whole scan.
+    if let Some(bytes) = grab_frame(path, &["-sseof".into(), "-1".into()]).await? {
+        return decode_image(&bytes);
+    }
+    Err(MediaError::Ffmpeg(format!(
+        "ffmpeg produced no frame at t={timestamp} (no final frame either)"
+    )))
+}
+
+/// Run ffmpeg with the given pre-input seek args and grab a single PNG frame.
+/// `Ok(None)` means ffmpeg exited cleanly but produced no frame (seek past the end).
+async fn grab_frame(path: &Path, seek: &[String]) -> Result<Option<Vec<u8>>, MediaError> {
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-v", "error", "-ss"])
-        .arg(format!("{timestamp}"))
+    cmd.args(["-v", "error"])
+        .args(seek)
         .arg("-i")
         .arg(path)
         .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"]);
     let stdout = capture("ffmpeg", &mut cmd).await?;
-    if stdout.is_empty() {
-        return Err(MediaError::Ffmpeg(format!(
-            "ffmpeg produced no frame at t={timestamp}"
-        )));
-    }
-    decode_image(&stdout)
+    Ok((!stdout.is_empty()).then_some(stdout))
 }
 
 /// Extract frames at each `timestamp` (one ffmpeg seek per timestamp).
@@ -176,6 +189,20 @@ fn parse_probe(stdout: &[u8]) -> Result<VideoInfo, MediaError> {
         .and_then(|n| n.as_str())
         .and_then(|s| s.parse::<u64>().ok());
 
+    // Reject still images handed to a video field: ffmpeg will happily "probe" a
+    // PNG/JPEG as a 1-frame stream, but it is not a video.
+    let format_name = v
+        .get("format")
+        .and_then(|f| f.get("format_name"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    let codec = video.get("codec_name").and_then(|c| c.as_str()).unwrap_or("");
+    if is_image_only(format_name, codec, duration, frame_count) {
+        return Err(MediaError::Ffmpeg(format!(
+            "expected a video but got a still image (format '{format_name}', codec '{codec}')"
+        )));
+    }
+
     Ok(VideoInfo {
         duration,
         fps,
@@ -183,6 +210,22 @@ fn parse_probe(stdout: &[u8]) -> Result<VideoInfo, MediaError> {
         width,
         height,
     })
+}
+
+/// Whether an ffprobe result describes a still image rather than a video. Image
+/// demuxers (`image2`, `*_pipe`, `apng`) are conclusive; otherwise a known
+/// still-image codec with at most one frame and no real duration is treated as an
+/// image. Animated formats (e.g. multi-frame GIF) have >1 frame and pass.
+fn is_image_only(format_name: &str, codec: &str, duration: f64, frame_count: Option<u64>) -> bool {
+    let image_format = format_name
+        .split(',')
+        .any(|f| f == "image2" || f == "apng" || f.ends_with("_pipe"));
+    if image_format {
+        return true;
+    }
+    const STILL_CODECS: &[&str] = &["png", "mjpeg", "bmp", "tiff", "webp", "gif"];
+    let single_frame = frame_count.map_or(true, |n| n <= 1);
+    STILL_CODECS.contains(&codec) && single_frame && duration <= 0.0
 }
 
 /// Parse a `"num/den"` rational (an ffmpeg frame rate) into f64.

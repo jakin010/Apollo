@@ -1,0 +1,129 @@
+syntax = "proto3";
+
+package apollo.v1;
+
+// =============================================================================
+// Shared messages and enums for the apollo.v1 services.
+//
+// This file defines no services; it is imported by both `inference.proto` (the
+// `Inference` service the apollo server implements) and `webhook.proto` (the
+// `Webhook` service a receiver implements). Keeping the messages here lets each
+// service compile a self-contained FileDescriptorSet for reflection without the
+// two services leaking into each other's schema.
+// =============================================================================
+
+// --------------------------------- requests ----------------------------------
+
+message ClassifyRequest      { InputItem item = 1; }
+message ClassifyBatchRequest { repeated InputItem items = 1; }
+message GetTaskRequest       { string task_id = 1; }
+message CancelRequest        { string task_id = 1; }
+message TaskCreated          { string task_id = 1; }
+message Ack                  {}
+
+// A content reference: a primary URL plus an optional fallback that is tried
+// only if `main` cannot be fetched or decoded. Not a oneof — main and fallback
+// coexist (a primary with a backup), rather than being mutually exclusive.
+message Url {
+  string main = 1;              // local path, file://, or http(s)://
+  optional string fallback = 2; // tried only if `main` fails
+}
+
+// An input plus the models to run on it. Every label must be compatible with
+// the chosen input modality.
+message InputItem {
+  repeated string models = 1;
+
+  oneof input {
+    Url    image_url = 2;   // fetched; supports a fallback
+    Url    video_url = 3;   // fetched; supports a fallback
+    string text      = 4;   // inline content (future); no URL, no fallback
+    Url    audio_url = 5;   // fetched; supports a fallback (future)
+  }
+}
+
+// ---------------------------------- results ----------------------------------
+
+message Task {
+  string id = 1;
+  TaskState state = 2;
+  // Aligned to the submitted items; a single Classify request yields length 1.
+  repeated ItemResult items = 3;
+}
+
+message ItemResult {
+  ItemState state = 1;
+  // Keyed by model label. One model failing does not sink the others.
+  map<string, ModelResult> results = 2;
+  // Set on item-level failure (e.g. the input could not be fetched).
+  string error = 3;
+}
+
+message ModelResult {
+  ModelState state = 1;
+
+  // Set only when state == MODEL_STATE_DONE:
+  //   classification : image input
+  //   frame_scan     : an image-classifier applied to a video (sampled frames)
+  oneof output {
+    Classification classification = 2;
+    FrameScan      frame_scan     = 3;
+  }
+
+  // Set only when state == MODEL_STATE_FAILED (inference error, timeout, ...).
+  string error = 4;
+}
+
+// A label set. Returned predictions are the top 5 unioned with any label
+// scoring above 0.90.
+message Classification {
+  repeated Prediction predictions = 1;
+}
+
+// An image-classifier run frame-by-frame over a video.
+message FrameScan {
+  // Rolled up across classified frames via the strategy aggregation (max/mean).
+  Classification aggregated = 1;
+  // Only the frames actually classified (early exit truncates this list).
+  repeated Frame frames = 2;
+}
+
+message Frame {
+  double timestamp = 1;             // seconds into the video
+  uint32 index     = 2;             // ordinal among sampled frames
+  Classification classification = 3;
+}
+
+message Prediction {
+  string label = 1;
+  float  score = 2;
+}
+
+// ----------------------------------- enums -----------------------------------
+// proto3 enum values share the package namespace, so each set is prefixed.
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_QUEUED      = 1;
+  TASK_STATE_PROCESSING  = 2;
+  TASK_STATE_COMPLETED   = 3;   // all items reached a terminal state (success or not)
+  TASK_STATE_FAILED      = 4;   // failed before any item could run
+  TASK_STATE_CANCELLED   = 5;   // cancelled by a client request
+}
+
+enum ItemState {
+  ITEM_STATE_UNSPECIFIED = 0;
+  ITEM_STATE_QUEUED      = 1;
+  ITEM_STATE_PROCESSING  = 2;
+  ITEM_STATE_COMPLETED   = 3;
+  ITEM_STATE_FAILED      = 4;
+  ITEM_STATE_CANCELLED   = 5;
+}
+
+enum ModelState {
+  MODEL_STATE_UNSPECIFIED = 0;
+  MODEL_STATE_QUEUED      = 1;
+  MODEL_STATE_PROCESSING  = 2;
+  MODEL_STATE_DONE        = 3;
+  MODEL_STATE_FAILED      = 4;
+}

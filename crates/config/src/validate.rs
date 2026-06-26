@@ -6,7 +6,6 @@
 
 use std::collections::BTreeSet;
 
-use apollo_domain::ModelKind;
 
 use crate::error::ConfigError;
 use crate::schema::{Backend, Config, SamplingKind};
@@ -48,13 +47,6 @@ impl Config {
                 if !self.strategies.contains_key(vs) {
                     errs.push(format!(
                         "model '{label}': video_strategy '{vs}' is not defined"
-                    ));
-                }
-                if model.architecture.kind() == ModelKind::VideoClassifier {
-                    errs.push(format!(
-                        "model '{label}': video-classifier ('{:?}') must not set \
-                         video_strategy (it classifies whole clips)",
-                        model.architecture
                     ));
                 }
             }

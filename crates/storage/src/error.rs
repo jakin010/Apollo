@@ -8,6 +8,9 @@ pub enum StorageError {
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
+    #[error("surrealdb error: {0}")]
+    Surreal(String),
+
     #[error("corrupt stored data: {0}")]
     Corrupt(String),
 

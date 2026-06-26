@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::ConfigError;
-use crate::schema::{Config, WebhookConfig};
+use crate::schema::Config;
 
 /// Built-in default config path: the per-user application config directory
 /// (`~/.config/apollo/config.toml` on Linux, `~/Library/Application
@@ -60,8 +60,8 @@ impl Config {
         if let Some(p) = o.port {
             self.app.port = p;
         }
-        if let Some(u) = &o.webhook_url {
-            self.webhook = Some(WebhookConfig { url: u.clone() });
+        if let Some(u) = &o.webhook_url && let Some(w) = self.webhook.as_mut() {
+            w.url = u.clone();
         }
     }
 }

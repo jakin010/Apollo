@@ -1,9 +1,10 @@
-//! Storage backends. `sqlite` is implemented; the others are future seams that
-//! currently cause [`crate::open`] to return
+//! Storage backends. `sqlite` and `surreal` are implemented; `postgres` is a future seam that
+//! currently causes [`crate::open`] to return
 //! [`StorageError::UnsupportedBackend`](crate::StorageError::UnsupportedBackend).
 
 pub mod sqlite;
+pub mod surreal;
 mod postgres;
-mod surrealdb;
 
 pub use sqlite::SqliteStorage;
+pub use surreal::SurrealStorage;
