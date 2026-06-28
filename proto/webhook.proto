@@ -14,8 +14,16 @@ import "common.proto";
 // server is configured with a secret, each call carries an
 // `x-apollo-webhook-signature` metadata header (lowercase-hex HMAC-SHA256 of the
 // task id) so the receiver can verify authenticity.
+//
+// Two methods, same endpoint, same signing, same bare-Task payload:
+//   * TaskStatus — every item reaching a terminal state (queued→…→completed/
+//     failed/cancelled), including intermediate transitions like `retrying`.
+//   * ItemFailed — additionally called for an item that has exhausted all retries
+//     (a dead-letter signal). The permanently-failed item is the one in the
+//     FAILED state; dedupe the same way.
 // =============================================================================
 
 service Webhook {
   rpc TaskStatus (Task) returns (Ack);
+  rpc ItemFailed (Task) returns (Ack);
 }

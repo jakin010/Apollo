@@ -6,21 +6,21 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use apollo_config::{EarlyExit, ModelConfig, StrategyConfig};
 use apollo_domain::{
-    Classification, DecodedImage, Frame, Input, Item, ItemState, Modality, ModelOutput,
-    ModelResult, ModelState,
+    Classification, DecodedImage, Frame, Input, Item, ItemState, ModelOutput, ModelResult,
+    ModelState, Modality, Url,
 };
 use apollo_media::{FrameRef, LocalMedia, VideoInfo};
 
-use crate::Engine;
 use crate::aggregate;
-use crate::error::{EngineError, media_err};
+use crate::error::{media_err, EngineError};
 use crate::worker::ModelHandle;
+use crate::Engine;
 
 /// A fetched, decoded/probed input ready for inference.
 enum Fetched {
@@ -36,7 +36,7 @@ impl Engine {
         self,
         task_id: String,
         idx: usize,
-        item: Item,
+        mut item: Item,
         cancel: Arc<AtomicBool>,
     ) {
         // Release the admission reservation on every exit path.
@@ -55,14 +55,20 @@ impl Engine {
         // (crash between the last result and the item transition): finalize without
         // re-fetching or re-running anything.
         if !item.models.is_empty() && item.models.iter().all(|m| model_done(&item, m)) {
-            let _ = self
-                .inner
-                .storage
-                .set_item_state(&task_id, idx, ItemState::Completed, None)
-                .await;
-            self.rollup_task_state(&task_id).await;
-            self.deliver_webhook(&task_id, idx).await;
+            self.complete_item(&task_id, idx).await;
             return;
+        }
+
+        // Content cache — URL fast path: when every still-pending model resolves
+        // through the url->content-hash->result chain, persist those results and
+        // finish without fetching or running anything (bounded by the cache TTL).
+        if self.cache_enabled() {
+            if let Some(url) = item_url(&item.input) {
+                if self.try_url_cache(&task_id, idx, &item, url).await {
+                    self.complete_item(&task_id, idx).await;
+                    return;
+                }
+            }
         }
 
         // Bound concurrent items globally (a coarse VRAM/throughput cap; the real
@@ -83,13 +89,55 @@ impl Engine {
         self.notify_item_change(&task_id, idx).await;
 
         tracing::debug!(task = %task_id, item = idx, models = item.models.len(), "processing item");
-        let fetched = match self.fetch_item(&item.input).await {
-            Ok(f) => f,
-            Err(e) => {
-                self.fail_item(&task_id, idx, &item, &e.to_string()).await;
-                return;
+        // Fetch with retries: a failed attempt (e.g. an unreachable URL) puts the
+        // item into `Retrying` — reported as such on the webhook — and tries again,
+        // up to `[app].max_retries`, before failing it permanently.
+        let max_retries = self.inner.config.app.max_retries;
+        let (fetched, content_hash) = loop {
+            match self.fetch_item(&item.input).await {
+                Ok(f) => break f,
+                Err(e) if item.retries < max_retries => {
+                    item.retries += 1;
+                    let _ = self
+                        .inner
+                        .storage
+                        .set_item_retries(&task_id, idx, item.retries)
+                        .await;
+                    let _ = self
+                        .inner
+                        .storage
+                        .set_item_state(&task_id, idx, ItemState::Retrying, Some(&e.to_string()))
+                        .await;
+                    tracing::warn!(
+                        task = %task_id, item = idx, attempt = item.retries, max = max_retries,
+                        error = %e, "item attempt failed; will retry"
+                    );
+                    self.notify_item_change(&task_id, idx).await;
+                    tokio::time::sleep(retry_backoff(item.retries)).await;
+                    if cancel.load(Ordering::SeqCst) {
+                        self.cancel_item(&task_id, idx).await;
+                        return;
+                    }
+                }
+                Err(e) => {
+                    // Retries exhausted (or disabled): permanent, dead-lettered failure.
+                    self.fail_item(&task_id, idx, &item, &e.to_string()).await;
+                    return;
+                }
             }
         };
+        // A retried item was left in `Retrying`; reflect that it is processing again
+        // (persisted for GetTask; the terminal webhook fires at the end).
+        if item.retries > 0 {
+            let _ = self
+                .inner
+                .storage
+                .set_item_state(&task_id, idx, ItemState::Processing, None)
+                .await;
+        }
+
+        let fresh_after = self.cache_fresh_after();
+        let url_hash = item_url(&item.input).map(|u| sha256_hex(u.main.as_bytes()));
 
         for label in &item.models {
             // Cancellation checkpoint between models.
@@ -100,6 +148,36 @@ impl Engine {
             if model_done(&item, label) {
                 continue;
             }
+
+            // Content-cache fast path: identical bytes already classified by this
+            // model + revision -> reuse the stored output, skipping inference.
+            if let Some(ch) = content_hash.as_deref() {
+                let rev = self.model_revision(label);
+                match self
+                    .inner
+                    .storage
+                    .cache_lookup(ch, label, &rev, fresh_after)
+                    .await
+                {
+                    Ok(Some(output)) => {
+                        let _ = self
+                            .inner
+                            .storage
+                            .upsert_model_result(&task_id, idx, label, &ModelResult::done(output))
+                            .await;
+                        if let Some(uh) = url_hash.as_deref() {
+                            let _ = self.inner.storage.url_cache_store(uh, label, &rev, ch).await;
+                        }
+                        tracing::debug!(task = %task_id, item = idx, model = %label, "cache hit");
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(task = %task_id, model = %label, error = %e, "cache lookup failed")
+                    }
+                }
+            }
+
             let _ = self
                 .inner
                 .storage
@@ -114,7 +192,20 @@ impl Engine {
                 .run_model(&task_id, idx, label, &item, &fetched, &cancel)
                 .await
             {
-                Ok(output) => ModelResult::done(output),
+                Ok(output) => {
+                    // Populate the cache on success (best-effort).
+                    if let Some(ch) = content_hash.as_deref() {
+                        let rev = self.model_revision(label);
+                        if let Err(e) = self.inner.storage.cache_store(ch, label, &rev, &output).await
+                        {
+                            tracing::warn!(task = %task_id, model = %label, error = %e, "cache store failed");
+                        }
+                        if let Some(uh) = url_hash.as_deref() {
+                            let _ = self.inner.storage.url_cache_store(uh, label, &rev, ch).await;
+                        }
+                    }
+                    ModelResult::done(output)
+                }
                 Err(EngineError::Cancelled) => {
                     self.cancel_item(&task_id, idx).await;
                     return;
@@ -128,16 +219,95 @@ impl Engine {
                 .await;
         }
 
+        self.complete_item(&task_id, idx).await;
+    }
+
+    /// Whether the result cache is configured and enabled.
+    fn cache_enabled(&self) -> bool {
+        self.inner.config.cache.as_ref().is_some_and(|c| c.enabled)
+    }
+
+    /// Lower bound (unix secs) on a cache entry's `created_at` for it to count as
+    /// fresh: `now - ttl`, or `0` (no cutoff) when no TTL is configured.
+    fn cache_fresh_after(&self) -> i64 {
+        match self.inner.config.cache.as_ref().and_then(|c| c.ttl_secs) {
+            Some(ttl) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                now - ttl as i64
+            }
+            None => 0,
+        }
+    }
+
+    /// The configured revision for a model label (part of the cache key, so a
+    /// revision bump invalidates prior cache entries). Empty if unknown.
+    fn model_revision(&self, label: &str) -> String {
+        self.inner
+            .config
+            .models
+            .get(label)
+            .map(|m| m.revision.clone())
+            .unwrap_or_default()
+    }
+
+    /// Finalize an item as completed: persist the state, roll up the task, and
+    /// fire the terminal webhook.
+    async fn complete_item(&self, task_id: &str, idx: usize) {
         if let Err(e) = self
             .inner
             .storage
-            .set_item_state(&task_id, idx, ItemState::Completed, None)
+            .set_item_state(task_id, idx, ItemState::Completed, None)
             .await
         {
             tracing::error!(task = %task_id, item = idx, error = %e, "set item completed");
         }
-        self.rollup_task_state(&task_id).await;
-        self.deliver_webhook(&task_id, idx).await;
+        self.rollup_task_state(task_id).await;
+        self.deliver_webhook(task_id, idx).await;
+    }
+
+    /// All-or-nothing URL fast path. If every not-yet-done model for this item
+    /// resolves through the url->content-hash->result chain (fresh per the TTL),
+    /// persist those results and return true; on any miss, persist nothing and
+    /// return false so the caller fetches and hashes the actual bytes instead.
+    async fn try_url_cache(&self, task_id: &str, idx: usize, item: &Item, url: &Url) -> bool {
+        let fresh_after = self.cache_fresh_after();
+        let url_hash = sha256_hex(url.main.as_bytes());
+        let mut resolved: Vec<(String, ModelOutput)> = Vec::new();
+        for label in &item.models {
+            if model_done(item, label) {
+                continue;
+            }
+            let rev = self.model_revision(label);
+            let content_hash = match self
+                .inner
+                .storage
+                .url_cache_lookup(&url_hash, label, &rev, fresh_after)
+                .await
+            {
+                Ok(Some(ch)) => ch,
+                _ => return false,
+            };
+            match self
+                .inner
+                .storage
+                .cache_lookup(&content_hash, label, &rev, fresh_after)
+                .await
+            {
+                Ok(Some(output)) => resolved.push((label.clone(), output)),
+                _ => return false,
+            }
+        }
+        for (label, output) in resolved {
+            let _ = self
+                .inner
+                .storage
+                .upsert_model_result(task_id, idx, &label, &ModelResult::done(output))
+                .await;
+        }
+        true
     }
 
     /// Mark an item cancelled (preserving any results already produced), roll the
@@ -172,6 +342,8 @@ impl Engine {
             .await;
         self.rollup_task_state(task_id).await;
         self.deliver_webhook(task_id, idx).await;
+        // Exhausted item -> dead-letter endpoint (if configured).
+        self.deliver_failure_webhook(task_id, idx).await;
     }
 
     /// Recompute the task's lifecycle state from its items and persist it when it
@@ -192,6 +364,29 @@ impl Engine {
         if desired != task.state {
             if let Err(e) = self.inner.storage.set_task_state(task_id, desired).await {
                 tracing::error!(task = %task_id, error = %e, "failed to roll up task state");
+            }
+        }
+        // Once a task is terminal, remove any staged upload files. They persist
+        // across restarts (so resume can re-read them) and are cleaned exactly
+        // here, when the task is finished for good.
+        if aggregate::task_terminal(desired) {
+            self.cleanup_uploads(&task.items);
+        }
+    }
+
+    /// Best-effort removal of `Input::Bytes` upload files for a finished task.
+    fn cleanup_uploads(&self, items: &[Item]) {
+        for item in items {
+            if let Input::Bytes { path, .. } = &item.input {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to remove upload file"
+                    ),
+                }
             }
         }
     }
@@ -227,14 +422,7 @@ impl Engine {
                 // Video: an image classifier over sampled frames, each frame bounded
                 // by `timeout` (applied inside run_frame_scan).
                 self.run_frame_scan(
-                    task_id,
-                    idx,
-                    label,
-                    &handle,
-                    media.path(),
-                    info,
-                    timeout,
-                    cancel,
+                    task_id, idx, label, &handle, media.path(), info, timeout, cancel,
                 )
                 .await
             }
@@ -246,37 +434,76 @@ impl Engine {
 
     /// Fetch the input once: download (with fallback), then decode an image or
     /// probe a video.
-    async fn fetch_item(&self, input: &Input) -> Result<Fetched, EngineError> {
+    async fn fetch_item(&self, input: &Input) -> Result<(Fetched, Option<String>), EngineError> {
+        let want_hash = self.cache_enabled();
         match input {
             Input::Image(url) => {
                 let media = apollo_media::fetch(url, &self.inner.fetch_limits)
                     .await
                     .map_err(media_err)?;
-                let bytes = media.read_bytes().map_err(media_err)?;
-                let img = tokio::task::spawn_blocking(move || apollo_media::decode_image(&bytes))
-                    .await
-                    .map_err(|e| EngineError::Join(e.to_string()))?
-                    .map_err(media_err)?;
-                Ok(Fetched::Image(img))
+                self.image_from_media(media, want_hash).await
             }
             Input::Video(url) => {
                 let media = apollo_media::fetch(url, &self.inner.fetch_limits)
                     .await
                     .map_err(media_err)?;
-                let info = apollo_media::probe(media.path()).await.map_err(media_err)?;
-                let max = self.inner.config.limits.max_video_seconds;
-                if max > 0 && info.duration > max as f64 {
-                    return Err(EngineError::Incompatible(format!(
-                        "video is {:.0}s, over the {max}s limit",
-                        info.duration
-                    )));
+                self.video_from_media(media, want_hash).await
+            }
+            Input::Bytes { path, video } => {
+                let media = LocalMedia::adopt(path.clone());
+                if *video {
+                    self.video_from_media(media, want_hash).await
+                } else {
+                    self.image_from_media(media, want_hash).await
                 }
-                Ok(Fetched::Video { media, info })
             }
             Input::Text(_) | Input::Audio(_) => Err(EngineError::Incompatible(
                 "text/audio inputs are not supported yet".into(),
             )),
         }
+    }
+
+    /// Decode `media` as an image, hashing the raw bytes for the cache key when
+    /// `want_hash` is set.
+    async fn image_from_media(
+        &self,
+        media: LocalMedia,
+        want_hash: bool,
+    ) -> Result<(Fetched, Option<String>), EngineError> {
+        let bytes = media.read_bytes().map_err(media_err)?;
+        let hash = if want_hash { Some(sha256_hex(&bytes)) } else { None };
+        let img = tokio::task::spawn_blocking(move || apollo_media::decode_image(&bytes))
+            .await
+            .map_err(|e| EngineError::Join(e.to_string()))?
+            .map_err(media_err)?;
+        Ok((Fetched::Image(img), hash))
+    }
+
+    /// Probe `media` as a video, hashing the file for the cache key when
+    /// `want_hash` is set. A hash failure degrades to "no caching", never an error.
+    async fn video_from_media(
+        &self,
+        media: LocalMedia,
+        want_hash: bool,
+    ) -> Result<(Fetched, Option<String>), EngineError> {
+        let info = apollo_media::probe(media.path()).await.map_err(media_err)?;
+        let max = self.inner.config.limits.max_video_seconds;
+        if max > 0 && info.duration > max as f64 {
+            return Err(EngineError::Incompatible(format!(
+                "video is {:.0}s, over the {max}s limit",
+                info.duration
+            )));
+        }
+        let hash = if want_hash {
+            let p = media.path().to_path_buf();
+            tokio::task::spawn_blocking(move || sha256_file(&p))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+        } else {
+            None
+        };
+        Ok((Fetched::Video { media, info }, hash))
     }
 
     /// Image-classifier over a video: plan frames per the model's strategy, skip
@@ -422,6 +649,57 @@ impl Engine {
 /// Whether a model already reached `Done` for this item (used to skip on resume).
 fn model_done(item: &Item, label: &str) -> bool {
     matches!(item.results.get(label), Some(r) if matches!(r.state, ModelState::Done))
+}
+
+/// Backoff before the Nth retry: 1s, 2s, 4s, 8s, … capped at 30s.
+fn retry_backoff(attempt: u32) -> Duration {
+    let secs = 1u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(u64::MAX);
+    Duration::from_secs(secs.min(30))
+}
+
+/// The fetchable URL of an input, if any (used as the cache's url key).
+fn item_url(input: &Input) -> Option<&Url> {
+    match input {
+        Input::Image(u) | Input::Video(u) | Input::Audio(u) => Some(u),
+        Input::Text(_) | Input::Bytes { .. } => None,
+    }
+}
+
+/// Hex-encoded SHA-256 of a byte slice.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    hex_encode(&digest)
+}
+
+/// Hex-encoded SHA-256 of a file, read in chunks so large videos are not loaded
+/// into memory at once. Blocking I/O — call from `spawn_blocking`.
+fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    Ok(hex_encode(&digest))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// `(labels, threshold)` when both the strategy enables early-exit and the model

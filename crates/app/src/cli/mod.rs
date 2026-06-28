@@ -1,6 +1,7 @@
 //! clap command tree: `start` / `stop` / `config`.
 
 mod config;
+mod keys;
 mod start;
 mod stop;
 
@@ -23,6 +24,10 @@ enum Command {
     /// Read or edit the config file.
     #[command(subcommand)]
     Config(config::ConfigCmd),
+    /// Generate a PASETO v4 signing keypair for authentication.
+    Keygen(keys::KeygenArgs),
+    /// Mint an API token signed with the secret key.
+    Token(keys::TokenArgs),
 }
 
 impl Cli {
@@ -31,6 +36,8 @@ impl Cli {
             Command::Start(args) => start::run(args),
             Command::Stop(args) => stop::run(args),
             Command::Config(cmd) => config::run(cmd),
+            Command::Keygen(args) => keys::run_keygen(args),
+            Command::Token(args) => keys::run_token(args),
         }
     }
 }
@@ -53,7 +60,9 @@ mod tests {
 
     #[test]
     fn parses_start_with_overrides() {
-        assert!(Cli::try_parse_from(["apollo", "start", "--port", "8080", "--daemon"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["apollo", "start", "--port", "8080", "--daemon"]).is_ok()
+        );
     }
 
     #[test]

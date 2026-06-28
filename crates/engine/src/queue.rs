@@ -1,13 +1,13 @@
 //! Task submission lifecycle, startup recovery, and the retention timer.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use apollo_domain::{Task, TaskState};
+use apollo_domain::{Input, Task, TaskState};
 
-use crate::Engine;
 use crate::error::EngineError;
+use crate::Engine;
 
 /// Resume attempts before a task is declared poison and failed.
 const MAX_RESUME_ATTEMPTS: u32 = 3;
@@ -30,6 +30,12 @@ impl Engine {
         }
 
         let tasks = self.inner.storage.load_incomplete_tasks().await?;
+
+        // Remove orphaned ClassifyStream uploads (files left by a task that
+        // finished but crashed before its upload was deleted). Safe here because
+        // recovery runs before the server accepts new uploads.
+        self.sweep_uploads(&tasks);
+
         let mut resumed = 0usize;
         for task in tasks {
             let attempts = self.inner.storage.increment_attempts(&task.id).await?;
@@ -51,6 +57,44 @@ impl Engine {
             resumed += 1;
         }
         Ok(resumed)
+    }
+
+    /// Remove `ClassifyStream` upload files no longer referenced by any incomplete
+    /// task. Runs once at startup, so there is no race with in-flight uploads.
+    fn sweep_uploads(&self, keep_tasks: &[Task]) {
+        let dir = self.upload_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "upload sweep: cannot read dir");
+                return;
+            }
+        };
+        let keep: std::collections::HashSet<std::path::PathBuf> = keep_tasks
+            .iter()
+            .flat_map(|t| &t.items)
+            .filter_map(|it| match &it.input {
+                Input::Bytes { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if keep.contains(&path) {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "upload sweep: remove failed")
+                }
+            }
+        }
+        if removed > 0 {
+            tracing::info!(removed, "swept orphaned upload files");
+        }
     }
 
     /// Drive one task to completion: mark it processing, run every item

@@ -8,11 +8,25 @@ max_concurrent = 20                            # global in-flight / VRAM ceiling
 idle_timeout   = 300                           # seconds a model stays resident while idle (unless keep_in_memory)
 max_memory     = "4gb"                          # soft resident-memory cap; new work rejected above it (0 = off)
 max_pending    = 1024                           # max queued/in-flight items before backpressure (0 = off)
+max_retries    = 3                              # times a failed item is retried before it is marked failed (0 = off)
 
 [webhook]
 url = "https://hooks.example.com:443"          # optional; omit the section to disable and let clients poll
-# secret          = "change-me"                 # optional shared secret; HMAC-signs each delivery (verify on the receiver)
+# secret          = "change-me"                 # optional shared secret; HMAC-signs the task id on each delivery (verify on the receiver)
 # redelivery_secs = 60                           # background retry interval for failed deliveries (0 = off)
+
+# Authentication (optional). With [auth] present, every Inference RPC must carry a
+# valid PASETO v4 token. Run `apollo keygen`, put the public key here, and mint
+# client tokens with `apollo token --subject NAME`.
+# [auth]
+# public_key = "k4.public.REPLACE_WITH_GENERATED_PUBLIC_KEY"
+
+# Result cache (optional). With [cache] present, model outputs are cached by
+# content hash (with a url->content-hash hint) so identical inputs skip inference.
+# Set ttl_secs to expire stale entries; omit for entries that never expire.
+# [cache]
+# enabled = true
+# ttl_secs = 86400
 
 # Safety limits applied when fetching remote inputs (SSRF + resource guards).
 [limits]

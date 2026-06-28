@@ -17,9 +17,9 @@ use apollo_domain::{
     Classification, Frame, Item, ItemState, ModelOutput, ModelResult, ModelState, Task, TaskState,
 };
 
-use crate::Storage;
 use crate::error::StorageError;
 use crate::resume::PendingWebhook;
+use crate::Storage;
 
 type Result<T> = std::result::Result<T, StorageError>;
 
@@ -39,6 +39,8 @@ const SCHEMA_V1: &[&str] = &[
         state             TEXT NOT NULL,
         error             TEXT,
         webhook_delivered INTEGER NOT NULL DEFAULT 0,
+        retries           INTEGER NOT NULL DEFAULT 0,
+        failure_delivered INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (task_id, idx)
     )",
     "CREATE TABLE IF NOT EXISTS model_results (
@@ -64,6 +66,25 @@ const SCHEMA_V1: &[&str] = &[
             REFERENCES model_results(task_id, item_idx, label) ON DELETE CASCADE
     )",
     "CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state)",
+];
+
+const SCHEMA_V2: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS cache (
+        content_hash TEXT NOT NULL,
+        model        TEXT NOT NULL,
+        revision     TEXT NOT NULL,
+        output_json  TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        PRIMARY KEY (content_hash, model, revision)
+    )",
+    "CREATE TABLE IF NOT EXISTS url_cache (
+        url_hash     TEXT NOT NULL,
+        model        TEXT NOT NULL,
+        revision     TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        PRIMARY KEY (url_hash, model, revision)
+    )",
 ];
 
 /// SQLite-backed [`Storage`].
@@ -113,7 +134,7 @@ impl SqliteStorage {
         let state = parse_task_state(trow.try_get::<String, _>("state")?.as_str())?;
 
         let irows = sqlx::query(
-            "SELECT idx, input_json, models_json, state, error
+            "SELECT idx, input_json, models_json, state, error, retries
              FROM items WHERE task_id = ? ORDER BY idx",
         )
         .bind(id)
@@ -127,6 +148,7 @@ impl SqliteStorage {
             let models_json: String = ir.try_get("models_json")?;
             let istate = parse_item_state(ir.try_get::<String, _>("state")?.as_str())?;
             let ierror: Option<String> = ir.try_get("error")?;
+            let iretries: i64 = ir.try_get("retries")?;
 
             let input = serde_json::from_str(&input_json)?;
             let models: Vec<String> = serde_json::from_str(&models_json)?;
@@ -169,6 +191,7 @@ impl SqliteStorage {
                 state: istate,
                 results,
                 error: ierror,
+                retries: iretries as u32,
             });
         }
 
@@ -191,9 +214,15 @@ impl Storage for SqliteStorage {
             for stmt in SCHEMA_V1 {
                 sqlx::query(*stmt).execute(&mut *tx).await?;
             }
-            sqlx::query("PRAGMA user_version = 1")
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query("PRAGMA user_version = 1").execute(&mut *tx).await?;
+            tx.commit().await?;
+        }
+        if version < 2 {
+            let mut tx = self.pool.begin().await?;
+            for stmt in SCHEMA_V2 {
+                sqlx::query(*stmt).execute(&mut *tx).await?;
+            }
+            sqlx::query("PRAGMA user_version = 2").execute(&mut *tx).await?;
             tx.commit().await?;
         }
         Ok(())
@@ -459,6 +488,40 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    async fn set_item_retries(&self, task_id: &str, item: usize, retries: u32) -> Result<()> {
+        sqlx::query("UPDATE items SET retries = ? WHERE task_id = ? AND idx = ?")
+            .bind(retries as i64)
+            .bind(task_id)
+            .bind(item as i64)
+            .execute(&self.pool)
+            .await?;
+        self.touch(task_id).await
+    }
+
+    async fn items_pending_failure_webhook(&self) -> Result<Vec<PendingWebhook>> {
+        let rows = sqlx::query(
+            "SELECT task_id, idx FROM items WHERE failure_delivered = 0 AND state = 'failed'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let task_id: String = r.try_get("task_id")?;
+            let idx: i64 = r.try_get("idx")?;
+            out.push(PendingWebhook { task_id, item_index: idx as usize });
+        }
+        Ok(out)
+    }
+
+    async fn mark_failure_delivered(&self, task_id: &str, item: usize) -> Result<()> {
+        sqlx::query("UPDATE items SET failure_delivered = 1 WHERE task_id = ? AND idx = ?")
+            .bind(task_id)
+            .bind(item as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64> {
         let res =
             sqlx::query("DELETE FROM tasks WHERE state IN ('completed', 'failed', 'cancelled') AND updated_at < ?")
@@ -466,6 +529,99 @@ impl Storage for SqliteStorage {
                 .execute(&self.pool)
                 .await?;
         Ok(res.rows_affected())
+    }
+
+    async fn cache_lookup(
+        &self,
+        content_hash: &str,
+        model: &str,
+        revision: &str,
+        fresh_after: i64,
+    ) -> Result<Option<ModelOutput>> {
+        let row = sqlx::query(
+            "SELECT output_json FROM cache
+             WHERE content_hash = ? AND model = ? AND revision = ? AND created_at >= ?",
+        )
+        .bind(content_hash)
+        .bind(model)
+        .bind(revision)
+        .bind(fresh_after)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => {
+                let json: String = r.get("output_json");
+                Ok(Some(serde_json::from_str(&json)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn cache_store(
+        &self,
+        content_hash: &str,
+        model: &str,
+        revision: &str,
+        output: &ModelOutput,
+    ) -> Result<()> {
+        let json = serde_json::to_string(output)?;
+        sqlx::query(
+            "INSERT INTO cache (content_hash, model, revision, output_json, created_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(content_hash, model, revision) DO UPDATE SET
+                output_json = excluded.output_json, created_at = excluded.created_at",
+        )
+        .bind(content_hash)
+        .bind(model)
+        .bind(revision)
+        .bind(json)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn url_cache_lookup(
+        &self,
+        url_hash: &str,
+        model: &str,
+        revision: &str,
+        fresh_after: i64,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT content_hash FROM url_cache
+             WHERE url_hash = ? AND model = ? AND revision = ? AND created_at >= ?",
+        )
+        .bind(url_hash)
+        .bind(model)
+        .bind(revision)
+        .bind(fresh_after)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<String, _>("content_hash")))
+    }
+
+    async fn url_cache_store(
+        &self,
+        url_hash: &str,
+        model: &str,
+        revision: &str,
+        content_hash: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO url_cache (url_hash, model, revision, content_hash, created_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(url_hash, model, revision) DO UPDATE SET
+                content_hash = excluded.content_hash, created_at = excluded.created_at",
+        )
+        .bind(url_hash)
+        .bind(model)
+        .bind(revision)
+        .bind(content_hash)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -493,11 +649,7 @@ fn parse_task_state(s: &str) -> Result<TaskState> {
         "completed" => TaskState::Completed,
         "failed" => TaskState::Failed,
         "cancelled" => TaskState::Cancelled,
-        other => {
-            return Err(StorageError::Corrupt(format!(
-                "unknown task state '{other}'"
-            )));
-        }
+        other => return Err(StorageError::Corrupt(format!("unknown task state '{other}'"))),
     })
 }
 
@@ -506,6 +658,7 @@ fn item_state_str(s: ItemState) -> &'static str {
         ItemState::Queued => "queued",
         ItemState::Processing => "processing",
         ItemState::Completed => "completed",
+        ItemState::Retrying => "retrying",
         ItemState::Failed => "failed",
         ItemState::Cancelled => "cancelled",
     }
@@ -516,13 +669,10 @@ fn parse_item_state(s: &str) -> Result<ItemState> {
         "queued" => ItemState::Queued,
         "processing" => ItemState::Processing,
         "completed" => ItemState::Completed,
+        "retrying" => ItemState::Retrying,
         "failed" => ItemState::Failed,
         "cancelled" => ItemState::Cancelled,
-        other => {
-            return Err(StorageError::Corrupt(format!(
-                "unknown item state '{other}'"
-            )));
-        }
+        other => return Err(StorageError::Corrupt(format!("unknown item state '{other}'"))),
     })
 }
 
@@ -541,11 +691,7 @@ fn parse_model_state(s: &str) -> Result<ModelState> {
         "processing" => ModelState::Processing,
         "done" => ModelState::Done,
         "failed" => ModelState::Failed,
-        other => {
-            return Err(StorageError::Corrupt(format!(
-                "unknown model state '{other}'"
-            )));
-        }
+        other => return Err(StorageError::Corrupt(format!("unknown model state '{other}'"))),
     })
 }
 
@@ -562,11 +708,7 @@ mod tests {
     fn temp_cfg() -> SqliteConfig {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "apollo-storage-test-{}-{}.db",
-            std::process::id(),
-            n
-        ));
+        p.push(format!("apollo-storage-test-{}-{}.db", std::process::id(), n));
         SqliteConfig {
             path: p.to_string_lossy().into_owned(),
             wal: true,
@@ -591,6 +733,7 @@ mod tests {
             state: ItemState::Queued,
             results: BTreeMap::new(),
             error: None,
+            retries: 0,
         };
         Task {
             id: "task-1".into(),
@@ -635,10 +778,7 @@ mod tests {
         assert!(t.items[0].results["general"].output.is_some());
 
         // Frame checkpoint + steps marker.
-        store
-            .set_steps_completed("task-1", 0, "nsfw", 1)
-            .await
-            .unwrap();
+        store.set_steps_completed("task-1", 0, "nsfw", 1).await.unwrap();
         store
             .append_frame(
                 "task-1",
@@ -657,10 +797,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            store.load_frames("task-1", 0, "nsfw").await.unwrap().len(),
-            1
-        );
+        assert_eq!(store.load_frames("task-1", 0, "nsfw").await.unwrap().len(), 1);
         assert_eq!(store.steps_completed("task-1", 0, "nsfw").await.unwrap(), 1);
 
         // Resume sees the in-flight task; attempts increment.

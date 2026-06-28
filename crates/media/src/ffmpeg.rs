@@ -31,10 +31,8 @@ pub struct VideoInfo {
 pub async fn probe(path: &Path) -> Result<VideoInfo, MediaError> {
     let mut cmd = Command::new("ffprobe");
     cmd.args([
-        "-v",
-        "quiet",
-        "-print_format",
-        "json",
+        "-v", "quiet",
+        "-print_format", "json",
         "-show_format",
         "-show_streams",
     ])
@@ -68,24 +66,13 @@ async fn grab_frame(path: &Path, seek: &[String]) -> Result<Option<Vec<u8>>, Med
         .args(seek)
         .arg("-i")
         .arg(path)
-        .args([
-            "-frames:v",
-            "1",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "pipe:1",
-        ]);
+        .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"]);
     let stdout = capture("ffmpeg", &mut cmd).await?;
     Ok((!stdout.is_empty()).then_some(stdout))
 }
 
 /// Extract frames at each `timestamp` (one ffmpeg seek per timestamp).
-pub async fn extract_frames(
-    path: &Path,
-    timestamps: &[f64],
-) -> Result<Vec<DecodedImage>, MediaError> {
+pub async fn extract_frames(path: &Path, timestamps: &[f64]) -> Result<Vec<DecodedImage>, MediaError> {
     let mut frames = Vec::with_capacity(timestamps.len());
     for &t in timestamps {
         frames.push(extract_frame(path, t).await?);
@@ -97,16 +84,11 @@ pub async fn extract_frames(
 pub async fn keyframe_timestamps(path: &Path) -> Result<Vec<f64>, MediaError> {
     let mut cmd = Command::new("ffprobe");
     cmd.args([
-        "-v",
-        "error",
-        "-skip_frame",
-        "nokey",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "frame=pts_time",
-        "-of",
-        "csv=print_section=0",
+        "-v", "error",
+        "-skip_frame", "nokey",
+        "-select_streams", "v:0",
+        "-show_entries", "frame=pts_time",
+        "-of", "csv=print_section=0",
     ])
     .arg(path);
     let stdout = capture("ffprobe", &mut cmd).await?;
@@ -214,10 +196,7 @@ fn parse_probe(stdout: &[u8]) -> Result<VideoInfo, MediaError> {
         .and_then(|f| f.get("format_name"))
         .and_then(|s| s.as_str())
         .unwrap_or("");
-    let codec = video
-        .get("codec_name")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
+    let codec = video.get("codec_name").and_then(|c| c.as_str()).unwrap_or("");
     if is_image_only(format_name, codec, duration, frame_count) {
         return Err(MediaError::Ffmpeg(format!(
             "expected a video but got a still image (format '{format_name}', codec '{codec}')"

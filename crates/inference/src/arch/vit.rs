@@ -4,12 +4,12 @@ use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use candle_transformers::models::vit;
 
-use apollo_domain::{Classification, DecodedImage, Prediction, select_top};
+use apollo_domain::{select_top, Classification, DecodedImage, Prediction};
 
-use crate::ImageClassifier;
 use crate::error::InferenceError;
 use crate::loader::{self, Hub};
 use crate::preprocess::{self, Normalization};
+use crate::ImageClassifier;
 
 /// A loaded ViT image classifier: weights, labels, and the input normalization.
 pub(crate) struct VitClassifier {

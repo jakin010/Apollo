@@ -15,7 +15,6 @@ package apollo.v1;
 // --------------------------------- requests ----------------------------------
 
 message ClassifyRequest      { InputItem item = 1; }
-message ClassifyBatchRequest { repeated InputItem items = 1; }
 message GetTaskRequest       { string task_id = 1; }
 message CancelRequest        { string task_id = 1; }
 message TaskCreated          { string task_id = 1; }
@@ -118,6 +117,7 @@ enum ItemState {
   ITEM_STATE_COMPLETED   = 3;
   ITEM_STATE_FAILED      = 4;
   ITEM_STATE_CANCELLED   = 5;
+  ITEM_STATE_RETRYING    = 6;   // a previous attempt failed; queued to retry
 }
 
 enum ModelState {

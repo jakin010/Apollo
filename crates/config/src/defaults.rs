@@ -27,6 +27,9 @@ pub(crate) fn revision() -> String {
 pub(crate) fn enabled() -> bool {
     true
 }
+pub(crate) fn cache_enabled() -> bool {
+    true
+}
 pub(crate) fn model_max_concurrent() -> u32 {
     8
 }
@@ -80,4 +83,7 @@ pub(crate) fn allowed_schemes() -> Vec<String> {
 }
 pub(crate) fn redelivery_secs() -> u32 {
     60
+}
+pub(crate) fn max_retries() -> u32 {
+    3
 }

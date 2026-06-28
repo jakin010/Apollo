@@ -89,9 +89,9 @@ fn worker_loop(
                             model = Some(m);
                         }
                         Err(e) => {
-                            let _ = job.reply.send(Err(EngineError::Inference(format!(
-                                "model load failed: {e}"
-                            ))));
+                            let _ = job
+                                .reply
+                                .send(Err(EngineError::Inference(format!("model load failed: {e}"))));
                             continue;
                         }
                     }

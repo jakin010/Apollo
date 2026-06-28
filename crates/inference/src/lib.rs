@@ -23,7 +23,7 @@ mod error;
 mod loader;
 mod preprocess;
 
-pub use device::{DeviceKind, select_device};
+pub use device::{select_device, DeviceKind};
 pub use error::InferenceError;
 pub use preprocess::Normalization;
 

@@ -39,11 +39,13 @@ impl GrpcWebhookSink {
     }
 }
 
-#[async_trait]
-impl WebhookSink for GrpcWebhookSink {
-    async fn deliver(&self, task: &Task, _item_index: usize) -> Result<(), WebhookError> {
-        // The wire message is the full Task (bare, per the proto); the receiver
-        // dedupes by id + which items are terminal.
+impl GrpcWebhookSink {
+    /// Build the bare-Task request, attaching the HMAC signature header when a
+    /// secret is set. Shared by both `TaskStatus` and `ItemFailed`.
+    fn build_request(
+        &self,
+        task: &Task,
+    ) -> Result<tonic::Request<apollo_proto::Task>, WebhookError> {
         let mut request = tonic::Request::new(task_to_proto(task.clone()));
         if let Some(secret) = &self.secret {
             let signature = sign(secret.as_bytes(), task.id.as_bytes());
@@ -51,9 +53,30 @@ impl WebhookSink for GrpcWebhookSink {
                 .map_err(|e| WebhookError(format!("building signature header: {e}")))?;
             request.metadata_mut().insert(SIGNATURE_HEADER, value);
         }
+        Ok(request)
+    }
+}
+
+#[async_trait]
+impl WebhookSink for GrpcWebhookSink {
+    async fn deliver(&self, task: &Task, _item_index: usize) -> Result<(), WebhookError> {
+        // The wire message is the full Task (bare, per the proto); the receiver
+        // dedupes by id + which items are terminal.
+        let request = self.build_request(task)?;
         let mut client = WebhookClient::new(self.channel.clone());
         client
             .task_status(request)
+            .await
+            .map_err(|status| WebhookError(status.to_string()))?;
+        Ok(())
+    }
+
+    async fn deliver_failed(&self, task: &Task, _item_index: usize) -> Result<(), WebhookError> {
+        // Dead-letter: same bare-Task payload and signing, different RPC method.
+        let request = self.build_request(task)?;
+        let mut client = WebhookClient::new(self.channel.clone());
+        client
+            .item_failed(request)
             .await
             .map_err(|status| WebhookError(status.to_string()))?;
         Ok(())

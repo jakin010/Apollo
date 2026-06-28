@@ -18,5 +18,5 @@ edition = "2024"
 
 [workspace.dependencies]
 tracing = { version = "0.1" }
-tokio = { version = "1", default-features = false }
+tokio = { version = "1.52", default-features = false }
 

@@ -18,6 +18,7 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 libc = "0.2"
+pasetors = "0.7"
 
 [features]
 # Build the binary with GPU support: `cargo build -p apollo --features cuda`.

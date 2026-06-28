@@ -79,12 +79,7 @@ fn set_get_remove_roundtrip() {
     edit::set(&mut doc, "app.port", "9090").unwrap();
     assert_eq!(edit::get(&doc, "app.port").as_deref(), Some("9090"));
 
-    edit::set(
-        &mut doc,
-        "models.nsfw.repo",
-        "Falconsai/nsfw_image_detection",
-    )
-    .unwrap();
+    edit::set(&mut doc, "models.nsfw.repo", "Falconsai/nsfw_image_detection").unwrap();
     assert_eq!(
         edit::get(&doc, "models.nsfw.repo").as_deref(),
         Some("\"Falconsai/nsfw_image_detection\"")

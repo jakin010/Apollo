@@ -126,6 +126,25 @@ impl Engine {
         engine
     }
 
+    /// Directory under which `ClassifyStream` uploads are staged: `[app].cache_dir`
+    /// (or the system temp dir if unset) joined with `uploads`. Not created here.
+    pub fn upload_dir(&self) -> PathBuf {
+        self.inner
+            .config
+            .app
+            .cache_dir
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("apollo"))
+            .join("uploads")
+    }
+
+    /// Hard cap on accepted upload bytes, mirroring the remote-download cap
+    /// (`[limits].max_download`). `None` means unlimited.
+    pub fn max_upload_bytes(&self) -> Option<u64> {
+        self.inner.fetch_limits.max_download_bytes
+    }
+
     /// Validate, persist, and start a task. Returns its id immediately; processing
     /// continues in the background. Validation is synchronous, so a bad request is
     /// rejected before anything is written.
@@ -160,6 +179,7 @@ impl Engine {
                 state: ItemState::Queued,
                 results: Default::default(),
                 error: None,
+                retries: 0,
             })
             .collect();
         let task = Task {

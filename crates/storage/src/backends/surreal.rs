@@ -23,10 +23,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
 use surrealdb::types::SurrealValue;
+use surrealdb::Surreal;
 
 use apollo_config::SurrealdbConfig;
 use apollo_domain::{
@@ -34,9 +34,9 @@ use apollo_domain::{
     TaskState,
 };
 
-use crate::Storage;
 use crate::error::StorageError;
 use crate::resume::PendingWebhook;
+use crate::Storage;
 
 type Result<T> = std::result::Result<T, StorageError>;
 
@@ -55,6 +55,8 @@ const SCHEMA: &str = "
     DEFINE TABLE IF NOT EXISTS item SCHEMALESS;
     DEFINE TABLE IF NOT EXISTS model_result SCHEMALESS;
     DEFINE TABLE IF NOT EXISTS frame SCHEMALESS;
+    DEFINE TABLE IF NOT EXISTS cache SCHEMALESS;
+    DEFINE TABLE IF NOT EXISTS url_cache SCHEMALESS;
     DEFINE INDEX IF NOT EXISTS task_state ON TABLE task FIELDS state;
     DEFINE INDEX IF NOT EXISTS task_created ON TABLE task FIELDS created_at;
     DEFINE INDEX IF NOT EXISTS item_task ON TABLE item FIELDS task_id;
@@ -74,7 +76,7 @@ const CREATE_TASK: &str = "
         CREATE type::record('item', [$tid, $it.idx]) SET
             task_id = $tid, idx = $it.idx, input_json = $it.input_json,
             models_json = $it.models_json, state = $it.state, error = $it.error,
-            webhook_delivered = false;
+            webhook_delivered = false, retries = 0, failure_delivered = false;
     };
     FOR $mr IN $mrs {
         CREATE type::record('model_result', [$tid, $mr.item_idx, $mr.label]) SET
@@ -101,6 +103,7 @@ struct ItemRow {
     models_json: String,
     state: String,
     error: Option<String>,
+    retries: i64,
 }
 
 #[derive(SurrealValue)]
@@ -201,7 +204,7 @@ impl SurrealStorage {
         let mut resp = self
             .db
             .query(
-                "SELECT idx, input_json, models_json, state, error
+                "SELECT idx, input_json, models_json, state, error, retries
                  FROM item WHERE task_id = $tid ORDER BY idx",
             )
             .bind(("tid", id.to_string()))
@@ -249,6 +252,7 @@ impl SurrealStorage {
                 state: parse_item_state(&ir.state)?,
                 results,
                 error: ir.error,
+                retries: ir.retries as u32,
             });
         }
 
@@ -448,7 +452,9 @@ impl Storage for SurrealStorage {
     async fn steps_completed(&self, task_id: &str, item: usize, label: &str) -> Result<u32> {
         let mut resp = self
             .db
-            .query("SELECT steps_completed FROM type::record('model_result', [$tid, $idx, $label])")
+            .query(
+                "SELECT steps_completed FROM type::record('model_result', [$tid, $idx, $label])",
+            )
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
             .bind(("label", label.to_string()))
@@ -523,6 +529,45 @@ impl Storage for SurrealStorage {
         Ok(())
     }
 
+    async fn set_item_retries(&self, task_id: &str, item: usize, retries: u32) -> Result<()> {
+        self.db
+            .query("UPDATE type::record('item', [$tid, $idx]) SET retries = $retries")
+            .bind(("tid", task_id.to_string()))
+            .bind(("idx", item as i64))
+            .bind(("retries", retries as i64))
+            .await?
+            .check()?;
+        self.touch(task_id).await
+    }
+
+    async fn items_pending_failure_webhook(&self) -> Result<Vec<PendingWebhook>> {
+        let mut resp = self
+            .db
+            .query(
+                "SELECT task_id, idx FROM item
+                 WHERE failure_delivered = false AND state = 'failed'",
+            )
+            .await?;
+        let rows: Vec<PendingRow> = resp.take(0)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| PendingWebhook {
+                task_id: r.task_id,
+                item_index: r.idx as usize,
+            })
+            .collect())
+    }
+
+    async fn mark_failure_delivered(&self, task_id: &str, item: usize) -> Result<()> {
+        self.db
+            .query("UPDATE type::record('item', [$tid, $idx]) SET failure_delivered = true")
+            .bind(("tid", task_id.to_string()))
+            .bind(("idx", item as i64))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64> {
         // SurrealDB does not cascade, so collect the doomed task ids first, then
         // delete children before the tasks themselves (a partial purge just leaves
@@ -552,6 +597,100 @@ impl Storage for SurrealStorage {
             .check()?;
         Ok(ids.len() as u64)
     }
+
+    async fn cache_lookup(
+        &self,
+        content_hash: &str,
+        model: &str,
+        revision: &str,
+        fresh_after: i64,
+    ) -> Result<Option<ModelOutput>> {
+        let mut resp = self
+            .db
+            .query(
+                "SELECT VALUE output_json FROM type::record('cache', [$ch, $model, $rev])
+                 WHERE created_at >= $fresh",
+            )
+            .bind(("ch", content_hash.to_string()))
+            .bind(("model", model.to_string()))
+            .bind(("rev", revision.to_string()))
+            .bind(("fresh", fresh_after))
+            .await?;
+        let rows: Vec<String> = resp.take(0)?;
+        match rows.into_iter().next() {
+            Some(j) => Ok(Some(serde_json::from_str(&j)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn cache_store(
+        &self,
+        content_hash: &str,
+        model: &str,
+        revision: &str,
+        output: &ModelOutput,
+    ) -> Result<()> {
+        let json = serde_json::to_string(output)?;
+        self.db
+            .query(
+                "UPSERT type::record('cache', [$ch, $model, $rev]) SET
+                    content_hash = $ch, model = $model, revision = $rev,
+                    output_json = $output, created_at = $ts",
+            )
+            .bind(("ch", content_hash.to_string()))
+            .bind(("model", model.to_string()))
+            .bind(("rev", revision.to_string()))
+            .bind(("output", json))
+            .bind(("ts", now()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn url_cache_lookup(
+        &self,
+        url_hash: &str,
+        model: &str,
+        revision: &str,
+        fresh_after: i64,
+    ) -> Result<Option<String>> {
+        let mut resp = self
+            .db
+            .query(
+                "SELECT VALUE content_hash FROM type::record('url_cache', [$uh, $model, $rev])
+                 WHERE created_at >= $fresh",
+            )
+            .bind(("uh", url_hash.to_string()))
+            .bind(("model", model.to_string()))
+            .bind(("rev", revision.to_string()))
+            .bind(("fresh", fresh_after))
+            .await?;
+        let rows: Vec<String> = resp.take(0)?;
+        Ok(rows.into_iter().next())
+    }
+
+    async fn url_cache_store(
+        &self,
+        url_hash: &str,
+        model: &str,
+        revision: &str,
+        content_hash: &str,
+    ) -> Result<()> {
+        self.db
+            .query(
+                "UPSERT type::record('url_cache', [$uh, $model, $rev]) SET
+                    url_hash = $uh, model = $model, revision = $rev,
+                    content_hash = $ch, created_at = $ts",
+            )
+            .bind(("uh", url_hash.to_string()))
+            .bind(("model", model.to_string()))
+            .bind(("rev", revision.to_string()))
+            .bind(("ch", content_hash.to_string()))
+            .bind(("ts", now()))
+            .await?
+            .check()?;
+        Ok(())
+    }
 }
 
 fn now() -> i64 {
@@ -578,11 +717,7 @@ fn parse_task_state(s: &str) -> Result<TaskState> {
         "completed" => TaskState::Completed,
         "failed" => TaskState::Failed,
         "cancelled" => TaskState::Cancelled,
-        other => {
-            return Err(StorageError::Corrupt(format!(
-                "unknown task state '{other}'"
-            )));
-        }
+        other => return Err(StorageError::Corrupt(format!("unknown task state '{other}'"))),
     })
 }
 
@@ -591,6 +726,7 @@ fn item_state_str(s: ItemState) -> &'static str {
         ItemState::Queued => "queued",
         ItemState::Processing => "processing",
         ItemState::Completed => "completed",
+        ItemState::Retrying => "retrying",
         ItemState::Failed => "failed",
         ItemState::Cancelled => "cancelled",
     }
@@ -601,13 +737,10 @@ fn parse_item_state(s: &str) -> Result<ItemState> {
         "queued" => ItemState::Queued,
         "processing" => ItemState::Processing,
         "completed" => ItemState::Completed,
+        "retrying" => ItemState::Retrying,
         "failed" => ItemState::Failed,
         "cancelled" => ItemState::Cancelled,
-        other => {
-            return Err(StorageError::Corrupt(format!(
-                "unknown item state '{other}'"
-            )));
-        }
+        other => return Err(StorageError::Corrupt(format!("unknown item state '{other}'"))),
     })
 }
 
@@ -626,10 +759,6 @@ fn parse_model_state(s: &str) -> Result<ModelState> {
         "processing" => ModelState::Processing,
         "done" => ModelState::Done,
         "failed" => ModelState::Failed,
-        other => {
-            return Err(StorageError::Corrupt(format!(
-                "unknown model state '{other}'"
-            )));
-        }
+        other => return Err(StorageError::Corrupt(format!("unknown model state '{other}'"))),
     })
 }

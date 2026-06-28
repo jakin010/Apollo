@@ -9,7 +9,8 @@ use crate::error::ConfigError;
 
 /// Load a config file as an editable, format-preserving document.
 pub fn load_document(path: &Path) -> Result<DocumentMut, ConfigError> {
-    let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
     text.parse::<DocumentMut>()
         .map_err(|e| ConfigError::Edit(e.to_string()))
 }

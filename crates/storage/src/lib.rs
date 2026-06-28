@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use apollo_config::{Backend, DatabaseConfig};
-use apollo_domain::{Frame, ItemState, ModelResult, Task, TaskState};
+use apollo_domain::{Frame, ItemState, ModelOutput, ModelResult, Task, TaskState};
 
 pub mod backends;
 pub mod error;
@@ -110,13 +110,72 @@ pub trait Storage: Send + Sync {
     /// between reaching a terminal state and delivering).
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError>;
 
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError>;
+    async fn mark_webhook_delivered(&self, task_id: &str, item: usize)
+        -> Result<(), StorageError>;
+
+    /// Persist an item's retry count (compared against `[app].max_retries`).
+    async fn set_item_retries(
+        &self,
+        task_id: &str,
+        item: usize,
+        retries: u32,
+    ) -> Result<(), StorageError>;
+
+    /// Permanently-failed items whose dead-letter (failure) webhook has not yet
+    /// been delivered — recovers a crash between final failure and delivery.
+    async fn items_pending_failure_webhook(
+        &self,
+    ) -> Result<Vec<PendingWebhook>, StorageError>;
+
+    async fn mark_failure_delivered(&self, task_id: &str, item: usize)
+        -> Result<(), StorageError>;
 
     // ------------------------------ retention ----------------------------
 
     /// Delete finished tasks last updated before `cutoff` (unix seconds).
     /// Returns the number of tasks removed.
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError>;
+
+    // -------------------------------- cache ------------------------------
+
+    /// Look up a cached model output by content hash. `fresh_after` is a lower
+    /// bound on `created_at` in unix seconds (`0` = no TTL). Returns the output if
+    /// a fresh entry exists.
+    async fn cache_lookup(
+        &self,
+        content_hash: &str,
+        model: &str,
+        revision: &str,
+        fresh_after: i64,
+    ) -> Result<Option<ModelOutput>, StorageError>;
+
+    /// Store a model output under its content hash (upsert; refreshes `created_at`).
+    async fn cache_store(
+        &self,
+        content_hash: &str,
+        model: &str,
+        revision: &str,
+        output: &ModelOutput,
+    ) -> Result<(), StorageError>;
+
+    /// Look up the content hash a URL last resolved to (the url->content hint).
+    /// `fresh_after` as above.
+    async fn url_cache_lookup(
+        &self,
+        url_hash: &str,
+        model: &str,
+        revision: &str,
+        fresh_after: i64,
+    ) -> Result<Option<String>, StorageError>;
+
+    /// Record the content hash a URL resolved to (upsert; refreshes `created_at`).
+    async fn url_cache_store(
+        &self,
+        url_hash: &str,
+        model: &str,
+        revision: &str,
+        content_hash: &str,
+    ) -> Result<(), StorageError>;
 }
 
 /// Open the configured backend and run migrations. Returns a trait object so the

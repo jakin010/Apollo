@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::defaults;
 use apollo_domain::Architecture;
+use crate::defaults;
 
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -19,13 +19,40 @@ pub struct Config {
     #[serde(default)]
     pub webhook: Option<WebhookConfig>,
     #[serde(default)]
+    pub auth: Option<AuthConfig>,
+    #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
     #[serde(default)]
+    pub cache: Option<CacheConfig>,
+    #[serde(default)]
     pub strategies: BTreeMap<String, StrategyConfig>,
     #[serde(default)]
     pub models: BTreeMap<String, ModelConfig>,
+}
+
+/// Authentication for the `Inference` service. When this section is present,
+/// every Inference RPC must carry a valid PASETO v4 token signed by the matching
+/// secret key (mint tokens with `apollo token`). Health and reflection stay open.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AuthConfig {
+    /// PASERK-encoded v4 **public** key (`k4.public.…`) used to verify tokens.
+    pub public_key: String,
+}
+
+/// Result cache (optional). When present and `enabled`, model outputs are cached
+/// by content hash (with a url→content-hash hint) so identical inputs skip
+/// inference. A bare `[cache]` section turns it on.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct CacheConfig {
+    /// Master switch. Defaults to true so `[cache]` alone enables caching.
+    #[serde(default = "crate::defaults::cache_enabled")]
+    pub enabled: bool,
+    /// Freshness window in seconds; entries older than this are ignored (and
+    /// eligible for purge). Omit for entries that never expire.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
 }
 
 /// `[app]` — application-wide settings.
@@ -62,6 +89,11 @@ pub struct AppConfig {
     /// RESOURCE_EXHAUSTED (backpressure). `0` disables the limit.
     #[serde(default = "crate::defaults::max_pending")]
     pub max_pending: u32,
+    /// Max times a failed item is retried before it is marked failed (and reported
+    /// to the webhook via the `Webhook.ItemFailed` dead-letter call). `0` disables
+    /// retries.
+    #[serde(default = "crate::defaults::max_retries")]
+    pub max_retries: u32,
 }
 
 impl AppConfig {
@@ -83,6 +115,7 @@ impl Default for AppConfig {
             config_file: None,
             max_memory: defaults::max_memory(),
             max_pending: defaults::max_pending(),
+            max_retries: 3,
         }
     }
 }
@@ -96,7 +129,7 @@ pub struct WebhookConfig {
     pub url: String,
     /// Optional shared secret. When set, each delivery carries an
     /// `x-apollo-webhook-signature` metadata header: lowercase-hex HMAC-SHA256 of
-    /// the protobuf-encoded payload, letting the receiver verify authenticity.
+    /// the task id, letting the receiver verify the call came from this server.
     #[serde(default)]
     pub secret: Option<String>,
     /// How often (seconds) the background loop retries deliveries left pending by

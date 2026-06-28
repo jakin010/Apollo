@@ -16,10 +16,7 @@ pub(crate) struct Hub {
 
 impl Hub {
     /// Open the repo named by `cfg` (at its revision), using `cache_dir` if given.
-    pub(crate) fn open(
-        cfg: &ModelConfig,
-        cache_dir: Option<&Path>,
-    ) -> Result<Self, InferenceError> {
+    pub(crate) fn open(cfg: &ModelConfig, cache_dir: Option<&Path>) -> Result<Self, InferenceError> {
         let api = match cache_dir {
             Some(dir) => ApiBuilder::new()
                 .with_cache_dir(dir.to_path_buf())

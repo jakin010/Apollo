@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use clap::Subcommand;
 
 use apollo_config::{edit, load};

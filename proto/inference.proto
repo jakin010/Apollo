@@ -12,17 +12,14 @@ import "common.proto";
 //   image -> any image-classifier
 //   video -> any image-classifier with a video_strategy (sampled-frame scan)
 //   text / audio -> models of that kind (future)
-// Invalid model/modality combinations are rejected synchronously by Classify /
-// ClassifyBatch before anything is queued. Runtime failures (unfetchable URL,
-// inference error, timeout) are reported per item / per model instead.
+// Invalid model/modality combinations are rejected synchronously by Classify
+// before anything is queued. Runtime failures (unfetchable URL, inference error,
+// timeout) are reported per item / per model instead.
 // =============================================================================
 
 service Inference {
   // Submit a single input. Returns immediately with a task id.
   rpc Classify (ClassifyRequest) returns (TaskCreated);
-
-  // Submit several inputs as one batch under a single task id.
-  rpc ClassifyBatch (ClassifyBatchRequest) returns (TaskCreated);
 
   // Poll task state and results. Backed by the database, so it survives restarts.
   rpc GetTask (GetTaskRequest) returns (Task);
@@ -31,4 +28,26 @@ service Inference {
   // the request (CANCELLED unless it had already finished). In-flight items stop
   // at the next checkpoint (between models / between sampled video frames).
   rpc CancelTask (CancelRequest) returns (Task);
+
+  // Submit a single input as a stream of raw content bytes (no URL fetch). The
+  // first message MUST be the `init` frame (models + modality); every following
+  // message carries `data` bytes in order. The server stages the bytes locally
+  // and returns a task id, exactly like Classify.
+  rpc ClassifyStream (stream ClassifyChunk) returns (TaskCreated);
+}
+
+// Opening frame for ClassifyStream: the model labels to run and whether the
+// streamed bytes are a video (true) or a single image (false).
+message ClassifyStreamInit {
+  repeated string models = 1;
+  bool video = 2;
+}
+
+// One message in a ClassifyStream. Exactly one of `init` (required, first) or
+// `data` (content bytes, in order) is set per message.
+message ClassifyChunk {
+  oneof payload {
+    ClassifyStreamInit init = 1;
+    bytes data = 2;
+  }
 }

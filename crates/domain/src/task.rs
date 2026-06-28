@@ -1,6 +1,7 @@
 //! Task lifecycle: `Task`, `Item`, `ModelResult`, and their state enums.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,10 @@ pub enum Input {
     Text(String),
     /// (future)
     Audio(Url),
+    /// Raw content bytes streamed in via `ClassifyStream` and staged to a local
+    /// file. `video` selects the processing path (false = image, true = video).
+    /// The file is removed once the owning task reaches a terminal state.
+    Bytes { path: PathBuf, video: bool },
 }
 
 impl Input {
@@ -37,6 +42,8 @@ impl Input {
             Input::Video(_) => Modality::Video,
             Input::Text(_) => Modality::Text,
             Input::Audio(_) => Modality::Audio,
+            Input::Bytes { video: false, .. } => Modality::Image,
+            Input::Bytes { video: true, .. } => Modality::Video,
         }
     }
 }
@@ -59,6 +66,9 @@ pub enum TaskState {
 pub enum ItemState {
     Queued,
     Processing,
+    /// A previous attempt failed but retries remain under the configured cap, so
+    /// the item is queued to run again.
+    Retrying,
     Completed,
     Failed,
     /// Cancelled by a client request before completing.
@@ -86,35 +96,19 @@ pub struct ModelResult {
 
 impl ModelResult {
     pub fn queued() -> Self {
-        Self {
-            state: ModelState::Queued,
-            output: None,
-            error: None,
-        }
+        Self { state: ModelState::Queued, output: None, error: None }
     }
 
     pub fn processing() -> Self {
-        Self {
-            state: ModelState::Processing,
-            output: None,
-            error: None,
-        }
+        Self { state: ModelState::Processing, output: None, error: None }
     }
 
     pub fn done(output: ModelOutput) -> Self {
-        Self {
-            state: ModelState::Done,
-            output: Some(output),
-            error: None,
-        }
+        Self { state: ModelState::Done, output: Some(output), error: None }
     }
 
     pub fn failed(error: impl Into<String>) -> Self {
-        Self {
-            state: ModelState::Failed,
-            output: None,
-            error: Some(error.into()),
-        }
+        Self { state: ModelState::Failed, output: None, error: Some(error.into()) }
     }
 }
 
@@ -130,6 +124,10 @@ pub struct Item {
     pub results: BTreeMap<String, ModelResult>,
     /// Set on item-level failure (e.g. the input could not be fetched).
     pub error: Option<String>,
+    /// Times this item has been retried after a failed attempt (resets nothing;
+    /// compared against `[app].max_retries`).
+    #[serde(default)]
+    pub retries: u32,
 }
 
 /// A unit of work: one or more inputs submitted together under a single id.

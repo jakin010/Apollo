@@ -2,9 +2,9 @@
 //! currently causes [`crate::open`] to return
 //! [`StorageError::UnsupportedBackend`](crate::StorageError::UnsupportedBackend).
 
-mod postgres;
 pub mod sqlite;
 pub mod surreal;
+mod postgres;
 
 pub use sqlite::SqliteStorage;
 pub use surreal::SurrealStorage;

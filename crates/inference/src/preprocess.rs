@@ -50,10 +50,8 @@ pub(crate) fn preprocess(
 }
 
 fn resize_rgb(img: &DecodedImage, size: u32) -> Result<Vec<u8>, InferenceError> {
-    let buf =
-        image::RgbImage::from_raw(img.width, img.height, img.data.clone()).ok_or_else(|| {
-            InferenceError::Preprocess("image buffer length does not match dimensions".into())
-        })?;
+    let buf = image::RgbImage::from_raw(img.width, img.height, img.data.clone())
+        .ok_or_else(|| InferenceError::Preprocess("image buffer length does not match dimensions".into()))?;
     let resized = image::imageops::resize(&buf, size, size, image::imageops::FilterType::Triangle);
     Ok(resized.into_raw())
 }

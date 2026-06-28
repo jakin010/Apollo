@@ -9,7 +9,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -29,6 +29,14 @@ const SIGNATURE_HEADER: &str = "x-apollo-webhook-signature";
 #[tonic::async_trait]
 pub trait WebhookHandler: Send + Sync + 'static {
     async fn on_task_status(&self, task: Task);
+
+    /// Invoked when an item has permanently failed (exhausted all retries) — the
+    /// dead-letter callback (`ItemFailed`). The failed item is the one in the
+    /// `Failed` state; dedupe as for [`on_task_status`](Self::on_task_status).
+    /// Defaults to a no-op; override to handle dead-lettered items.
+    async fn on_item_failed(&self, task: Task) {
+        let _ = task;
+    }
 }
 
 /// A webhook receiver. Build it from a [`WebhookHandler`], optionally set a shared
@@ -125,6 +133,14 @@ impl<H: WebhookHandler> Webhook for Service<H> {
         self.handler.on_task_status(request.into_inner()).await;
         Ok(Response::new(Ack {}))
     }
+
+    async fn item_failed(&self, request: Request<Task>) -> Result<Response<Ack>, Status> {
+        if let Some(secret) = &self.secret {
+            verify_signature(secret, &request)?;
+        }
+        self.handler.on_item_failed(request.into_inner()).await;
+        Ok(Response::new(Ack {}))
+    }
 }
 
 /// Verify the `x-apollo-webhook-signature` header against the task id: it must be
@@ -140,7 +156,8 @@ fn verify_signature(secret: &[u8], request: &Request<Task>) -> Result<(), Status
     let provided =
         hex_decode(header).ok_or_else(|| Status::unauthenticated("malformed webhook signature"))?;
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts a key of any length");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts a key of any length");
     mac.update(request.get_ref().id.as_bytes());
     let expected = mac.finalize().into_bytes();
 
@@ -184,9 +201,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// with the `reflection` feature; advertises the `Webhook` service (and the
 /// shared messages) — not `Inference`.
 #[cfg(feature = "reflection")]
-fn reflection_service() -> tonic_reflection::server::v1::ServerReflectionServer<
-    impl tonic_reflection::server::v1::ServerReflection,
-> {
+fn reflection_service(
+) -> tonic_reflection::server::v1::ServerReflectionServer<impl tonic_reflection::server::v1::ServerReflection>
+{
     tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(apollo_proto::WEBHOOK_DESCRIPTOR_SET)
         .build_v1()

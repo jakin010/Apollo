@@ -12,6 +12,10 @@ tonic-reflection = "0.14"
 tonic-health = "0.14"
 hmac = "0.12"
 sha2 = "0.10"
+pasetors = "0.7"
+thiserror = "2"
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 tracing = { workspace = true }
 

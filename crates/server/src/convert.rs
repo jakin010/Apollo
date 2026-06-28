@@ -121,6 +121,7 @@ fn item_state(s: dom::ItemState) -> pb::ItemState {
         dom::ItemState::Queued => pb::ItemState::Queued,
         dom::ItemState::Processing => pb::ItemState::Processing,
         dom::ItemState::Completed => pb::ItemState::Completed,
+        dom::ItemState::Retrying => pb::ItemState::Retrying,
         dom::ItemState::Failed => pb::ItemState::Failed,
         dom::ItemState::Cancelled => pb::ItemState::Cancelled,
     }
@@ -233,6 +234,7 @@ mod tests {
                 state: dom::ItemState::Completed,
                 results,
                 error: None,
+                retries: 0,
             }],
         };
 
@@ -271,6 +273,7 @@ mod tests {
                 state: dom::ItemState::Failed,
                 results: std::collections::BTreeMap::new(),
                 error: Some("fetch failed".into()),
+                retries: 0,
             }],
         };
         let pt = task_to_proto(task);

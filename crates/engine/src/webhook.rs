@@ -30,33 +30,59 @@ impl From<String> for WebhookError {
 /// notifications (e.g. an item entering `Processing`) are best-effort.
 #[async_trait]
 pub trait WebhookSink: Send + Sync {
-    /// Deliver the current `task`, identifying which item just changed state.
+    /// Deliver routine task status (the `TaskStatus` call): the current `task`,
+    /// identifying which item just changed state.
     async fn deliver(&self, task: &Task, item_index: usize) -> Result<(), WebhookError>;
+
+    /// Deliver a dead-letter notification (the `ItemFailed` call) for an item that
+    /// has exhausted all retries. Same endpoint and payload as `deliver`.
+    async fn deliver_failed(&self, task: &Task, item_index: usize) -> Result<(), WebhookError>;
 }
 
 impl Engine {
-    /// Load the task and push it to the sink. Returns `true` on successful
-    /// delivery; a no-op returning `false` when no sink is configured or the task
-    /// is missing. No bookkeeping — callers decide whether to track delivery.
+    /// Load a task for delivery, logging and returning `None` on miss/error.
+    async fn load_task_for_webhook(&self, task_id: &str) -> Option<Task> {
+        match self.inner.storage.get_task(task_id).await {
+            Ok(Some(t)) => Some(t),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(task = %task_id, error = %e, "webhook: could not load task");
+                None
+            }
+        }
+    }
+
+    /// Push routine task status (`TaskStatus`). No-op returning `false` if no sink
+    /// is configured or the task is missing. No bookkeeping.
     async fn push_webhook(&self, task_id: &str, item_index: usize) -> bool {
         let Some(sink) = self.inner.webhook.as_ref() else {
             return false;
         };
-        let task = match self.inner.storage.get_task(task_id).await {
-            Ok(Some(t)) => t,
-            Ok(None) => return false,
-            Err(e) => {
-                tracing::warn!(task = %task_id, error = %e, "webhook: could not load task");
-                return false;
-            }
+        let Some(task) = self.load_task_for_webhook(task_id).await else {
+            return false;
         };
         match sink.deliver(&task, item_index).await {
             Ok(()) => true,
             Err(e) => {
-                tracing::warn!(
-                    task = %task_id, item = item_index, error = %e,
-                    "webhook delivery failed"
-                );
+                tracing::warn!(task = %task_id, item = item_index, error = %e, "webhook delivery failed");
+                false
+            }
+        }
+    }
+
+    /// Push a dead-letter notification (`ItemFailed`) to the same sink. No-op
+    /// returning `false` if no sink is configured or the task is missing.
+    async fn push_failed_webhook(&self, task_id: &str, item_index: usize) -> bool {
+        let Some(sink) = self.inner.webhook.as_ref() else {
+            return false;
+        };
+        let Some(task) = self.load_task_for_webhook(task_id).await else {
+            return false;
+        };
+        match sink.deliver_failed(&task, item_index).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(task = %task_id, item = item_index, error = %e, "failure webhook delivery failed");
                 false
             }
         }
@@ -107,9 +133,40 @@ impl Engine {
         });
     }
 
+    /// Fire the dead-letter call (`ItemFailed`) for a permanently-failed item, to
+    /// the same webhook endpoint. Spawned, retried with backoff, marks the
+    /// failure-delivered flag on success, otherwise left for the periodic
+    /// redelivery loop. No-op without a configured webhook sink.
+    pub(crate) async fn deliver_failure_webhook(&self, task_id: &str, item_index: usize) {
+        if self.inner.webhook.is_none() {
+            return;
+        }
+        let engine = self.clone();
+        let task_id = task_id.to_string();
+        tokio::spawn(async move {
+            for delay in [0u64, 1, 3] {
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                }
+                if engine.push_failed_webhook(&task_id, item_index).await {
+                    let _ = engine
+                        .inner
+                        .storage
+                        .mark_failure_delivered(&task_id, item_index)
+                        .await;
+                    return;
+                }
+            }
+            tracing::warn!(
+                task = %task_id, item = item_index,
+                "failure webhook undelivered after retries; left pending for redelivery"
+            );
+        });
+    }
+
     /// Start the periodic redelivery loop: every `[webhook].redelivery_secs`,
-    /// re-attempt every terminal item whose webhook is still undelivered. No-op
-    /// when there is no sink or the interval is zero.
+    /// re-attempt every terminal item whose task-status or dead-letter webhook is
+    /// still undelivered. No-op when no sink is configured or the interval is zero.
     pub(crate) fn spawn_redelivery(&self) {
         if self.inner.webhook.is_none() {
             return;
@@ -140,6 +197,18 @@ impl Engine {
                     Ok(_) => {}
                     Err(e) => {
                         tracing::warn!(error = %e, "redelivery: could not list pending webhooks")
+                    }
+                }
+                match engine.inner.storage.items_pending_failure_webhook().await {
+                    Ok(pending) if !pending.is_empty() => {
+                        tracing::debug!(count = pending.len(), "redelivering pending failure webhooks");
+                        for p in pending {
+                            engine.deliver_failure_webhook(&p.task_id, p.item_index).await;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "redelivery: could not list pending failure webhooks")
                     }
                 }
             }

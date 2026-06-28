@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 
 /// Path where a running instance records its PID.
 fn pid_path() -> PathBuf {
@@ -32,7 +32,9 @@ impl PidFile {
         match fs::read_to_string(&path) {
             Ok(s) => Ok(s.trim().parse::<u32>().ok()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
+            Err(e) => {
+                Err(anyhow::Error::new(e).context(format!("reading {}", path.display())))
+            }
         }
     }
 }
@@ -66,7 +68,7 @@ pub fn terminate(_pid: u32) -> anyhow::Result<()> {
 pub async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         match signal(SignalKind::terminate()) {
             Ok(mut term) => {
                 tokio::select! {
