@@ -76,7 +76,17 @@ message ModelResult {
 // A label set. Returned predictions are the top 5 unioned with any label
 // scoring above 0.90.
 message Classification {
+  // Flat predictions (vit, or siglip with a plain `labels` list). The `label` is
+  // a class index (vit) or a label-list index (siglip), not a name.
   repeated Prediction predictions = 1;
+  // Grouped child-category scores for siglip taxonomy models: parent category id
+  // -> its child categories with aggregated scores. Empty in flat mode.
+  map<uint32, CategoryScores> groups = 2;
+}
+
+// The child categories (and their aggregated scores) under one parent category.
+message CategoryScores {
+  repeated Prediction scores = 1;
 }
 
 // An image-classifier run frame-by-frame over a video.
@@ -94,7 +104,7 @@ message Frame {
 }
 
 message Prediction {
-  string label = 1;
+  uint32 label = 1;
   float  score = 2;
 }
 

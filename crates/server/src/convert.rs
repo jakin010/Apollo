@@ -78,14 +78,26 @@ fn output_to_proto(o: dom::ModelOutput) -> pb::model_result::Output {
 
 fn classification_to_proto(c: dom::Classification) -> pb::Classification {
     pb::Classification {
-        predictions: c
-            .predictions
+        predictions: c.predictions.into_iter().map(prediction_to_proto).collect(),
+        groups: c
+            .groups
             .into_iter()
-            .map(|p| pb::Prediction {
-                label: p.label,
-                score: p.score,
+            .map(|(parent, preds)| {
+                (
+                    parent,
+                    pb::CategoryScores {
+                        scores: preds.into_iter().map(prediction_to_proto).collect(),
+                    },
+                )
             })
             .collect(),
+    }
+}
+
+fn prediction_to_proto(p: dom::Prediction) -> pb::Prediction {
+    pb::Prediction {
+        label: p.label,
+        score: p.score,
     }
 }
 
@@ -213,9 +225,10 @@ mod tests {
     fn task_maps_states_results_and_classification() {
         let classification = dom::Classification {
             predictions: vec![dom::Prediction {
-                label: "cat".into(),
+                label: 7,
                 score: 0.9,
             }],
+            ..Default::default()
         };
         let mut results = std::collections::BTreeMap::new();
         results.insert(
@@ -252,7 +265,7 @@ mod tests {
         match &mr.output {
             Some(pb::model_result::Output::Classification(c)) => {
                 assert_eq!(c.predictions.len(), 1);
-                assert_eq!(c.predictions[0].label, "cat");
+                assert_eq!(c.predictions[0].label, 7);
                 assert!((c.predictions[0].score - 0.9).abs() < 1e-6);
             }
             _ => panic!("expected a classification output"),

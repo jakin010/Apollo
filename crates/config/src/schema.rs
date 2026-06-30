@@ -115,7 +115,7 @@ impl Default for AppConfig {
             config_file: None,
             max_memory: defaults::max_memory(),
             max_pending: defaults::max_pending(),
-            max_retries: 3,
+            max_retries: defaults::max_retries(),
         }
     }
 }
@@ -290,6 +290,7 @@ pub struct StrategyConfig {
 #[serde(rename_all = "lowercase")]
 pub enum Aggregation {
     Max,
+    #[serde(alias = "average")]
     Mean,
 }
 
@@ -355,14 +356,40 @@ pub struct ModelConfig {
     /// Early-exit trigger for video scans (model-specific labels + threshold).
     #[serde(default)]
     pub early_exit: Option<EarlyExit>,
+    /// Candidate labels for open-vocabulary architectures (siglip). Each is
+    /// embedded via the text tower and scored against the image; ignored by
+    /// fixed-head architectures (vit) that get their labels from the weights.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Optional prompt template wrapping each label before encoding, e.g.
+    /// `"a photo of a {}"` (a `{}` placeholder is substituted; otherwise the
+    /// template is prefixed). The bare label is what's returned in results.
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+    /// Keep labels scoring at or above this (siglip sigmoid probability). For a
+    /// video frame scan, set this low so true peaks survive into the temporal
+    /// pool. Defaults to 0.5 when unset.
+    #[serde(default)]
+    pub score_threshold: Option<f32>,
+    /// Cap on the number of labels returned (highest-scoring first). `None`
+    /// returns every label above the threshold.
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    /// Path to a taxonomy file (TOML) defining grouped, prompt-backed categories
+    /// for a siglip model. Relative paths resolve from the config file's
+    /// directory. Mutually exclusive with `labels`.
+    #[serde(default)]
+    pub taxonomy_file: Option<String>,
 }
 
 /// `[models.<label>.early_exit]` — what counts as a trigger for this model.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EarlyExit {
-    /// Stop the scan when any of these labels crosses `threshold` on a frame.
-    pub labels: Vec<String>,
+    /// Stop the scan when any of these category ids crosses `threshold` on a
+    /// frame (a class index for vit; a label index or taxonomy child id for
+    /// siglip).
+    pub labels: Vec<u32>,
     #[serde(default = "crate::defaults::early_exit_threshold")]
     pub threshold: f32,
 }

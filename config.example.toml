@@ -96,6 +96,9 @@ fps    = 5
 # ============================== models ==============================
 # Flat. `architecture` selects the candle builder. Almost everything else
 # is optional. An image-classifier with `video_strategy` set also accepts video.
+# Note: video is handled by running an image-classifier over sampled frames —
+# set `video_strategy` on a `vit` model (see `general`/`nsfw` above). There is no
+# separate video-model architecture.
 
 [models.general]
 architecture   = "vit"
@@ -113,9 +116,11 @@ repo           = "Falconsai/nsfw_image_detection"
 video_strategy = "progressive_scan"
 
 [models.nsfw.early_exit]        # model-side: what counts as a trigger. Absent -> no early exit.
-labels    = ["nsfw"]
+labels    = [1]
 threshold = 0.85
 
-# Note: video is handled by running an image-classifier over sampled frames —
-# set `video_strategy` on a `vit` model (see `general`/`nsfw` above). There is no
-# separate video-model architecture.
+[models.category]
+architecture = "siglip"
+repo = "google/siglip-base-patch16-224"
+taxonomy_file = "taxonomy.example.toml"
+score_threshold = 0.5               # keep labels at/above this sigmoid prob

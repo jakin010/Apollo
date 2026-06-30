@@ -6,11 +6,9 @@ use toml_edit::DocumentMut;
 use crate::schema::{Backend, SamplingKind};
 use crate::{edit, load};
 
-const EXAMPLE: &str = include_str!("../../../config.example.toml");
-
 #[test]
 fn parses_and_validates_example() {
-    let cfg = load::from_str(EXAMPLE).expect("example config should parse");
+    let cfg = load::load_from("../../config.example.toml".as_ref()).expect("example config should parse");
     cfg.validate().expect("example config should be valid");
 
     assert!(cfg.has_models());
@@ -19,7 +17,7 @@ fn parses_and_validates_example() {
     let nsfw = cfg.models.get("nsfw").expect("nsfw model");
     assert_eq!(nsfw.video_strategy.as_deref(), Some("progressive_scan"));
     let ee = nsfw.early_exit.as_ref().expect("nsfw early_exit");
-    assert_eq!(ee.labels, vec!["nsfw".to_string()]);
+    assert_eq!(ee.labels, vec![1u32]);
 
     let scan = cfg.strategies.get("progressive_scan").expect("strategy");
     assert_eq!(scan.sampling[0].method, SamplingKind::Iframes);

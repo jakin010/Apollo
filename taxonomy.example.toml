@@ -1,0 +1,102 @@
+# Example SigLIP taxonomy.
+#
+# A two-level tree. Top-level tables are PARENT categories — each needs an
+# integer `id`. Their nested tables are CHILD categories — each needs an `id`, a
+# list of `prompts`, and an optional `aggregation`: "mean" (the default),
+# "average" (an alias for mean), or "max", controlling how that child's per-prompt
+# scores combine into a single child score.
+#
+# SigLIP scores every prompt independently; a child's score is the aggregation of
+# its own prompts. Results come back grouped as parent-id -> [(child-id, score)],
+# with every child included (no thresholding). Reference it from a model with
+#   taxonomy_file = "taxonomy.toml"
+# (a relative path resolves from the config file's directory).
+#
+# Ids are arbitrary unique u32s; the 1000*parent convention below is only for
+# readability. Parent ids and child ids live in separate namespaces.
+
+[food_and_drink]
+id = 1
+
+[food_and_drink.meals]
+id = 1001
+prompts = ["a plate of food", "a home cooked meal", "a restaurant dish", "a bowl of pasta or noodles"]
+aggregation = "mean"
+
+[food_and_drink.desserts_and_baking]
+id = 1002
+prompts = ["a cake or pastry", "a dessert on a plate", "freshly baked bread", "an ice cream cone"]
+aggregation = "average"  # alias for mean
+
+[food_and_drink.non_alcoholic_drinks]
+id = 1003
+prompts = ["a cup of coffee", "a fruit smoothie or juice", "a glass of soda", "a cup of tea"]
+aggregation = "max"
+
+[food_and_drink.alcohol]
+id = 1004
+# no `aggregation` -> defaults to mean
+prompts = ["a glass of wine", "a cocktail drink", "a glass of beer", "a bottle of liquor"]
+
+[food_and_drink.fast_food]
+id = 1005
+prompts = ["a hamburger", "a whole pizza", "a serving of french fries", "a hot dog"]
+
+[scene]
+id = 2
+
+[scene.nature]
+id = 2001
+# `max`: one strong "beach" frame should light the category even if the other
+# nature prompts stay low — the prompts are alternatives, not a conjunction.
+prompts = ["a nature landscape", "a forest", "mountains or hills", "a beach"]
+aggregation = "max"
+
+[scene.urban]
+id = 2002
+prompts = ["a city street", "a building exterior", "an urban skyline at night"]
+aggregation = "max"
+
+[scene.indoor]
+id = 2003
+prompts = ["a home interior", "an office workspace", "a restaurant or cafe interior", "a classroom"]
+aggregation = "max"
+
+[subject]
+id = 3
+
+[subject.people]
+id = 3001
+prompts = ["a single person portrait", "a group of people", "a large crowd"]
+aggregation = "max"
+
+[subject.animals]
+id = 3002
+prompts = ["a dog", "a cat", "a bird", "wildlife in nature"]
+aggregation = "max"
+
+[subject.vehicles]
+id = 3003
+prompts = ["a car", "a motorcycle", "an airplane", "a boat or ship"]
+aggregation = "max"
+
+[content_type]
+id = 4
+
+[content_type.text_or_document]
+id = 4001
+prompts = ["a screenshot of text", "a document or infographic", "a chart or data visualization"]
+aggregation = "max"
+
+[content_type.meme]
+id = 4002
+prompts = ["a meme with text overlay"]
+
+[content_type.product_photo]
+id = 4003
+prompts = ["a product photo on a plain background", "a technology gadget or computer"]
+aggregation = "mean"
+
+[content_type.video_game]
+id = 4004
+prompts = ["a video game screenshot"]

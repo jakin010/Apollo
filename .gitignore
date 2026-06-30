@@ -19,6 +19,8 @@ __*
 
 # database
 *.db
+*.db-wal
+*.db-shm
 *.sql
 *.sql.gz
 
@@ -28,3 +30,6 @@ __*
 # unnesecery files
 *.txt
 !requirements.txt
+*.zip
+*.tar
+*.tar.gz

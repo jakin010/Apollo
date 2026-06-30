@@ -31,7 +31,11 @@ pub fn from_str(text: &str) -> Result<Config, ConfigError> {
 pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
     let text =
         std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
-    from_str(&text)
+    let mut config = from_str(&text)?;
+    if let Some(base) = path.parent() {
+        config.resolve_paths(base);
+    }
+    Ok(config)
 }
 
 /// Resolve the config path (CLI flag wins, else the built-in default) and load it.
@@ -52,6 +56,19 @@ pub struct Overrides {
 }
 
 impl Config {
+    /// Resolve relative model `taxonomy_file` paths against `base` (the directory
+    /// of the config file), so downstream consumers can open them directly.
+    fn resolve_paths(&mut self, base: &Path) {
+        for model in self.models.values_mut() {
+            if let Some(tf) = &model.taxonomy_file {
+                let p = Path::new(tf);
+                if p.is_relative() {
+                    model.taxonomy_file = Some(base.join(p).to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+
     /// Apply run-only overrides in place.
     pub fn apply_overrides(&mut self, o: &Overrides) {
         if let Some(e) = &o.endpoint {

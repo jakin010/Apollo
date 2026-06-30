@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum Architecture {
     Vit,
+    Siglip,
 }
 
 /// Modality of an input.

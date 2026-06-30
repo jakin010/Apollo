@@ -704,7 +704,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// `(labels, threshold)` when both the strategy enables early-exit and the model
 /// defines trigger labels; otherwise `None` (early-exit needs both).
-fn early_exit_for(strategy: &StrategyConfig, model: &ModelConfig) -> Option<(Vec<String>, f32)> {
+fn early_exit_for(strategy: &StrategyConfig, model: &ModelConfig) -> Option<(Vec<u32>, f32)> {
     if !strategy.early_exit {
         return None;
     }

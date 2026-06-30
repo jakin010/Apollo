@@ -5,8 +5,7 @@
 //! [`Config::has_models`].
 
 use std::collections::BTreeSet;
-
-
+use std::path::Path;
 use crate::error::ConfigError;
 use crate::schema::{Backend, Config, SamplingKind};
 
@@ -61,6 +60,16 @@ impl Config {
                         "model '{label}': early_exit has no effect without a video_strategy"
                     ));
                 }
+            }
+            if !model.labels.is_empty() && model.taxonomy_file.is_some() {
+                errs.push(format!(
+                    "model '{label}': set either `labels` or `taxonomy_file`, not both"
+                ));
+            }
+            if let Some(tf) = &model.taxonomy_file && !Path::new(tf).exists() {
+                errs.push(format!(
+                    "model '{label}': taxonomy file `{}` does not exist", tf
+                ));
             }
         }
 

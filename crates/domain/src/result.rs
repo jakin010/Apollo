@@ -1,12 +1,16 @@
 //! Result shapes: `Prediction`, `Classification`, and `FrameScan` (`aggregated`
 //! plus per-frame `Frame`s with timestamps).
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-/// A single (label, score) prediction.
+/// A single (category-id, score) prediction. `label` is an integer id — a class
+/// index (vit), a label-list index (siglip with plain labels), or a taxonomy
+/// child-category id (siglip with a taxonomy) — never a name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Prediction {
-    pub label: String,
+    pub label: u32,
     pub score: f32,
 }
 
@@ -14,7 +18,13 @@ pub struct Prediction {
 /// scoring above 0.90 (assembled in `apollo-engine`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Classification {
+    /// Flat predictions (vit; siglip with a plain `labels` list).
     pub predictions: Vec<Prediction>,
+    /// Grouped child scores for siglip taxonomy models: parent category id ->
+    /// its child categories (as predictions whose `label` is the child id) with
+    /// their aggregated scores. Empty in flat mode.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groups: BTreeMap<u32, Vec<Prediction>>,
 }
 
 /// One classified video frame.
@@ -61,26 +71,26 @@ pub fn select_top(mut preds: Vec<Prediction>) -> Vec<Prediction> {
 mod tests {
     use super::*;
 
-    fn p(label: &str, score: f32) -> Prediction {
-        Prediction { label: label.into(), score }
+    fn p(label: u32, score: f32) -> Prediction {
+        Prediction { label, score }
     }
 
     #[test]
     fn keeps_five_by_default() {
         let preds = vec![
-            p("a", 0.8), p("b", 0.7), p("c", 0.6),
-            p("d", 0.5), p("e", 0.4), p("f", 0.3), p("g", 0.2),
+            p(1, 0.8), p(2, 0.7), p(3, 0.6),
+            p(4, 0.5), p(5, 0.4), p(6, 0.3), p(7, 0.2),
         ];
         let out = select_top(preds);
         assert_eq!(out.len(), 5);
-        assert_eq!(out[0].label, "a");
+        assert_eq!(out[0].label, 1);
     }
 
     #[test]
     fn unions_high_confidence_beyond_five() {
         let preds = vec![
-            p("a", 0.95), p("b", 0.94), p("c", 0.93),
-            p("d", 0.92), p("e", 0.91), p("f", 0.905),
+            p(1, 0.95), p(2, 0.94), p(3, 0.93),
+            p(4, 0.92), p(5, 0.91), p(6, 0.905),
         ];
         // all six exceed 0.90, so all six are returned even though that is > 5
         assert_eq!(select_top(preds).len(), 6);

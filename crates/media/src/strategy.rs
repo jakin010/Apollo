@@ -58,15 +58,23 @@ pub async fn plan(
         .collect())
 }
 
-/// Roll per-frame classifications into one, by `max` or `mean` of each label's
-/// score across all frames, then apply the standard top-5 ∪ >0.90 selection.
+/// Roll per-frame classifications into one. Flat predictions are pooled by `max`
+/// or `mean` of each label's score across all frames. For taxonomy models the
+/// per-parent child scores are pooled the same way and regrouped (the parent ->
+/// child structure is read from the frames, so this stays model-agnostic);
+/// otherwise the standard top-5 ∪ >0.90 selection is applied to the flat list.
+/// `mean` divides by the total frame count, so a category present in only a few
+/// frames pools to a low, prevalence-weighted score.
 pub fn aggregate(per_frame: &[Classification], how: Aggregation) -> Classification {
     use std::collections::BTreeMap;
 
-    let mut acc: BTreeMap<String, f32> = BTreeMap::new();
+    let denom = per_frame.len().max(1) as f32;
+
+    // Pool flat predictions by label id across all frames.
+    let mut flat: BTreeMap<u32, f32> = BTreeMap::new();
     for frame in per_frame {
         for p in &frame.predictions {
-            let entry = acc.entry(p.label.clone()).or_insert(match how {
+            let entry = flat.entry(p.label).or_insert(match how {
                 Aggregation::Max => f32::MIN,
                 Aggregation::Mean => 0.0,
             });
@@ -77,8 +85,26 @@ pub fn aggregate(per_frame: &[Classification], how: Aggregation) -> Classificati
         }
     }
 
-    let denom = per_frame.len().max(1) as f32;
-    let preds = acc
+    // Pool grouped child scores (taxonomy models) the same way. Each (parent,
+    // child) pools independently across frames; the grouping is taken from the
+    // frames themselves, so no taxonomy definition is needed here.
+    let mut grouped: BTreeMap<(u32, u32), f32> = BTreeMap::new();
+    for frame in per_frame {
+        for (parent, children) in &frame.groups {
+            for c in children {
+                let entry = grouped.entry((*parent, c.label)).or_insert(match how {
+                    Aggregation::Max => f32::MIN,
+                    Aggregation::Mean => 0.0,
+                });
+                match how {
+                    Aggregation::Max => *entry = entry.max(c.score),
+                    Aggregation::Mean => *entry += c.score,
+                }
+            }
+        }
+    }
+
+    let predictions = flat
         .into_iter()
         .map(|(label, value)| Prediction {
             label,
@@ -89,18 +115,39 @@ pub fn aggregate(per_frame: &[Classification], how: Aggregation) -> Classificati
         })
         .collect::<Vec<_>>();
 
+    if grouped.is_empty() {
+        // Non-taxonomy rollup: the standard top-5 ∪ >0.90 selection.
+        return Classification {
+            predictions: select_top(predictions),
+            ..Default::default()
+        };
+    }
+
+    // Taxonomy rollup: keep every child, regrouped under its parent (and kept
+    // flat too, for parity with single-image taxonomy results) — no truncation.
+    let mut groups: BTreeMap<u32, Vec<Prediction>> = BTreeMap::new();
+    for ((parent, child), value) in grouped {
+        groups.entry(parent).or_default().push(Prediction {
+            label: child,
+            score: match how {
+                Aggregation::Max => value,
+                Aggregation::Mean => value / denom,
+            },
+        });
+    }
     Classification {
-        predictions: select_top(preds),
+        predictions,
+        groups,
     }
 }
 
 /// Whether any trigger label is predicted at or above `threshold` — the
 /// early-exit condition for a video scan.
-pub fn triggered(class: &Classification, labels: &[String], threshold: f32) -> bool {
+pub fn triggered(class: &Classification, labels: &[u32], threshold: f32) -> bool {
     class
         .predictions
         .iter()
-        .any(|p| p.score >= threshold && labels.iter().any(|l| l == &p.label))
+        .any(|p| p.score >= threshold && labels.contains(&p.label))
 }
 
 fn cmp_f64(a: &f64, b: &f64) -> Ordering {
@@ -120,12 +167,13 @@ mod tests {
         SamplingStep { step: n, method, fps, count, nth: None, threshold: None }
     }
 
-    fn classification(preds: &[(&str, f32)]) -> Classification {
+    fn classification(preds: &[(u32, f32)]) -> Classification {
         Classification {
             predictions: preds
                 .iter()
-                .map(|(l, s)| Prediction { label: (*l).into(), score: *s })
+                .map(|(l, s)| Prediction { label: *l, score: *s })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -171,8 +219,8 @@ mod tests {
             &info(60.0, 30.0),
             &[step(1, SamplingKind::Uniform, Some(2000), None)],
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         let max_seek = 60.0 - 1.0 / 30.0;
         assert!(!frames.is_empty());
         assert!(frames.iter().all(|f| f.timestamp <= max_seek + 1e-9));
@@ -181,26 +229,68 @@ mod tests {
     #[test]
     fn aggregate_mean_and_max() {
         let frames = vec![
-            classification(&[("cat", 0.9), ("dog", 0.1)]),
-            classification(&[("cat", 0.5)]),
+            classification(&[(1, 0.9), (2, 0.1)]),
+            classification(&[(1, 0.5)]),
         ];
 
         let mean = aggregate(&frames, Aggregation::Mean);
-        let cat = mean.predictions.iter().find(|p| p.label == "cat").unwrap();
+        let cat = mean.predictions.iter().find(|p| p.label == 1).unwrap();
         assert!((cat.score - 0.7).abs() < 1e-6);
-        let dog = mean.predictions.iter().find(|p| p.label == "dog").unwrap();
+        let dog = mean.predictions.iter().find(|p| p.label == 2).unwrap();
         assert!((dog.score - 0.05).abs() < 1e-6);
 
         let max = aggregate(&frames, Aggregation::Max);
-        let cat = max.predictions.iter().find(|p| p.label == "cat").unwrap();
+        let cat = max.predictions.iter().find(|p| p.label == 1).unwrap();
         assert!((cat.score - 0.9).abs() < 1e-6);
     }
 
     #[test]
+    fn aggregate_pools_and_regroups_taxonomy() {
+        use std::collections::BTreeMap;
+        // One parent (10) with two children (101, 102) across two frames. Each
+        // frame carries both the flat predictions and the grouped view, as a
+        // taxonomy classifier produces.
+        let frame = |a: f32, b: f32| {
+            let mut groups = BTreeMap::new();
+            groups.insert(
+                10u32,
+                vec![
+                    Prediction { label: 101, score: a },
+                    Prediction { label: 102, score: b },
+                ],
+            );
+            Classification {
+                predictions: vec![
+                    Prediction { label: 101, score: a },
+                    Prediction { label: 102, score: b },
+                ],
+                groups,
+            }
+        };
+        let frames = vec![frame(0.9, 0.2), frame(0.5, 0.4)];
+
+        let max = aggregate(&frames, Aggregation::Max);
+        assert_eq!(max.groups.len(), 1);
+        let kids = &max.groups[&10];
+        assert!((kids.iter().find(|p| p.label == 101).unwrap().score - 0.9).abs() < 1e-6);
+        assert!((kids.iter().find(|p| p.label == 102).unwrap().score - 0.4).abs() < 1e-6);
+
+        let mean = aggregate(&frames, Aggregation::Mean);
+        let kids = &mean.groups[&10];
+        // mean divides by total frames: (0.9+0.5)/2 = 0.7, (0.2+0.4)/2 = 0.3
+        assert!((kids.iter().find(|p| p.label == 101).unwrap().score - 0.7).abs() < 1e-6);
+        assert!((kids.iter().find(|p| p.label == 102).unwrap().score - 0.3).abs() < 1e-6);
+        // The flat list stays consistent with the grouped values.
+        assert!(
+            (mean.predictions.iter().find(|p| p.label == 101).unwrap().score - 0.7).abs() < 1e-6
+        );
+    }
+
+    #[test]
     fn triggered_respects_labels_and_threshold() {
-        let c = classification(&[("nsfw", 0.95), ("sfw", 0.05)]);
-        assert!(triggered(&c, &["nsfw".into()], 0.85));
-        assert!(!triggered(&c, &["nsfw".into()], 0.99));
-        assert!(!triggered(&c, &["violence".into()], 0.5));
+        let c = classification(&[(1, 0.95), (2, 0.05)]);
+        assert!(triggered(&c, &[1], 0.85));
+        assert!(!triggered(&c, &[1], 0.99));
+        assert!(!triggered(&c, &[3], 0.5));
     }
 }

@@ -23,7 +23,7 @@ use crate::Storage;
 
 type Result<T> = std::result::Result<T, StorageError>;
 
-const SCHEMA_V1: &[&str] = &[
+const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS tasks (
         id          TEXT PRIMARY KEY,
         state       TEXT NOT NULL,
@@ -66,9 +66,6 @@ const SCHEMA_V1: &[&str] = &[
             REFERENCES model_results(task_id, item_idx, label) ON DELETE CASCADE
     )",
     "CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state)",
-];
-
-const SCHEMA_V2: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS cache (
         content_hash TEXT NOT NULL,
         model        TEXT NOT NULL,
@@ -206,25 +203,11 @@ impl SqliteStorage {
 #[async_trait]
 impl Storage for SqliteStorage {
     async fn migrate(&self) -> Result<()> {
-        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-            .fetch_one(&self.pool)
-            .await?;
-        if version < 1 {
-            let mut tx = self.pool.begin().await?;
-            for stmt in SCHEMA_V1 {
-                sqlx::query(*stmt).execute(&mut *tx).await?;
-            }
-            sqlx::query("PRAGMA user_version = 1").execute(&mut *tx).await?;
-            tx.commit().await?;
+        let mut tx = self.pool.begin().await?;
+        for stmt in SCHEMA {
+            sqlx::query(*stmt).execute(&mut *tx).await?;
         }
-        if version < 2 {
-            let mut tx = self.pool.begin().await?;
-            for stmt in SCHEMA_V2 {
-                sqlx::query(*stmt).execute(&mut *tx).await?;
-            }
-            sqlx::query("PRAGMA user_version = 2").execute(&mut *tx).await?;
-            tx.commit().await?;
-        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -765,9 +748,10 @@ mod tests {
         // A completed result with output.
         let out = ModelOutput::Classification(Classification {
             predictions: vec![Prediction {
-                label: "cat".into(),
+                label: 7,
                 score: 0.99,
             }],
+            ..Default::default()
         });
         store
             .upsert_model_result("task-1", 0, "general", &ModelResult::done(out))
@@ -789,9 +773,10 @@ mod tests {
                     index: 0,
                     classification: Classification {
                         predictions: vec![Prediction {
-                            label: "sfw".into(),
+                            label: 0,
                             score: 0.8,
                         }],
+                        ..Default::default()
                     },
                 },
             )

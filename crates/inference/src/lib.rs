@@ -29,7 +29,9 @@ pub use preprocess::Normalization;
 
 /// An image classifier: independent per-image classification, batched.
 pub trait ImageClassifier: Send + Sync {
-    /// Classify a batch of images, one [`Classification`] per input (top-5 ∪ >0.90).
+    /// Classify a batch of images, one [`Classification`] per input. Label
+    /// selection is architecture-specific (vit: top-5 ∪ >0.90; siglip: a sigmoid
+    /// threshold).
     fn classify(&self, images: &[DecodedImage]) -> Result<Vec<Classification>, InferenceError>;
     /// The model's label set, ordered by class index.
     fn labels(&self) -> &[String];
@@ -45,5 +47,6 @@ pub fn load(
     let hub = loader::Hub::open(cfg, cache_dir)?;
     match cfg.architecture {
         Architecture::Vit => Ok(Box::new(arch::vit::load(&hub, device)?)),
+        Architecture::Siglip => Ok(Box::new(arch::siglip::load(&hub, cfg, device)?)),
     }
 }

@@ -62,15 +62,14 @@ impl ImageClassifier for VitClassifier {
             let preds = row
                 .iter()
                 .enumerate()
-                .filter_map(|(i, &score)| {
-                    self.labels.get(i).map(|label| Prediction {
-                        label: label.clone(),
-                        score,
-                    })
+                .map(|(i, &score)| Prediction {
+                    label: i as u32,
+                    score,
                 })
                 .collect::<Vec<_>>();
             out.push(Classification {
                 predictions: select_top(preds),
+                ..Default::default()
             });
         }
         Ok(out)

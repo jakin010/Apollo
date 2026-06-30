@@ -13,6 +13,7 @@ pub mod edit;
 pub mod error;
 pub mod load;
 pub mod schema;
+pub mod taxonomy;
 pub mod validate;
 
 #[cfg(test)]
@@ -20,6 +21,7 @@ mod tests;
 
 pub use error::ConfigError;
 pub use load::Overrides;
+pub use taxonomy::{TaxonChild, Taxonomy};
 pub use schema::{
     Aggregation, AppConfig, AuthConfig, Backend, CacheConfig, Config, DatabaseConfig, EarlyExit,
     LimitsConfig,
