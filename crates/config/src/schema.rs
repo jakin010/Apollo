@@ -198,17 +198,14 @@ impl Default for DatabaseConfig {
 /// Database backend. New backends are added here and in `apollo-storage`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Backend {
+    #[default]
     Sqlite,
     Postgres,
     Surrealdb,
 }
 
-impl Default for Backend {
-    fn default() -> Self {
-        Backend::Sqlite
-    }
-}
 
 /// `[database.sqlite]`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

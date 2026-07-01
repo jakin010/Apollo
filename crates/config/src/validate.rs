@@ -42,13 +42,12 @@ impl Config {
         }
 
         for (label, model) in &self.models {
-            if let Some(vs) = &model.video_strategy {
-                if !self.strategies.contains_key(vs) {
+            if let Some(vs) = &model.video_strategy
+                && !self.strategies.contains_key(vs) {
                     errs.push(format!(
                         "model '{label}': video_strategy '{vs}' is not defined"
                     ));
                 }
-            }
             if let Some(ee) = &model.early_exit {
                 if ee.labels.is_empty() {
                     errs.push(format!(
@@ -94,14 +93,13 @@ impl Config {
                         step.order
                     ));
                 }
-                if let Some(stop) = &step.stop_if {
-                    if stop.labels.is_empty() {
+                if let Some(stop) = &step.stop_if
+                    && stop.labels.is_empty() {
                         errs.push(format!(
                             "pipeline '{name}': step '{}' stop_if needs at least one label id",
                             step.model
                         ));
                     }
-                }
             }
         }
 
