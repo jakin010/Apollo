@@ -78,11 +78,6 @@ pub struct AppConfig {
     /// `RUST_LOG` environment variable, if set, overrides this at startup.
     #[serde(default = "crate::defaults::log_level")]
     pub log_level: String,
-    /// Canonical path the running daemon treats as authoritative (for writes and
-    /// reloads). Does not locate the file initially — that's `--config` or the
-    /// built-in default in [`crate::load`].
-    #[serde(default)]
-    pub config_file: Option<String>,
     /// Soft ceiling on resident process memory (e.g. `4gb`, `512mb`; `0` = off).
     /// New work is rejected with RESOURCE_EXHAUSTED while usage is above this.
     #[serde(default = "crate::defaults::max_memory")]
@@ -114,7 +109,6 @@ impl Default for AppConfig {
             max_concurrent: defaults::global_max_concurrent(),
             idle_timeout: defaults::idle_timeout(),
             log_level: defaults::log_level(),
-            config_file: None,
             max_memory: defaults::max_memory(),
             max_pending: defaults::max_pending(),
             max_retries: defaults::max_retries(),
