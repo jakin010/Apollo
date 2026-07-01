@@ -1,7 +1,9 @@
 //! Task lifecycle: `Task`, `Item`, `ModelResult`, and their state enums.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +84,152 @@ pub enum ModelState {
     Processing,
     Done,
     Failed,
+    /// Not run because an earlier pipeline step's gate fired.
+    Skipped,
+}
+
+/// The string in a stored state column matched no known variant of that state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseStateError {
+    kind: &'static str,
+    value: String,
+}
+
+impl fmt::Display for ParseStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown {} state {:?}", self.kind, self.value)
+    }
+}
+
+impl std::error::Error for ParseStateError {}
+
+impl TaskState {
+    /// The stable lowercase token used to persist this state.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskState::Queued => "queued",
+            TaskState::Processing => "processing",
+            TaskState::Completed => "completed",
+            TaskState::Failed => "failed",
+            TaskState::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl FromStr for TaskState {
+    type Err = ParseStateError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "queued" => TaskState::Queued,
+            "processing" => TaskState::Processing,
+            "completed" => TaskState::Completed,
+            "failed" => TaskState::Failed,
+            "cancelled" => TaskState::Cancelled,
+            _ => return Err(ParseStateError { kind: "task", value: s.to_string() }),
+        })
+    }
+}
+
+impl ItemState {
+    /// The stable lowercase token used to persist this state.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ItemState::Queued => "queued",
+            ItemState::Processing => "processing",
+            ItemState::Retrying => "retrying",
+            ItemState::Completed => "completed",
+            ItemState::Failed => "failed",
+            ItemState::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl FromStr for ItemState {
+    type Err = ParseStateError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "queued" => ItemState::Queued,
+            "processing" => ItemState::Processing,
+            "retrying" => ItemState::Retrying,
+            "completed" => ItemState::Completed,
+            "failed" => ItemState::Failed,
+            "cancelled" => ItemState::Cancelled,
+            _ => return Err(ParseStateError { kind: "item", value: s.to_string() }),
+        })
+    }
+}
+
+impl ModelState {
+    /// The stable lowercase token used to persist this state.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelState::Queued => "queued",
+            ModelState::Processing => "processing",
+            ModelState::Done => "done",
+            ModelState::Failed => "failed",
+            ModelState::Skipped => "skipped",
+        }
+    }
+}
+
+impl FromStr for ModelState {
+    type Err = ParseStateError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "queued" => ModelState::Queued,
+            "processing" => ModelState::Processing,
+            "done" => ModelState::Done,
+            "failed" => ModelState::Failed,
+            "skipped" => ModelState::Skipped,
+            _ => return Err(ParseStateError { kind: "model", value: s.to_string() }),
+        })
+    }
+}
+
+/// A category for a failure, for programmatic handling by clients.
+/// `Unspecified` means an uncategorized/custom error carried by its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    Unspecified,
+    Fetch,
+    Decode,
+    Inference,
+    Timeout,
+    Cancelled,
+    ModelUnavailable,
+    Internal,
+}
+
+/// A structured error attached to a failed item or model result: a machine-
+/// readable `kind` plus a human-readable `message`. A custom error uses
+/// `ErrorKind::Unspecified` with the text in `message`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskError {
+    pub kind: ErrorKind,
+    pub message: String,
+}
+
+impl TaskError {
+    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self { kind, message: message.into() }
+    }
+    /// An uncategorized error carrying only a message.
+    pub fn custom(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Unspecified, message)
+    }
+    pub fn fetch(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Fetch, message)
+    }
+    pub fn inference(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Inference, message)
+    }
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Cancelled, message)
+    }
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Internal, message)
+    }
 }
 
 /// Result of running one model on one input.
@@ -91,7 +239,7 @@ pub struct ModelResult {
     /// Present only when `state == ModelState::Done`.
     pub output: Option<ModelOutput>,
     /// Present only when `state == ModelState::Failed`.
-    pub error: Option<String>,
+    pub error: Option<TaskError>,
 }
 
 impl ModelResult {
@@ -107,8 +255,12 @@ impl ModelResult {
         Self { state: ModelState::Done, output: Some(output), error: None }
     }
 
-    pub fn failed(error: impl Into<String>) -> Self {
-        Self { state: ModelState::Failed, output: None, error: Some(error.into()) }
+    pub fn failed(error: TaskError) -> Self {
+        Self { state: ModelState::Failed, output: None, error: Some(error) }
+    }
+
+    pub fn skipped() -> Self {
+        Self { state: ModelState::Skipped, output: None, error: None }
     }
 }
 
@@ -117,13 +269,18 @@ impl ModelResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub input: Input,
-    /// Model labels requested for this input.
+    /// Model labels requested for this input. For a pipeline item these are the
+    /// pipeline's step models, in execution order.
     pub models: Vec<String>,
+    /// Name of the pipeline to run this item through, if any. When set, `models`
+    /// runs as an ordered, gated sequence rather than as a parallel set.
+    #[serde(default)]
+    pub pipeline: Option<String>,
     pub state: ItemState,
     /// Per-model results, keyed by model label.
     pub results: BTreeMap<String, ModelResult>,
     /// Set on item-level failure (e.g. the input could not be fetched).
-    pub error: Option<String>,
+    pub error: Option<TaskError>,
     /// Times this item has been retried after a failed attempt (resets nothing;
     /// compared against `[app].max_retries`).
     #[serde(default)]

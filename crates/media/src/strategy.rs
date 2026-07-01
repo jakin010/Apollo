@@ -58,13 +58,12 @@ pub async fn plan(
         .collect())
 }
 
-/// Roll per-frame classifications into one. Flat predictions are pooled by `max`
-/// or `mean` of each label's score across all frames. For taxonomy models the
-/// per-parent child scores are pooled the same way and regrouped (the parent ->
-/// child structure is read from the frames, so this stays model-agnostic);
-/// otherwise the standard top-5 ∪ >0.90 selection is applied to the flat list.
-/// `mean` divides by the total frame count, so a category present in only a few
-/// frames pools to a low, prevalence-weighted score.
+/// Roll per-frame classifications into one. Predictions are pooled by `max` or
+/// `mean` of each label's score across all frames (taxonomy child scores pool
+/// the same way, since they are now just flat predictions keyed by child id),
+/// then the standard top-5 ∪ >0.90 selection is applied. `mean` divides by the
+/// total frame count, so a category present in only a few frames pools to a low,
+/// prevalence-weighted score.
 pub fn aggregate(per_frame: &[Classification], how: Aggregation) -> Classification {
     use std::collections::BTreeMap;
 
@@ -85,25 +84,6 @@ pub fn aggregate(per_frame: &[Classification], how: Aggregation) -> Classificati
         }
     }
 
-    // Pool grouped child scores (taxonomy models) the same way. Each (parent,
-    // child) pools independently across frames; the grouping is taken from the
-    // frames themselves, so no taxonomy definition is needed here.
-    let mut grouped: BTreeMap<(u32, u32), f32> = BTreeMap::new();
-    for frame in per_frame {
-        for (parent, children) in &frame.groups {
-            for c in children {
-                let entry = grouped.entry((*parent, c.label)).or_insert(match how {
-                    Aggregation::Max => f32::MIN,
-                    Aggregation::Mean => 0.0,
-                });
-                match how {
-                    Aggregation::Max => *entry = entry.max(c.score),
-                    Aggregation::Mean => *entry += c.score,
-                }
-            }
-        }
-    }
-
     let predictions = flat
         .into_iter()
         .map(|(label, value)| Prediction {
@@ -115,29 +95,10 @@ pub fn aggregate(per_frame: &[Classification], how: Aggregation) -> Classificati
         })
         .collect::<Vec<_>>();
 
-    if grouped.is_empty() {
-        // Non-taxonomy rollup: the standard top-5 ∪ >0.90 selection.
-        return Classification {
-            predictions: select_top(predictions),
-            ..Default::default()
-        };
-    }
-
-    // Taxonomy rollup: keep every child, regrouped under its parent (and kept
-    // flat too, for parity with single-image taxonomy results) — no truncation.
-    let mut groups: BTreeMap<u32, Vec<Prediction>> = BTreeMap::new();
-    for ((parent, child), value) in grouped {
-        groups.entry(parent).or_default().push(Prediction {
-            label: child,
-            score: match how {
-                Aggregation::Max => value,
-                Aggregation::Mean => value / denom,
-            },
-        });
-    }
+    // Taxonomy results are flat predictions like any other model now, so there is
+    // a single rollup: the standard top-5 ∪ >0.90 selection.
     Classification {
-        predictions,
-        groups,
+        predictions: select_top(predictions),
     }
 }
 
@@ -242,48 +203,6 @@ mod tests {
         let max = aggregate(&frames, Aggregation::Max);
         let cat = max.predictions.iter().find(|p| p.label == 1).unwrap();
         assert!((cat.score - 0.9).abs() < 1e-6);
-    }
-
-    #[test]
-    fn aggregate_pools_and_regroups_taxonomy() {
-        use std::collections::BTreeMap;
-        // One parent (10) with two children (101, 102) across two frames. Each
-        // frame carries both the flat predictions and the grouped view, as a
-        // taxonomy classifier produces.
-        let frame = |a: f32, b: f32| {
-            let mut groups = BTreeMap::new();
-            groups.insert(
-                10u32,
-                vec![
-                    Prediction { label: 101, score: a },
-                    Prediction { label: 102, score: b },
-                ],
-            );
-            Classification {
-                predictions: vec![
-                    Prediction { label: 101, score: a },
-                    Prediction { label: 102, score: b },
-                ],
-                groups,
-            }
-        };
-        let frames = vec![frame(0.9, 0.2), frame(0.5, 0.4)];
-
-        let max = aggregate(&frames, Aggregation::Max);
-        assert_eq!(max.groups.len(), 1);
-        let kids = &max.groups[&10];
-        assert!((kids.iter().find(|p| p.label == 101).unwrap().score - 0.9).abs() < 1e-6);
-        assert!((kids.iter().find(|p| p.label == 102).unwrap().score - 0.4).abs() < 1e-6);
-
-        let mean = aggregate(&frames, Aggregation::Mean);
-        let kids = &mean.groups[&10];
-        // mean divides by total frames: (0.9+0.5)/2 = 0.7, (0.2+0.4)/2 = 0.3
-        assert!((kids.iter().find(|p| p.label == 101).unwrap().score - 0.7).abs() < 1e-6);
-        assert!((kids.iter().find(|p| p.label == 102).unwrap().score - 0.3).abs() < 1e-6);
-        // The flat list stays consistent with the grouped values.
-        assert!(
-            (mean.predictions.iter().find(|p| p.label == 101).unwrap().score - 0.7).abs() < 1e-6
-        );
     }
 
     #[test]

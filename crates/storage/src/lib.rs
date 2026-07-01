@@ -5,11 +5,12 @@
 //! selects the implementation at startup via [`open`]. SQLite and SurrealDB are implemented; Postgres is a future seam.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
 use apollo_config::{Backend, DatabaseConfig};
-use apollo_domain::{Frame, ItemState, ModelOutput, ModelResult, Task, TaskState};
+use apollo_domain::{Frame, ItemState, ModelOutput, ModelResult, Task, TaskError, TaskState};
 
 pub mod backends;
 pub mod error;
@@ -18,6 +19,29 @@ pub mod retention;
 
 pub use backends::{SqliteStorage, SurrealStorage};
 pub use error::StorageError;
+
+/// Serialize a task error to the JSON stored in an `error` column.
+fn error_to_json(error: Option<&TaskError>) -> Result<Option<String>, StorageError> {
+    match error {
+        Some(e) => Ok(Some(serde_json::to_string(e)?)),
+        None => Ok(None),
+    }
+}
+
+/// Parse a stored `error` column back into a task error, falling back to a
+/// custom (uncategorized) error if the column is not valid JSON.
+fn error_from_stored(raw: Option<String>) -> Option<TaskError> {
+    raw.map(|s| serde_json::from_str::<TaskError>(&s).unwrap_or_else(|_| TaskError::custom(s)))
+}
+
+/// Current UNIX time in whole seconds, saturating to 0 before the epoch. Used for
+/// the `created`/`updated` timestamps both backends stamp on writes.
+pub(crate) fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 pub use resume::PendingWebhook;
 
 /// Persistence operations the rest of the app depends on. Task lifecycle is fully
@@ -43,7 +67,7 @@ pub trait Storage: Send + Sync {
         task_id: &str,
         item: usize,
         state: ItemState,
-        error: Option<&str>,
+        error: Option<&TaskError>,
     ) -> Result<(), StorageError>;
 
     /// Insert or update the result for one (item, model). Leaves frame progress

@@ -14,6 +14,9 @@ pub enum StorageError {
     #[error("corrupt stored data: {0}")]
     Corrupt(String),
 
+    #[error("invalid stored state: {0}")]
+    State(#[from] apollo_domain::ParseStateError),
+
     #[error("unsupported backend '{0}' (not implemented in this version)")]
     UnsupportedBackend(String),
 }

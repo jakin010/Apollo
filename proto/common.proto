@@ -39,6 +39,11 @@ message InputItem {
     string text      = 4;   // inline content (future); no URL, no fallback
     Url    audio_url = 5;   // fetched; supports a fallback (future)
   }
+
+  // Run this input through a named [pipelines.<name>] instead of `models` as a
+  // parallel set: the pipeline's steps run in order and may early-exit. At least
+  // one of `models` or `pipeline` must be set.
+  optional string pipeline = 6;
 }
 
 // ---------------------------------- results ----------------------------------
@@ -55,7 +60,7 @@ message ItemResult {
   // Keyed by model label. One model failing does not sink the others.
   map<string, ModelResult> results = 2;
   // Set on item-level failure (e.g. the input could not be fetched).
-  string error = 3;
+  Error error = 3;
 }
 
 message ModelResult {
@@ -70,23 +75,36 @@ message ModelResult {
   }
 
   // Set only when state == MODEL_STATE_FAILED (inference error, timeout, ...).
-  string error = 4;
+  Error error = 4;
+}
+
+// A structured error. `kind` categorizes it for programmatic handling; `message`
+// carries human-readable detail (and is always allowed). A purely ad-hoc error
+// uses ERROR_TYPE_UNSPECIFIED with the text in `message`. (`kind`, not `type`, to
+// avoid the Rust keyword.)
+message Error {
+  ErrorType kind = 1;
+  string message = 2;
+}
+
+enum ErrorType {
+  ERROR_TYPE_UNSPECIFIED = 0;        // uncategorized / custom (see message)
+  ERROR_TYPE_FETCH = 1;              // the input could not be fetched
+  ERROR_TYPE_DECODE = 2;             // fetched, but could not be decoded
+  ERROR_TYPE_INFERENCE = 3;          // a model failed during inference
+  ERROR_TYPE_TIMEOUT = 4;            // an operation exceeded its deadline
+  ERROR_TYPE_CANCELLED = 5;          // the task was cancelled
+  ERROR_TYPE_MODEL_UNAVAILABLE = 6;  // a model could not be loaded
+  ERROR_TYPE_INTERNAL = 7;           // an unexpected server error
 }
 
 // A label set. Returned predictions are the top 5 unioned with any label
 // scoring above 0.90.
 message Classification {
-  // Flat predictions (vit, or siglip with a plain `labels` list). The `label` is
-  // a class index (vit) or a label-list index (siglip), not a name.
+  // Flat predictions. The `label` is a class index (vit) or a label-list index
+  // (siglip flat); for a siglip taxonomy model it is the child-category id. The
+  // per-parent grouping was dropped — reconstruct it from the taxonomy if needed.
   repeated Prediction predictions = 1;
-  // Grouped child-category scores for siglip taxonomy models: parent category id
-  // -> its child categories with aggregated scores. Empty in flat mode.
-  map<uint32, CategoryScores> groups = 2;
-}
-
-// The child categories (and their aggregated scores) under one parent category.
-message CategoryScores {
-  repeated Prediction scores = 1;
 }
 
 // An image-classifier run frame-by-frame over a video.
@@ -136,4 +154,5 @@ enum ModelState {
   MODEL_STATE_PROCESSING  = 2;
   MODEL_STATE_DONE        = 3;
   MODEL_STATE_FAILED      = 4;
+  MODEL_STATE_SKIPPED     = 5;   // skipped by an earlier pipeline gate
 }

@@ -22,6 +22,7 @@ fn url(main: impl Into<String>, fallback: Option<String>) -> Url {
 pub fn image(url: impl Into<String>, models: impl IntoIterator<Item = impl Into<String>>) -> InputItem {
     InputItem {
         models: models_of(models),
+        pipeline: None,
         input: Some(Input::ImageUrl(self::url(url, None))),
     }
 }
@@ -34,6 +35,7 @@ pub fn image_with_fallback(
 ) -> InputItem {
     InputItem {
         models: models_of(models),
+        pipeline: None,
         input: Some(Input::ImageUrl(url(main, Some(fallback.into())))),
     }
 }
@@ -43,6 +45,7 @@ pub fn image_with_fallback(
 pub fn video(url: impl Into<String>, models: impl IntoIterator<Item = impl Into<String>>) -> InputItem {
     InputItem {
         models: models_of(models),
+        pipeline: None,
         input: Some(Input::VideoUrl(self::url(url, None))),
     }
 }
@@ -55,6 +58,7 @@ pub fn video_with_fallback(
 ) -> InputItem {
     InputItem {
         models: models_of(models),
+        pipeline: None,
         input: Some(Input::VideoUrl(url(main, Some(fallback.into())))),
     }
 }
@@ -63,6 +67,7 @@ pub fn video_with_fallback(
 pub fn text(content: impl Into<String>, models: impl IntoIterator<Item = impl Into<String>>) -> InputItem {
     InputItem {
         models: models_of(models),
+        pipeline: None,
         input: Some(Input::Text(content.into())),
     }
 }
@@ -71,6 +76,7 @@ pub fn text(content: impl Into<String>, models: impl IntoIterator<Item = impl In
 pub fn audio(url: impl Into<String>, models: impl IntoIterator<Item = impl Into<String>>) -> InputItem {
     InputItem {
         models: models_of(models),
+        pipeline: None,
         input: Some(Input::AudioUrl(self::url(url, None))),
     }
 }

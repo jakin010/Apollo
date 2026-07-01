@@ -14,11 +14,12 @@
 //!     threshold beats top-k here.
 //!   * **taxonomy** — a `taxonomy_file` grouping prompts into parent/child
 //!     categories. Each child's prompt scores are aggregated (mean/max) into one
-//!     child score; results are every child grouped under its parent (each
-//!     `Prediction.label` is the child id). No thresholding — the full score
-//!     vector is returned and stored.
+//!     child score; the children scoring at/above `score_threshold` are returned
+//!     flat in `predictions` (each `Prediction.label` is the child id), highest
+//!     first. The parent grouping is NOT duplicated into `groups` — it is just
+//!     these children keyed by parent, reconstructable from the taxonomy. With no
+//!     `score_threshold` set, every child is kept.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor, D};
@@ -47,7 +48,10 @@ enum Mode {
         max_results: Option<usize>,
     },
     /// `taxonomy_file`: aggregate per child, group by parent; `label` is child id.
-    Taxonomy { children: Vec<TaxonChild> },
+    Taxonomy {
+        threshold: f32,
+        children: Vec<TaxonChild>,
+    },
 }
 
 /// A loaded SigLIP classifier: the model, the precomputed (L2-normalized) prompt
@@ -103,6 +107,10 @@ pub(crate) fn load(
             (
                 tax.prompts.clone(),
                 Mode::Taxonomy {
+                    // Unlike flat mode (where the threshold is the selection
+                    // mechanism), taxonomy historically returned every child; an
+                    // unset threshold preserves that (0.0 keeps everything).
+                    threshold: cfg.score_threshold.unwrap_or(0.0),
                     children: tax.children,
                 },
                 tax.prompts,
@@ -170,7 +178,9 @@ impl ImageClassifier for SiglipClassifier {
                     threshold,
                     max_results,
                 } => flat_classification(&row, *threshold, *max_results),
-                Mode::Taxonomy { children } => taxonomy_classification(&row, children),
+                Mode::Taxonomy { threshold, children } => {
+                    taxonomy_classification(&row, *threshold, children)
+                }
             })
             .collect();
         Ok(out)
@@ -203,32 +213,36 @@ fn flat_classification(row: &[f32], threshold: f32, max_results: Option<usize>) 
     }
     Classification {
         predictions: preds,
-        ..Default::default()
     }
 }
 
 /// Taxonomy mode: aggregate each child's prompt scores (mean/max) into one child
-/// score, then return every child both flat (`predictions`, for video temporal
-/// pooling) and grouped under its parent (`groups`). `label` is the child id.
-fn taxonomy_classification(row: &[f32], children: &[TaxonChild]) -> Classification {
-    let mut predictions = Vec::with_capacity(children.len());
-    let mut groups: BTreeMap<u32, Vec<Prediction>> = BTreeMap::new();
-    for child in children {
-        let slice = &row[child.prompt_start..child.prompt_start + child.prompt_len];
-        let score = match child.aggregation {
-            Aggregation::Max => slice.iter().copied().fold(f32::MIN, f32::max),
-            Aggregation::Mean => slice.iter().sum::<f32>() / slice.len() as f32,
-        };
-        let pred = Prediction {
-            label: child.id,
-            score,
-        };
-        predictions.push(pred.clone());
-        groups.entry(child.parent_id).or_default().push(pred);
-    }
+/// score, keep the children scoring at/above `threshold`, and return them flat in
+/// `predictions` (highest first; `label` is the child id). The per-parent
+/// grouping is left to the caller, who can reconstruct it from the taxonomy.
+fn taxonomy_classification(row: &[f32], threshold: f32, children: &[TaxonChild]) -> Classification {
+    let mut predictions = children
+        .iter()
+        .map(|child| {
+            let slice = &row[child.prompt_start..child.prompt_start + child.prompt_len];
+            let score = match child.aggregation {
+                Aggregation::Max => slice.iter().copied().fold(f32::MIN, f32::max),
+                Aggregation::Mean => slice.iter().sum::<f32>() / slice.len() as f32,
+            };
+            Prediction {
+                label: child.id,
+                score,
+            }
+        })
+        .filter(|p| p.score >= threshold)
+        .collect::<Vec<_>>();
+    predictions.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Classification {
         predictions,
-        groups,
     }
 }
 

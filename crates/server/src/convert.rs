@@ -23,9 +23,13 @@ pub(crate) fn submission_from_proto(item: pb::InputItem) -> Result<Submission, S
         Some(Input::AudioUrl(u)) => dom::Input::Audio(url_from_proto(u)),
         None => return Err("input item has no `input` set".into()),
     };
+    if item.models.is_empty() && item.pipeline.is_none() {
+        return Err("input item must set `models` or a `pipeline`".into());
+    }
     Ok(Submission {
         input,
         models: item.models,
+        pipeline: item.pipeline,
     })
 }
 
@@ -56,7 +60,7 @@ fn item_to_proto(it: dom::Item) -> pb::ItemResult {
     pb::ItemResult {
         state: item_state(it.state) as i32,
         results,
-        error: it.error.unwrap_or_default(),
+        error: it.error.map(error_to_proto),
     }
 }
 
@@ -64,7 +68,7 @@ fn model_to_proto(m: dom::ModelResult) -> pb::ModelResult {
     pb::ModelResult {
         state: model_state(m.state) as i32,
         output: m.output.map(output_to_proto),
-        error: m.error.unwrap_or_default(),
+        error: m.error.map(error_to_proto),
     }
 }
 
@@ -79,18 +83,26 @@ fn output_to_proto(o: dom::ModelOutput) -> pb::model_result::Output {
 fn classification_to_proto(c: dom::Classification) -> pb::Classification {
     pb::Classification {
         predictions: c.predictions.into_iter().map(prediction_to_proto).collect(),
-        groups: c
-            .groups
-            .into_iter()
-            .map(|(parent, preds)| {
-                (
-                    parent,
-                    pb::CategoryScores {
-                        scores: preds.into_iter().map(prediction_to_proto).collect(),
-                    },
-                )
-            })
-            .collect(),
+    }
+}
+
+fn error_to_proto(e: dom::TaskError) -> pb::Error {
+    pb::Error {
+        kind: error_kind_to_proto(e.kind) as i32,
+        message: e.message,
+    }
+}
+
+fn error_kind_to_proto(k: dom::ErrorKind) -> pb::ErrorType {
+    match k {
+        dom::ErrorKind::Unspecified => pb::ErrorType::Unspecified,
+        dom::ErrorKind::Fetch => pb::ErrorType::Fetch,
+        dom::ErrorKind::Decode => pb::ErrorType::Decode,
+        dom::ErrorKind::Inference => pb::ErrorType::Inference,
+        dom::ErrorKind::Timeout => pb::ErrorType::Timeout,
+        dom::ErrorKind::Cancelled => pb::ErrorType::Cancelled,
+        dom::ErrorKind::ModelUnavailable => pb::ErrorType::ModelUnavailable,
+        dom::ErrorKind::Internal => pb::ErrorType::Internal,
     }
 }
 
@@ -145,6 +157,7 @@ fn model_state(s: dom::ModelState) -> pb::ModelState {
         dom::ModelState::Processing => pb::ModelState::Processing,
         dom::ModelState::Done => pb::ModelState::Done,
         dom::ModelState::Failed => pb::ModelState::Failed,
+        dom::ModelState::Skipped => pb::ModelState::Skipped,
     }
 }
 
@@ -165,6 +178,7 @@ mod tests {
     fn image_submission_carries_url_and_models() {
         let item = pb::InputItem {
             models: vec!["resnet".into(), "vit".into()],
+            pipeline: None,
             input: Some(pb::input_item::Input::ImageUrl(pb::Url {
                 main: "http://x/cat.jpg".into(),
                 fallback: Some("file:///cat.jpg".into()),
@@ -186,6 +200,7 @@ mod tests {
         use pb::input_item::Input;
         let item = pb::InputItem {
             models: vec!["m".into()],
+            pipeline: None,
             input: Some(Input::VideoUrl(pb_url("v"))),
         };
         assert!(matches!(
@@ -195,6 +210,7 @@ mod tests {
 
         let item = pb::InputItem {
             models: vec!["m".into()],
+            pipeline: None,
             input: Some(Input::Text("hello".into())),
         };
         match submission_from_proto(item).unwrap().input {
@@ -204,6 +220,7 @@ mod tests {
 
         let item = pb::InputItem {
             models: vec!["m".into()],
+            pipeline: None,
             input: Some(Input::AudioUrl(pb_url("a"))),
         };
         assert!(matches!(
@@ -216,6 +233,7 @@ mod tests {
     fn submission_without_input_is_rejected() {
         let item = pb::InputItem {
             models: vec!["m".into()],
+            pipeline: None,
             input: None,
         };
         assert!(submission_from_proto(item).is_err());
@@ -228,7 +246,6 @@ mod tests {
                 label: 7,
                 score: 0.9,
             }],
-            ..Default::default()
         };
         let mut results = std::collections::BTreeMap::new();
         results.insert(
@@ -244,6 +261,7 @@ mod tests {
                     fallback: None,
                 }),
                 models: vec!["m".into()],
+                pipeline: None,
                 state: dom::ItemState::Completed,
                 results,
                 error: None,
@@ -258,7 +276,7 @@ mod tests {
 
         let item = &pt.items[0];
         assert_eq!(item.state, pb::ItemState::Completed as i32);
-        assert_eq!(item.error, "");
+        assert!(item.error.is_none());
 
         let mr = item.results.get("m").expect("model result present");
         assert_eq!(mr.state, pb::ModelState::Done as i32);
@@ -283,14 +301,17 @@ mod tests {
                     fallback: None,
                 }),
                 models: vec!["m".into()],
+                pipeline: None,
                 state: dom::ItemState::Failed,
                 results: std::collections::BTreeMap::new(),
-                error: Some("fetch failed".into()),
+                error: Some(dom::TaskError::fetch("fetch failed")),
                 retries: 0,
             }],
         };
         let pt = task_to_proto(task);
         assert_eq!(pt.items[0].state, pb::ItemState::Failed as i32);
-        assert_eq!(pt.items[0].error, "fetch failed");
+        let e = pt.items[0].error.as_ref().expect("item error present");
+        assert_eq!(e.kind, pb::ErrorType::Fetch as i32);
+        assert_eq!(e.message, "fetch failed");
     }
 }

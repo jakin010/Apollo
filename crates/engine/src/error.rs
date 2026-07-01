@@ -6,8 +6,12 @@ pub enum EngineError {
     Storage(#[from] apollo_storage::StorageError),
 
     #[error("media error: {0}")]
-    Media(String),
+    Media(#[from] apollo_media::MediaError),
 
+    /// A stringified inference failure. Kept as `String` rather than
+    /// `#[from] InferenceError` because one failure is fanned out to every waiter
+    /// in a batch (so the payload must be cheaply cloneable) and `InferenceError`
+    /// is not `Clone`.
     #[error("inference error: {0}")]
     Inference(String),
 
@@ -40,8 +44,4 @@ pub enum EngineError {
 
     #[error("engine is shutting down")]
     ShuttingDown,
-}
-
-pub(crate) fn media_err(e: apollo_media::MediaError) -> EngineError {
-    EngineError::Media(e.to_string())
 }

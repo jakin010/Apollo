@@ -51,7 +51,7 @@ pub use webhook::{serve_webhook, serve_webhook_with_shutdown, WebhookHandler, We
 
 // Re-export the wire types so downstreams don't need to depend on `apollo-proto`.
 pub use apollo_proto::{
-    Ack, CategoryScores, Classification, Frame, FrameScan, InputItem, ItemResult, ItemState,
+    Ack, Classification, Error, ErrorType, Frame, FrameScan, InputItem, ItemResult, ItemState,
     ModelResult, ModelState, Prediction, Task, TaskCreated, TaskState, Url,
 };
 /// The `InputItem.input` oneof (`ImageUrl`, `VideoUrl`, `Text`, `AudioUrl`).

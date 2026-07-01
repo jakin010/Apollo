@@ -25,6 +25,7 @@ pub use taxonomy::{TaxonChild, Taxonomy};
 pub use schema::{
     Aggregation, AppConfig, AuthConfig, Backend, CacheConfig, Config, DatabaseConfig, EarlyExit,
     LimitsConfig,
-    ModelConfig, PostgresConfig, SamplingKind, SamplingStep, SqliteConfig, StrategyConfig,
+    ModelConfig, PipelineConfig, PipelineStep, PostgresConfig, SamplingKind, SamplingStep,
+    SqliteConfig, StrategyConfig,
     SurrealdbConfig, WebhookConfig,
 };

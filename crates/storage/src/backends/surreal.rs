@@ -20,8 +20,6 @@
 //! in the `const` statements below. Moving to a new major (4.x) means bumping the
 //! version literal and revisiting only this module.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use async_trait::async_trait;
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
@@ -31,11 +29,12 @@ use surrealdb::Surreal;
 use apollo_config::SurrealdbConfig;
 use apollo_domain::{
     Classification, Frame, Input, Item, ItemState, ModelOutput, ModelResult, ModelState, Task,
-    TaskState,
+    TaskError, TaskState,
 };
 
 use crate::error::StorageError;
 use crate::resume::PendingWebhook;
+use crate::now;
 use crate::Storage;
 
 type Result<T> = std::result::Result<T, StorageError>;
@@ -75,7 +74,7 @@ const CREATE_TASK: &str = "
     FOR $it IN $items {
         CREATE type::record('item', [$tid, $it.idx]) SET
             task_id = $tid, idx = $it.idx, input_json = $it.input_json,
-            models_json = $it.models_json, state = $it.state, error = $it.error,
+            models_json = $it.models_json, pipeline = $it.pipeline, state = $it.state, error = $it.error,
             webhook_delivered = false, retries = 0, failure_delivered = false;
     };
     FOR $mr IN $mrs {
@@ -101,6 +100,7 @@ struct ItemRow {
     idx: i64,
     input_json: String,
     models_json: String,
+    pipeline: Option<String>,
     state: String,
     error: Option<String>,
     retries: i64,
@@ -137,6 +137,7 @@ struct ItemInsert {
     idx: i64,
     input_json: String,
     models_json: String,
+    pipeline: Option<String>,
     state: String,
     error: Option<String>,
 }
@@ -199,12 +200,12 @@ impl SurrealStorage {
         let Some(trow) = trows.into_iter().next() else {
             return Ok(None);
         };
-        let state = parse_task_state(&trow.state)?;
+        let state = trow.state.parse::<TaskState>()?;
 
         let mut resp = self
             .db
             .query(
-                "SELECT idx, input_json, models_json, state, error, retries
+                "SELECT idx, input_json, models_json, pipeline, state, error, retries
                  FROM item WHERE task_id = $tid ORDER BY idx",
             )
             .bind(("tid", id.to_string()))
@@ -239,9 +240,9 @@ impl SurrealStorage {
                 results.insert(
                     mr.label,
                     ModelResult {
-                        state: parse_model_state(&mr.state)?,
+                        state: mr.state.parse::<ModelState>()?,
                         output,
-                        error: mr.error,
+                        error: crate::error_from_stored(mr.error),
                     },
                 );
             }
@@ -249,9 +250,10 @@ impl SurrealStorage {
             items.push(Item {
                 input,
                 models,
-                state: parse_item_state(&ir.state)?,
+                pipeline: ir.pipeline,
+                state: ir.state.parse::<ItemState>()?,
                 results,
-                error: ir.error,
+                error: crate::error_from_stored(ir.error),
                 retries: ir.retries as u32,
             });
         }
@@ -280,19 +282,20 @@ impl Storage for SurrealStorage {
                 idx: idx as i64,
                 input_json: serde_json::to_string(&item.input)?,
                 models_json: serde_json::to_string(&item.models)?,
-                state: item_state_str(item.state).to_string(),
-                error: item.error.clone(),
+                pipeline: item.pipeline.clone(),
+                state: item.state.as_str().to_string(),
+                error: crate::error_to_json(item.error.as_ref())?,
             });
             for (label, mr) in &item.results {
                 mrs.push(ModelInsert {
                     item_idx: idx as i64,
                     label: label.clone(),
-                    state: model_state_str(mr.state).to_string(),
+                    state: mr.state.as_str().to_string(),
                     output_json: match &mr.output {
                         Some(o) => Some(serde_json::to_string(o)?),
                         None => None,
                     },
-                    error: mr.error.clone(),
+                    error: crate::error_to_json(mr.error.as_ref())?,
                 });
             }
         }
@@ -300,7 +303,7 @@ impl Storage for SurrealStorage {
         self.db
             .query(CREATE_TASK)
             .bind(("tid", task.id.clone()))
-            .bind(("tstate", task_state_str(task.state).to_string()))
+            .bind(("tstate", task.state.as_str().to_string()))
             .bind(("ts", ts))
             .bind(("items", items))
             .bind(("mrs", mrs))
@@ -317,7 +320,7 @@ impl Storage for SurrealStorage {
         self.db
             .query("UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts")
             .bind(("tid", id.to_string()))
-            .bind(("state", task_state_str(state).to_string()))
+            .bind(("state", state.as_str().to_string()))
             .bind(("ts", now()))
             .await?
             .check()?;
@@ -329,14 +332,14 @@ impl Storage for SurrealStorage {
         task_id: &str,
         item: usize,
         state: ItemState,
-        error: Option<&str>,
+        error: Option<&TaskError>,
     ) -> Result<()> {
         self.db
             .query("UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error")
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
-            .bind(("state", item_state_str(state).to_string()))
-            .bind(("error", error.map(|s| s.to_string())))
+            .bind(("state", state.as_str().to_string()))
+            .bind(("error", crate::error_to_json(error)?))
             .await?
             .check()?;
         self.touch(task_id).await
@@ -364,9 +367,9 @@ impl Storage for SurrealStorage {
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
             .bind(("label", label.to_string()))
-            .bind(("state", model_state_str(result.state).to_string()))
+            .bind(("state", result.state.as_str().to_string()))
             .bind(("output", output_json))
-            .bind(("error", result.error.clone()))
+            .bind(("error", crate::error_to_json(result.error.as_ref())?))
             .await?
             .check()?;
         self.touch(task_id).await
@@ -691,74 +694,4 @@ impl Storage for SurrealStorage {
             .check()?;
         Ok(())
     }
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn task_state_str(s: TaskState) -> &'static str {
-    match s {
-        TaskState::Queued => "queued",
-        TaskState::Processing => "processing",
-        TaskState::Completed => "completed",
-        TaskState::Failed => "failed",
-        TaskState::Cancelled => "cancelled",
-    }
-}
-
-fn parse_task_state(s: &str) -> Result<TaskState> {
-    Ok(match s {
-        "queued" => TaskState::Queued,
-        "processing" => TaskState::Processing,
-        "completed" => TaskState::Completed,
-        "failed" => TaskState::Failed,
-        "cancelled" => TaskState::Cancelled,
-        other => return Err(StorageError::Corrupt(format!("unknown task state '{other}'"))),
-    })
-}
-
-fn item_state_str(s: ItemState) -> &'static str {
-    match s {
-        ItemState::Queued => "queued",
-        ItemState::Processing => "processing",
-        ItemState::Completed => "completed",
-        ItemState::Retrying => "retrying",
-        ItemState::Failed => "failed",
-        ItemState::Cancelled => "cancelled",
-    }
-}
-
-fn parse_item_state(s: &str) -> Result<ItemState> {
-    Ok(match s {
-        "queued" => ItemState::Queued,
-        "processing" => ItemState::Processing,
-        "completed" => ItemState::Completed,
-        "retrying" => ItemState::Retrying,
-        "failed" => ItemState::Failed,
-        "cancelled" => ItemState::Cancelled,
-        other => return Err(StorageError::Corrupt(format!("unknown item state '{other}'"))),
-    })
-}
-
-fn model_state_str(s: ModelState) -> &'static str {
-    match s {
-        ModelState::Queued => "queued",
-        ModelState::Processing => "processing",
-        ModelState::Done => "done",
-        ModelState::Failed => "failed",
-    }
-}
-
-fn parse_model_state(s: &str) -> Result<ModelState> {
-    Ok(match s {
-        "queued" => ModelState::Queued,
-        "processing" => ModelState::Processing,
-        "done" => ModelState::Done,
-        "failed" => ModelState::Failed,
-        other => return Err(StorageError::Corrupt(format!("unknown model state '{other}'"))),
-    })
 }

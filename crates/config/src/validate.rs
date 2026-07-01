@@ -73,6 +73,35 @@ impl Config {
             }
         }
 
+        for (name, pipeline) in &self.pipelines {
+            if pipeline.steps.is_empty() {
+                errs.push(format!("pipeline '{name}': has no steps"));
+            }
+            let mut orders = BTreeSet::new();
+            for step in &pipeline.steps {
+                if !self.models.contains_key(&step.model) {
+                    errs.push(format!(
+                        "pipeline '{name}': step references unknown model '{}'",
+                        step.model
+                    ));
+                }
+                if !orders.insert(step.order) {
+                    errs.push(format!(
+                        "pipeline '{name}': duplicate step order {}",
+                        step.order
+                    ));
+                }
+                if let Some(stop) = &step.stop_if {
+                    if stop.labels.is_empty() {
+                        errs.push(format!(
+                            "pipeline '{name}': step '{}' stop_if needs at least one label id",
+                            step.model
+                        ));
+                    }
+                }
+            }
+        }
+
         match self.database.backend {
             Backend::Postgres if self.database.postgres.is_none() => errs.push(
                 "database.backend = 'postgres' but [database.postgres] is missing".into(),

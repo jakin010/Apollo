@@ -1,8 +1,6 @@
 //! Result shapes: `Prediction`, `Classification`, and `FrameScan` (`aggregated`
 //! plus per-frame `Frame`s with timestamps).
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 /// A single (category-id, score) prediction. `label` is an integer id — a class
@@ -18,13 +16,9 @@ pub struct Prediction {
 /// scoring above 0.90 (assembled in `apollo-engine`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Classification {
-    /// Flat predictions (vit; siglip with a plain `labels` list).
+    /// Flat predictions. For a siglip taxonomy model the `label` is the child
+    /// category id (the per-parent grouping is left to the caller).
     pub predictions: Vec<Prediction>,
-    /// Grouped child scores for siglip taxonomy models: parent category id ->
-    /// its child categories (as predictions whose `label` is the child id) with
-    /// their aggregated scores. Empty in flat mode.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub groups: BTreeMap<u32, Vec<Prediction>>,
 }
 
 /// One classified video frame.

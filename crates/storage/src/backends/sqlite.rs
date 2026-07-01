@@ -6,7 +6,7 @@
 //! per-model progress and are overlaid onto a queued baseline when reconstructing
 //! a task, so a model that hasn't started yet still reads back as `Queued`.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -14,11 +14,13 @@ use sqlx::{Row, SqlitePool};
 
 use apollo_config::SqliteConfig;
 use apollo_domain::{
-    Classification, Frame, Item, ItemState, ModelOutput, ModelResult, ModelState, Task, TaskState,
+    Classification, Frame, Item, ItemState, ModelOutput, ModelResult, ModelState, Task, TaskError,
+    TaskState,
 };
 
 use crate::error::StorageError;
 use crate::resume::PendingWebhook;
+use crate::now;
 use crate::Storage;
 
 type Result<T> = std::result::Result<T, StorageError>;
@@ -36,6 +38,7 @@ const SCHEMA: &[&str] = &[
         idx               INTEGER NOT NULL,
         input_json        TEXT NOT NULL,
         models_json       TEXT NOT NULL,
+        pipeline          TEXT,
         state             TEXT NOT NULL,
         error             TEXT,
         webhook_delivered INTEGER NOT NULL DEFAULT 0,
@@ -128,10 +131,10 @@ impl SqliteStorage {
         else {
             return Ok(None);
         };
-        let state = parse_task_state(trow.try_get::<String, _>("state")?.as_str())?;
+        let state = trow.try_get::<String, _>("state")?.parse::<TaskState>()?;
 
         let irows = sqlx::query(
-            "SELECT idx, input_json, models_json, state, error, retries
+            "SELECT idx, input_json, models_json, pipeline, state, error, retries
              FROM items WHERE task_id = ? ORDER BY idx",
         )
         .bind(id)
@@ -143,7 +146,8 @@ impl SqliteStorage {
             let idx: i64 = ir.try_get("idx")?;
             let input_json: String = ir.try_get("input_json")?;
             let models_json: String = ir.try_get("models_json")?;
-            let istate = parse_item_state(ir.try_get::<String, _>("state")?.as_str())?;
+            let ipipeline: Option<String> = ir.try_get("pipeline")?;
+            let istate = ir.try_get::<String, _>("state")?.parse::<ItemState>()?;
             let ierror: Option<String> = ir.try_get("error")?;
             let iretries: i64 = ir.try_get("retries")?;
 
@@ -165,7 +169,7 @@ impl SqliteStorage {
             .await?;
             for mr in mrows {
                 let label: String = mr.try_get("label")?;
-                let mstate = parse_model_state(mr.try_get::<String, _>("state")?.as_str())?;
+                let mstate = mr.try_get::<String, _>("state")?.parse::<ModelState>()?;
                 let output_json: Option<String> = mr.try_get("output_json")?;
                 let merror: Option<String> = mr.try_get("error")?;
                 let output = match output_json {
@@ -177,7 +181,7 @@ impl SqliteStorage {
                     ModelResult {
                         state: mstate,
                         output,
-                        error: merror,
+                        error: crate::error_from_stored(merror),
                     },
                 );
             }
@@ -185,9 +189,10 @@ impl SqliteStorage {
             items.push(Item {
                 input,
                 models,
+                pipeline: ipipeline,
                 state: istate,
                 results,
-                error: ierror,
+                error: crate::error_from_stored(ierror),
                 retries: iretries as u32,
             });
         }
@@ -218,7 +223,7 @@ impl Storage for SqliteStorage {
             "INSERT INTO tasks (id, state, attempts, created_at, updated_at) VALUES (?, ?, 0, ?, ?)",
         )
         .bind(&task.id)
-        .bind(task_state_str(task.state))
+        .bind(task.state.as_str())
         .bind(ts)
         .bind(ts)
         .execute(&mut *tx)
@@ -229,15 +234,16 @@ impl Storage for SqliteStorage {
             let models_json = serde_json::to_string(&item.models)?;
             sqlx::query(
                 "INSERT INTO items
-                    (task_id, idx, input_json, models_json, state, error, webhook_delivered)
-                 VALUES (?, ?, ?, ?, ?, ?, 0)",
+                    (task_id, idx, input_json, models_json, pipeline, state, error, webhook_delivered)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
             )
             .bind(&task.id)
             .bind(idx as i64)
             .bind(&input_json)
             .bind(&models_json)
-            .bind(item_state_str(item.state))
-            .bind(item.error.as_deref())
+            .bind(item.pipeline.as_deref())
+            .bind(item.state.as_str())
+            .bind(crate::error_to_json(item.error.as_ref())?)
             .execute(&mut *tx)
             .await?;
 
@@ -254,9 +260,9 @@ impl Storage for SqliteStorage {
                 .bind(&task.id)
                 .bind(idx as i64)
                 .bind(label)
-                .bind(model_state_str(mr.state))
+                .bind(mr.state.as_str())
                 .bind(output_json)
-                .bind(mr.error.as_deref())
+                .bind(crate::error_to_json(mr.error.as_ref())?)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -271,7 +277,7 @@ impl Storage for SqliteStorage {
 
     async fn set_task_state(&self, id: &str, state: TaskState) -> Result<()> {
         sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
-            .bind(task_state_str(state))
+            .bind(state.as_str())
             .bind(now())
             .bind(id)
             .execute(&self.pool)
@@ -284,11 +290,11 @@ impl Storage for SqliteStorage {
         task_id: &str,
         item: usize,
         state: ItemState,
-        error: Option<&str>,
+        error: Option<&TaskError>,
     ) -> Result<()> {
         sqlx::query("UPDATE items SET state = ?, error = ? WHERE task_id = ? AND idx = ?")
-            .bind(item_state_str(state))
-            .bind(error)
+            .bind(state.as_str())
+            .bind(crate::error_to_json(error)?)
             .bind(task_id)
             .bind(item as i64)
             .execute(&self.pool)
@@ -318,9 +324,9 @@ impl Storage for SqliteStorage {
         .bind(task_id)
         .bind(item as i64)
         .bind(label)
-        .bind(model_state_str(result.state))
+        .bind(result.state.as_str())
         .bind(output_json)
-        .bind(result.error.as_deref())
+        .bind(crate::error_to_json(result.error.as_ref())?)
         .execute(&self.pool)
         .await?;
         self.touch(task_id).await
@@ -608,76 +614,6 @@ impl Storage for SqliteStorage {
     }
 }
 
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn task_state_str(s: TaskState) -> &'static str {
-    match s {
-        TaskState::Queued => "queued",
-        TaskState::Processing => "processing",
-        TaskState::Completed => "completed",
-        TaskState::Failed => "failed",
-        TaskState::Cancelled => "cancelled",
-    }
-}
-
-fn parse_task_state(s: &str) -> Result<TaskState> {
-    Ok(match s {
-        "queued" => TaskState::Queued,
-        "processing" => TaskState::Processing,
-        "completed" => TaskState::Completed,
-        "failed" => TaskState::Failed,
-        "cancelled" => TaskState::Cancelled,
-        other => return Err(StorageError::Corrupt(format!("unknown task state '{other}'"))),
-    })
-}
-
-fn item_state_str(s: ItemState) -> &'static str {
-    match s {
-        ItemState::Queued => "queued",
-        ItemState::Processing => "processing",
-        ItemState::Completed => "completed",
-        ItemState::Retrying => "retrying",
-        ItemState::Failed => "failed",
-        ItemState::Cancelled => "cancelled",
-    }
-}
-
-fn parse_item_state(s: &str) -> Result<ItemState> {
-    Ok(match s {
-        "queued" => ItemState::Queued,
-        "processing" => ItemState::Processing,
-        "completed" => ItemState::Completed,
-        "retrying" => ItemState::Retrying,
-        "failed" => ItemState::Failed,
-        "cancelled" => ItemState::Cancelled,
-        other => return Err(StorageError::Corrupt(format!("unknown item state '{other}'"))),
-    })
-}
-
-fn model_state_str(s: ModelState) -> &'static str {
-    match s {
-        ModelState::Queued => "queued",
-        ModelState::Processing => "processing",
-        ModelState::Done => "done",
-        ModelState::Failed => "failed",
-    }
-}
-
-fn parse_model_state(s: &str) -> Result<ModelState> {
-    Ok(match s {
-        "queued" => ModelState::Queued,
-        "processing" => ModelState::Processing,
-        "done" => ModelState::Done,
-        "failed" => ModelState::Failed,
-        other => return Err(StorageError::Corrupt(format!("unknown model state '{other}'"))),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +649,7 @@ mod tests {
                 fallback: Some("http://y/a.jpg".into()),
             }),
             models: vec!["general".into(), "nsfw".into()],
+            pipeline: None,
             state: ItemState::Queued,
             results: BTreeMap::new(),
             error: None,

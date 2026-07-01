@@ -42,6 +42,9 @@ use registry::Registry;
 pub struct Submission {
     pub input: Input,
     pub models: Vec<String>,
+    /// Optional named pipeline. When set, the engine resolves it to an ordered
+    /// model list and runs the item as a gated sequence instead of a parallel set.
+    pub pipeline: Option<String>,
 }
 
 /// The orchestration engine. Clone freely — all clones share one core.
@@ -152,15 +155,32 @@ impl Engine {
         if submissions.is_empty() {
             return Err(EngineError::Incompatible("no items submitted".into()));
         }
-        for s in &submissions {
+        // Resolve any named pipelines to their ordered model lists up front, so
+        // the resulting models get the same compatibility checks as a direct
+        // `models` list. Unknown pipeline names are rejected here.
+        let mut resolved = Vec::with_capacity(submissions.len());
+        for s in submissions {
+            let Submission { input, models, pipeline } = s;
+            let (models, pipeline) = match pipeline {
+                Some(name) => {
+                    let p = self.inner.config.pipelines.get(&name).ok_or_else(|| {
+                        EngineError::Config(format!("unknown pipeline '{name}'"))
+                    })?;
+                    let mut steps = p.steps.clone();
+                    steps.sort_by_key(|x| x.order);
+                    (steps.into_iter().map(|x| x.model).collect::<Vec<_>>(), Some(name))
+                }
+                None => (models, None),
+            };
             self.inner
                 .registry
-                .validate_item(&self.inner.config, &s.input, &s.models)?;
+                .validate_item(&self.inner.config, &input, &models)?;
+            resolved.push((input, models, pipeline));
         }
 
         // Backpressure: shed load instead of growing memory without bound.
         self.check_memory()?;
-        let n = submissions.len();
+        let n = resolved.len();
         let prev = self.inner.in_flight.fetch_add(n, Ordering::SeqCst);
         if self.inner.max_pending > 0 && prev + n > self.inner.max_pending {
             self.inner.in_flight.fetch_sub(n, Ordering::SeqCst);
@@ -171,11 +191,12 @@ impl Engine {
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let items = submissions
+        let items = resolved
             .into_iter()
-            .map(|s| Item {
-                input: s.input,
-                models: s.models,
+            .map(|(input, models, pipeline)| Item {
+                input,
+                models,
+                pipeline,
                 state: ItemState::Queued,
                 results: Default::default(),
                 error: None,

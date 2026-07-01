@@ -69,7 +69,6 @@ impl ImageClassifier for VitClassifier {
                 .collect::<Vec<_>>();
             out.push(Classification {
                 predictions: select_top(preds),
-                ..Default::default()
             });
         }
         Ok(out)

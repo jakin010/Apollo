@@ -100,6 +100,21 @@ fps    = 5
 # set `video_strategy` on a `vit` model (see `general`/`nsfw` above). There is no
 # separate video-model architecture.
 
+# --- Pipelines: ordered, gated model execution ---------------------------------
+# A pipeline runs its steps in ascending `order` for one input, rather than
+# running `models` as a parallel set. If a step's optional `stop_if` fires (any
+# listed category id at/above the threshold on that model's output), the pipeline
+# early-exits and later steps are marked skipped — the task completes and fires
+# the task webhook. A step *failure* (inference error) instead fails the whole
+# pipeline: it is retried up to [app].max_retries, then dead-lettered. A request
+# sets `pipeline = "moderation"` on its item instead of `models`.
+# [pipelines.moderation]
+# steps = [
+#   { model = "nsfw",    order = 1, stop_if = { labels = [1], threshold = 0.85 } },
+#   { model = "category", order = 2 },
+#   { model = "general", order = 3 },
+# ]
+
 [models.general]
 architecture   = "vit"
 repo           = "google/vit-base-patch16-224"

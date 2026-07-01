@@ -155,6 +155,7 @@ impl Inference for InferenceService {
                 video: init.video,
             },
             models: init.models,
+            pipeline: None,
         };
         let model_count = submission.models.len();
         let task_id = match self.engine.submit(vec![submission]).await {

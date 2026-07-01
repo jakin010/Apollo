@@ -29,6 +29,8 @@ pub struct Config {
     #[serde(default)]
     pub strategies: BTreeMap<String, StrategyConfig>,
     #[serde(default)]
+    pub pipelines: BTreeMap<String, PipelineConfig>,
+    #[serde(default)]
     pub models: BTreeMap<String, ModelConfig>,
 }
 
@@ -392,4 +394,33 @@ pub struct EarlyExit {
     pub labels: Vec<u32>,
     #[serde(default = "crate::defaults::early_exit_threshold")]
     pub threshold: f32,
+}
+
+/// `[pipelines.<name>]` — an ordered, gated sequence of models for one input.
+/// Steps run in ascending `order`; if a step's optional `stop_if` trigger fires
+/// on that model's output, the remaining steps are skipped and the task
+/// completes normally (firing the task webhook). A step *failure* (inference
+/// error) instead fails the whole pipeline, routing the item through the normal
+/// retry + dead-letter path.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineConfig {
+    pub steps: Vec<PipelineStep>,
+}
+
+/// One step of a pipeline: a model, its position in the order, and an optional
+/// gate condition evaluated on that model's output.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineStep {
+    /// The model label to run (must be defined under `[models.*]`).
+    pub model: String,
+    /// Execution position; steps run in ascending `order`, unique per pipeline.
+    pub order: u32,
+    /// If set and this model's output triggers it (any listed id at or above the
+    /// threshold), the pipeline early-exits and later steps are skipped. Reuses
+    /// the `EarlyExit` shape (`labels` + `threshold`) but is independent of a
+    /// model's own `[models.<l>.early_exit]` (which governs video frame scans).
+    #[serde(default)]
+    pub stop_if: Option<EarlyExit>,
 }
