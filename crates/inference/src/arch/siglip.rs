@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{D, DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::siglip;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -30,10 +30,10 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use apollo_config::{Aggregation, ModelConfig, TaxonChild, Taxonomy};
 use apollo_domain::{Classification, DecodedImage, Prediction};
 
+use crate::ImageClassifier;
 use crate::error::InferenceError;
 use crate::loader::Hub;
 use crate::preprocess::{self, Normalization};
-use crate::ImageClassifier;
 
 /// Per-label keep threshold for flat mode when the config doesn't set one.
 const DEFAULT_THRESHOLD: f32 = 0.5;
@@ -167,7 +167,9 @@ impl ImageClassifier for SiglipClassifier {
         // SigLIP logit = scale.exp() * sim + bias; probability = sigmoid(logit),
         // computed as 1 / (1 + exp(-logit)).
         let scale = self.logit_scale.exp()?;
-        let logits = sims.broadcast_mul(&scale)?.broadcast_add(&self.logit_bias)?;
+        let logits = sims
+            .broadcast_mul(&scale)?
+            .broadcast_add(&self.logit_bias)?;
         let probs = logits.neg()?.exp()?.affine(1.0, 1.0)?.recip()?;
         let rows: Vec<Vec<f32>> = probs.to_vec2()?;
 
@@ -178,9 +180,10 @@ impl ImageClassifier for SiglipClassifier {
                     threshold,
                     max_results,
                 } => flat_classification(&row, *threshold, *max_results),
-                Mode::Taxonomy { threshold, children } => {
-                    taxonomy_classification(&row, *threshold, children)
-                }
+                Mode::Taxonomy {
+                    threshold,
+                    children,
+                } => taxonomy_classification(&row, *threshold, children),
             })
             .collect();
         Ok(out)
@@ -211,9 +214,7 @@ fn flat_classification(row: &[f32], threshold: f32, max_results: Option<usize>) 
     if let Some(k) = max_results {
         preds.truncate(k);
     }
-    Classification {
-        predictions: preds,
-    }
+    Classification { predictions: preds }
 }
 
 /// Taxonomy mode: aggregate each child's prompt scores (mean/max) into one child
@@ -241,9 +242,7 @@ fn taxonomy_classification(row: &[f32], threshold: f32, children: &[TaxonChild])
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Classification {
-        predictions,
-    }
+    Classification { predictions }
 }
 
 /// Wrap each label in the prompt template (replacing a `{}` placeholder, or
@@ -265,9 +264,13 @@ fn load_tokenizer(hub: &Hub, max_len: usize) -> Result<Tokenizer, InferenceError
             "expected 'tokenizer.json' in the siglip repo (the fast tokenizer)".into(),
         )
     })?;
-    let mut tokenizer =
-        Tokenizer::from_file(path).map_err(|e| InferenceError::Config(format!("tokenizer: {e}")))?;
-    let len = if max_len == 0 { DEFAULT_MAX_TOKENS } else { max_len };
+    let mut tokenizer = Tokenizer::from_file(path)
+        .map_err(|e| InferenceError::Config(format!("tokenizer: {e}")))?;
+    let len = if max_len == 0 {
+        DEFAULT_MAX_TOKENS
+    } else {
+        max_len
+    };
     tokenizer.with_padding(Some(PaddingParams {
         strategy: PaddingStrategy::Fixed(len),
         ..Default::default()

@@ -106,7 +106,7 @@ impl Taxonomy {
                         return Err(ConfigError::Parse(format!(
                             "taxonomy: '{qualified}' has unknown aggregation '{other}' \
                              (use mean/average/max)"
-                        )))
+                        )));
                     }
                 };
 
@@ -135,7 +135,8 @@ fn read_id(tbl: &toml::Table, ctx: &str) -> Result<u32, ConfigError> {
         .get("id")
         .and_then(|v| v.as_integer())
         .ok_or_else(|| ConfigError::Parse(format!("taxonomy: '{ctx}' needs an integer `id`")))?;
-    u32::try_from(id).map_err(|_| ConfigError::Parse(format!("taxonomy: '{ctx}' id {id} out of range")))
+    u32::try_from(id)
+        .map_err(|_| ConfigError::Parse(format!("taxonomy: '{ctx}' id {id} out of range")))
 }
 
 #[cfg(test)]

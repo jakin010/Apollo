@@ -201,9 +201,14 @@ impl Engine {
                 }
                 match engine.inner.storage.items_pending_failure_webhook().await {
                     Ok(pending) if !pending.is_empty() => {
-                        tracing::debug!(count = pending.len(), "redelivering pending failure webhooks");
+                        tracing::debug!(
+                            count = pending.len(),
+                            "redelivering pending failure webhooks"
+                        );
                         for p in pending {
-                            engine.deliver_failure_webhook(&p.task_id, p.item_index).await;
+                            engine
+                                .deliver_failure_webhook(&p.task_id, p.item_index)
+                                .await;
                         }
                     }
                     Ok(_) => {}

@@ -8,12 +8,12 @@
 //! - [`error`]    — [`ConfigError`]
 
 pub mod defaults;
-pub mod units;
 pub mod edit;
 pub mod error;
 pub mod load;
 pub mod schema;
 pub mod taxonomy;
+pub mod units;
 pub mod validate;
 
 #[cfg(test)]
@@ -21,11 +21,9 @@ mod tests;
 
 pub use error::ConfigError;
 pub use load::Overrides;
-pub use taxonomy::{TaxonChild, Taxonomy};
 pub use schema::{
     Aggregation, AppConfig, AuthConfig, Backend, CacheConfig, Config, DatabaseConfig, EarlyExit,
-    LimitsConfig,
-    ModelConfig, PipelineConfig, PipelineStep, PostgresConfig, SamplingKind, SamplingStep,
-    SqliteConfig, StrategyConfig,
-    SurrealdbConfig, WebhookConfig,
+    LimitsConfig, ModelConfig, PipelineConfig, PipelineStep, PostgresConfig, SamplingKind,
+    SamplingStep, SqliteConfig, StrategyConfig, SurrealdbConfig, WebhookConfig,
 };
+pub use taxonomy::{TaxonChild, Taxonomy};

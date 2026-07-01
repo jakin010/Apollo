@@ -1,13 +1,13 @@
 //! Task submission lifecycle, startup recovery, and the retention timer.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use apollo_domain::{Input, Task, TaskState};
 
-use crate::error::EngineError;
 use crate::Engine;
+use crate::error::EngineError;
 
 /// Resume attempts before a task is declared poison and failed.
 const MAX_RESUME_ATTEMPTS: u32 = 3;

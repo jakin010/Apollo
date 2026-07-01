@@ -29,8 +29,7 @@ pub fn from_str(text: &str) -> Result<Config, ConfigError> {
 
 /// Read and parse a config from a specific file.
 pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
+    let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
     let mut config = from_str(&text)?;
     if let Some(base) = path.parent() {
         config.resolve_paths(base);

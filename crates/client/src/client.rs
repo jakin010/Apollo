@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
+use tonic::transport::{Channel, Endpoint};
 
 use apollo_proto::classify_chunk::Payload;
 use apollo_proto::inference_client::InferenceClient;

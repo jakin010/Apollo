@@ -47,17 +47,17 @@ mod webhook;
 pub mod item;
 
 pub use client::{Client, ClientBuilder, ClientError};
-pub use webhook::{serve_webhook, serve_webhook_with_shutdown, WebhookHandler, WebhookReceiver};
+pub use webhook::{WebhookHandler, WebhookReceiver, serve_webhook, serve_webhook_with_shutdown};
 
 // Re-export the wire types so downstreams don't need to depend on `apollo-proto`.
-pub use apollo_proto::{
-    Ack, Classification, Error, ErrorType, Frame, FrameScan, InputItem, ItemResult, ItemState,
-    ModelResult, ModelState, Prediction, Task, TaskCreated, TaskState, Url,
-};
 /// The `InputItem.input` oneof (`ImageUrl`, `VideoUrl`, `Text`, `AudioUrl`).
 pub use apollo_proto::input_item::Input as InputKind;
 /// The `ModelResult.output` oneof (`Classification`, `FrameScan`).
 pub use apollo_proto::model_result::Output as ModelOutput;
+pub use apollo_proto::{
+    Ack, Classification, Error, ErrorType, Frame, FrameScan, InputItem, ItemResult, ItemState,
+    ModelResult, ModelState, Prediction, Task, TaskCreated, TaskState, Url,
+};
 
 // `tonic::async_trait` is re-exported for implementing [`WebhookHandler`] without
 // taking a direct dependency on the `async-trait` crate.

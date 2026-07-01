@@ -12,11 +12,11 @@
 
 use std::sync::Arc;
 
+use pasetors::Public;
 use pasetors::claims::ClaimsValidationRules;
 use pasetors::keys::AsymmetricPublicKey;
 use pasetors::token::UntrustedToken;
 use pasetors::version4::V4;
-use pasetors::Public;
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
 

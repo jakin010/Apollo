@@ -60,9 +60,7 @@ mod tests {
 
     #[test]
     fn parses_start_with_overrides() {
-        assert!(
-            Cli::try_parse_from(["apollo", "start", "--port", "8080", "--daemon"]).is_ok()
-        );
+        assert!(Cli::try_parse_from(["apollo", "start", "--port", "8080", "--daemon"]).is_ok());
     }
 
     #[test]

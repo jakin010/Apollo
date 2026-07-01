@@ -160,15 +160,23 @@ impl Engine {
         // `models` list. Unknown pipeline names are rejected here.
         let mut resolved = Vec::with_capacity(submissions.len());
         for s in submissions {
-            let Submission { input, models, pipeline } = s;
+            let Submission {
+                input,
+                models,
+                pipeline,
+            } = s;
             let (models, pipeline) = match pipeline {
                 Some(name) => {
-                    let p = self.inner.config.pipelines.get(&name).ok_or_else(|| {
-                        EngineError::Config(format!("unknown pipeline '{name}'"))
-                    })?;
+                    let p =
+                        self.inner.config.pipelines.get(&name).ok_or_else(|| {
+                            EngineError::Config(format!("unknown pipeline '{name}'"))
+                        })?;
                     let mut steps = p.steps.clone();
                     steps.sort_by_key(|x| x.order);
-                    (steps.into_iter().map(|x| x.model).collect::<Vec<_>>(), Some(name))
+                    (
+                        steps.into_iter().map(|x| x.model).collect::<Vec<_>>(),
+                        Some(name),
+                    )
                 }
                 None => (models, None),
             };

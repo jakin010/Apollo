@@ -134,8 +134,7 @@ pub trait Storage: Send + Sync {
     /// between reaching a terminal state and delivering).
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError>;
 
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize)
-        -> Result<(), StorageError>;
+    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError>;
 
     /// Persist an item's retry count (compared against `[app].max_retries`).
     async fn set_item_retries(
@@ -147,12 +146,9 @@ pub trait Storage: Send + Sync {
 
     /// Permanently-failed items whose dead-letter (failure) webhook has not yet
     /// been delivered — recovers a crash between final failure and delivery.
-    async fn items_pending_failure_webhook(
-        &self,
-    ) -> Result<Vec<PendingWebhook>, StorageError>;
+    async fn items_pending_failure_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError>;
 
-    async fn mark_failure_delivered(&self, task_id: &str, item: usize)
-        -> Result<(), StorageError>;
+    async fn mark_failure_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError>;
 
     // ------------------------------ retention ----------------------------
 

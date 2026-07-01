@@ -156,8 +156,7 @@ fn verify_signature(secret: &[u8], request: &Request<Task>) -> Result<(), Status
     let provided =
         hex_decode(header).ok_or_else(|| Status::unauthenticated("malformed webhook signature"))?;
 
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts a key of any length");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts a key of any length");
     mac.update(request.get_ref().id.as_bytes());
     let expected = mac.finalize().into_bytes();
 
@@ -201,9 +200,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// with the `reflection` feature; advertises the `Webhook` service (and the
 /// shared messages) — not `Inference`.
 #[cfg(feature = "reflection")]
-fn reflection_service(
-) -> tonic_reflection::server::v1::ServerReflectionServer<impl tonic_reflection::server::v1::ServerReflection>
-{
+fn reflection_service() -> tonic_reflection::server::v1::ServerReflectionServer<
+    impl tonic_reflection::server::v1::ServerReflection,
+> {
     tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(apollo_proto::WEBHOOK_DESCRIPTOR_SET)
         .build_v1()

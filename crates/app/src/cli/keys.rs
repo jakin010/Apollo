@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use pasetors::claims::Claims;
 use pasetors::keys::{AsymmetricKeyPair, AsymmetricSecretKey, Generate};
@@ -20,8 +20,7 @@ pub struct KeygenArgs {}
 
 /// Generate a PASETO v4 signing keypair and print both keys as PASERK.
 pub fn run_keygen(_args: KeygenArgs) -> Result<()> {
-    let kp =
-        AsymmetricKeyPair::<V4>::generate().map_err(|e| anyhow!("generating keypair: {e}"))?;
+    let kp = AsymmetricKeyPair::<V4>::generate().map_err(|e| anyhow!("generating keypair: {e}"))?;
 
     let mut public = String::new();
     kp.public

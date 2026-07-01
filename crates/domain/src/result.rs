@@ -52,7 +52,11 @@ pub enum ModelOutput {
 /// Select the predictions to return: the top 5 by score, unioned with any label
 /// scoring above 0.90. Input need not be sorted; output is sorted high-to-low.
 pub fn select_top(mut preds: Vec<Prediction>) -> Vec<Prediction> {
-    preds.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    preds.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     preds
         .into_iter()
         .enumerate()
@@ -72,8 +76,13 @@ mod tests {
     #[test]
     fn keeps_five_by_default() {
         let preds = vec![
-            p(1, 0.8), p(2, 0.7), p(3, 0.6),
-            p(4, 0.5), p(5, 0.4), p(6, 0.3), p(7, 0.2),
+            p(1, 0.8),
+            p(2, 0.7),
+            p(3, 0.6),
+            p(4, 0.5),
+            p(5, 0.4),
+            p(6, 0.3),
+            p(7, 0.2),
         ];
         let out = select_top(preds);
         assert_eq!(out.len(), 5);
@@ -83,8 +92,12 @@ mod tests {
     #[test]
     fn unions_high_confidence_beyond_five() {
         let preds = vec![
-            p(1, 0.95), p(2, 0.94), p(3, 0.93),
-            p(4, 0.92), p(5, 0.91), p(6, 0.905),
+            p(1, 0.95),
+            p(2, 0.94),
+            p(3, 0.93),
+            p(4, 0.92),
+            p(5, 0.91),
+            p(6, 0.905),
         ];
         // all six exceed 0.90, so all six are returned even though that is > 5
         assert_eq!(select_top(preds).len(), 6);

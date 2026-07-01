@@ -4,10 +4,10 @@
 //! (a default `[app]`-only config is valid for the `config` command); see
 //! [`Config::has_models`].
 
-use std::collections::BTreeSet;
-use std::path::Path;
 use crate::error::ConfigError;
 use crate::schema::{Backend, Config, SamplingKind};
+use std::collections::BTreeSet;
+use std::path::Path;
 
 impl Config {
     /// Collect all problems; `Ok` only if there are none.
@@ -66,9 +66,12 @@ impl Config {
                     "model '{label}': set either `labels` or `taxonomy_file`, not both"
                 ));
             }
-            if let Some(tf) = &model.taxonomy_file && !Path::new(tf).exists() {
+            if let Some(tf) = &model.taxonomy_file
+                && !Path::new(tf).exists()
+            {
                 errs.push(format!(
-                    "model '{label}': taxonomy file `{}` does not exist", tf
+                    "model '{label}': taxonomy file `{}` does not exist",
+                    tf
                 ));
             }
         }
@@ -103,12 +106,11 @@ impl Config {
         }
 
         match self.database.backend {
-            Backend::Postgres if self.database.postgres.is_none() => errs.push(
-                "database.backend = 'postgres' but [database.postgres] is missing".into(),
-            ),
-            Backend::Surrealdb if self.database.surrealdb.is_none() => errs.push(
-                "database.backend = 'surrealdb' but [database.surrealdb] is missing".into(),
-            ),
+            Backend::Postgres if self.database.postgres.is_none() => {
+                errs.push("database.backend = 'postgres' but [database.postgres] is missing".into())
+            }
+            Backend::Surrealdb if self.database.surrealdb.is_none() => errs
+                .push("database.backend = 'surrealdb' but [database.surrealdb] is missing".into()),
             _ => {}
         }
 

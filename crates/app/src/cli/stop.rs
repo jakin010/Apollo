@@ -1,6 +1,6 @@
 //! `stop`: read the PID file and signal a graceful shutdown.
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use clap::Args;
 
 #[derive(Args)]

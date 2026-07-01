@@ -33,7 +33,10 @@ pub enum Input {
     /// Raw content bytes streamed in via `ClassifyStream` and staged to a local
     /// file. `video` selects the processing path (false = image, true = video).
     /// The file is removed once the owning task reaches a terminal state.
-    Bytes { path: PathBuf, video: bool },
+    Bytes {
+        path: PathBuf,
+        video: bool,
+    },
 }
 
 impl Input {
@@ -125,7 +128,12 @@ impl FromStr for TaskState {
             "completed" => TaskState::Completed,
             "failed" => TaskState::Failed,
             "cancelled" => TaskState::Cancelled,
-            _ => return Err(ParseStateError { kind: "task", value: s.to_string() }),
+            _ => {
+                return Err(ParseStateError {
+                    kind: "task",
+                    value: s.to_string(),
+                });
+            }
         })
     }
 }
@@ -154,7 +162,12 @@ impl FromStr for ItemState {
             "completed" => ItemState::Completed,
             "failed" => ItemState::Failed,
             "cancelled" => ItemState::Cancelled,
-            _ => return Err(ParseStateError { kind: "item", value: s.to_string() }),
+            _ => {
+                return Err(ParseStateError {
+                    kind: "item",
+                    value: s.to_string(),
+                });
+            }
         })
     }
 }
@@ -181,7 +194,12 @@ impl FromStr for ModelState {
             "done" => ModelState::Done,
             "failed" => ModelState::Failed,
             "skipped" => ModelState::Skipped,
-            _ => return Err(ParseStateError { kind: "model", value: s.to_string() }),
+            _ => {
+                return Err(ParseStateError {
+                    kind: "model",
+                    value: s.to_string(),
+                });
+            }
         })
     }
 }
@@ -212,7 +230,10 @@ pub struct TaskError {
 
 impl TaskError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into() }
+        Self {
+            kind,
+            message: message.into(),
+        }
     }
     /// An uncategorized error carrying only a message.
     pub fn custom(message: impl Into<String>) -> Self {
@@ -244,23 +265,43 @@ pub struct ModelResult {
 
 impl ModelResult {
     pub fn queued() -> Self {
-        Self { state: ModelState::Queued, output: None, error: None }
+        Self {
+            state: ModelState::Queued,
+            output: None,
+            error: None,
+        }
     }
 
     pub fn processing() -> Self {
-        Self { state: ModelState::Processing, output: None, error: None }
+        Self {
+            state: ModelState::Processing,
+            output: None,
+            error: None,
+        }
     }
 
     pub fn done(output: ModelOutput) -> Self {
-        Self { state: ModelState::Done, output: Some(output), error: None }
+        Self {
+            state: ModelState::Done,
+            output: Some(output),
+            error: None,
+        }
     }
 
     pub fn failed(error: TaskError) -> Self {
-        Self { state: ModelState::Failed, output: None, error: Some(error) }
+        Self {
+            state: ModelState::Failed,
+            output: None,
+            error: Some(error),
+        }
     }
 
     pub fn skipped() -> Self {
-        Self { state: ModelState::Skipped, output: None, error: None }
+        Self {
+            state: ModelState::Skipped,
+            output: None,
+            error: None,
+        }
     }
 }
 

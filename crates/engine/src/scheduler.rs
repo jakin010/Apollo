@@ -6,21 +6,21 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use apollo_config::{EarlyExit, ModelConfig, PipelineStep, StrategyConfig};
 use apollo_domain::{
-    Classification, DecodedImage, Frame, Input, Item, ItemState, ModelOutput, ModelResult,
-    ModelState, Modality, TaskError, Url,
+    Classification, DecodedImage, Frame, Input, Item, ItemState, Modality, ModelOutput,
+    ModelResult, ModelState, TaskError, Url,
 };
 use apollo_media::{FrameRef, LocalMedia, VideoInfo};
 
+use crate::Engine;
 use crate::aggregate;
 use crate::error::EngineError;
 use crate::worker::ModelHandle;
-use crate::Engine;
 
 /// A fetched, decoded/probed input ready for inference.
 enum Fetched {
@@ -110,7 +110,12 @@ impl Engine {
                     let _ = self
                         .inner
                         .storage
-                        .set_item_state(&task_id, idx, ItemState::Retrying, Some(&TaskError::fetch(e.to_string())))
+                        .set_item_state(
+                            &task_id,
+                            idx,
+                            ItemState::Retrying,
+                            Some(&TaskError::fetch(e.to_string())),
+                        )
                         .await;
                     tracing::warn!(
                         task = %task_id, item = idx, attempt = item.retries, max = max_retries,
@@ -125,7 +130,8 @@ impl Engine {
                 }
                 Err(e) => {
                     // Retries exhausted (or disabled): permanent, dead-lettered failure.
-                    self.fail_item(&task_id, idx, &item, TaskError::fetch(e.to_string())).await;
+                    self.fail_item(&task_id, idx, &item, TaskError::fetch(e.to_string()))
+                        .await;
                     return;
                 }
             }
@@ -188,7 +194,11 @@ impl Engine {
                             .upsert_model_result(&task_id, idx, label, &ModelResult::done(output))
                             .await;
                         if let Some(uh) = url_hash.as_deref() {
-                            let _ = self.inner.storage.url_cache_store(uh, label, &rev, ch).await;
+                            let _ = self
+                                .inner
+                                .storage
+                                .url_cache_store(uh, label, &rev, ch)
+                                .await;
                         }
                         tracing::debug!(task = %task_id, item = idx, model = %label, "cache hit");
                         continue;
@@ -218,12 +228,20 @@ impl Engine {
                     // Populate the cache on success (best-effort).
                     if let Some(ch) = content_hash.as_deref() {
                         let rev = self.model_revision(label);
-                        if let Err(e) = self.inner.storage.cache_store(ch, label, &rev, &output).await
+                        if let Err(e) = self
+                            .inner
+                            .storage
+                            .cache_store(ch, label, &rev, &output)
+                            .await
                         {
                             tracing::warn!(task = %task_id, model = %label, error = %e, "cache store failed");
                         }
                         if let Some(uh) = url_hash.as_deref() {
-                            let _ = self.inner.storage.url_cache_store(uh, label, &rev, ch).await;
+                            let _ = self
+                                .inner
+                                .storage
+                                .url_cache_store(uh, label, &rev, ch)
+                                .await;
                         }
                     }
                     ModelResult::done(output)
@@ -265,8 +283,13 @@ impl Engine {
         let steps = match self.pipeline_steps(pipeline) {
             Some(s) => s,
             None => {
-                self.fail_item(task_id, idx, item, TaskError::internal(format!("unknown pipeline '{pipeline}'")))
-                    .await;
+                self.fail_item(
+                    task_id,
+                    idx,
+                    item,
+                    TaskError::internal(format!("unknown pipeline '{pipeline}'")),
+                )
+                .await;
                 return;
             }
         };
@@ -404,7 +427,8 @@ impl Engine {
                                 &ModelResult::failed(TaskError::inference(e.to_string())),
                             )
                             .await;
-                        self.fail_item(task_id, idx, &item, TaskError::inference(e.to_string())).await;
+                        self.fail_item(task_id, idx, &item, TaskError::inference(e.to_string()))
+                            .await;
                         return;
                     }
                 }
@@ -534,7 +558,12 @@ impl Engine {
         let _ = self
             .inner
             .storage
-            .set_item_state(task_id, idx, ItemState::Cancelled, Some(&TaskError::cancelled("cancelled")))
+            .set_item_state(
+                task_id,
+                idx,
+                ItemState::Cancelled,
+                Some(&TaskError::cancelled("cancelled")),
+            )
             .await;
         self.rollup_task_state(task_id).await;
         self.deliver_webhook(task_id, idx).await;
@@ -640,7 +669,14 @@ impl Engine {
                 // Video: an image classifier over sampled frames, each frame bounded
                 // by `timeout` (applied inside run_frame_scan).
                 self.run_frame_scan(
-                    task_id, idx, label, &handle, media.path(), info, timeout, cancel,
+                    task_id,
+                    idx,
+                    label,
+                    &handle,
+                    media.path(),
+                    info,
+                    timeout,
+                    cancel,
                 )
                 .await
             }
@@ -656,13 +692,11 @@ impl Engine {
         let want_hash = self.cache_enabled();
         match input {
             Input::Image(url) => {
-                let media = apollo_media::fetch(url, &self.inner.fetch_limits)
-                    .await?;
+                let media = apollo_media::fetch(url, &self.inner.fetch_limits).await?;
                 self.image_from_media(media, want_hash).await
             }
             Input::Video(url) => {
-                let media = apollo_media::fetch(url, &self.inner.fetch_limits)
-                    .await?;
+                let media = apollo_media::fetch(url, &self.inner.fetch_limits).await?;
                 self.video_from_media(media, want_hash).await
             }
             Input::Bytes { path, video } => {
@@ -687,7 +721,11 @@ impl Engine {
         want_hash: bool,
     ) -> Result<(Fetched, Option<String>), EngineError> {
         let bytes = media.read_bytes()?;
-        let hash = if want_hash { Some(sha256_hex(&bytes)) } else { None };
+        let hash = if want_hash {
+            Some(sha256_hex(&bytes))
+        } else {
+            None
+        };
         let img = tokio::task::spawn_blocking(move || apollo_media::decode_image(&bytes))
             .await
             .map_err(|e| EngineError::Join(e.to_string()))??;
@@ -740,8 +778,7 @@ impl Engine {
         let strategy = self.strategy_for(&model)?;
         let frame_timeout_msg = format!("model '{label}' timed out classifying a video frame");
 
-        let plan = apollo_media::plan(path, info, &strategy.sampling)
-            .await?;
+        let plan = apollo_media::plan(path, info, &strategy.sampling).await?;
 
         // Seed from frames already persisted on a previous run.
         let prior = self
@@ -773,8 +810,7 @@ impl Engine {
                 return Err(EngineError::Cancelled);
             }
             let timestamps: Vec<f64> = chunk.iter().map(|f| f.timestamp).collect();
-            let images = apollo_media::extract_frames(path, &timestamps)
-                .await?;
+            let images = apollo_media::extract_frames(path, &timestamps).await?;
 
             // Issue the whole chunk concurrently so the worker merges it into one
             // forward pass; each frame is bounded by the model's per-frame timeout.
@@ -882,7 +918,9 @@ fn output_triggers(out: &ModelOutput, cond: &EarlyExit) -> bool {
 
 /// Backoff before the Nth retry: 1s, 2s, 4s, 8s, … capped at 30s.
 fn retry_backoff(attempt: u32) -> Duration {
-    let secs = 1u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(u64::MAX);
+    let secs = 1u64
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u64::MAX);
     Duration::from_secs(secs.min(30))
 }
 
