@@ -114,11 +114,12 @@ impl Inference for InferenceService {
                     Some(Payload::Data(bytes)) => {
                         total += bytes.len() as u64;
                         if let Some(max) = cap
-                            && total > max {
-                                return Err(Status::resource_exhausted(format!(
-                                    "upload exceeds the {max}-byte limit"
-                                )));
-                            }
+                            && total > max
+                        {
+                            return Err(Status::resource_exhausted(format!(
+                                "upload exceeds the {max}-byte limit"
+                            )));
+                        }
                         saw_data = true;
                         file.write_all(&bytes)
                             .await

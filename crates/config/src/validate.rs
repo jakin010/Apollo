@@ -40,22 +40,24 @@ impl Config {
                 }
                 if let SamplingKind::Scene = s.method
                     && let Some(t) = s.threshold
-                        && (!t.is_finite() || !(0.0..=1.0).contains(&t)) {
-                            errs.push(format!(
+                    && (!t.is_finite() || !(0.0..=1.0).contains(&t))
+                {
+                    errs.push(format!(
                                 "strategy '{name}' step {}: scene threshold must be finite and within 0.0..=1.0 (got {t})",
                                 s.step
                             ));
-                        }
+                }
             }
         }
 
         for (label, model) in &self.models {
             if let Some(vs) = &model.video_strategy
-                && !self.strategies.contains_key(vs) {
-                    errs.push(format!(
-                        "model '{label}': video_strategy '{vs}' is not defined"
-                    ));
-                }
+                && !self.strategies.contains_key(vs)
+            {
+                errs.push(format!(
+                    "model '{label}': video_strategy '{vs}' is not defined"
+                ));
+            }
             if let Some(ee) = &model.early_exit {
                 if ee.labels.is_empty() {
                     errs.push(format!(
@@ -102,12 +104,13 @@ impl Config {
                     ));
                 }
                 if let Some(stop) = &step.stop_if
-                    && stop.labels.is_empty() {
-                        errs.push(format!(
-                            "pipeline '{name}': step '{}' stop_if needs at least one label id",
-                            step.model
-                        ));
-                    }
+                    && stop.labels.is_empty()
+                {
+                    errs.push(format!(
+                        "pipeline '{name}': step '{}' stop_if needs at least one label id",
+                        step.model
+                    ));
+                }
             }
         }
 

@@ -217,7 +217,6 @@ pub enum Backend {
     Surrealdb,
 }
 
-
 /// `[database.sqlite]`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

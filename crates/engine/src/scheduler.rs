@@ -66,12 +66,14 @@ impl Engine {
         // cache at once, which would bypass the per-step gate (a step the gate
         // should skip could be resurrected from another task's content cache).
         // Pipelines consult the content cache per step, after the gate decision.
-        if self.cache_enabled() && item.pipeline.is_none()
+        if self.cache_enabled()
+            && item.pipeline.is_none()
             && let Some(url) = item_url(&item.input)
-                && self.try_url_cache(&task_id, idx, &item, url).await {
-                    self.complete_item(&task_id, idx).await;
-                    return;
-                }
+            && self.try_url_cache(&task_id, idx, &item, url).await
+        {
+            self.complete_item(&task_id, idx).await;
+            return;
+        }
 
         // Bound concurrent items globally (a coarse VRAM/throughput cap; the real
         // GPU batching happens inside each model worker). Admission is by priority:
@@ -308,10 +310,11 @@ impl Engine {
                     match r.state {
                         ModelState::Done => {
                             if let (Some(cond), Some(out)) = (&step.stop_if, &r.output)
-                                && output_triggers(out, cond) {
-                                    stop_idx = Some(i);
-                                    break;
-                                }
+                                && output_triggers(out, cond)
+                            {
+                                stop_idx = Some(i);
+                                break;
+                            }
                             continue;
                         }
                         ModelState::Skipped => continue,
@@ -343,10 +346,11 @@ impl Engine {
                                 .await;
                         }
                         if let Some(cond) = &step.stop_if
-                            && output_triggers(&output, cond) {
-                                stop_idx = Some(i);
-                                break;
-                            }
+                            && output_triggers(&output, cond)
+                        {
+                            stop_idx = Some(i);
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -388,10 +392,11 @@ impl Engine {
                             .await;
                         item.results.insert(step.model.clone(), done);
                         if let Some(cond) = &step.stop_if
-                            && output_triggers(&output, cond) {
-                                stop_idx = Some(i);
-                                break;
-                            }
+                            && output_triggers(&output, cond)
+                        {
+                            stop_idx = Some(i);
+                            break;
+                        }
                     }
                     Err(EngineError::Cancelled) => {
                         self.cancel_item(task_id, idx).await;
@@ -604,9 +609,10 @@ impl Engine {
         }
         let desired = aggregate::task_state_for(&task);
         if desired != task.state
-            && let Err(e) = self.inner.storage.set_task_state(task_id, desired).await {
-                tracing::error!(task = %task_id, error = %e, "failed to roll up task state");
-            }
+            && let Err(e) = self.inner.storage.set_task_state(task_id, desired).await
+        {
+            tracing::error!(task = %task_id, error = %e, "failed to roll up task state");
+        }
         // Once a task is terminal, remove any staged upload files. They persist
         // across restarts (so resume can re-read them) and are cleaned exactly
         // here, when the task is finished for good.
@@ -830,9 +836,10 @@ impl Engine {
                     .append_frame(task_id, idx, label, &frame)
                     .await;
                 if let Some((labels, threshold)) = early.as_ref()
-                    && apollo_media::triggered(&frame.classification, labels, *threshold) {
-                        stop = true;
-                    }
+                    && apollo_media::triggered(&frame.classification, labels, *threshold)
+                {
+                    stop = true;
+                }
                 frames.push(frame);
                 if stop {
                     break 'scan;

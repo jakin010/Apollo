@@ -21,8 +21,8 @@
 use apollo_proto::*;
 use prost::Message;
 use prost_types::{
-    field_descriptor_proto::{Label, Type},
     DescriptorProto, FieldDescriptorProto, FileDescriptorSet,
+    field_descriptor_proto::{Label, Type},
 };
 use std::collections::BTreeMap;
 
@@ -66,7 +66,12 @@ fn scalar(f: &FieldDescriptorProto, number: i32, ty: Type, label: Label) {
 #[track_caller]
 fn message(f: &FieldDescriptorProto, number: i32, type_name: &str, label: Label) {
     assert_eq!(f.number(), number, "`{}` field number", f.name());
-    assert_eq!(f.r#type(), Type::Message, "`{}` should be a message", f.name());
+    assert_eq!(
+        f.r#type(),
+        Type::Message,
+        "`{}` should be a message",
+        f.name()
+    );
     assert_eq!(f.type_name(), type_name, "`{}` referenced type", f.name());
     assert_eq!(f.label(), label, "`{}` cardinality", f.name());
 }
@@ -137,14 +142,29 @@ fn task_and_result_messages() {
     // repeated synthetic entry message.
     let ir = fields_by_name(&msgs["ItemResult"]);
     enumeration(&ir["state"], 1, ".apollo.v1.ItemState", Label::Optional);
-    message(&ir["results"], 2, ".apollo.v1.ItemResult.ResultsEntry", Label::Repeated);
+    message(
+        &ir["results"],
+        2,
+        ".apollo.v1.ItemResult.ResultsEntry",
+        Label::Repeated,
+    );
     message(&ir["error"], 3, ".apollo.v1.Error", Label::Optional);
     assert_eq!(ir.len(), 3);
 
     let mr = fields_by_name(&msgs["ModelResult"]);
     enumeration(&mr["state"], 1, ".apollo.v1.ModelState", Label::Optional);
-    message(&mr["classification"], 2, ".apollo.v1.Classification", Label::Optional);
-    message(&mr["frame_scan"], 3, ".apollo.v1.FrameScan", Label::Optional);
+    message(
+        &mr["classification"],
+        2,
+        ".apollo.v1.Classification",
+        Label::Optional,
+    );
+    message(
+        &mr["frame_scan"],
+        3,
+        ".apollo.v1.FrameScan",
+        Label::Optional,
+    );
     message(&mr["error"], 4, ".apollo.v1.Error", Label::Optional);
     assert_eq!(mr.len(), 4);
 
@@ -159,18 +179,33 @@ fn classification_messages() {
     let msgs = all_messages();
 
     let c = fields_by_name(&msgs["Classification"]);
-    message(&c["predictions"], 1, ".apollo.v1.Prediction", Label::Repeated);
+    message(
+        &c["predictions"],
+        1,
+        ".apollo.v1.Prediction",
+        Label::Repeated,
+    );
     assert_eq!(c.len(), 1);
 
     let fs = fields_by_name(&msgs["FrameScan"]);
-    message(&fs["aggregated"], 1, ".apollo.v1.Classification", Label::Optional);
+    message(
+        &fs["aggregated"],
+        1,
+        ".apollo.v1.Classification",
+        Label::Optional,
+    );
     message(&fs["frames"], 2, ".apollo.v1.Frame", Label::Repeated);
     assert_eq!(fs.len(), 2);
 
     let fr = fields_by_name(&msgs["Frame"]);
     scalar(&fr["timestamp"], 1, Type::Double, Label::Optional);
     scalar(&fr["index"], 2, Type::Uint32, Label::Optional);
-    message(&fr["classification"], 3, ".apollo.v1.Classification", Label::Optional);
+    message(
+        &fr["classification"],
+        3,
+        ".apollo.v1.Classification",
+        Label::Optional,
+    );
     assert_eq!(fr.len(), 3);
 
     let p = fields_by_name(&msgs["Prediction"]);
@@ -189,7 +224,12 @@ fn stream_messages() {
     assert_eq!(si.len(), 2);
 
     let cc = fields_by_name(&msgs["ClassifyChunk"]);
-    message(&cc["init"], 1, ".apollo.v1.ClassifyStreamInit", Label::Optional);
+    message(
+        &cc["init"],
+        1,
+        ".apollo.v1.ClassifyStreamInit",
+        Label::Optional,
+    );
     scalar(&cc["data"], 2, Type::Bytes, Label::Optional);
     assert_eq!(cc.len(), 2);
 }
@@ -268,7 +308,12 @@ fn first_wire_tag<M: Message>(msg: &M) -> (u64, u64) {
 #[test]
 fn wire_tags_cover_each_type() {
     // string (length-delimited), field 1
-    assert_eq!(first_wire_tag(&GetTaskRequest { task_id: "x".into() }), (1, LEN));
+    assert_eq!(
+        first_wire_tag(&GetTaskRequest {
+            task_id: "x".into()
+        }),
+        (1, LEN)
+    );
 
     // embedded message (length-delimited), field 1
     assert_eq!(
@@ -282,8 +327,20 @@ fn wire_tags_cover_each_type() {
     );
 
     // uint32 (varint) field 1 and float (32-bit) field 2 on Prediction
-    assert_eq!(first_wire_tag(&Prediction { label: 7, score: 0.0 }), (1, VARINT));
-    assert_eq!(first_wire_tag(&Prediction { label: 0, score: 1.5 }), (2, I32));
+    assert_eq!(
+        first_wire_tag(&Prediction {
+            label: 7,
+            score: 0.0
+        }),
+        (1, VARINT)
+    );
+    assert_eq!(
+        first_wire_tag(&Prediction {
+            label: 0,
+            score: 1.5
+        }),
+        (2, I32)
+    );
 
     // double (64-bit) field 1 on Frame
     assert_eq!(
@@ -366,8 +423,14 @@ fn full_task_round_trips() {
                         state: ModelState::Done as i32,
                         output: Some(model_result::Output::Classification(Classification {
                             predictions: vec![
-                                Prediction { label: 3, score: 0.97 },
-                                Prediction { label: 8, score: 0.42 },
+                                Prediction {
+                                    label: 3,
+                                    score: 0.97,
+                                },
+                                Prediction {
+                                    label: 8,
+                                    score: 0.42,
+                                },
                             ],
                         })),
                         error: None,
@@ -389,5 +452,8 @@ fn full_task_round_trips() {
     let mut buf = Vec::new();
     task.encode(&mut buf).expect("encode");
     let decoded = Task::decode(&buf[..]).expect("decode");
-    assert_eq!(task, decoded, "Task should survive an encode/decode round trip");
+    assert_eq!(
+        task, decoded,
+        "Task should survive an encode/decode round trip"
+    );
 }

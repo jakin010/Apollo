@@ -172,11 +172,12 @@ async fn download(url_str: &str, limits: &FetchLimits) -> Result<LocalMedia, Med
         .map_err(|e| MediaError::Http(format!("{url_str}: {e}")))?;
 
     if let (Some(max), Some(len)) = (limits.max_download_bytes, resp.content_length())
-        && len > max {
-            return Err(MediaError::Http(format!(
-                "{url_str}: content-length {len} exceeds limit of {max} bytes"
-            )));
-        }
+        && len > max
+    {
+        return Err(MediaError::Http(format!(
+            "{url_str}: content-length {len} exceeds limit of {max} bytes"
+        )));
+    }
 
     let mut bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = resp
@@ -185,11 +186,12 @@ async fn download(url_str: &str, limits: &FetchLimits) -> Result<LocalMedia, Med
         .map_err(|e| MediaError::Http(format!("reading body of {url_str}: {e}")))?
     {
         if let Some(max) = limits.max_download_bytes
-            && bytes.len() as u64 + chunk.len() as u64 > max {
-                return Err(MediaError::Http(format!(
-                    "{url_str}: download exceeds limit of {max} bytes"
-                )));
-            }
+            && bytes.len() as u64 + chunk.len() as u64 > max
+        {
+            return Err(MediaError::Http(format!(
+                "{url_str}: download exceeds limit of {max} bytes"
+            )));
+        }
         bytes.extend_from_slice(&chunk);
     }
 

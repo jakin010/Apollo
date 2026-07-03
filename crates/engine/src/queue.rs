@@ -119,12 +119,12 @@ impl Engine {
                 .storage
                 .set_task_state(&task_id, TaskState::Processing)
                 .await
-            {
-                tracing::error!(task = %task_id, error = %e, "failed to mark task processing");
-                self.inner.in_flight.fetch_sub(n_items, Ordering::SeqCst);
-                self.inner.cancels.lock().unwrap().remove(&task_id);
-                return;
-            }
+        {
+            tracing::error!(task = %task_id, error = %e, "failed to mark task processing");
+            self.inner.in_flight.fetch_sub(n_items, Ordering::SeqCst);
+            self.inner.cancels.lock().unwrap().remove(&task_id);
+            return;
+        }
 
         let mut handles = Vec::with_capacity(n_items);
         for (idx, item) in task.items.into_iter().enumerate() {

@@ -27,9 +27,11 @@ pub fn parse_size(s: &str) -> Option<u64> {
         return Some(v.saturating_mul(mult));
     }
     if let Ok(f) = num.parse::<f64>()
-        && f.is_finite() && f >= 0.0 {
-            return Some((f * mult as f64) as u64);
-        }
+        && f.is_finite()
+        && f >= 0.0
+    {
+        return Some((f * mult as f64) as u64);
+    }
     None
 }
 
