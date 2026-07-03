@@ -17,6 +17,6 @@ members = [
 edition = "2024"
 
 [workspace.dependencies]
+tonic = { version = "0.14" }
 tracing = { version = "0.1" }
 tokio = { version = "1.52", default-features = false }
-

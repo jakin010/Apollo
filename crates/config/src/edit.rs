@@ -25,11 +25,12 @@ pub fn create_default_if_missing(path: &Path) -> Result<bool, ConfigError> {
     if path.exists() {
         return Ok(false);
     }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| ConfigError::Io(parent.to_path_buf(), e))?;
         }
+    }
     std::fs::write(path, default_app_toml()).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
     Ok(true)
 }

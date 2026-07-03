@@ -113,8 +113,8 @@ impl Engine {
                 .clone()
         };
 
-        if !cancel.load(Ordering::SeqCst)
-            && let Err(e) = self
+        if !cancel.load(Ordering::SeqCst) {
+            if let Err(e) = self
                 .inner
                 .storage
                 .set_task_state(&task_id, TaskState::Processing)
@@ -125,6 +125,7 @@ impl Engine {
                 self.inner.cancels.lock().unwrap().remove(&task_id);
                 return;
             }
+        }
 
         let mut handles = Vec::with_capacity(n_items);
         for (idx, item) in task.items.into_iter().enumerate() {

@@ -44,16 +44,20 @@ pub async fn probe(path: &Path) -> Result<VideoInfo, MediaError> {
 }
 
 /// Extract a single frame at `timestamp` seconds, decoded to RGB8.
-pub async fn extract_frame(path: &Path, timestamp: f64) -> Result<DecodedImage, MediaError> {
+pub async fn extract_frame(
+    path: &Path,
+    timestamp: f64,
+    max_pixels: Option<u64>,
+) -> Result<DecodedImage, MediaError> {
     // Primary: fast input-seek to the requested time.
     if let Some(bytes) = grab_frame(path, &["-ss".into(), format!("{timestamp}")]).await? {
-        return decode_image(&bytes);
+        return decode_image(&bytes, max_pixels);
     }
     // The seek landed past the last decodable frame (imprecise duration / VFR);
     // fall back to the file's final frame so a near-end sample still yields an
     // image instead of failing the whole scan.
     if let Some(bytes) = grab_frame(path, &["-sseof".into(), "-1".into()]).await? {
-        return decode_image(&bytes);
+        return decode_image(&bytes, max_pixels);
     }
     Err(MediaError::Ffmpeg(format!(
         "ffmpeg produced no frame at t={timestamp} (no final frame either)"
@@ -85,10 +89,11 @@ async fn grab_frame(path: &Path, seek: &[String]) -> Result<Option<Vec<u8>>, Med
 pub async fn extract_frames(
     path: &Path,
     timestamps: &[f64],
+    max_pixels: Option<u64>,
 ) -> Result<Vec<DecodedImage>, MediaError> {
     let mut frames = Vec::with_capacity(timestamps.len());
     for &t in timestamps {
-        frames.push(extract_frame(path, t).await?);
+        frames.push(extract_frame(path, t, max_pixels).await?);
     }
     Ok(frames)
 }
@@ -115,6 +120,13 @@ pub async fn keyframe_timestamps(path: &Path) -> Result<Vec<f64>, MediaError> {
 
 /// Timestamps of scene changes above `threshold` (0..1). Backs `scene` sampling.
 pub async fn scene_timestamps(path: &Path, threshold: f64) -> Result<Vec<f64>, MediaError> {
+    // Defensive: config validation already enforces 0.0..=1.0, but never
+    // interpolate a non-finite or out-of-range value into the filter expression.
+    let threshold = if threshold.is_nan() {
+        0.0
+    } else {
+        threshold.clamp(0.0, 1.0)
+    };
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "info", "-i"])
         .arg(path)
@@ -245,7 +257,7 @@ fn is_image_only(format_name: &str, codec: &str, duration: f64, frame_count: Opt
         return true;
     }
     const STILL_CODECS: &[&str] = &["png", "mjpeg", "bmp", "tiff", "webp", "gif"];
-    let single_frame = frame_count.is_none_or(|n| n <= 1);
+    let single_frame = frame_count.map_or(true, |n| n <= 1);
     STILL_CODECS.contains(&codec) && single_frame && duration <= 0.0
 }
 

@@ -155,7 +155,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "apollo"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "apollo-config",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "apollo-client"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "apollo-proto",
  "futures",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "apollo-config"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "apollo-domain",
  "dirs",
@@ -198,14 +198,14 @@ dependencies = [
 
 [[package]]
 name = "apollo-domain"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "apollo-engine"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "apollo-config",
  "apollo-domain",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "apollo-inference"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "apollo-config",
  "apollo-domain",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "apollo-media"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "apollo-config",
  "apollo-domain",
@@ -257,9 +257,10 @@ dependencies = [
 
 [[package]]
 name = "apollo-proto"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "prost",
+ "prost-types",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -267,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "apollo-server"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "apollo-domain",
  "apollo-engine",
@@ -287,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "apollo-storage"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "apollo-config",
  "apollo-domain",

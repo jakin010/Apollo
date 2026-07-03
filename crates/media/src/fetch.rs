@@ -24,6 +24,13 @@ pub struct FetchLimits {
     /// Hard cap on downloaded bytes; the download aborts once exceeded. `None`
     /// means unlimited.
     pub max_download_bytes: Option<u64>,
+    /// Allow `file://` and bare local-path inputs. When `false`, both are refused
+    /// (remote `http(s)` fetches are unaffected).
+    pub allow_local_files: bool,
+    /// Directories a local path must canonicalize inside to be accepted (resolving
+    /// `..` and symlinks). Empty means no local path is permitted, even when
+    /// `allow_local_files` is set.
+    pub local_roots: Vec<PathBuf>,
 }
 
 impl Default for FetchLimits {
@@ -32,6 +39,8 @@ impl Default for FetchLimits {
             allowed_schemes: vec!["http".to_string(), "https".to_string()],
             block_private_ips: true,
             max_download_bytes: Some(512 * 1024 * 1024),
+            allow_local_files: false,
+            local_roots: Vec::new(),
         }
     }
 }
@@ -84,7 +93,7 @@ pub async fn fetch(url: &Url, limits: &FetchLimits) -> Result<LocalMedia, MediaE
 
 async fn resolve(src: &str, limits: &FetchLimits) -> Result<LocalMedia, MediaError> {
     if let Some(rest) = src.strip_prefix("file://") {
-        return local(rest);
+        return local(rest, limits);
     }
     if let Some((scheme, _)) = src.split_once("://") {
         // A URL with an explicit scheme: it must be permitted, then downloaded.
@@ -99,16 +108,37 @@ async fn resolve(src: &str, limits: &FetchLimits) -> Result<LocalMedia, MediaErr
         }
         return download(src, limits).await;
     }
-    local(src)
+    local(src, limits)
 }
 
-fn local(path: &str) -> Result<LocalMedia, MediaError> {
-    let p = PathBuf::from(path);
-    if !p.is_file() {
+/// Resolve a local-path input under the local-file policy: access is off unless
+/// `allow_local_files` is set, and even then the path must canonicalize (resolving
+/// `..` and symlinks) inside one of `local_roots`. This is the gate that keeps an
+/// untrusted request from reading arbitrary files (e.g. `file:///etc/passwd`).
+fn local(path: &str, limits: &FetchLimits) -> Result<LocalMedia, MediaError> {
+    if !limits.allow_local_files {
+        return Err(MediaError::Http(
+            "local file inputs are disabled (enable limits.allow_local_files and set limits.local_roots)"
+                .into(),
+        ));
+    }
+    let canonical =
+        std::fs::canonicalize(path).map_err(|_| MediaError::NotFound(path.to_string()))?;
+    if !canonical.is_file() {
         return Err(MediaError::NotFound(path.to_string()));
     }
+    let inside_root = limits.local_roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .map(|r| canonical.starts_with(&r))
+            .unwrap_or(false)
+    });
+    if !inside_root {
+        return Err(MediaError::Http(format!(
+            "local path {path:?} is outside the permitted roots"
+        )));
+    }
     Ok(LocalMedia {
-        path: p,
+        path: canonical,
         _temp: None,
     })
 }
@@ -141,12 +171,13 @@ async fn download(url_str: &str, limits: &FetchLimits) -> Result<LocalMedia, Med
         .error_for_status()
         .map_err(|e| MediaError::Http(format!("{url_str}: {e}")))?;
 
-    if let (Some(max), Some(len)) = (limits.max_download_bytes, resp.content_length())
-        && len > max {
+    if let (Some(max), Some(len)) = (limits.max_download_bytes, resp.content_length()) {
+        if len > max {
             return Err(MediaError::Http(format!(
                 "{url_str}: content-length {len} exceeds limit of {max} bytes"
             )));
         }
+    }
 
     let mut bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = resp
@@ -154,12 +185,13 @@ async fn download(url_str: &str, limits: &FetchLimits) -> Result<LocalMedia, Med
         .await
         .map_err(|e| MediaError::Http(format!("reading body of {url_str}: {e}")))?
     {
-        if let Some(max) = limits.max_download_bytes
-            && bytes.len() as u64 + chunk.len() as u64 > max {
+        if let Some(max) = limits.max_download_bytes {
+            if bytes.len() as u64 + chunk.len() as u64 > max {
                 return Err(MediaError::Http(format!(
                     "{url_str}: download exceeds limit of {max} bytes"
                 )));
             }
+        }
         bytes.extend_from_slice(&chunk);
     }
 
@@ -219,7 +251,7 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
                 || v6
                     .to_ipv4_mapped()
-                    .is_some_and(|m| is_blocked_ip(IpAddr::V4(m)))
+                    .map_or(false, |m| is_blocked_ip(IpAddr::V4(m)))
         }
     }
 }

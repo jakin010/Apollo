@@ -146,6 +146,15 @@ pub struct LimitsConfig {
     pub block_private_ips: bool,
     /// URL schemes permitted for remote fetches.
     pub allowed_schemes: Vec<String>,
+    /// Allow `file://` and bare local paths as inputs. Off by default; even when
+    /// on, a path must resolve inside one of `local_roots`.
+    pub allow_local_files: bool,
+    /// Directories a local-file input may resolve inside (after canonicalization,
+    /// so `..`/symlinks cannot escape). Empty means no local path is permitted.
+    pub local_roots: Vec<String>,
+    /// Max decoded pixels (`width * height`) for an image, guarding against
+    /// decompression bombs. `0` = unlimited.
+    pub max_pixels: u64,
 }
 
 impl Default for LimitsConfig {
@@ -155,6 +164,9 @@ impl Default for LimitsConfig {
             max_video_seconds: defaults::max_video_seconds(),
             block_private_ips: defaults::block_private_ips(),
             allowed_schemes: defaults::allowed_schemes(),
+            allow_local_files: defaults::allow_local_files(),
+            local_roots: defaults::local_roots(),
+            max_pixels: defaults::max_pixels(),
         }
     }
 }
@@ -196,9 +208,8 @@ impl Default for DatabaseConfig {
 }
 
 /// Database backend. New backends are added here and in `apollo-storage`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
-#[derive(Default)]
 pub enum Backend {
     #[default]
     Sqlite,

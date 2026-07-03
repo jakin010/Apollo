@@ -62,6 +62,8 @@ struct Inner {
     webhook: Option<Arc<dyn WebhookSink>>,
     /// SSRF / resource limits applied to remote input fetches.
     fetch_limits: FetchLimits,
+    /// Max decoded pixels (`width * height`) per image; `None` disables the cap.
+    max_pixels: Option<u64>,
     /// Soft resident-memory cap in bytes; `None` disables the check.
     max_memory_bytes: Option<u64>,
     /// Max items queued or in-flight before submissions are rejected; `0` = off.
@@ -106,7 +108,16 @@ impl Engine {
             allowed_schemes: config.limits.allowed_schemes.clone(),
             block_private_ips: config.limits.block_private_ips,
             max_download_bytes: config.limits.max_download_bytes(),
+            allow_local_files: config.limits.allow_local_files,
+            local_roots: config
+                .limits
+                .local_roots
+                .iter()
+                .cloned()
+                .map(PathBuf::from)
+                .collect(),
         };
+        let max_pixels = (config.limits.max_pixels != 0).then_some(config.limits.max_pixels);
         let max_memory_bytes = config.app.max_memory_bytes();
         let max_pending = config.app.max_pending as usize;
 
@@ -118,6 +129,7 @@ impl Engine {
                 gate,
                 webhook,
                 fetch_limits,
+                max_pixels,
                 max_memory_bytes,
                 max_pending,
                 in_flight: AtomicUsize::new(0),

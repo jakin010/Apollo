@@ -34,6 +34,9 @@ url = "https://hooks.example.com:443"          # optional; omit the section to d
 # max_video_seconds = 3600                       # reject videos longer than this (0 = unlimited)
 # block_private_ips = true                       # refuse hosts resolving to private/loopback/link-local addresses
 # allowed_schemes   = ["http", "https"]          # URL schemes permitted for remote fetches
+# allow_local_files = false                      # allow file:// and bare local paths as inputs (off by default)
+# local_roots       = ["/srv/media"]            # dirs a local input must resolve inside (required when allow_local_files = true)
+# max_pixels        = 50000000                  # max decoded image pixels W*H, guards decompression bombs (0 = unlimited)
 
 [database]
 backend   = "sqlite"            # sqlite | postgres | surrealdb  (postgres: future)
@@ -138,4 +141,4 @@ threshold = 0.85
 architecture = "siglip"
 repo = "google/siglip-base-patch16-224"
 taxonomy_file = "taxonomy.example.toml"
-score_threshold = 0.5               # keep labels at/above this sigmoid prob
+score_threshold = 0.00001               # keep labels at/above this sigmoid prob

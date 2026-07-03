@@ -1,0 +1,201 @@
+name: Release
+
+# Triggers on any tag matching v* (e.g. v0.1.0, v1.2.3-rc1).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to create the release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  # Extra files (besides the binary) bundled into every release tarball.
+  EXTRA_FILES: "config.example.toml taxonomy.example.toml README.md LICENSE"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # macOS — Apple Silicon. Metal is compiled in automatically for macOS
+  # targets (see crates/inference/Cargo.toml's target-cfg), no feature
+  # flag needed.
+  # ---------------------------------------------------------------------
+  build-macos-arm64:
+    name: macOS (arm64)
+    runs-on: macos-latest # currently macOS 15, Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: brew install protobuf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin
+
+      - name: Build
+        run: cargo build --release --locked -p apollo --target aarch64-apple-darwin
+
+      - name: Package
+        run: |
+          bash .github/scripts/package.sh aarch64-apple-darwin "${{ github.ref_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apollo-aarch64-apple-darwin
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------
+  # macOS — Intel. macos-13 was retired in Dec 2025; macos-15-intel is the
+  # current label for x86_64 hardware.
+  # ---------------------------------------------------------------------
+  build-macos-intel:
+    name: macOS (x86_64)
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: brew install protobuf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-apple-darwin
+
+      - name: Build
+        run: cargo build --release --locked -p apollo --target x86_64-apple-darwin
+
+      - name: Package
+        run: |
+          bash .github/scripts/package.sh x86_64-apple-darwin "${{ github.ref_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apollo-x86_64-apple-darwin
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------
+  # Linux — CPU only. The portable fallback: no CUDA feature, so nothing
+  # links against the CUDA runtime and the binary starts on ANY Linux
+  # x86_64 host (GPU or not). This is what to run when CUDA is unavailable
+  # — the CUDA build below hard-links the CUDA libraries and will not even
+  # start without them.
+  # ---------------------------------------------------------------------
+  build-linux-cpu:
+    name: Linux x86_64 (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-gnu-cpu
+
+      - name: Build
+        run: cargo build --release --locked -p apollo
+
+      - name: Package
+        run: |
+          bash .github/scripts/package.sh x86_64-unknown-linux-gnu "${{ github.ref_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apollo-x86_64-unknown-linux-gnu
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------
+  # Linux — CUDA. GitHub-hosted runners have no GPU; this installs the
+  # CUDA *toolkit* (nvcc + headers + libs) so `--features cuda` compiles
+  # and links, without needing a GPU present at build time. The resulting
+  # binary needs a matching (or newer) NVIDIA driver on the machine that
+  # runs it, and dynamically links the CUDA runtime libraries — see the
+  # release notes caveat baked into package.sh.
+  # ---------------------------------------------------------------------
+  build-linux-cuda:
+    name: Linux x86_64 (CUDA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        with:
+          cuda: "12.6.0"
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-gnu-cuda
+
+      - name: Build
+        run: cargo build --release --locked -p apollo --features cuda
+
+      - name: Package
+        run: |
+          bash .github/scripts/package.sh x86_64-unknown-linux-gnu-cuda "${{ github.ref_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apollo-x86_64-unknown-linux-gnu-cuda
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------
+  # Publish: gather every platform's tarball, checksum them, and create
+  # the GitHub release with all assets attached.
+  # ---------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [build-macos-arm64, build-macos-intel, build-linux-cpu, build-linux-cuda]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          body: |
+            ## Binaries
+
+            | Platform | Notes |
+            |---|---|
+            | `apollo-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz` | Apple Silicon, Metal-accelerated |
+            | `apollo-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz` | Intel Mac, CPU |
+            | `apollo-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64, **CPU only — runs on any host, no GPU required.** Use this if you don't have an NVIDIA GPU. |
+            | `apollo-${{ github.ref_name }}-x86_64-unknown-linux-gnu-cuda.tar.gz` | Linux x86_64, built with `--features cuda`. **Hard-links the CUDA runtime: requires an NVIDIA GPU and drivers/libraries compatible with CUDA 12.6 on the host, or it will not start.** If CUDA isn't available, use the CPU build above. |
+
+            Verify with `sha256sum -c SHA256SUMS.txt`.

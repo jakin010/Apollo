@@ -1,16 +1,27 @@
 //! Compute-device selection.
 //!
-//! A single per-platform binary adapts to the machine it runs on. The backends
-//! compiled in depend on the build target:
+//! At runtime this picks the best backend that actually initializes, in the
+//! order CUDA → Metal → CPU, considering only backends compiled into the binary:
 //!
 //! * **CUDA** — compiled in only with `--features cuda` (Linux/Windows + NVIDIA
-//!   toolkit). Used at runtime only if a CUDA device initializes.
-//! * **Metal** — compiled in automatically on macOS. Used at runtime only if a
-//!   Metal device initializes.
+//!   toolkit). Selected at runtime only if a CUDA device initializes.
+//! * **Metal** — compiled in automatically on macOS. Selected only if a Metal
+//!   device initializes.
 //! * **CPU** — always available, the final fallback.
 //!
-//! Selection is therefore "look at what's actually here": a CUDA build on a host
-//! with no GPU quietly drops to CPU; a macOS build uses Metal when present.
+//! `select_device()` therefore drops to CPU whenever the preferred backend is
+//! compiled in but cannot bring up a device — no GPU present, driver mismatch,
+//! device busy. On macOS it runs regardless, since Metal ships with the OS.
+//!
+//! IMPORTANT — this fallback only covers a backend that is *present but
+//! unusable*. It does NOT make a CUDA build portable. candle links the CUDA
+//! runtime at load time (cudarc's `dynamic-linking` feature), so a
+//! `--features cuda` binary carries hard `NEEDED` entries for
+//! `libcuda`/`libcudart`/`libcublas`/`libcurand`/`libnvrtc`; if those are absent
+//! the dynamic loader aborts the process *before* `main()` and none of this code
+//! runs. To run where CUDA may be missing, ship the CPU-only build (compiled
+//! without `--features cuda`) — it links nothing CUDA-related and starts
+//! anywhere, selecting CPU here.
 
 use candle_core::Device;
 

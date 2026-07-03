@@ -81,6 +81,15 @@ pub(crate) fn block_private_ips() -> bool {
 pub(crate) fn allowed_schemes() -> Vec<String> {
     vec!["http".to_string(), "https".to_string()]
 }
+pub(crate) fn allow_local_files() -> bool {
+    false
+}
+pub(crate) fn local_roots() -> Vec<String> {
+    Vec::new()
+}
+pub(crate) fn max_pixels() -> u64 {
+    50_000_000
+}
 pub(crate) fn redelivery_secs() -> u32 {
     60
 }
