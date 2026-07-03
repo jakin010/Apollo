@@ -66,14 +66,12 @@ impl Engine {
         // cache at once, which would bypass the per-step gate (a step the gate
         // should skip could be resurrected from another task's content cache).
         // Pipelines consult the content cache per step, after the gate decision.
-        if self.cache_enabled() && item.pipeline.is_none() {
-            if let Some(url) = item_url(&item.input) {
-                if self.try_url_cache(&task_id, idx, &item, url).await {
+        if self.cache_enabled() && item.pipeline.is_none()
+            && let Some(url) = item_url(&item.input)
+                && self.try_url_cache(&task_id, idx, &item, url).await {
                     self.complete_item(&task_id, idx).await;
                     return;
                 }
-            }
-        }
 
         // Bound concurrent items globally (a coarse VRAM/throughput cap; the real
         // GPU batching happens inside each model worker). Admission is by priority:
@@ -309,12 +307,11 @@ impl Engine {
                 if let Some(r) = item.results.get(&step.model) {
                     match r.state {
                         ModelState::Done => {
-                            if let (Some(cond), Some(out)) = (&step.stop_if, &r.output) {
-                                if output_triggers(out, cond) {
+                            if let (Some(cond), Some(out)) = (&step.stop_if, &r.output)
+                                && output_triggers(out, cond) {
                                     stop_idx = Some(i);
                                     break;
                                 }
-                            }
                             continue;
                         }
                         ModelState::Skipped => continue,
@@ -345,12 +342,11 @@ impl Engine {
                                 .url_cache_store(uh, &step.model, &rev, ch)
                                 .await;
                         }
-                        if let Some(cond) = &step.stop_if {
-                            if output_triggers(&output, cond) {
+                        if let Some(cond) = &step.stop_if
+                            && output_triggers(&output, cond) {
                                 stop_idx = Some(i);
                                 break;
                             }
-                        }
                         continue;
                     }
                 }
@@ -391,12 +387,11 @@ impl Engine {
                             .upsert_model_result(task_id, idx, &step.model, &done)
                             .await;
                         item.results.insert(step.model.clone(), done);
-                        if let Some(cond) = &step.stop_if {
-                            if output_triggers(&output, cond) {
+                        if let Some(cond) = &step.stop_if
+                            && output_triggers(&output, cond) {
                                 stop_idx = Some(i);
                                 break;
                             }
-                        }
                     }
                     Err(EngineError::Cancelled) => {
                         self.cancel_item(task_id, idx).await;
@@ -608,11 +603,10 @@ impl Engine {
             return;
         }
         let desired = aggregate::task_state_for(&task);
-        if desired != task.state {
-            if let Err(e) = self.inner.storage.set_task_state(task_id, desired).await {
+        if desired != task.state
+            && let Err(e) = self.inner.storage.set_task_state(task_id, desired).await {
                 tracing::error!(task = %task_id, error = %e, "failed to roll up task state");
             }
-        }
         // Once a task is terminal, remove any staged upload files. They persist
         // across restarts (so resume can re-read them) and are cleaned exactly
         // here, when the task is finished for good.
@@ -765,6 +759,7 @@ impl Engine {
     /// frames already classified (resume), classify the rest in worker-batched
     /// chunks (persisting each as a checkpoint), and early-exit when a trigger
     /// fires. Rolls up into a `FrameScan`.
+    #[allow(clippy::too_many_arguments)]
     async fn run_frame_scan(
         &self,
         task_id: &str,
@@ -834,11 +829,10 @@ impl Engine {
                     .storage
                     .append_frame(task_id, idx, label, &frame)
                     .await;
-                if let Some((labels, threshold)) = early.as_ref() {
-                    if apollo_media::triggered(&frame.classification, labels, *threshold) {
+                if let Some((labels, threshold)) = early.as_ref()
+                    && apollo_media::triggered(&frame.classification, labels, *threshold) {
                         stop = true;
                     }
-                }
                 frames.push(frame);
                 if stop {
                     break 'scan;

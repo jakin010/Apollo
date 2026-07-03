@@ -2,8 +2,9 @@
 //! server/client) via tonic-prost-build, and emits a SEPARATE, self-contained
 //! `FileDescriptorSet` per service so each side's gRPC reflection advertises only
 //! the service it serves:
-//!   * `inference_descriptor.bin` — shared messages + the `Inference` service
-//!   * `webhook_descriptor.bin`   — shared messages + the `Webhook` service
+//!   * `inference_descriptor.bin` — shared messages + the `Inference` service.
+//!   * `webhook_descriptor.bin`   — shared messages + the `Webhook` service.
+//!
 //! Both land in `OUT_DIR` and are pulled in by `lib.rs`.
 //!
 //! Requires `protoc` on the build host (e.g. `apt-get install protobuf-compiler`
@@ -34,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(
             &[common.clone(), inference.clone(), webhook.clone()],
-            &[proto_dir.clone()],
+            std::slice::from_ref(&proto_dir),
         )?;
 
     // Emit one self-contained descriptor set per service. `--include_imports`

@@ -171,13 +171,12 @@ async fn download(url_str: &str, limits: &FetchLimits) -> Result<LocalMedia, Med
         .error_for_status()
         .map_err(|e| MediaError::Http(format!("{url_str}: {e}")))?;
 
-    if let (Some(max), Some(len)) = (limits.max_download_bytes, resp.content_length()) {
-        if len > max {
+    if let (Some(max), Some(len)) = (limits.max_download_bytes, resp.content_length())
+        && len > max {
             return Err(MediaError::Http(format!(
                 "{url_str}: content-length {len} exceeds limit of {max} bytes"
             )));
         }
-    }
 
     let mut bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = resp
@@ -185,13 +184,12 @@ async fn download(url_str: &str, limits: &FetchLimits) -> Result<LocalMedia, Med
         .await
         .map_err(|e| MediaError::Http(format!("reading body of {url_str}: {e}")))?
     {
-        if let Some(max) = limits.max_download_bytes {
-            if bytes.len() as u64 + chunk.len() as u64 > max {
+        if let Some(max) = limits.max_download_bytes
+            && bytes.len() as u64 + chunk.len() as u64 > max {
                 return Err(MediaError::Http(format!(
                     "{url_str}: download exceeds limit of {max} bytes"
                 )));
             }
-        }
         bytes.extend_from_slice(&chunk);
     }
 
@@ -251,7 +249,7 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
                 || v6
                     .to_ipv4_mapped()
-                    .map_or(false, |m| is_blocked_ip(IpAddr::V4(m)))
+                    .is_some_and(|m| is_blocked_ip(IpAddr::V4(m)))
         }
     }
 }

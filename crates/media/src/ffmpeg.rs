@@ -257,7 +257,7 @@ fn is_image_only(format_name: &str, codec: &str, duration: f64, frame_count: Opt
         return true;
     }
     const STILL_CODECS: &[&str] = &["png", "mjpeg", "bmp", "tiff", "webp", "gif"];
-    let single_frame = frame_count.map_or(true, |n| n <= 1);
+    let single_frame = frame_count.is_none_or(|n| n <= 1);
     STILL_CODECS.contains(&codec) && single_frame && duration <= 0.0
 }
 

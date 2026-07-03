@@ -169,7 +169,7 @@ fn verify_signature(secret: &[u8], request: &Request<Task>) -> Result<(), Status
 
 /// Decode a hex string (either case) to bytes, or `None` if malformed.
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     fn nibble(b: u8) -> Option<u8> {
