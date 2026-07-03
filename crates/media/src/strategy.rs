@@ -154,7 +154,6 @@ mod tests {
                     score: *s,
                 })
                 .collect(),
-            ..Default::default()
         }
     }
 

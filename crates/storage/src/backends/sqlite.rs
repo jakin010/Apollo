@@ -695,7 +695,6 @@ mod tests {
                 label: 7,
                 score: 0.99,
             }],
-            ..Default::default()
         });
         store
             .upsert_model_result("task-1", 0, "general", &ModelResult::done(out))
@@ -723,7 +722,6 @@ mod tests {
                             label: 0,
                             score: 0.8,
                         }],
-                        ..Default::default()
                     },
                 },
             )

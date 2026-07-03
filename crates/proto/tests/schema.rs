@@ -363,7 +363,7 @@ fn wire_tags_cover_each_type() {
     // bytes (length-delimited) field 2, via the ClassifyChunk oneof
     assert_eq!(
         first_wire_tag(&ClassifyChunk {
-            payload: Some(classify_chunk::Payload::Data(vec![1, 2, 3].into())),
+            payload: Some(classify_chunk::Payload::Data(vec![1, 2, 3])),
         }),
         (2, LEN)
     );
