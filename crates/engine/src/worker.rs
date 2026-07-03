@@ -128,7 +128,7 @@ fn run_batch(model: &dyn ImageClassifier, first: Job, rx: &Receiver<Job>, batch:
     }
     match model.classify(&images) {
         Ok(results) => {
-            for (reply, c) in replies.into_iter().zip(results.into_iter()) {
+            for (reply, c) in replies.into_iter().zip(results) {
                 let _ = reply.send(Ok(c));
             }
         }

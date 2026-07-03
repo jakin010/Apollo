@@ -823,7 +823,7 @@ impl Engine {
             });
             let results = futures::future::join_all(calls).await;
 
-            for (fref, res) in chunk.iter().zip(results.into_iter()) {
+            for (fref, res) in chunk.iter().zip(results) {
                 let classification = res?;
                 let frame = Frame {
                     timestamp: fref.timestamp,
