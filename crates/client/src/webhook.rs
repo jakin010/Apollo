@@ -28,30 +28,38 @@ const SIGNATURE_HEADER: &str = "x-apollo-webhook-signature";
 /// [`apollo_client::async_trait`](crate::async_trait)).
 #[tonic::async_trait]
 pub trait WebhookHandler: Send + Sync + 'static {
-    async fn on_task_status(&self, task: Task);
+    async fn on_task_status(&self, task: Task) -> Result<Response<Ack>, Status>;
 
     /// Invoked when an item has permanently failed (exhausted all retries) — the
     /// dead-letter callback (`ItemFailed`). The failed item is the one in the
     /// `Failed` state; dedupe as for [`on_task_status`](Self::on_task_status).
     /// Defaults to a no-op; override to handle dead-lettered items.
-    async fn on_item_failed(&self, task: Task) {
-        let _ = task;
-    }
+    async fn on_item_failed(&self, task: Task) -> Result<Response<Ack>, Status>;
 }
 
 /// A webhook receiver. Build it from a [`WebhookHandler`], optionally set a shared
 /// `secret` so deliveries are signature-verified for you, then `serve`.
 ///
 /// ```no_run
-/// # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
-/// # use apollo_client::{WebhookReceiver, WebhookHandler, Task};
-/// # struct Sink;
-/// # #[tonic::async_trait] impl WebhookHandler for Sink { async fn on_task_status(&self, _t: Task) {} }
-/// WebhookReceiver::new(Sink)
-///     .secret("shared-secret")          // must match the server's [webhook].secret
-///     .serve("0.0.0.0:9090".parse()?)
-///     .await?;
-/// # Ok(()) }
+/// use tonic::Response;///
+///
+/// use apollo_proto::Ack;
+/// use tonic::Status;
+/// async fn ex() -> Result<(), Box<dyn std::error::Error>> {
+///     use apollo_client::{WebhookReceiver, WebhookHandler, Task};
+///     struct Sink;
+///
+///     #[tonic::async_trait]
+///     impl WebhookHandler for Sink {
+///         async fn on_task_status(&self, _t: Task) -> Result<Response<Ack>, Status> { Ok(Response::new(Ack {})) }
+///         async fn on_item_failed(&self, _t: Task) -> Result<Response<Ack>, Status> { Ok(Response::new(Ack {})) }
+///     }
+///     WebhookReceiver::new(Sink)
+///         .secret("shared-secret")          // must match the server's [webhook].secret
+///         .serve("0.0.0.0:9090".parse()?)
+///         .await?;
+///     Ok(())
+/// }
 /// ```
 pub struct WebhookReceiver<H> {
     handler: H,
@@ -130,16 +138,14 @@ impl<H: WebhookHandler> Webhook for Service<H> {
         if let Some(secret) = &self.secret {
             verify_signature(secret, &request)?;
         }
-        self.handler.on_task_status(request.into_inner()).await;
-        Ok(Response::new(Ack {}))
+        self.handler.on_task_status(request.into_inner()).await
     }
 
     async fn item_failed(&self, request: Request<Task>) -> Result<Response<Ack>, Status> {
         if let Some(secret) = &self.secret {
             verify_signature(secret, &request)?;
         }
-        self.handler.on_item_failed(request.into_inner()).await;
-        Ok(Response::new(Ack {}))
+        self.handler.on_item_failed(request.into_inner()).await
     }
 }
 

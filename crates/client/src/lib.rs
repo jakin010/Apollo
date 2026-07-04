@@ -28,17 +28,19 @@
 //!
 //! ```no_run
 //! # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
-//! use apollo_client::{serve_webhook, WebhookHandler, Task};
+//!     use apollo_client::{serve_webhook, WebhookHandler, Task};
+//!     use apollo_proto::Ack;
+//!     use tonic::{Response, Status};
 //!
-//! struct Sink;
-//! #[tonic::async_trait]
-//! impl WebhookHandler for Sink {
-//!     async fn on_task_status(&self, task: Task) {
-//!         println!("task {} -> {:?}", task.id, task.state());
+//!     struct Sink;
+//!     #[tonic::async_trait]
+//!     impl WebhookHandler for Sink {
+//!         async fn on_task_status(&self, _t: Task) -> Result<Response<Ack>, Status> { Ok(Response::new(Ack {})) }
+//!         async fn on_item_failed(&self, _t: Task) -> Result<Response<Ack>, Status> { Ok(Response::new(Ack {})) }
 //!     }
+//!     serve_webhook("0.0.0.0:9090".parse()?, Sink).await?;
+//!     Ok(())
 //! }
-//! serve_webhook("0.0.0.0:9090".parse()?, Sink).await?;
-//! # Ok(()) }
 //! ```
 
 mod client;
