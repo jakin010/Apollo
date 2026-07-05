@@ -1,6 +1,8 @@
 # Database & persistence
 
-Apollo persists the **entire task lifecycle**, so work survives restarts and interrupted video scans resume from where they stopped. Persistence is tracked at **per‑`(item, model)`** granularity — a crash mid‑task doesn't redo already‑completed pieces — with individual classified video frames checkpointed for fine‑grained resume. The same storage layer also holds the optional result cache and the webhook delivery flags.
+Apollo persists the **entire task lifecycle**, so work survives restarts and interrupted video scans resume from where they stopped. Persistence is tracked at **per‑`(item, model)`** granularity — a crash mid‑task doesn't redo already‑completed pieces — with individual classified video frames checkpointed for fine‑grained resume. The same storage layer also holds the optional result cache and the webhook delivery flag.
+
+> **Storage keeps an item layer; the wire API does not.** Each request submits a single input, so the gRPC/webhook `Task` reports one result directly (`Task → Models → Model`, see [grpc-api.md](./grpc-api.md#result-messages)). Internally the engine still models that input as an *item* — the unit of fetch, retry (`RETRYING`), and resume — which is why the schema below is `(item, model)`-grained.
 
 All of this sits behind one `Storage` trait; the `[database].backend` setting selects the implementation at startup, and `open()` runs schema migrations before the server begins serving.
 
@@ -79,7 +81,6 @@ One row per input within a task. `PRIMARY KEY (task_id, idx)`.
 | `error` | TEXT | Item‑level error as JSON, if failed. |
 | `webhook_delivered` | INTEGER | 0/1 — the `TaskStatus` delivery flag. |
 | `retries` | INTEGER | Retry count, compared against `[app].max_retries`. |
-| `failure_delivered` | INTEGER | 0/1 — the `ItemFailed` (dead‑letter) delivery flag. |
 
 ### `model_results`
 
@@ -139,7 +140,7 @@ On startup the engine loads every task still in a non‑terminal state, fully re
 - `tasks.state` (indexed) to find incomplete work,
 - `model_results.state` + `frames` + `steps_completed` to skip already‑finished models and frames,
 - `tasks.attempts` (bumped per resume) to **fail a poison task** once it exceeds its cap instead of crash‑looping,
-- `items.webhook_delivered` / `items.failure_delivered` to redeliver any webhook that a crash left un‑acknowledged.
+- `items.webhook_delivered` to redeliver any `TaskStatus` webhook that a crash left un‑acknowledged.
 
 ---
 

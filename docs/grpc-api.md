@@ -32,7 +32,7 @@ A validation failure returns `InvalidArgument` and no task is created. On succes
 
 ### `GetTask(GetTaskRequest) → Task`
 
-Returns the full current `Task` (state + per‑item, per‑model results). Returns `NotFound` if the id is unknown. Because task state is persisted, this works across server restarts and for finished tasks (until they are purged by [retention](./database.md#retention)).
+Returns the full current `Task` — its `result` oneof carries a task‑level `error`, a live `state`, or the per‑model `models` once finished. Returns `NotFound` if the id is unknown. Because task state is persisted, this works across server restarts and for finished tasks (until they are purged by [retention](./database.md#retention)).
 
 ### `CancelTask(CancelRequest) → Task`
 
@@ -102,23 +102,28 @@ Notes:
 ```protobuf
 message Task {
   string id = 1;
-  TaskState state = 2;
-  repeated ItemResult items = 3;    // aligned to submitted items; Classify → length 1
-}
 
-message ItemResult {
-  ItemState state = 1;
-  map<string, ModelResult> results = 2;   // keyed by model label
-  Error error = 3;                          // set on item‑level failure (e.g. fetch failed)
-}
+  reserved 2 to 99;                         // previous layout (state/items) — retired
 
-message ModelResult {
-  ModelState state = 1;
-  oneof output {                            // set only when state == DONE
-    Classification classification = 2;      // image input
-    FrameScan      frame_scan     = 3;      // image classifier applied to a video
+  oneof result {
+    Error     error  = 100;                 // task‑level failure (implicit "failed")
+    TaskState state  = 101;                 // non‑terminal or cancelled
+    Models    models = 102;                 // per‑model results (implicit "completed")
   }
-  Error error = 4;                          // set only when state == FAILED
+}
+
+message Models {
+  optional string pipeline = 1;             // the pipeline the input ran through, if any
+  map<string, Model> models = 2;            // keyed by model label
+}
+
+message Model {
+  oneof result {
+    Error          error          = 1;      // this model failed (implicit "failed")
+    ModelState     state          = 2;      // still queued / processing, or skipped
+    Classification classification = 3;      // image input (implicit "done")
+    FrameScan      frame_scan     = 4;      // classifier over a video (implicit "done")
+  }
 }
 
 message Classification {
@@ -141,11 +146,12 @@ message Prediction { uint32 label = 1; float score = 2; }
 
 **Result semantics:**
 
+- A `Task` reports its outcome through a single `result` oneof: `error` for a task‑level failure, `state` while it is queued / processing (or cancelled), or `models` once it finishes. The presence of `models` is itself the "completed" signal and `error` the "failed" signal — there is no explicit `COMPLETED`/`FAILED` state. Each `Model` likewise carries exactly one of an `error`, a live `state`, or a result payload (`classification` / `frame_scan`).
 - A `Classification` returns the **top 5 predictions unioned with any label scoring above 0.90** — so a confident sixth label is never dropped, and you always get at least the top few.
 - `label` is an integer id, never a name: a class index for `vit`, a label‑list index for `siglip` with a plain `labels` list, or a **taxonomy child‑category id** for `siglip` with a taxonomy. Map ids back to names using your `labels`/taxonomy definition.
 - For `siglip`, `score` is an independent **sigmoid probability**; the `score_threshold` on the model controls which labels are kept.
 - Video results come back as a `FrameScan`: `aggregated` is the roll‑up across classified frames (using the strategy's `max`/`mean` aggregation), and `frames` are the individual classified frames (truncated if the scan early‑exited).
-- One model failing does **not** sink the others — its `ModelResult` carries the `error`; sibling models still report their results.
+- One model failing does **not** sink the others — that model's `Model.result` is an `error`; sibling models still report their `classification` / `frame_scan`.
 
 ### `Error` — structured failures
 
@@ -167,7 +173,7 @@ enum ErrorType {
 }
 ```
 
-`Error` appears at two levels: on `ItemResult` (item‑wide failures such as an unfetchable input) and on `ModelResult` (a single model's failure). Switch on `kind` for programmatic handling; `message` carries the detail (for a purely ad‑hoc error, `kind` is `UNSPECIFIED` and everything is in `message`).
+`Error` appears at two levels: on `Task.result` (a task‑wide failure such as an unfetchable input) and on `Model.result` (a single model's failure). Switch on `kind` for programmatic handling; `message` carries the detail (for a purely ad‑hoc error, `kind` is `UNSPECIFIED` and everything is in `message`).
 
 ---
 
@@ -178,32 +184,20 @@ enum TaskState {
   TASK_STATE_UNSPECIFIED = 0;
   TASK_STATE_QUEUED      = 1;
   TASK_STATE_PROCESSING  = 2;
-  TASK_STATE_COMPLETED   = 3;   // all items reached a terminal state (success or not)
-  TASK_STATE_FAILED      = 4;   // failed before any item could run
+  reserved 3, 4;                 // was COMPLETED / FAILED — now implicit (see Task.result)
   TASK_STATE_CANCELLED   = 5;
-}
-
-enum ItemState {
-  ITEM_STATE_UNSPECIFIED = 0;
-  ITEM_STATE_QUEUED      = 1;
-  ITEM_STATE_PROCESSING  = 2;
-  ITEM_STATE_COMPLETED   = 3;
-  ITEM_STATE_FAILED      = 4;
-  ITEM_STATE_CANCELLED   = 5;
-  ITEM_STATE_RETRYING    = 6;   // a previous attempt failed; queued to retry
 }
 
 enum ModelState {
   MODEL_STATE_UNSPECIFIED = 0;
   MODEL_STATE_QUEUED      = 1;
   MODEL_STATE_PROCESSING  = 2;
-  MODEL_STATE_DONE        = 3;
-  MODEL_STATE_FAILED      = 4;
+  reserved 3, 4;                 // was DONE / FAILED — now implicit (see Model.result)
   MODEL_STATE_SKIPPED     = 5;   // skipped because an earlier pipeline gate fired
 }
 ```
 
-`TASK_STATE_COMPLETED` means every item reached a terminal state — **not** that every model succeeded. Inspect each `ModelResult.state`/`error` for per‑model outcomes.
+There is no `COMPLETED`/`FAILED` state: a finished task carries `models` in its `result` (completed) or `error` (failed), and `state` appears only while it is queued / processing or was cancelled. Completion means every model was **attempted** — not that every model succeeded, so inspect each `Model.result` for per‑model outcomes. The same pattern applies to `Model`: a finished model carries a result payload or an `error`, and `ModelState` conveys only queued / processing / skipped.
 
 ---
 

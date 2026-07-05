@@ -40,7 +40,7 @@ Relative `taxonomy_file` paths inside a model are resolved against the **config 
 | `log_level` | string | `"info"` | `trace`/`debug`/`info`/`warn`/`error`. The `RUST_LOG` env var overrides this at startup. |
 | `max_memory` | size | `"4gb"` | Soft resident‑memory ceiling. New work is rejected with `RESOURCE_EXHAUSTED` while usage is above it (`0` = off). |
 | `max_pending` | u32 | `1024` | Max items queued or in‑flight before submissions are rejected with `RESOURCE_EXHAUSTED` (backpressure). `0` = off. |
-| `max_retries` | u32 | `3` | Times a failed item is retried before it is marked failed (and reported via the `ItemFailed` dead‑letter webhook). `0` = no retries. |
+| `max_retries` | u32 | `3` | Times a failed item is retried before it is marked failed. `0` = no retries. |
 
 ---
 
@@ -77,9 +77,9 @@ Clients send the token in the **`authorization`** metadata header (with or witho
 
 ---
 
-## `[limits]` — remote‑fetch safety (SSRF + resource guards)
+## `[limits]` — input safety (SSRF, local‑file, and resource guards)
 
-Applied when fetching remote inputs.
+Guards applied to inputs: SSRF protection when fetching remote URLs, a gate on local‑file inputs, and caps that bound resource use during download and decode.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -87,6 +87,11 @@ Applied when fetching remote inputs.
 | `max_video_seconds` | u32 | `3600` | Reject videos longer than this. `0` = unlimited. |
 | `block_private_ips` | bool | `true` | Refuse hosts resolving to private / loopback / link‑local addresses (SSRF guard). |
 | `allowed_schemes` | list | `["http", "https"]` | URL schemes permitted for remote fetches. |
+| `allow_local_files` | bool | `false` | Allow `file://` and bare local‑path inputs. Off by default; even when on, a path must resolve inside one of `local_roots`. |
+| `local_roots` | list | `[]` | Directories a local‑file input may resolve inside (checked after canonicalization, so `..`/symlinks can't escape). Empty means no local path is permitted, even with `allow_local_files = true`. |
+| `max_pixels` | u64 | `50000000` | Max decoded image pixels (width × height), rejecting decompression bombs before the pixel buffer is allocated. `0` = unlimited. Applies to still images and to sampled video frames. |
+
+> `max_download` caps the *encoded* bytes; `max_pixels` caps the *decoded* resolution — a small, highly compressible image can blow past memory even under the download cap, so both matter. Local‑file inputs (`file://` / bare paths) are refused unless you explicitly opt in via `allow_local_files` **and** list `local_roots`; this keeps an untrusted request from reading arbitrary files off the server.
 
 ---
 
@@ -247,7 +252,7 @@ score_threshold = 0.1        # low, so frame‑scan peaks survive aggregation
 
 ## `[pipelines.<name>]` — ordered, gated model execution
 
-A pipeline runs its steps in ascending `order` for one input, instead of running `models` as a parallel set. If a step's optional `stop_if` gate fires (any listed category id at/above the threshold on that model's output), the pipeline **early‑exits** and later steps are marked `SKIPPED` — the task completes normally and fires the task webhook. A step **failure** (inference error) instead fails the whole pipeline, which is retried up to `[app].max_retries` and then dead‑lettered.
+A pipeline runs its steps in ascending `order` for one input, instead of running `models` as a parallel set. If a step's optional `stop_if` gate fires (any listed category id at/above the threshold on that model's output), the pipeline **early‑exits** and later steps are marked `SKIPPED` — the task completes normally and fires the task webhook. A step **failure** (inference error) instead fails the whole pipeline, which is retried up to `[app].max_retries` and then marked failed.
 
 A request opts in by setting `pipeline = "<name>"` on its item (instead of `models`).
 

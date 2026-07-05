@@ -12,7 +12,7 @@ Models are loaded from [Hugging Face](https://huggingface.co/) and executed with
 - **Classify a video.** Any image classifier can be pointed at a video; Apollo samples frames according to a named **strategy**, classifies each frame, and rolls the per‑frame scores up into one result. Scans can **early‑exit** as soon as a trigger label fires.
 - **Run ordered pipelines.** Instead of running models as a parallel set, an input can be sent through a named **pipeline** whose steps run in order and can **gate** (stop early) based on a previous step's output — e.g. "run the NSFW model first; only run the expensive category model if it's clean."
 - **Skip repeated work.** An optional result **cache** keys model outputs by content hash, so identical inputs don't get re‑inferred.
-- **Notify on completion.** An optional **webhook** fires as each item reaches a terminal state, with a dead‑letter signal for items that exhaust their retries.
+- **Notify on completion.** An optional **webhook** fires as a task reaches a terminal state (and on intermediate transitions), carrying the full current `Task`.
 
 ## Core concepts
 
@@ -64,7 +64,7 @@ There is **no separate video architecture** — video is always "an image classi
 2. The scheduler fetches the input **once**, then fans it out to each model's worker. A global concurrency cap (a priority‑ordered gate) bounds how many inferences run at once (your VRAM budget).
 3. Each model runs on its own dedicated worker thread that **lazily loads** weights on first use, **batches** concurrent requests into one forward pass, and **unloads** after an idle timeout (unless the model is pinned with `keep_in_memory`).
 4. Results are written per `(item, model)` as they complete. For video, each classified frame is checkpointed so an interrupted scan resumes without re‑doing frames.
-5. When every model for an item is done, the item reaches a terminal state, the webhook (if configured) fires, and `GetTask` reflects the final result. A failing item is **retried** up to `[app].max_retries`, then **dead‑lettered** (the `ItemFailed` webhook).
+5. When every model for an item is done, the item reaches a terminal state, the webhook (if configured) fires, and `GetTask` reflects the final result. A failing item is **retried** up to `[app].max_retries` before being marked failed.
 
 On startup the engine **recovers** any tasks left non‑terminal by a previous run and re‑queues them; a poison task that keeps crashing is failed once its resume‑attempt count exceeds the cap.
 

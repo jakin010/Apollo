@@ -11,29 +11,27 @@ The contract is `apollo.v1.Webhook`, defined in `proto/webhook.proto` (sharing m
 ```protobuf
 service Webhook {
   rpc TaskStatus (Task) returns (Ack);
-  rpc ItemFailed (Task) returns (Ack);
 }
 
 message Ack {}   // empty acknowledgement
 ```
 
-Both methods take a **bare `Task`** (the same `Task` message `GetTask` returns) and return an empty `Ack`. Return a successful gRPC response to acknowledge; return an error status to signal a delivery failure (Apollo will retry — see below).
+`TaskStatus` takes a **bare `Task`** (the same `Task` message `GetTask` returns) and returns an empty `Ack`. Return a successful gRPC response (an `Ack`) to acknowledge; return an error status to signal a delivery failure (Apollo will retry — see below).
 
 | Method | Fired when |
 |--------|-----------|
-| `TaskStatus` | An item reaches a terminal state (`queued → … → completed / failed / cancelled`), including intermediate transitions like `retrying`. |
-| `ItemFailed` | **Additionally** for an item that has exhausted all retries — a dead‑letter signal. The permanently‑failed item is the one in the `FAILED` state. |
+| `TaskStatus` | The task reaches a terminal state (finished with `models`, failed with `error`, or cancelled), and on intermediate transitions while it is processing. |
 
-Both carry the **full current `Task`**, so the receiver sees all items and their results, not just the one that changed.
+It carries the **full current `Task`**, so the receiver sees the task's `result` — its per‑model `models`, an `error`, or a live `state` — not just what changed.
 
 ---
 
 ## Delivery semantics
 
-- **One delivery per terminal item.** The webhook fires as each item reaches a terminal state; a single‑item task (every `Classify`) therefore produces one `TaskStatus` delivery when it finishes.
-- **At‑least‑once.** Apollo persists a per‑item "delivered" flag and only clears it after a successful call, but a crash between the model finishing and the flag being set will cause a redelivery. **Receivers must dedupe.** Dedupe on `Task.id` plus the index of the item that is terminal (for `ItemFailed`, the item in the `FAILED` state).
-- **Retries on failure.** If a delivery fails (the receiver is down or returns an error), it is retried by a background loop every `[webhook].redelivery_secs` seconds (default 60; `0` disables periodic retry). Undelivered items are also retried on server **restart**, recovered from the persisted flag.
-- **Which items reached a terminal state** is something the receiver computes from the payload; the wire message is intentionally the whole `Task`.
+- **One delivery as the task finishes** (plus intermediate transitions). Every `Classify` submits a single input, so a task produces a `TaskStatus` delivery when it reaches a terminal state.
+- **At‑least‑once.** Apollo persists a "delivered" flag and only clears it after a successful call, but a crash between finishing and the flag being set will cause a redelivery. **Receivers must dedupe on `Task.id`.**
+- **Retries on failure.** If a delivery fails (the receiver is down or returns an error), it is retried by a background loop every `[webhook].redelivery_secs` seconds (default 60; `0` disables periodic retry). Undelivered webhooks are also retried on server **restart**, recovered from the persisted flag.
+- **Whether the task finished, failed, or is still processing** is read from the payload's `result` (`models` / `error` / `state`); the wire message is intentionally the whole `Task`.
 
 Because delivery is at‑least‑once and unordered across retries, treat each webhook as "here is the current state of this task" rather than "here is a single event."
 
@@ -71,22 +69,18 @@ See [configuration.md → Webhook](./configuration.md#webhook--outbound-delivery
 
 ## Implementing a receiver
 
-Generate server stubs from `proto/webhook.proto` (which imports `common.proto`) in your language of choice, then implement `TaskStatus` and `ItemFailed`. A minimal sketch:
+Generate server stubs from `proto/webhook.proto` (which imports `common.proto`) in your language of choice, then implement `TaskStatus`. A minimal sketch:
 
 ```text
 service Webhook:
   rpc TaskStatus(task):
       verify x-apollo-webhook-signature == hex(HMAC_SHA256(secret, task.id))   # if a secret is set
-      terminal = [i for i in task.items if i.state in (COMPLETED, FAILED, CANCELLED)]
-      if already_processed(task.id, terminal_indexes):   # idempotency / dedupe
+      if already_processed(task.id):        # idempotency / dedupe
           return Ack()
-      persist(task)
-      return Ack()
-
-  rpc ItemFailed(task):
-      # dead‑letter: an item exhausted its retries (the one in state FAILED)
-      verify signature as above
-      alert_or_record_dead_letter(task)
+      switch task.result:
+          case models:  record success (per‑model results in models.models)
+          case error:   record the task‑level failure
+          case state:   still processing / cancelled (optional to handle)
       return Ack()
 ```
 

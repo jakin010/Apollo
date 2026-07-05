@@ -145,15 +145,17 @@ jobs:
       # bf16) or 90 to pin to Hopper.
       CUDA_COMPUTE_CAP: ${{ vars.CUDA_COMPUTE_CAP || '80' }}
     steps:
-      # The CUDA image is a bare toolkit image (no host compiler, git, or
-      # curl), so install the host-side build prerequisites first: nvcc needs
-      # a C/C++ compiler, checkout needs git, rustup needs curl. No `sudo` —
-      # the container runs as root.
+      # The CUDA image is a bare toolkit image (no host compiler, git, curl, or
+      # openssl), so install the host-side build prerequisites first: nvcc needs
+      # a C/C++ compiler, checkout needs git, rustup needs curl, and openssl-sys
+      # (pulled by hf-hub's model downloader) needs libssl-dev + pkg-config.
+      # ubuntu-latest ships these already, which is why only this container job
+      # needs them. No `sudo` — the container runs as root.
       - name: Install build prerequisites
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git curl ca-certificates build-essential pkg-config protobuf-compiler
+            git curl ca-certificates build-essential pkg-config libssl-dev protobuf-compiler
 
       - uses: actions/checkout@v4
 
