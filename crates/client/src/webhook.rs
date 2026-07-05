@@ -9,7 +9,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -20,46 +20,37 @@ use apollo_proto::{Ack, Task};
 /// Metadata header carrying the delivery signature.
 const SIGNATURE_HEADER: &str = "x-apollo-webhook-signature";
 
-/// Handle task-status callbacks. Invoked once per item as it reaches a terminal
-/// state, carrying the full current [`Task`]. Delivery is at-least-once, so
-/// dedupe (e.g. by `Task.id` plus which items are terminal).
+/// Handle task-status callbacks. Invoked as a task reaches a terminal state (and
+/// on intermediate transitions), carrying the full current [`Task`]. Delivery is
+/// at-least-once, so dedupe (e.g. by `Task.id`).
+///
+/// Return `Ok(Response::new(Ack {}))` to acknowledge the delivery; returning an
+/// error `Status` tells the sender the delivery was not accepted, so it will be
+/// retried on the next redelivery pass.
 ///
 /// Implement with `#[tonic::async_trait]` (re-exported as
 /// [`apollo_client::async_trait`](crate::async_trait)).
 #[tonic::async_trait]
 pub trait WebhookHandler: Send + Sync + 'static {
     async fn on_task_status(&self, task: Task) -> Result<Response<Ack>, Status>;
-
-    /// Invoked when an item has permanently failed (exhausted all retries) — the
-    /// dead-letter callback (`ItemFailed`). The failed item is the one in the
-    /// `Failed` state; dedupe as for [`on_task_status`](Self::on_task_status).
-    /// Defaults to a no-op; override to handle dead-lettered items.
-    async fn on_item_failed(&self, task: Task) -> Result<Response<Ack>, Status>;
 }
 
 /// A webhook receiver. Build it from a [`WebhookHandler`], optionally set a shared
 /// `secret` so deliveries are signature-verified for you, then `serve`.
 ///
 /// ```no_run
-/// use tonic::Response;///
-///
-/// use apollo_proto::Ack;
-/// use tonic::Status;
-/// async fn ex() -> Result<(), Box<dyn std::error::Error>> {
-///     use apollo_client::{WebhookReceiver, WebhookHandler, Task};
-///     struct Sink;
-///
-///     #[tonic::async_trait]
-///     impl WebhookHandler for Sink {
-///         async fn on_task_status(&self, _t: Task) -> Result<Response<Ack>, Status> { Ok(Response::new(Ack {})) }
-///         async fn on_item_failed(&self, _t: Task) -> Result<Response<Ack>, Status> { Ok(Response::new(Ack {})) }
-///     }
-///     WebhookReceiver::new(Sink)
-///         .secret("shared-secret")          // must match the server's [webhook].secret
-///         .serve("0.0.0.0:9090".parse()?)
-///         .await?;
-///     Ok(())
-/// }
+/// # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
+/// # use apollo_client::{WebhookReceiver, WebhookHandler, Task, Ack};
+/// # use tonic::{Response, Status};
+/// # struct Sink;
+/// # #[tonic::async_trait] impl WebhookHandler for Sink {
+/// #     async fn on_task_status(&self, _t: Task) -> Result<Response<Ack>, Status> { Ok(Response::new(Ack {})) }
+/// # }
+/// WebhookReceiver::new(Sink)
+///     .secret("shared-secret")          // must match the server's [webhook].secret
+///     .serve("0.0.0.0:9090".parse()?)
+///     .await?;
+/// # Ok(()) }
 /// ```
 pub struct WebhookReceiver<H> {
     handler: H,
@@ -139,13 +130,6 @@ impl<H: WebhookHandler> Webhook for Service<H> {
             verify_signature(secret, &request)?;
         }
         self.handler.on_task_status(request.into_inner()).await
-    }
-
-    async fn item_failed(&self, request: Request<Task>) -> Result<Response<Ack>, Status> {
-        if let Some(secret) = &self.secret {
-            verify_signature(secret, &request)?;
-        }
-        self.handler.on_item_failed(request.into_inner()).await
     }
 }
 

@@ -42,41 +42,69 @@ fn url_from_proto(u: pb::Url) -> dom::Url {
 
 // ------------------------------ domain -> proto ------------------------------
 
-/// Full task tree, for `GetTask` responses and webhook payloads.
+/// Full task, for `GetTask` responses and webhook payloads. A domain task carries
+/// exactly one input, which maps onto the `Task.result` oneof: a task-level error,
+/// a non-terminal/cancelled `state`, or the per-model `models` once finished.
 pub(crate) fn task_to_proto(t: dom::Task) -> pb::Task {
-    pb::Task {
-        id: t.id,
-        state: task_state(t.state) as i32,
-        items: t.items.into_iter().map(item_to_proto).collect(),
+    let dom::Task {
+        id,
+        state,
+        mut items,
+    } = t;
+    let result = (!items.is_empty()).then(|| task_result(state, items.remove(0)));
+    pb::Task { id, result }
+}
+
+/// Map the (single) domain item + task state onto `Task.result`:
+///   * an item-level error, or a `Failed` task -> `error` (implicit "failed");
+///   * a `Completed` task                      -> `models` (implicit "completed");
+///   * otherwise                     -> `state` (queued / processing / cancelled).
+fn task_result(state: dom::TaskState, it: dom::Item) -> pb::task::Result {
+    use pb::task::Result as R;
+    if let Some(err) = it.error {
+        return R::Error(error_to_proto(err));
+    }
+    match state {
+        dom::TaskState::Completed => {
+            let models: HashMap<String, pb::Model> = it
+                .results
+                .into_iter()
+                .map(|(label, r)| (label, model_to_proto(r)))
+                .collect();
+            R::Models(pb::Models {
+                pipeline: it.pipeline,
+                models,
+            })
+        }
+        // Failed with no attached error: surface a generic task-level error so the
+        // oneof still distinguishes failure from a live state.
+        dom::TaskState::Failed => R::Error(pb::Error {
+            kind: pb::ErrorType::Unspecified as i32,
+            message: "task failed".to_string(),
+        }),
+        dom::TaskState::Queued => R::State(pb::TaskState::Queued as i32),
+        dom::TaskState::Processing => R::State(pb::TaskState::Processing as i32),
+        dom::TaskState::Cancelled => R::State(pb::TaskState::Cancelled as i32),
     }
 }
 
-fn item_to_proto(it: dom::Item) -> pb::ItemResult {
-    let results: HashMap<String, pb::ModelResult> = it
-        .results
-        .into_iter()
-        .map(|(label, r)| (label, model_to_proto(r)))
-        .collect();
-    pb::ItemResult {
-        state: item_state(it.state) as i32,
-        results,
-        error: it.error.map(error_to_proto),
-    }
-}
-
-fn model_to_proto(m: dom::ModelResult) -> pb::ModelResult {
-    pb::ModelResult {
-        state: model_state(m.state) as i32,
-        output: m.output.map(output_to_proto),
-        error: m.error.map(error_to_proto),
-    }
-}
-
-fn output_to_proto(o: dom::ModelOutput) -> pb::model_result::Output {
-    use pb::model_result::Output;
-    match o {
-        dom::ModelOutput::Classification(c) => Output::Classification(classification_to_proto(c)),
-        dom::ModelOutput::FrameScan(f) => Output::FrameScan(frame_scan_to_proto(f)),
+/// Map one domain model result onto `Model.result`: an error (implicit "failed"),
+/// a classification / frame-scan output (implicit "done"), or a live `state`
+/// (queued / processing / skipped).
+fn model_to_proto(m: dom::ModelResult) -> pb::Model {
+    use pb::model::Result as R;
+    let result = if let Some(err) = m.error {
+        R::Error(error_to_proto(err))
+    } else if let Some(output) = m.output {
+        match output {
+            dom::ModelOutput::Classification(c) => R::Classification(classification_to_proto(c)),
+            dom::ModelOutput::FrameScan(f) => R::FrameScan(frame_scan_to_proto(f)),
+        }
+    } else {
+        R::State(model_state(m.state) as i32)
+    };
+    pb::Model {
+        result: Some(result),
     }
 }
 
@@ -130,34 +158,14 @@ fn frame_to_proto(fr: dom::Frame) -> pb::Frame {
 
 // enums (domain has no `Unspecified`; we never emit it)
 
-fn task_state(s: dom::TaskState) -> pb::TaskState {
-    match s {
-        dom::TaskState::Queued => pb::TaskState::Queued,
-        dom::TaskState::Processing => pb::TaskState::Processing,
-        dom::TaskState::Completed => pb::TaskState::Completed,
-        dom::TaskState::Failed => pb::TaskState::Failed,
-        dom::TaskState::Cancelled => pb::TaskState::Cancelled,
-    }
-}
-
-fn item_state(s: dom::ItemState) -> pb::ItemState {
-    match s {
-        dom::ItemState::Queued => pb::ItemState::Queued,
-        dom::ItemState::Processing => pb::ItemState::Processing,
-        dom::ItemState::Completed => pb::ItemState::Completed,
-        dom::ItemState::Retrying => pb::ItemState::Retrying,
-        dom::ItemState::Failed => pb::ItemState::Failed,
-        dom::ItemState::Cancelled => pb::ItemState::Cancelled,
-    }
-}
-
+/// Non-terminal / skipped model state. Done and Failed are conveyed by the
+/// output / error arms of `Model.result`, so they never reach here.
 fn model_state(s: dom::ModelState) -> pb::ModelState {
     match s {
         dom::ModelState::Queued => pb::ModelState::Queued,
         dom::ModelState::Processing => pb::ModelState::Processing,
-        dom::ModelState::Done => pb::ModelState::Done,
-        dom::ModelState::Failed => pb::ModelState::Failed,
         dom::ModelState::Skipped => pb::ModelState::Skipped,
+        dom::ModelState::Done | dom::ModelState::Failed => pb::ModelState::Unspecified,
     }
 }
 
@@ -239,8 +247,28 @@ mod tests {
         assert!(submission_from_proto(item).is_err());
     }
 
+    fn item(
+        state: dom::ItemState,
+        results: std::collections::BTreeMap<String, dom::ModelResult>,
+        error: Option<dom::TaskError>,
+        pipeline: Option<String>,
+    ) -> dom::Item {
+        dom::Item {
+            input: dom::Input::Image(dom::Url {
+                main: "u".into(),
+                fallback: None,
+            }),
+            models: vec!["m".into()],
+            pipeline,
+            state,
+            results,
+            error,
+            retries: 0,
+        }
+    }
+
     #[test]
-    fn task_maps_states_results_and_classification() {
+    fn completed_task_maps_to_models_with_classification() {
         let classification = dom::Classification {
             predictions: vec![dom::Prediction {
                 label: 7,
@@ -255,63 +283,67 @@ mod tests {
         let task = dom::Task {
             id: "t1".into(),
             state: dom::TaskState::Completed,
-            items: vec![dom::Item {
-                input: dom::Input::Image(dom::Url {
-                    main: "u".into(),
-                    fallback: None,
-                }),
-                models: vec!["m".into()],
-                pipeline: None,
-                state: dom::ItemState::Completed,
+            items: vec![item(
+                dom::ItemState::Completed,
                 results,
-                error: None,
-                retries: 0,
-            }],
+                None,
+                Some("p".into()),
+            )],
         };
 
         let pt = task_to_proto(task);
         assert_eq!(pt.id, "t1");
-        assert_eq!(pt.state, pb::TaskState::Completed as i32);
-        assert_eq!(pt.items.len(), 1);
-
-        let item = &pt.items[0];
-        assert_eq!(item.state, pb::ItemState::Completed as i32);
-        assert!(item.error.is_none());
-
-        let mr = item.results.get("m").expect("model result present");
-        assert_eq!(mr.state, pb::ModelState::Done as i32);
-        match &mr.output {
-            Some(pb::model_result::Output::Classification(c)) => {
+        let models = match pt.result {
+            Some(pb::task::Result::Models(m)) => m,
+            other => panic!("expected a Models result, got {other:?}"),
+        };
+        assert_eq!(models.pipeline.as_deref(), Some("p"));
+        let model = models.models.get("m").expect("model result present");
+        match &model.result {
+            Some(pb::model::Result::Classification(c)) => {
                 assert_eq!(c.predictions.len(), 1);
                 assert_eq!(c.predictions[0].label, 7);
                 assert!((c.predictions[0].score - 0.9).abs() < 1e-6);
             }
-            _ => panic!("expected a classification output"),
+            other => panic!("expected a classification, got {other:?}"),
         }
     }
 
     #[test]
-    fn item_level_error_becomes_string() {
+    fn task_error_maps_to_error_result() {
         let task = dom::Task {
             id: "t2".into(),
-            state: dom::TaskState::Completed,
-            items: vec![dom::Item {
-                input: dom::Input::Image(dom::Url {
-                    main: "u".into(),
-                    fallback: None,
-                }),
-                models: vec!["m".into()],
-                pipeline: None,
-                state: dom::ItemState::Failed,
-                results: std::collections::BTreeMap::new(),
-                error: Some(dom::TaskError::fetch("fetch failed")),
-                retries: 0,
-            }],
+            state: dom::TaskState::Failed,
+            items: vec![item(
+                dom::ItemState::Failed,
+                std::collections::BTreeMap::new(),
+                Some(dom::TaskError::fetch("fetch failed")),
+                None,
+            )],
         };
-        let pt = task_to_proto(task);
-        assert_eq!(pt.items[0].state, pb::ItemState::Failed as i32);
-        let e = pt.items[0].error.as_ref().expect("item error present");
-        assert_eq!(e.kind, pb::ErrorType::Fetch as i32);
-        assert_eq!(e.message, "fetch failed");
+        let err = match task_to_proto(task).result {
+            Some(pb::task::Result::Error(e)) => e,
+            other => panic!("expected an Error result, got {other:?}"),
+        };
+        assert_eq!(err.kind, pb::ErrorType::Fetch as i32);
+        assert_eq!(err.message, "fetch failed");
+    }
+
+    #[test]
+    fn live_task_maps_to_state() {
+        let task = dom::Task {
+            id: "t3".into(),
+            state: dom::TaskState::Processing,
+            items: vec![item(
+                dom::ItemState::Processing,
+                std::collections::BTreeMap::new(),
+                None,
+                None,
+            )],
+        };
+        match task_to_proto(task).result {
+            Some(pb::task::Result::State(s)) => assert_eq!(s, pb::TaskState::Processing as i32),
+            other => panic!("expected a State result, got {other:?}"),
+        }
     }
 }

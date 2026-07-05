@@ -1,6 +1,6 @@
 [package]
 name = "apollo-server"
-version = "1.0.1"
+version.workspace = true
 edition.workspace = true
 
 [dependencies]
@@ -10,8 +10,8 @@ apollo-proto  = { path = "../proto" }
 tonic = { workspace = true }
 tonic-reflection = "0.14"
 tonic-health = "0.14"
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13.0"
+sha2 = "0.11.0"
 pasetors = "0.7"
 thiserror = "2"
 tokio = { workspace = true, features = ["fs", "io-util", "rt"] }

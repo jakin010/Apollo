@@ -119,31 +119,43 @@ jobs:
           path: dist/*.tar.gz
 
   # ---------------------------------------------------------------------
-  # Linux — CUDA. GitHub-hosted runners have no GPU; this installs the
-  # CUDA *toolkit* (nvcc + headers + libs) so `--features cuda` compiles
-  # and links, without needing a GPU present at build time. The resulting
-  # binary needs a matching (or newer) NVIDIA driver on the machine that
-  # runs it, and dynamically links the CUDA runtime libraries — see the
-  # release notes caveat baked into package.sh.
+  # Linux — CUDA. GitHub-hosted runners have no GPU, so we build inside
+  # NVIDIA's official CUDA *devel* image: it ships nvcc, the full set of
+  # CUDA libraries (cudart, cublas, cublasLt, curand, nvrtc) with their
+  # linker symlinks, headers, and the libcuda *stub* — everything needed to
+  # compile and link candle's CUDA backend without a GPU present. cudarc
+  # adds the stub dir to the link search path itself, so `-lcuda` resolves
+  # against the stub. The resulting binary hard-links the CUDA runtime and
+  # needs a matching NVIDIA driver on the host to run (see the release
+  # notes); if CUDA is unavailable, use the CPU build above.
   # ---------------------------------------------------------------------
   build-linux-cuda:
     name: Linux x86_64 (CUDA)
     runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.6.2-devel-ubuntu22.04
+    env:
+      # No GPU on the runner, so candle-kernels cannot detect the compute
+      # capability via nvidia-smi — set it explicitly (this was the build
+      # failure). The kernels build to PTX, which is forward-compatible, so
+      # this is the MINIMUM GPU generation: newer cards (Ada sm_89, Hopper
+      # sm_90, ...) run it via driver JIT. Default sm_80 (Ampere: A100 / A10
+      # / RTX 30xx) also keeps candle's bf16 kernels enabled (disabled below
+      # sm_80). Override with a repo variable, e.g. 75 for T4/Turing (loses
+      # bf16) or 90 to pin to Hopper.
+      CUDA_COMPUTE_CAP: ${{ vars.CUDA_COMPUTE_CAP || '80' }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install protoc
+      # The CUDA image is a bare toolkit image (no host compiler, git, or
+      # curl), so install the host-side build prerequisites first: nvcc needs
+      # a C/C++ compiler, checkout needs git, rustup needs curl. No `sudo` —
+      # the container runs as root.
+      - name: Install build prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential pkg-config protobuf-compiler
 
-      - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.19
-        id: cuda-toolkit
-        with:
-          cuda: "12.6.0"
-          method: network
-          sub-packages: '["nvcc", "cudart"]'
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -155,8 +167,7 @@ jobs:
         run: cargo build --release --locked -p apollo --features cuda
 
       - name: Package
-        run: |
-          bash .github/scripts/package.sh x86_64-unknown-linux-gnu-cuda "${{ github.ref_name }}"
+        run: bash .github/scripts/package.sh x86_64-unknown-linux-gnu-cuda "${{ github.ref_name }}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -196,6 +207,6 @@ jobs:
             | `apollo-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz` | Apple Silicon, Metal-accelerated |
             | `apollo-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz` | Intel Mac, CPU |
             | `apollo-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64, **CPU only — runs on any host, no GPU required.** Use this if you don't have an NVIDIA GPU. |
-            | `apollo-${{ github.ref_name }}-x86_64-unknown-linux-gnu-cuda.tar.gz` | Linux x86_64, built with `--features cuda`. **Hard-links the CUDA runtime: requires an NVIDIA GPU and drivers/libraries compatible with CUDA 12.6 on the host, or it will not start.** If CUDA isn't available, use the CPU build above. |
+            | `apollo-${{ github.ref_name }}-x86_64-unknown-linux-gnu-cuda.tar.gz` | Linux x86_64, built with `--features cuda`. **Hard-links the CUDA runtime: requires an NVIDIA GPU and drivers/libraries compatible with CUDA 12.6 on the host, or it will not start.** Built for compute capability **sm_80 (Ampere) and up** — A100/A10/RTX 30xx and newer (Ada, Hopper) run via PTX JIT; older GPUs (e.g. Turing/T4 sm_75) are not covered. If CUDA isn't available, use the CPU build above. |
 
             Verify with `sha256sum -c SHA256SUMS.txt`.

@@ -144,12 +144,6 @@ pub trait Storage: Send + Sync {
         retries: u32,
     ) -> Result<(), StorageError>;
 
-    /// Permanently-failed items whose dead-letter (failure) webhook has not yet
-    /// been delivered — recovers a crash between final failure and delivery.
-    async fn items_pending_failure_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError>;
-
-    async fn mark_failure_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError>;
-
     // ------------------------------ retention ----------------------------
 
     /// Delete finished tasks last updated before `cutoff` (unix seconds).

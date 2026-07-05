@@ -1,6 +1,6 @@
 [package]
 name = "apollo-inference"
-version = "1.0.1"
+version.workspace = true
 edition.workspace = true
 
 [dependencies]

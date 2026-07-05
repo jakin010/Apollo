@@ -129,44 +129,40 @@ fn url_and_input_item() {
 }
 
 #[test]
-fn task_and_result_messages() {
+fn task_models_model_messages() {
     let msgs = all_messages();
 
+    // Task: id + a `result` oneof at 100..=102, with 2..99 reserved.
     let t = fields_by_name(&msgs["Task"]);
     scalar(&t["id"], 1, Type::String, Label::Optional);
-    enumeration(&t["state"], 2, ".apollo.v1.TaskState", Label::Optional);
-    message(&t["items"], 3, ".apollo.v1.ItemResult", Label::Repeated);
-    assert_eq!(t.len(), 3);
+    message(&t["error"], 100, ".apollo.v1.Error", Label::Optional);
+    enumeration(&t["state"], 101, ".apollo.v1.TaskState", Label::Optional);
+    message(&t["models"], 102, ".apollo.v1.Models", Label::Optional);
+    assert_eq!(t.len(), 4);
 
-    // `map<string, ModelResult> results = 2` is represented on the wire as a
-    // repeated synthetic entry message.
-    let ir = fields_by_name(&msgs["ItemResult"]);
-    enumeration(&ir["state"], 1, ".apollo.v1.ItemState", Label::Optional);
+    // Models: optional pipeline + a `map<string, Model>` (repeated synthetic entry).
+    let ms = fields_by_name(&msgs["Models"]);
+    scalar(&ms["pipeline"], 1, Type::String, Label::Optional);
     message(
-        &ir["results"],
+        &ms["models"],
         2,
-        ".apollo.v1.ItemResult.ResultsEntry",
+        ".apollo.v1.Models.ModelsEntry",
         Label::Repeated,
     );
-    message(&ir["error"], 3, ".apollo.v1.Error", Label::Optional);
-    assert_eq!(ir.len(), 3);
+    assert_eq!(ms.len(), 2);
 
-    let mr = fields_by_name(&msgs["ModelResult"]);
-    enumeration(&mr["state"], 1, ".apollo.v1.ModelState", Label::Optional);
+    // Model: a `result` oneof of error / state / classification / frame_scan.
+    let m = fields_by_name(&msgs["Model"]);
+    message(&m["error"], 1, ".apollo.v1.Error", Label::Optional);
+    enumeration(&m["state"], 2, ".apollo.v1.ModelState", Label::Optional);
     message(
-        &mr["classification"],
-        2,
+        &m["classification"],
+        3,
         ".apollo.v1.Classification",
         Label::Optional,
     );
-    message(
-        &mr["frame_scan"],
-        3,
-        ".apollo.v1.FrameScan",
-        Label::Optional,
-    );
-    message(&mr["error"], 4, ".apollo.v1.Error", Label::Optional);
-    assert_eq!(mr.len(), 4);
+    message(&m["frame_scan"], 4, ".apollo.v1.FrameScan", Label::Optional);
+    assert_eq!(m.len(), 4);
 
     let e = fields_by_name(&msgs["Error"]);
     enumeration(&e["kind"], 1, ".apollo.v1.ErrorType", Label::Optional);
@@ -249,26 +245,16 @@ fn enum_values() {
     assert_eq!(ErrorType::ModelUnavailable as i32, 6);
     assert_eq!(ErrorType::Internal as i32, 7);
 
+    // Completed(3) / Failed(4) were removed — implicit in Task.result (models / error).
     assert_eq!(TaskState::Unspecified as i32, 0);
     assert_eq!(TaskState::Queued as i32, 1);
     assert_eq!(TaskState::Processing as i32, 2);
-    assert_eq!(TaskState::Completed as i32, 3);
-    assert_eq!(TaskState::Failed as i32, 4);
     assert_eq!(TaskState::Cancelled as i32, 5);
 
-    assert_eq!(ItemState::Unspecified as i32, 0);
-    assert_eq!(ItemState::Queued as i32, 1);
-    assert_eq!(ItemState::Processing as i32, 2);
-    assert_eq!(ItemState::Completed as i32, 3);
-    assert_eq!(ItemState::Failed as i32, 4);
-    assert_eq!(ItemState::Cancelled as i32, 5);
-    assert_eq!(ItemState::Retrying as i32, 6);
-
+    // Done(3) / Failed(4) were removed — implicit in Model.result (a payload / error).
     assert_eq!(ModelState::Unspecified as i32, 0);
     assert_eq!(ModelState::Queued as i32, 1);
     assert_eq!(ModelState::Processing as i32, 2);
-    assert_eq!(ModelState::Done as i32, 3);
-    assert_eq!(ModelState::Failed as i32, 4);
     assert_eq!(ModelState::Skipped as i32, 5);
 }
 
@@ -368,13 +354,13 @@ fn wire_tags_cover_each_type() {
         (2, LEN)
     );
 
-    // enum (varint) field 2 — Task.state set to a non-zero value
+    // enum arm inside the Task.result oneof: `state` is field 101 (varint)
     assert_eq!(
         first_wire_tag(&Task {
-            state: TaskState::Queued as i32,
-            ..Default::default()
+            id: "".to_string(),
+            result: Some(task::Result::State(TaskState::Queued as i32)),
         }),
-        (2, VARINT)
+        (101, VARINT)
     );
 
     // oneof arms carry their own field numbers: image_url #2 (message), text #4 (string)
@@ -409,19 +395,18 @@ fn wire_tags_cover_each_type() {
 
 #[test]
 fn full_task_round_trips() {
-    // A populated Task exercising nested messages, the results map, a oneof
-    // output, repeated predictions, an item-level Error, and every enum family.
+    // A completed Task whose Models map holds two models — one done with a
+    // classification, one failed with an Error — exercising both Model.result
+    // arms, nested predictions, the map, and the Task.result oneof.
     let task = Task {
         id: "task-123".into(),
-        state: TaskState::Completed as i32,
-        items: vec![
-            ItemResult {
-                state: ItemState::Completed as i32,
-                results: std::collections::HashMap::from([(
+        result: Some(task::Result::Models(Models {
+            pipeline: Some("default".into()),
+            models: std::collections::HashMap::from([
+                (
                     "vit".to_string(),
-                    ModelResult {
-                        state: ModelState::Done as i32,
-                        output: Some(model_result::Output::Classification(Classification {
+                    Model {
+                        result: Some(model::Result::Classification(Classification {
                             predictions: vec![
                                 Prediction {
                                     label: 3,
@@ -433,20 +418,19 @@ fn full_task_round_trips() {
                                 },
                             ],
                         })),
-                        error: None,
                     },
-                )]),
-                error: None,
-            },
-            ItemResult {
-                state: ItemState::Failed as i32,
-                results: std::collections::HashMap::new(),
-                error: Some(Error {
-                    kind: ErrorType::Fetch as i32,
-                    message: "could not fetch input".into(),
-                }),
-            },
-        ],
+                ),
+                (
+                    "siglip".to_string(),
+                    Model {
+                        result: Some(model::Result::Error(Error {
+                            kind: ErrorType::Inference as i32,
+                            message: "model errored".into(),
+                        })),
+                    },
+                ),
+            ]),
+        })),
     };
 
     let mut buf = Vec::new();

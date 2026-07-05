@@ -1,6 +1,6 @@
 [package]
 name = "apollo-proto"
-version = "1.0.1"
+version.workspace = true
 edition.workspace = true
 build = "build.rs"
 
@@ -13,4 +13,5 @@ prost = "0.14"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
+# Provides FileDescriptorSet/DescriptorProto for the schema-stability tests.
 prost-types = "0.14"

@@ -75,7 +75,7 @@ const CREATE_TASK: &str = "
         CREATE type::record('item', [$tid, $it.idx]) SET
             task_id = $tid, idx = $it.idx, input_json = $it.input_json,
             models_json = $it.models_json, pipeline = $it.pipeline, state = $it.state, error = $it.error,
-            webhook_delivered = false, retries = 0, failure_delivered = false;
+            webhook_delivered = false, retries = 0;
     };
     FOR $mr IN $mrs {
         CREATE type::record('model_result', [$tid, $mr.item_idx, $mr.label]) SET
@@ -539,34 +539,6 @@ impl Storage for SurrealStorage {
             .await?
             .check()?;
         self.touch(task_id).await
-    }
-
-    async fn items_pending_failure_webhook(&self) -> Result<Vec<PendingWebhook>> {
-        let mut resp = self
-            .db
-            .query(
-                "SELECT task_id, idx FROM item
-                 WHERE failure_delivered = false AND state = 'failed'",
-            )
-            .await?;
-        let rows: Vec<PendingRow> = resp.take(0)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| PendingWebhook {
-                task_id: r.task_id,
-                item_index: r.idx as usize,
-            })
-            .collect())
-    }
-
-    async fn mark_failure_delivered(&self, task_id: &str, item: usize) -> Result<()> {
-        self.db
-            .query("UPDATE type::record('item', [$tid, $idx]) SET failure_delivered = true")
-            .bind(("tid", task_id.to_string()))
-            .bind(("idx", item as i64))
-            .await?
-            .check()?;
-        Ok(())
     }
 
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64> {

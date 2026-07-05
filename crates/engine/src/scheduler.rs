@@ -589,8 +589,6 @@ impl Engine {
             .await;
         self.rollup_task_state(task_id).await;
         self.deliver_webhook(task_id, idx).await;
-        // Exhausted item -> dead-letter endpoint (if configured).
-        self.deliver_failure_webhook(task_id, idx).await;
     }
 
     /// Recompute the task's lifecycle state from its items and persist it when it
@@ -823,7 +821,7 @@ impl Engine {
             });
             let results = futures::future::join_all(calls).await;
 
-            for (fref, res) in chunk.iter().zip(results) {
+            for (fref, res) in chunk.iter().zip(results.into_iter()) {
                 let classification = res?;
                 let frame = Frame {
                     timestamp: fref.timestamp,

@@ -43,7 +43,6 @@ const SCHEMA: &[&str] = &[
         error             TEXT,
         webhook_delivered INTEGER NOT NULL DEFAULT 0,
         retries           INTEGER NOT NULL DEFAULT 0,
-        failure_delivered INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (task_id, idx)
     )",
     "CREATE TABLE IF NOT EXISTS model_results (
@@ -485,33 +484,6 @@ impl Storage for SqliteStorage {
             .execute(&self.pool)
             .await?;
         self.touch(task_id).await
-    }
-
-    async fn items_pending_failure_webhook(&self) -> Result<Vec<PendingWebhook>> {
-        let rows = sqlx::query(
-            "SELECT task_id, idx FROM items WHERE failure_delivered = 0 AND state = 'failed'",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let task_id: String = r.try_get("task_id")?;
-            let idx: i64 = r.try_get("idx")?;
-            out.push(PendingWebhook {
-                task_id,
-                item_index: idx as usize,
-            });
-        }
-        Ok(out)
-    }
-
-    async fn mark_failure_delivered(&self, task_id: &str, item: usize) -> Result<()> {
-        sqlx::query("UPDATE items SET failure_delivered = 1 WHERE task_id = ? AND idx = ?")
-            .bind(task_id)
-            .bind(item as i64)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
 
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64> {

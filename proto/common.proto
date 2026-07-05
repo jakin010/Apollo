@@ -48,34 +48,49 @@ message InputItem {
 
 // ---------------------------------- results ----------------------------------
 
+// A task carries a single input. Its `result` is exactly one of:
+//   * error  — the task failed as a whole (e.g. the input could not be fetched);
+//   * state  — a non-terminal (queued/processing) or cancelled task;
+//   * models — the task finished and per-model results are available.
+// The presence of `models` is itself the "completed" signal and the presence of
+// `error` the "failed" signal, so those two states are implicit rather than enum
+// values. Fields 2..99 are reserved — the previous layout put `state`/`items`
+// there — so the result payload starts at 100, leaving room for future
+// top-level fields.
 message Task {
   string id = 1;
-  TaskState state = 2;
-  // Aligned to the submitted items; a single Classify request yields length 1.
-  repeated ItemResult items = 3;
-}
 
-message ItemResult {
-  ItemState state = 1;
-  // Keyed by model label. One model failing does not sink the others.
-  map<string, ModelResult> results = 2;
-  // Set on item-level failure (e.g. the input could not be fetched).
-  Error error = 3;
-}
+  reserved 2 to 99;
 
-message ModelResult {
-  ModelState state = 1;
-
-  // Set only when state == MODEL_STATE_DONE:
-  //   classification : image input
-  //   frame_scan     : an image-classifier applied to a video (sampled frames)
-  oneof output {
-    Classification classification = 2;
-    FrameScan      frame_scan     = 3;
+  oneof result {
+    Error     error  = 100;  // task-level failure (implicit "failed")
+    TaskState state  = 101;  // non-terminal or cancelled
+    Models    models = 102;  // per-model results (implicit "completed")
   }
+}
 
-  // Set only when state == MODEL_STATE_FAILED (inference error, timeout, ...).
-  Error error = 4;
+// Per-model results for a finished task, keyed by model label. One model failing
+// does not sink the others — each carries its own `result`.
+message Models {
+  // The pipeline the input ran through, if any (else `models` was a flat set).
+  optional string pipeline = 1;
+  map<string, Model> models = 2;
+}
+
+// The outcome of running one model. Exactly one of:
+//   * error          — the model failed (inference error, timeout, ...);
+//   * state          — the model is still queued/processing, or was skipped;
+//   * classification — image input result;
+//   * frame_scan     — an image-classifier applied to a video (sampled frames).
+// A set `classification`/`frame_scan` is the implicit "done" signal and a set
+// `error` the implicit "failed" signal.
+message Model {
+  oneof result {
+    Error          error          = 1;  // implicit "failed"
+    ModelState     state          = 2;  // queued / processing / skipped
+    Classification classification = 3;  // implicit "done" (image)
+    FrameScan      frame_scan     = 4;  // implicit "done" (video scan)
+  }
 }
 
 // A structured error. `kind` categorizes it for programmatic handling; `message`
@@ -129,30 +144,24 @@ message Prediction {
 // ----------------------------------- enums -----------------------------------
 // proto3 enum values share the package namespace, so each set is prefixed.
 
+// Non-terminal (and cancelled) task states. "Completed" and "failed" are not
+// listed here: they are conveyed by Task.result being `models` or `error`.
 enum TaskState {
   TASK_STATE_UNSPECIFIED = 0;
   TASK_STATE_QUEUED      = 1;
   TASK_STATE_PROCESSING  = 2;
-  TASK_STATE_COMPLETED   = 3;   // all items reached a terminal state (success or not)
-  TASK_STATE_FAILED      = 4;   // failed before any item could run
+  reserved 3, 4;  // was COMPLETED / FAILED — now implicit (see Task.result)
+  reserved "TASK_STATE_COMPLETED", "TASK_STATE_FAILED";
   TASK_STATE_CANCELLED   = 5;   // cancelled by a client request
 }
 
-enum ItemState {
-  ITEM_STATE_UNSPECIFIED = 0;
-  ITEM_STATE_QUEUED      = 1;
-  ITEM_STATE_PROCESSING  = 2;
-  ITEM_STATE_COMPLETED   = 3;
-  ITEM_STATE_FAILED      = 4;
-  ITEM_STATE_CANCELLED   = 5;
-  ITEM_STATE_RETRYING    = 6;   // a previous attempt failed; queued to retry
-}
-
+// Non-terminal (and skipped) model states. "Done" and "failed" are not listed:
+// they are conveyed by Model.result being a result payload or `error`.
 enum ModelState {
   MODEL_STATE_UNSPECIFIED = 0;
   MODEL_STATE_QUEUED      = 1;
   MODEL_STATE_PROCESSING  = 2;
-  MODEL_STATE_DONE        = 3;
-  MODEL_STATE_FAILED      = 4;
+  reserved 3, 4;  // was DONE / FAILED — now implicit (see Model.result)
+  reserved "MODEL_STATE_DONE", "MODEL_STATE_FAILED";
   MODEL_STATE_SKIPPED     = 5;   // skipped by an earlier pipeline gate
 }

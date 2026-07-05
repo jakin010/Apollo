@@ -25,5 +25,4 @@ import "common.proto";
 
 service Webhook {
   rpc TaskStatus (Task) returns (Ack);
-  rpc ItemFailed (Task) returns (Ack);
 }

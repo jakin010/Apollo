@@ -9,7 +9,7 @@
 //! delivered-flag; this type only performs the gRPC call.
 
 use async_trait::async_trait;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
@@ -41,7 +41,7 @@ impl GrpcWebhookSink {
 
 impl GrpcWebhookSink {
     /// Build the bare-Task request, attaching the HMAC signature header when a
-    /// secret is set. Shared by both `TaskStatus` and `ItemFailed`.
+    /// secret is set. Used by `TaskStatus`.
     fn build_request(
         &self,
         task: &Task,
@@ -66,17 +66,6 @@ impl WebhookSink for GrpcWebhookSink {
         let mut client = WebhookClient::new(self.channel.clone());
         client
             .task_status(request)
-            .await
-            .map_err(|status| WebhookError(status.to_string()))?;
-        Ok(())
-    }
-
-    async fn deliver_failed(&self, task: &Task, _item_index: usize) -> Result<(), WebhookError> {
-        // Dead-letter: same bare-Task payload and signing, different RPC method.
-        let request = self.build_request(task)?;
-        let mut client = WebhookClient::new(self.channel.clone());
-        client
-            .item_failed(request)
             .await
             .map_err(|status| WebhookError(status.to_string()))?;
         Ok(())

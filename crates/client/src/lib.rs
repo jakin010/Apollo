@@ -22,25 +22,25 @@
 //!     .classify(item::image("https://example.com/cat.jpg", ["resnet"]))
 //!     .await?;
 //! let task = client.get_task(&task_id).await?;
-//! println!("state = {:?}", task.state());
+//! println!("id = {:?}", task.id);
 //! # Ok(()) }
 //! ```
 //!
 //! ```no_run
 //! # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
-//!     use apollo_client::{serve_webhook, WebhookHandler, Task};
-//!     use apollo_proto::Ack;
-//!     use tonic::{Response, Status};
+//! use apollo_client::{serve_webhook, WebhookHandler, Task, Ack};
+//! use tonic::{Response, Status};
 //!
-//!     struct Sink;
-//!     #[tonic::async_trait]
-//!     impl WebhookHandler for Sink {
-//!         async fn on_task_status(&self, _t: Task) -> Result<Response<Ack>, Status> { Ok(Response::new(Ack {})) }
-//!         async fn on_item_failed(&self, _t: Task) -> Result<Response<Ack>, Status> { Ok(Response::new(Ack {})) }
+//! struct Sink;
+//! #[tonic::async_trait]
+//! impl WebhookHandler for Sink {
+//!     async fn on_task_status(&self, task: Task) -> Result<Response<Ack>, Status> {
+//!         println!("task {} -> {:?}", task.id, task.result);
+//!         Ok(Response::new(Ack {}))
 //!     }
-//!     serve_webhook("0.0.0.0:9090".parse()?, Sink).await?;
-//!     Ok(())
 //! }
+//! serve_webhook("0.0.0.0:9090".parse()?, Sink).await?;
+//! # Ok(()) }
 //! ```
 
 mod client;
@@ -54,11 +54,13 @@ pub use webhook::{WebhookHandler, WebhookReceiver, serve_webhook, serve_webhook_
 // Re-export the wire types so downstreams don't need to depend on `apollo-proto`.
 /// The `InputItem.input` oneof (`ImageUrl`, `VideoUrl`, `Text`, `AudioUrl`).
 pub use apollo_proto::input_item::Input as InputKind;
-/// The `ModelResult.output` oneof (`Classification`, `FrameScan`).
-pub use apollo_proto::model_result::Output as ModelOutput;
+/// The `Model.result` oneof (`Error`, `State`, `Classification`, `FrameScan`).
+pub use apollo_proto::model::Result as ModelResult;
+/// The `Task.result` oneof (`Error`, `State`, `Models`).
+pub use apollo_proto::task::Result as TaskResult;
 pub use apollo_proto::{
-    Ack, Classification, Error, ErrorType, Frame, FrameScan, InputItem, ItemResult, ItemState,
-    ModelResult, ModelState, Prediction, Task, TaskCreated, TaskState, Url,
+    Ack, Classification, Error, ErrorType, Frame, FrameScan, InputItem, Model, ModelState, Models,
+    Prediction, Task, TaskCreated, TaskState, Url,
 };
 
 // `tonic::async_trait` is re-exported for implementing [`WebhookHandler`] without
