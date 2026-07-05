@@ -65,6 +65,7 @@ fn descriptor_set(
     out: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let status = Command::new(protoc)
+        .arg("--experimental_allow_proto3_optional")
         .arg("--include_imports")
         .arg("-I")
         .arg(include)

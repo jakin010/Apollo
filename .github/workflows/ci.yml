@@ -3,7 +3,21 @@ name: CI
 on:
   push:
     branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "proto/**"
   pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "proto/**"
+
 
 # Cancel a stale run when new commits land on the same branch/PR.
 concurrency:
