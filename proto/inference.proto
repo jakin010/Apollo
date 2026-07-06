@@ -41,6 +41,7 @@ service Inference {
 message ClassifyStreamInit {
   repeated string models = 1;
   bool video = 2;
+  optional string pipeline = 3;   // run a named pipeline instead of `models` (as in InputItem)
 }
 
 // One message in a ClassifyStream. Exactly one of `init` (required, first) or

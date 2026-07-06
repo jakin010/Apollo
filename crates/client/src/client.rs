@@ -20,6 +20,35 @@ use pasetors::version4::V4;
 /// message ceiling.
 const STREAM_CHUNK: usize = 64 * 1024;
 
+/// Opening parameters for a [`Client::classify_stream`] / [`Client::classify_stream_bytes`]
+/// call: which models (or a `pipeline`) to run, and whether the streamed bytes
+/// are a video. Set **either** `models` or `pipeline`, mirroring `Classify`.
+///
+/// ```
+/// # use apollo_client::StreamInit;
+/// let init = StreamInit { models: vec!["nsfw".into()], video: true, ..Default::default() };
+/// let pipe = StreamInit { pipeline: Some("moderation".into()), ..Default::default() };
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct StreamInit {
+    /// Model labels to run as a parallel set. Set this or `pipeline`.
+    pub models: Vec<String>,
+    /// A named pipeline to run instead of `models`.
+    pub pipeline: Option<String>,
+    /// `true` if the streamed bytes are a video, `false` for a single image.
+    pub video: bool,
+}
+
+impl StreamInit {
+    fn into_proto(self) -> ClassifyStreamInit {
+        ClassifyStreamInit {
+            models: self.models,
+            video: self.video,
+            pipeline: self.pipeline,
+        }
+    }
+}
+
 /// Errors talking to an apollo server.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -126,27 +155,52 @@ impl Client {
         Ok(resp.into_inner().task_id)
     }
 
-    /// Stream the raw bytes of a single image or video and create a task for it.
-    /// `video` selects the processing path (false = image). `data` is sent as an
-    /// opening init frame followed by 64 KiB content frames. Returns the task id.
+    /// Stream the raw bytes of a single input and create a task for it, feeding a
+    /// stream of byte chunks — keep yielding buffers until the stream ends, then
+    /// the task is submitted. Use this to stream a large file (or a live source)
+    /// without buffering it all in memory: wrap a reader with
+    /// `tokio_util::io::ReaderStream`, drive a channel with
+    /// `tokio_stream::wrappers::ReceiverStream`, or pass `futures::stream::iter`.
+    /// Each yielded buffer is fragmented into ≤64 KiB content frames. Returns the
+    /// task id.
+    ///
+    /// The server stages the bytes to disk as they arrive and enforces the upload
+    /// cap incrementally, so nothing has to be held in memory end to end.
     pub async fn classify_stream(
         &self,
-        models: Vec<String>,
-        video: bool,
-        data: Vec<u8>,
+        init: StreamInit,
+        chunks: impl futures::Stream<Item = Vec<u8>> + Send + 'static,
     ) -> Result<String, ClientError> {
-        let mut msgs = Vec::with_capacity(data.len() / STREAM_CHUNK + 2);
-        msgs.push(ClassifyChunk {
-            payload: Some(Payload::Init(ClassifyStreamInit { models, video })),
+        use futures::StreamExt;
+        let init_frame = ClassifyChunk {
+            payload: Some(Payload::Init(init.into_proto())),
+        };
+        // The init frame first, then every buffer fragmented into wire-sized
+        // content frames, in order.
+        let data_frames = chunks.flat_map(|buf| {
+            let frames: Vec<ClassifyChunk> = buf
+                .chunks(STREAM_CHUNK)
+                .map(|c| ClassifyChunk {
+                    payload: Some(Payload::Data(c.to_vec())),
+                })
+                .collect();
+            futures::stream::iter(frames)
         });
-        for chunk in data.chunks(STREAM_CHUNK) {
-            msgs.push(ClassifyChunk {
-                payload: Some(Payload::Data(chunk.to_vec())),
-            });
-        }
-        let req = self.request(futures::stream::iter(msgs))?;
+        let stream = futures::stream::once(async move { init_frame }).chain(data_frames);
+        let req = self.request(stream)?;
         let resp = self.inner.clone().classify_stream(req).await?;
         Ok(resp.into_inner().task_id)
+    }
+
+    /// Convenience over [`classify_stream`](Self::classify_stream) for content
+    /// already fully in memory: streams a single buffer.
+    pub async fn classify_stream_bytes(
+        &self,
+        init: StreamInit,
+        data: Vec<u8>,
+    ) -> Result<String, ClientError> {
+        self.classify_stream(init, futures::stream::once(async move { data }))
+            .await
     }
 
     /// Poll a task's state and per-item / per-model results.

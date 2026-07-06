@@ -48,7 +48,7 @@ mod webhook;
 
 pub mod item;
 
-pub use client::{Client, ClientBuilder, ClientError};
+pub use client::{Client, ClientBuilder, ClientError, StreamInit};
 pub use webhook::{WebhookHandler, WebhookReceiver, serve_webhook, serve_webhook_with_shutdown};
 
 // Re-export the wire types so downstreams don't need to depend on `apollo-proto`.

@@ -217,7 +217,8 @@ fn stream_messages() {
     let si = fields_by_name(&msgs["ClassifyStreamInit"]);
     scalar(&si["models"], 1, Type::String, Label::Repeated);
     scalar(&si["video"], 2, Type::Bool, Label::Optional);
-    assert_eq!(si.len(), 2);
+    scalar(&si["pipeline"], 3, Type::String, Label::Optional);
+    assert_eq!(si.len(), 3);
 
     let cc = fields_by_name(&msgs["ClassifyChunk"]);
     message(
@@ -342,6 +343,7 @@ fn wire_tags_cover_each_type() {
         first_wire_tag(&ClassifyStreamInit {
             models: vec![],
             video: true,
+            pipeline: None,
         }),
         (2, VARINT)
     );
@@ -388,6 +390,7 @@ fn wire_tags_cover_each_type() {
         first_wire_tag(&ClassifyStreamInit {
             models: vec!["only".into()],
             video: false,
+            pipeline: None,
         }),
         (1, LEN)
     );

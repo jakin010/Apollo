@@ -42,10 +42,10 @@ Requests cooperative cancellation and returns the task's state **after** the req
 
 Submits one input as a byte stream instead of a URL — useful for local content you don't want to (or can't) expose over HTTP.
 
-- The **first** message MUST be the `init` frame (`ClassifyStreamInit`): the model labels to run and whether the bytes are a `video` (`true`) or a single image (`false`).
-- Every subsequent message carries `data` bytes, **in order**.
+- The **first** message MUST be the `init` frame (`ClassifyStreamInit`): the models **or** a `pipeline` to run (set one, exactly as with `Classify`), and whether the bytes are a `video` (`true`) or a single image (`false`).
+- Every subsequent message carries `data` bytes, **in order**. Send **as many `data` frames as you like** — keep streaming until you close the request; you don't have to send the whole input in one frame. The server appends each frame to the staging file as it arrives, so neither side needs to hold the entire input in memory.
 
-The server streams the bytes to a staging file, enforces the upload byte cap (`[limits].max_download`), then submits it exactly like `Classify`. A second `init`, a stream with no data, or exceeding the cap is rejected (`InvalidArgument` / `ResourceExhausted`) and the staging file is cleaned up. The staged file is removed automatically once the task reaches a terminal state.
+The server streams the bytes to a staging file, enforcing the upload byte cap (`[limits].max_download`) **incrementally** as frames arrive, then submits it exactly like `Classify`. A second `init`, a stream with no data, an `init` frame that sets neither `models` nor `pipeline`, or exceeding the cap is rejected (`InvalidArgument` / `ResourceExhausted`) and the staging file is cleaned up. The staged file is removed automatically once the task reaches a terminal state.
 
 ---
 
@@ -60,7 +60,11 @@ message CancelRequest   { string task_id = 1; }
 message TaskCreated     { string task_id = 1; }
 
 // For ClassifyStream:
-message ClassifyStreamInit { repeated string models = 1; bool video = 2; }
+message ClassifyStreamInit {
+  repeated string models   = 1;   // model labels to run (set this or `pipeline`)
+  bool            video    = 2;   // true = video bytes, false = a single image
+  optional string pipeline = 3;   // run a named pipeline instead of `models`
+}
 message ClassifyChunk {
   oneof payload {
     ClassifyStreamInit init = 1;   // required, first message
@@ -272,4 +276,4 @@ grpcurl -plaintext -H "authorization: v4.public.…" \
   -d '{"task_id": "01H…"}' localhost:8080 apollo.v1.Inference/GetTask
 ```
 
-`ClassifyStream` is a client‑streaming RPC (init frame, then data frames); it is normally driven from the generated client (`apollo-client`) rather than by hand.
+`ClassifyStream` is a client‑streaming RPC (init frame, then data frames); it is normally driven from the generated client (`apollo-client`). Its `Client::classify_stream` takes a `StreamInit` (models or pipeline, plus `video`) and an async stream of byte chunks, so you can feed a large file or live source incrementally; `Client::classify_stream_bytes` is the convenience for content already in memory.

@@ -91,8 +91,10 @@ impl Inference for InferenceService {
                 ));
             }
         };
-        if init.models.is_empty() {
-            return Err(Status::invalid_argument("init frame lists no models"));
+        if init.models.is_empty() && init.pipeline.is_none() {
+            return Err(Status::invalid_argument(
+                "init frame must set `models` or a `pipeline`",
+            ));
         }
 
         // Stage the streamed bytes to a file under the upload dir.
@@ -153,7 +155,7 @@ impl Inference for InferenceService {
                 video: init.video,
             },
             models: init.models,
-            pipeline: None,
+            pipeline: init.pipeline,
         };
         let model_count = submission.models.len();
         let task_id = match self.engine.submit(vec![submission]).await {
