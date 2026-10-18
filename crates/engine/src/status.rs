@@ -21,8 +21,9 @@ pub struct EngineStatus {
     pub slots_busy: usize,
     /// Items waiting for a slot.
     pub slots_waiting: usize,
-    /// Resident memory of the process, when the platform reports it.
-    pub rss_bytes: Option<u64>,
+    /// Memory the process is using (`phys_footprint` on macOS, which includes
+    /// Metal buffers; resident set size elsewhere), when the platform reports it.
+    pub memory_bytes: Option<u64>,
     /// Soft memory cap (`[app].max_memory`), when set.
     pub max_memory_bytes: Option<u64>,
     pub models: Vec<ModelStatus>,
@@ -118,7 +119,7 @@ impl Engine {
             slots_total,
             slots_busy,
             slots_waiting,
-            rss_bytes: memory::current_rss_bytes(),
+            memory_bytes: memory::current_memory_bytes(),
             max_memory_bytes: inner.max_memory_bytes,
             models,
             tasks,

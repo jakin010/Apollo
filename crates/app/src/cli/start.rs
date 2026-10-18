@@ -228,7 +228,7 @@ async fn build_report(
         log_file: info.log_file.clone(),
         device: s.device,
         memory: st::Memory {
-            rss_bytes: s.rss_bytes,
+            used_bytes: s.memory_bytes,
             limit_bytes: s.max_memory_bytes,
         },
         queue: st::Queue {

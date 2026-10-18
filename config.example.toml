@@ -6,7 +6,7 @@ port           = 8080
 cache_dir      = "/var/cache/apollo"           # optional
 max_concurrent = 20                            # global in-flight / VRAM ceiling
 idle_timeout   = 300                           # seconds a model stays resident while idle (unless keep_in_memory)
-max_memory     = "4gb"                          # soft resident-memory cap; new work rejected above it (0 = off)
+max_memory     = "4gb"                          # soft process-memory cap (incl. Metal buffers on macOS); new work rejected above it (0 = off)
 max_pending    = 1024                           # max queued/in-flight items before backpressure (0 = off)
 max_retries    = 3                              # times a failed item is retried before it is marked failed (0 = off)
 device         = "auto"                         # auto (CUDA → Metal → CPU), or pin one: cpu / metal / cuda

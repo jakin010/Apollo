@@ -35,7 +35,11 @@ pub struct StatusReport {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Memory {
-    pub rss_bytes: Option<u64>,
+    /// Memory the server process is using: `phys_footprint` on macOS (includes
+    /// Metal GPU buffers), resident set size elsewhere. Older servers sent it
+    /// as `rss_bytes`.
+    #[serde(alias = "rss_bytes")]
+    pub used_bytes: Option<u64>,
     pub limit_bytes: Option<u64>,
 }
 
@@ -245,10 +249,12 @@ pub fn render(r: &StatusReport, now: SystemTime, rates: Option<&Rates>) -> Strin
     }
     line(format!(
         "  memory     {}{}",
-        r.memory.rss_bytes.map_or("unknown".into(), bytes),
+        r.memory
+            .used_bytes
+            .map_or("unknown".into(), |b| format!("{} used", bytes(b))),
         r.memory
             .limit_bytes
-            .map_or(String::new(), |l| format!(" resident (limit {})", bytes(l)))
+            .map_or(String::new(), |l| format!(" (limit {})", bytes(l)))
     ));
 
     line(String::new());
@@ -428,7 +434,7 @@ mod tests {
             log_file: None,
             device: "metal".into(),
             memory: Memory {
-                rss_bytes: Some(3 * 1024 * 1024 * 1024 / 2),
+                used_bytes: Some(3 * 1024 * 1024 * 1024 / 2),
                 limit_bytes: Some(4 * 1024 * 1024 * 1024),
             },
             queue: Queue {
@@ -493,7 +499,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("TLS on, auth on"), "{text}");
-        assert!(text.contains("1.5 GiB resident (limit 4.0 GiB)"), "{text}");
+        assert!(text.contains("1.5 GiB used (limit 4.0 GiB)"), "{text}");
         assert!(text.contains("3 items in flight (limit 1,024); 2 of 20 slots busy, 1 waiting"));
         assert!(text.contains("1,204 completed"));
         assert!(text.contains("https://hooks.example.com — 0 pending deliveries"));
@@ -501,6 +507,15 @@ mod tests {
         assert!(text.contains("loaded (pinned)"));
         assert!(text.contains("12,402"));
         assert!(text.contains("3s ago"), "{text}");
+    }
+
+    #[test]
+    fn reads_the_old_rss_bytes_field() {
+        let m: Memory =
+            serde_json::from_str(r#"{"rss_bytes": 1024, "limit_bytes": null}"#).unwrap();
+        assert_eq!(m.used_bytes, Some(1024));
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["used_bytes"], 1024);
     }
 
     #[test]

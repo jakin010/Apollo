@@ -38,7 +38,7 @@ Relative `taxonomy_file` paths inside a model are resolved against the **config 
 | `max_concurrent` | u32 | `20` | Global ceiling on items being processed at once — fetching their input and running models (your VRAM budget). A slot is released while an item backs off between retries. |
 | `idle_timeout` | u32 (secs) | `300` | How long a model stays resident while idle before its weights are unloaded, unless it sets `keep_in_memory`. |
 | `log_level` | string | `"info"` | `trace`/`debug`/`info`/`warn`/`error`. The `RUST_LOG` env var overrides this at startup. |
-| `max_memory` | size | `"4gb"` | Soft resident‑memory ceiling. New work is rejected with `RESOURCE_EXHAUSTED` while usage is above it (`0` = off). |
+| `max_memory` | size | `"4gb"` | Soft ceiling on the server process's memory. New work is rejected with `RESOURCE_EXHAUSTED` while usage is above it (`0` = off). On macOS usage is the process's physical footprint (what Activity Monitor and `footprint` show), which includes Metal GPU buffers; on Apple Silicon these hold the model weights and activations and are not part of the resident set size. Elsewhere it is the resident set size, so CUDA device memory is not counted. |
 | `max_pending` | u32 | `1024` | Max items queued or in‑flight before submissions are rejected with `RESOURCE_EXHAUSTED` (backpressure). `0` = off. |
 | `max_retries` | u32 | `3` | Times an item is retried after a **transient** failure (network error, HTTP 5xx/408/429, model timeout or load failure, inference error): a failed fetch is re‑fetched, failed models (or the failed pipeline step) re‑run while finished ones are kept. Permanent failures (refused URL, HTTP 4xx, undecodable or over‑limit input) are not retried. `0` = no retries. |
 | `device` | string | `"auto"` | Compute backend for the models. `auto` picks the first that initializes: CUDA (only in `cuda` builds), then Metal (macOS), then CPU. `cpu` always uses the CPU, even on a GPU machine. `metal` / `cuda` pin that backend and fall back to CPU, with a warning, if it can't be used. |
@@ -418,12 +418,12 @@ apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
 - **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url`, or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
 - **`status`** reports whether the server is running and its live state:
   - version, PID, uptime, listen address, TLS/auth, config file, database, and log file;
-  - resident memory against `max_memory`;
+  - memory in use against `max_memory` (measured as for `max_memory`: physical footprint on macOS, resident set size elsewhere);
   - the queue (items in flight, busy/waiting concurrency slots);
   - task counts by state, and pending webhook deliveries;
   - per model: loaded or not, input size, queued requests, batch size, images classified, and last use.
 
-  `--json` prints the same as JSON. The exit status is `0` when running and `3` when not (like `systemctl status`).
+  `--json` prints the same as JSON; memory in use is `memory.used_bytes` (earlier builds named it `memory.rss_bytes`). The exit status is `0` when running and `3` when not (like `systemctl status`).
 
   `--watch` (`-w`) keeps the view open and refreshes it in place every second (`-n 0.5` for twice a second; minimum 0.2) until Ctrl‑C, adding live throughput: images per second per model and in total. If the server stops or restarts, it shows that and waits for it. With `--json`, `--watch` prints one JSON object per line per refresh (`time`, `running`, `status`, `rates`, `error`); when the output is not a terminal, each refresh is printed in sequence instead of redrawn. The server answers on a Unix socket in its private per‑user directory (`$XDG_RUNTIME_DIR/apollo/` on Linux, otherwise the state directory), so only the same OS user can query it — run `apollo status` as that user.
 - **`config get|set|remove`** edit the file by **dotted key** (e.g. `models.nsfw.repo`), format‑preserving. `set` creates missing tables — and a default `[app]`‑only file — as needed.

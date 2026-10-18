@@ -71,7 +71,7 @@ struct Inner {
     fetch_limits: FetchLimits,
     /// Max decoded pixels (`width * height`) per image; `None` disables the cap.
     max_pixels: Option<u64>,
-    /// Soft resident-memory cap in bytes; `None` disables the check.
+    /// Soft memory cap in bytes (see [`memory`]); `None` disables the check.
     max_memory_bytes: Option<u64>,
     /// Max items queued or in-flight before submissions are rejected; `0` = off.
     max_pending: usize,
@@ -346,19 +346,19 @@ impl Engine {
         Ok(())
     }
 
-    /// Reject new work while resident memory is over the configured soft cap.
+    /// Reject new work while process memory is over the configured soft cap.
     fn check_memory(&self) -> Result<(), EngineError> {
         let Some(limit) = self.inner.max_memory_bytes else {
             return Ok(());
         };
-        let Some(rss) = memory::current_rss_bytes() else {
+        let Some(used) = memory::current_memory_bytes() else {
             return Ok(());
         };
-        if rss >= limit {
+        if used >= limit {
             const MIB: u64 = 1024 * 1024;
             return Err(EngineError::Overloaded(format!(
-                "memory limit reached ({} MiB resident >= {} MiB cap)",
-                rss / MIB,
+                "memory limit reached ({} MiB in use >= {} MiB cap)",
+                used / MIB,
                 limit / MIB
             )));
         }

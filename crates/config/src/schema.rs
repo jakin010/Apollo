@@ -134,7 +134,9 @@ pub struct AppConfig {
     /// built-in default in [`crate::load`].
     #[serde(default)]
     pub config_file: Option<String>,
-    /// Soft ceiling on resident process memory (e.g. `4gb`, `512mb`; `0` = off).
+    /// Soft ceiling on process memory (e.g. `4gb`, `512mb`; `0` = off): the
+    /// physical footprint on macOS (including Metal buffers), resident set size
+    /// elsewhere.
     /// New work is rejected with RESOURCE_EXHAUSTED while usage is above this.
     #[serde(default = "crate::defaults::max_memory")]
     pub max_memory: String,
