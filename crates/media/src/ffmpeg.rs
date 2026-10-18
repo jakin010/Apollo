@@ -4,8 +4,16 @@
 //! ffmpeg). A single-pass `select`-filter extraction would decode the video only
 //! once and is the natural optimization; per-seek is used here because it keeps
 //! the code simple and the behavior easy to reason about for resume.
+//!
+//! Inputs are untrusted, so every invocation:
+//! * restricts ffmpeg to the `file` protocol (`-protocol_whitelist file`), so a
+//!   crafted playlist or reference file can never make ffmpeg open a network
+//!   URL, and
+//! * runs under a deadline and is killed when it expires, so a pathological file
+//!   cannot hang a scan forever.
 
 use std::path::Path;
+use std::time::Duration;
 
 use tokio::process::Command;
 
@@ -13,6 +21,14 @@ use apollo_domain::DecodedImage;
 
 use crate::decode::decode_image;
 use crate::error::MediaError;
+
+/// Deadline for a probe or a single-frame extraction.
+const SHORT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Deadline for a pass that decodes the whole video (keyframe / scene scans).
+const FULL_PASS_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Input options applied to every ffmpeg / ffprobe call (see module docs).
+const INPUT_GUARD: [&str; 2] = ["-protocol_whitelist", "file"];
 
 /// Video metadata from `ffprobe`.
 #[derive(Debug, Clone)]
@@ -30,16 +46,17 @@ pub struct VideoInfo {
 /// Probe a video file for duration, frame rate, and dimensions.
 pub async fn probe(path: &Path) -> Result<VideoInfo, MediaError> {
     let mut cmd = Command::new("ffprobe");
-    cmd.args([
-        "-v",
-        "quiet",
-        "-print_format",
-        "json",
-        "-show_format",
-        "-show_streams",
-    ])
-    .arg(path);
-    let stdout = capture("ffprobe", &mut cmd).await?;
+    cmd.args(INPUT_GUARD)
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
+        .arg(path);
+    let stdout = capture("ffprobe", &mut cmd, SHORT_TIMEOUT).await?;
     parse_probe(&stdout)
 }
 
@@ -69,6 +86,7 @@ pub async fn extract_frame(
 async fn grab_frame(path: &Path, seek: &[String]) -> Result<Option<Vec<u8>>, MediaError> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error"])
+        .args(INPUT_GUARD)
         .args(seek)
         .arg("-i")
         .arg(path)
@@ -81,7 +99,7 @@ async fn grab_frame(path: &Path, seek: &[String]) -> Result<Option<Vec<u8>>, Med
             "png",
             "pipe:1",
         ]);
-    let stdout = capture("ffmpeg", &mut cmd).await?;
+    let stdout = capture("ffmpeg", &mut cmd, SHORT_TIMEOUT).await?;
     Ok((!stdout.is_empty()).then_some(stdout))
 }
 
@@ -101,20 +119,21 @@ pub async fn extract_frames(
 /// Presentation timestamps of all keyframes (I-frames). Backs `iframes` sampling.
 pub async fn keyframe_timestamps(path: &Path) -> Result<Vec<f64>, MediaError> {
     let mut cmd = Command::new("ffprobe");
-    cmd.args([
-        "-v",
-        "error",
-        "-skip_frame",
-        "nokey",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "frame=pts_time",
-        "-of",
-        "csv=print_section=0",
-    ])
-    .arg(path);
-    let stdout = capture("ffprobe", &mut cmd).await?;
+    cmd.args(INPUT_GUARD)
+        .args([
+            "-v",
+            "error",
+            "-skip_frame",
+            "nokey",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "frame=pts_time",
+            "-of",
+            "csv=print_section=0",
+        ])
+        .arg(path);
+    let stdout = capture("ffprobe", &mut cmd, FULL_PASS_TIMEOUT).await?;
     Ok(parse_float_lines(&stdout))
 }
 
@@ -128,40 +147,50 @@ pub async fn scene_timestamps(path: &Path, threshold: f64) -> Result<Vec<f64>, M
         threshold.clamp(0.0, 1.0)
     };
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-v", "info", "-i"])
+    cmd.args(["-v", "info"])
+        .args(INPUT_GUARD)
+        .arg("-i")
         .arg(path)
         .arg("-vf")
         .arg(format!("select='gt(scene,{threshold})',showinfo"))
         .args(["-an", "-f", "null", "-"]);
     // showinfo reports via stderr; a successful run still exits 0.
-    let stderr = capture_stderr("ffmpeg", &mut cmd).await?;
+    let stderr = capture_stderr("ffmpeg", &mut cmd, FULL_PASS_TIMEOUT).await?;
     Ok(parse_showinfo_pts(&stderr))
 }
 
 // -------------------------------- internals --------------------------------
 
-async fn capture(name: &str, cmd: &mut Command) -> Result<Vec<u8>, MediaError> {
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| MediaError::Ffmpeg(format!("spawning {name}: {e}")))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(MediaError::Ffmpeg(format!(
-            "{name} failed ({}): {}",
-            out.status,
-            err.trim()
-        )));
-    }
-    Ok(out.stdout)
+async fn capture(name: &str, cmd: &mut Command, timeout: Duration) -> Result<Vec<u8>, MediaError> {
+    Ok(run(name, cmd, timeout).await?.stdout)
 }
 
 /// Like [`capture`] but returns stderr (for filters that report there).
-async fn capture_stderr(name: &str, cmd: &mut Command) -> Result<Vec<u8>, MediaError> {
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| MediaError::Ffmpeg(format!("spawning {name}: {e}")))?;
+async fn capture_stderr(
+    name: &str,
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Result<Vec<u8>, MediaError> {
+    Ok(run(name, cmd, timeout).await?.stderr)
+}
+
+/// Run `cmd` to completion within `timeout`, killing it if the deadline passes,
+/// and fail on a non-zero exit.
+async fn run(
+    name: &str,
+    cmd: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, MediaError> {
+    cmd.kill_on_drop(true);
+    let out = match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(out) => out.map_err(|e| MediaError::Ffmpeg(format!("spawning {name}: {e}")))?,
+        Err(_) => {
+            return Err(MediaError::Ffmpeg(format!(
+                "{name} timed out after {}s",
+                timeout.as_secs()
+            )));
+        }
+    };
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(MediaError::Ffmpeg(format!(
@@ -170,7 +199,7 @@ async fn capture_stderr(name: &str, cmd: &mut Command) -> Result<Vec<u8>, MediaE
             err.trim()
         )));
     }
-    Ok(out.stderr)
+    Ok(out)
 }
 
 fn parse_probe(stdout: &[u8]) -> Result<VideoInfo, MediaError> {
@@ -199,6 +228,7 @@ fn parse_probe(stdout: &[u8]) -> Result<VideoInfo, MediaError> {
                 .and_then(|x| x.as_str())
                 .and_then(parse_rational)
         })
+        .filter(|f| f.is_finite() && *f > 0.0)
         .unwrap_or(0.0);
 
     let duration = v
@@ -212,6 +242,9 @@ fn parse_probe(stdout: &[u8]) -> Result<VideoInfo, MediaError> {
                 .and_then(|d| d.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
         })
+        // Container metadata is untrusted: a NaN / infinite duration would make
+        // the sampling loops run forever, so treat it as unknown.
+        .filter(|d| d.is_finite() && *d >= 0.0)
         .unwrap_or(0.0);
 
     let frame_count = video
@@ -269,11 +302,13 @@ fn parse_rational(s: &str) -> Option<f64> {
     (den != 0.0).then_some(num / den)
 }
 
-/// One float per non-empty line (ffprobe csv of `pts_time`).
+/// One float per non-empty line (ffprobe csv of `pts_time`). Only the first csv
+/// field is read: newer ffprobe versions append a trailing separator to some
+/// rows (e.g. `0.000000,` for a frame carrying side data).
 fn parse_float_lines(bytes: &[u8]) -> Vec<f64> {
     String::from_utf8_lossy(bytes)
         .lines()
-        .filter_map(|l| l.trim().parse::<f64>().ok())
+        .filter_map(|l| l.split(',').next()?.trim().parse::<f64>().ok())
         .collect()
 }
 
@@ -291,4 +326,26 @@ fn parse_showinfo_pts(bytes: &[u8]) -> Vec<f64> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_float_lines, parse_probe};
+
+    #[test]
+    fn probe_rejects_non_finite_metadata() {
+        let json =
+            br#"{"streams":[{"codec_type":"video","codec_name":"h264","width":64,"height":64,
+            "avg_frame_rate":"1/0","r_frame_rate":"0/0"}],
+            "format":{"format_name":"mov,mp4","duration":"inf"}}"#;
+        let info = parse_probe(json).unwrap();
+        assert_eq!(info.duration, 0.0);
+        assert_eq!(info.fps, 0.0);
+    }
+
+    #[test]
+    fn keyframe_lines_tolerate_trailing_separator() {
+        let out = b"0.000000,\n2.000000\n\n4.500000\nN/A\n";
+        assert_eq!(parse_float_lines(out), vec![0.0, 2.0, 4.5]);
+    }
 }

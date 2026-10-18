@@ -35,12 +35,12 @@ Relative `taxonomy_file` paths inside a model are resolved against the **config 
 | `endpoint` | string | `"0.0.0.0"` | Bind host/IP. (The example uses `127.0.0.1` for local‑only.) |
 | `port` | u16 | `8080` | Bind port. |
 | `cache_dir` | string | *(none)* | Optional directory for model/download caches. |
-| `max_concurrent` | u32 | `20` | Global ceiling on concurrent in‑flight inferences (your VRAM budget). |
+| `max_concurrent` | u32 | `20` | Global ceiling on items being processed at once — fetching their input and running models (your VRAM budget). A slot is released while an item backs off between retries. |
 | `idle_timeout` | u32 (secs) | `300` | How long a model stays resident while idle before its weights are unloaded, unless it sets `keep_in_memory`. |
 | `log_level` | string | `"info"` | `trace`/`debug`/`info`/`warn`/`error`. The `RUST_LOG` env var overrides this at startup. |
 | `max_memory` | size | `"4gb"` | Soft resident‑memory ceiling. New work is rejected with `RESOURCE_EXHAUSTED` while usage is above it (`0` = off). |
 | `max_pending` | u32 | `1024` | Max items queued or in‑flight before submissions are rejected with `RESOURCE_EXHAUSTED` (backpressure). `0` = off. |
-| `max_retries` | u32 | `3` | Times a failed item is retried before it is marked failed. `0` = no retries. |
+| `max_retries` | u32 | `3` | Times an item is retried after a **transient** failure (network error, HTTP 5xx/408/429, model timeout or load failure, inference error): a failed fetch is re‑fetched, failed models (or the failed pipeline step) re‑run while finished ones are kept. Permanent failures (refused URL, HTTP 4xx, undecodable or over‑limit input) are not retried. `0` = no retries. |
 
 ---
 
@@ -51,29 +51,78 @@ Optional. Omit the whole section to disable delivery and let clients poll. See [
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `url` | string | *(required if section present)* | gRPC receiver target. Scheme selects transport: `https` = TLS, `http` = plaintext. Path is ignored. |
-| `secret` | string | *(none)* | Shared secret. When set, each delivery carries `x-apollo-webhook-signature` = hex HMAC‑SHA256 of the task id. |
+| `secret` | string | *(none)* | Shared secret. When set, each delivery is signed: `x-apollo-webhook-signature` = `v1=` + hex HMAC‑SHA256 over the delivery timestamp and the exact payload bytes (see [webhooks.md → Signing](./webhooks.md#signing-and-authenticity)). |
 | `redelivery_secs` | u32 | `60` | Background retry interval for failed deliveries. `0` disables periodic retry (still retried on restart). |
 
 ---
 
 ## `[auth]` — authentication
 
-Optional. When present, **every `Inference` RPC** must carry a valid PASETO v4 token (health and reflection stay open).
+**On by default.** Every `Inference` RPC must carry a valid PASETO v4 token (health and reflection stay open). The section is optional: with no `[auth]` at all, authentication is still enabled.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `public_key` | string | *(required if section present)* | PASERK‑encoded v4 **public** key (`k4.public.…`) used to verify tokens. |
+| `enabled` | bool | `true` | Require a token on every `Inference` RPC. Set `false` only on a trusted network — anyone who can reach the port can then submit work and read results (the server logs a warning at startup). |
+| `public_key` | string | *(none)* | PASERK‑encoded v4 **public** key (`k4.public.…`) used to verify tokens. When unset, the server uses a **local keypair** (below). |
+| `admin_subjects` | list | `[]` | Token subjects that may read and cancel **every** task. Everyone else only sees tasks created by their own subject. |
+| `revocation_file` | string | `<state dir>/revoked_tokens` | Revoked token ids / subjects, written by `apollo revoke` and re‑read by running servers within ~10 s. Relative paths resolve from the config file's directory. |
 
-Setup:
+**Zero‑config (local keypair).** Without `public_key`, the server creates a signing keypair on first start and keeps it in `auth.key` in its private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS; owner‑only). `apollo token` reads that file when no other secret key is given, so the minimal setup is:
+
+```bash
+apollo start --daemon                                   # first start creates the keypair
+apollo token --subject my-client --expires 30d           # prints a token for a client to present
+```
+
+Run `apollo token` as the same OS user as the server (it looks in that user's state directory).
+
+**Explicit keypair** (e.g. several servers sharing one key, or keys managed by your secret store):
 
 ```bash
 apollo keygen                                 # prints public_key + secret_key (PASERK)
-# put public_key in [auth].public_key; keep secret_key safe
+apollo config set auth.public_key "k4.public.…"   # keep secret_key safe
 export APOLLO_SECRET_KEY="k4.secret.…"
-apollo token --subject ci-runner --expires 30d   # prints a token for a client to present
+apollo token --subject ci-runner --expires 30d
 ```
 
+To turn authentication off: `apollo config set auth.enabled false`.
+
+**Task ownership.** Every task records the subject (`sub`) of the token that submitted it. `GetTask` and `CancelTask` from any other subject return `NOT_FOUND` — the same answer as for an id that does not exist — unless the caller's subject is in `admin_subjects`. Tasks submitted while authentication was disabled have no owner and are visible only to admins once it is on. Give each client (or tenant) its own subject.
+
+**Revoking tokens.** `apollo token` gives every token a random id and prints it on stderr. To revoke without rotating the keypair:
+
+```bash
+apollo revoke --id 3f9c…             # one token, by the id `apollo token` printed
+apollo revoke --token "v4.public.…"  # one token, reading its id from the token
+apollo revoke --subject ci-runner    # every token of a subject (incl. tokens minted before ids existed)
+```
+
+Each command appends a line (`id <id>` or `subject <name>`) to the revocation file; running servers pick it up within about 10 seconds. The file is plain text: delete a line to un‑revoke. Run `apollo revoke` as the server's OS user (or pass `--config` when `revocation_file` is set there). If the file becomes unreadable, the server keeps the last list it loaded.
+
 Clients send the token in the **`authorization`** metadata header (with or without a `Bearer ` prefix). See [grpc-api.md → Authentication](./grpc-api.md#authentication).
+
+---
+
+## `[tls]` — serve over TLS
+
+Optional. With this section the gRPC API is served over TLS (HTTP/2 + ALPN); without it Apollo speaks plaintext, which is fine on loopback or behind a TLS‑terminating proxy. The server logs a warning when it serves plaintext on a non‑loopback address.
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `cert_file` | string | *(required)* | PEM certificate chain, leaf first. |
+| `key_file` | string | *(required)* | PEM private key for the certificate. |
+| `client_ca_file` | string | *(none)* | PEM CA bundle. When set, **mutual TLS** is required: clients must present a certificate signed by it (in addition to any `[auth]` token). |
+
+Relative paths resolve from the config file's directory; startup fails if a file is missing. Certificates are read at startup — restart after renewing them.
+
+```toml
+[tls]
+cert_file = "/etc/apollo/tls/fullchain.pem"
+key_file  = "/etc/apollo/tls/privkey.pem"
+# client_ca_file = "/etc/apollo/tls/clients-ca.pem"   # require client certificates
+```
+
+Clients then connect to `https://host:port`. With `apollo-client`, a private or self‑signed CA is trusted via `.ca_certificate(pem)`, a client certificate for mutual TLS is set via `.client_identity(cert_pem, key_pem)`, and `.tls_domain_name(name)` overrides the name checked against the certificate.
 
 ---
 
@@ -91,18 +140,22 @@ Guards applied to inputs: SSRF protection when fetching remote URLs, a gate on l
 | `local_roots` | list | `[]` | Directories a local‑file input may resolve inside (checked after canonicalization, so `..`/symlinks can't escape). Empty means no local path is permitted, even with `allow_local_files = true`. |
 | `max_pixels` | u64 | `50000000` | Max decoded image pixels (width × height), rejecting decompression bombs before the pixel buffer is allocated. `0` = unlimited. Applies to still images and to sampled video frames. |
 
+> Video inputs are probed and decoded by ffmpeg restricted to the local `file` protocol, so a crafted container or playlist cannot make ffmpeg open network URLs. Downloads are stored under a fixed name (keeping only a known media extension), and frame dimensions are checked against `max_pixels` before any frame is decoded.
+>
+> If `HTTP_PROXY`/`HTTPS_PROXY` are set, remote fetches go through that proxy and the proxy resolves hostnames, so `block_private_ips` can only vet what Apollo itself resolves — enforce egress rules on the proxy too.
+
 > `max_download` caps the *encoded* bytes; `max_pixels` caps the *decoded* resolution — a small, highly compressible image can blow past memory even under the download cap, so both matter. Local‑file inputs (`file://` / bare paths) are refused unless you explicitly opt in via `allow_local_files` **and** list `local_roots`; this keeps an untrusted request from reading arbitrary files off the server.
 
 ---
 
 ## `[cache]` — result cache
 
-Optional. A bare `[cache]` section turns it on (`enabled` defaults to `true`). When enabled, model outputs are cached by **content hash** (with a URL→content‑hash hint) so identical inputs skip inference. See [database.md → Result cache](./database.md#result-cache).
+Optional. A bare `[cache]` section turns it on (`enabled` defaults to `true`). When enabled, model outputs are cached by **content hash** (with a URL→content‑hash hint) so identical inputs skip inference. The URL hint assumes a URL's content does not change within `ttl_secs` (forever, without a TTL); set a TTL if your URLs can serve different content over time. The hint is only recorded when the content came from `main`, not from `fallback`. See [database.md → Result cache](./database.md#result-cache).
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `enabled` | bool | `true` | Master switch (so `[cache]` alone enables caching). |
-| `ttl_secs` | u64 | *(none)* | Freshness window in seconds; older entries are ignored and eligible for purge. Omit for entries that never expire. |
+| `ttl_secs` | u64 | *(none)* | Freshness window in seconds; older entries are ignored and deleted by an hourly purge. Omit for entries that never expire. |
 
 ---
 
@@ -200,9 +253,9 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 | `repo` | string | *(required)* | Hugging Face repo. |
 | `revision` | string | `"main"` | Repo revision/branch/tag. |
 | `enabled` | bool | `true` | If `false`, the model is rejected at submit time. |
-| `keep_in_memory` | bool | `false` | Pin the weights resident (skip idle‑unload). |
+| `keep_in_memory` | bool | `false` | Load the weights at startup and keep them resident (skip idle‑unload). |
 | `max_concurrent` | u32 | `8` | GPU **batch size** for this model's worker. |
-| `timeout` | u32 (secs) | `30` | Max **processing** time per `(input, model)`; queue wait excluded. |
+| `timeout` | u32 (secs) | `30` | Max time for one classification — one image, or one sampled video frame — measured from when it is handed to the model's batch queue. Excludes waiting for an admission slot and loading a cold model (loading has its own 30‑minute limit). |
 | `priority` | i32 | `0` | Scheduling priority; higher is admitted from the queue ahead of earlier‑submitted lower‑priority work. May be negative. |
 | `video_strategy` | string | *(none)* | Opts an image classifier into **video** input via the named strategy. |
 | `early_exit` | table | *(none)* | Video‑scan trigger for this model (see below). |
@@ -252,7 +305,7 @@ score_threshold = 0.1        # low, so frame‑scan peaks survive aggregation
 
 ## `[pipelines.<name>]` — ordered, gated model execution
 
-A pipeline runs its steps in ascending `order` for one input, instead of running `models` as a parallel set. If a step's optional `stop_if` gate fires (any listed category id at/above the threshold on that model's output), the pipeline **early‑exits** and later steps are marked `SKIPPED` — the task completes normally and fires the task webhook. A step **failure** (inference error) instead fails the whole pipeline, which is retried up to `[app].max_retries` and then marked failed.
+A pipeline runs its steps in ascending `order` for one input, instead of running `models` as a parallel set. If a step's optional `stop_if` gate fires (any listed category id at/above the threshold on that model's output), the pipeline **early‑exits** and later steps are marked `SKIPPED` — the task completes normally and fires the task webhook. A step **failure** instead fails the whole pipeline: a transient one is retried up to `[app].max_retries` (finished steps are kept), then the item is marked failed.
 
 A request opts in by setting `pipeline = "<name>"` on its item (instead of `models`).
 
@@ -318,9 +371,11 @@ apollo config set    <key> <value> [--config PATH]
 apollo config remove <key> [--config PATH]
 apollo keygen                            # print a PASETO v4 keypair (PASERK)
 apollo token --subject NAME [--expires 30d] [--secret-key-file PATH]
+apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
 ```
 
-- **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--daemon` re‑executes the binary detached, writing a PID file and logging to `apollo.log` in the temp dir.
+- **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url`, or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
 - **`config get|set|remove`** edit the file by **dotted key** (e.g. `models.nsfw.repo`), format‑preserving. `set` creates missing tables — and a default `[app]`‑only file — as needed.
 - **`keygen`** prints a fresh public/secret PASERK keypair.
-- **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` or the `APOLLO_SECRET_KEY` env var. `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key (revoke by rotating the keypair). The token goes in the client's `authorization` metadata.
+- **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` (a bare PASERK or `keygen` output), else the `APOLLO_SECRET_KEY` env var, else the server's local keypair file (`auth.key` in the state directory). `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key. The token goes to stdout (it goes in the client's `authorization` metadata) and its id to stderr.
+- **`revoke`** adds a token id or a subject to the revocation file (see [Authentication](#auth--authentication)); running servers apply it within ~10 s.

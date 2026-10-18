@@ -335,4 +335,9 @@ pub struct Task {
     pub state: TaskState,
     /// Aligned to the submitted inputs.
     pub items: Vec<Item>,
+    /// Subject (`sub` claim) of the token that submitted the task; only that
+    /// subject (or an admin) may read or cancel it. `None` when the task was
+    /// submitted with authentication disabled.
+    #[serde(default)]
+    pub owner: Option<String>,
 }

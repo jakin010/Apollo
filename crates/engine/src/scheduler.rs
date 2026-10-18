@@ -15,17 +15,32 @@ use apollo_domain::{
     Classification, DecodedImage, Frame, Input, Item, ItemState, Modality, ModelOutput,
     ModelResult, ModelState, TaskError, Url,
 };
-use apollo_media::{FrameRef, LocalMedia, VideoInfo};
+use apollo_media::{FrameRef, LocalMedia, MediaError, VideoInfo};
 
 use crate::Engine;
 use crate::aggregate;
 use crate::error::EngineError;
+use crate::gate::GatePermit;
 use crate::worker::ModelHandle;
+
+/// How long to wait for a cold model to download and load. Separate from (and
+/// much longer than) the per-classification `timeout`, which only starts once
+/// the weights are resident.
+const MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// A fetched, decoded/probed input ready for inference.
 enum Fetched {
     Image(DecodedImage),
     Video { media: LocalMedia, info: VideoInfo },
+}
+
+/// The result of fetching an item's input once.
+struct FetchedInput {
+    fetched: Fetched,
+    /// SHA-256 of the content, when the result cache is enabled.
+    content_hash: Option<String>,
+    /// Whether the content came from the `fallback` URL rather than `main`.
+    used_fallback: bool,
 }
 
 impl Engine {
@@ -79,8 +94,15 @@ impl Engine {
         // GPU batching happens inside each model worker). Admission is by priority:
         // an item's priority is the highest among the models it targets, so a
         // high-priority item is admitted ahead of earlier-queued lower-priority ones.
+        // The slot is held while fetching and running models, and released while
+        // backing off between retries.
         let priority = self.item_priority(&item);
-        let _permit = self.inner.gate.clone().acquire(priority).await;
+        let mut permit = Some(self.inner.gate.clone().acquire(priority).await);
+        // Waiting for a slot can take a while; honour a cancel that arrived meanwhile.
+        if cancel.load(Ordering::SeqCst) {
+            self.cancel_item(&task_id, idx).await;
+            return;
+        }
 
         if let Err(e) = self
             .inner
@@ -93,61 +115,51 @@ impl Engine {
         self.notify_item_change(&task_id, idx).await;
 
         tracing::debug!(task = %task_id, item = idx, models = item.models.len(), "processing item");
-        // Fetch with retries: a failed attempt (e.g. an unreachable URL) puts the
-        // item into `Retrying` — reported as such on the webhook — and tries again,
-        // up to `[app].max_retries`, before failing it permanently.
+        // Fetch with retries: a transient failure (e.g. an unreachable host) puts
+        // the item into `Retrying` and tries again, up to `[app].max_retries`. A
+        // permanent one (refused URL, undecodable content) fails at once.
         let max_retries = self.inner.config.app.max_retries;
-        let (fetched, content_hash) = loop {
+        let FetchedInput {
+            fetched,
+            content_hash,
+            used_fallback,
+        } = loop {
             match self.fetch_item(&item.input).await {
                 Ok(f) => break f,
-                Err(e) if item.retries < max_retries => {
-                    item.retries += 1;
-                    let _ = self
-                        .inner
-                        .storage
-                        .set_item_retries(&task_id, idx, item.retries)
-                        .await;
-                    let _ = self
-                        .inner
-                        .storage
-                        .set_item_state(
+                Err(e) if e.is_transient() && item.retries < max_retries => {
+                    let err = e.to_fetch_error();
+                    if !self
+                        .retry_after_failure(
                             &task_id,
                             idx,
-                            ItemState::Retrying,
-                            Some(&TaskError::fetch(e.to_string())),
+                            &mut item,
+                            err,
+                            &mut permit,
+                            priority,
+                            &cancel,
                         )
-                        .await;
-                    tracing::warn!(
-                        task = %task_id, item = idx, attempt = item.retries, max = max_retries,
-                        error = %e, "item attempt failed; will retry"
-                    );
-                    self.notify_item_change(&task_id, idx).await;
-                    tokio::time::sleep(retry_backoff(item.retries)).await;
-                    if cancel.load(Ordering::SeqCst) {
-                        self.cancel_item(&task_id, idx).await;
+                        .await
+                    {
                         return;
                     }
                 }
                 Err(e) => {
-                    // Retries exhausted (or disabled): permanent, dead-lettered failure.
-                    self.fail_item(&task_id, idx, &item, TaskError::fetch(e.to_string()))
+                    // Permanent, or retries exhausted: dead-lettered failure.
+                    self.fail_item(&task_id, idx, &item, e.to_fetch_error())
                         .await;
                     return;
                 }
             }
         };
-        // A retried item was left in `Retrying`; reflect that it is processing again
-        // (persisted for GetTask; the terminal webhook fires at the end).
-        if item.retries > 0 {
-            let _ = self
-                .inner
-                .storage
-                .set_item_state(&task_id, idx, ItemState::Processing, None)
-                .await;
-        }
 
         let fresh_after = self.cache_fresh_after();
-        let url_hash = item_url(&item.input).map(|u| sha256_hex(u.main.as_bytes()));
+        // The url->content hint is keyed by `main`, so only record it when the
+        // bytes actually came from `main` (not from the fallback).
+        let url_hash = if used_fallback {
+            None
+        } else {
+            item_url(&item.input).map(|u| sha256_hex(u.main.as_bytes()))
+        };
 
         // Pipeline items run as an ordered, gated sequence with strict failure
         // semantics; the input was fetched once above and is reused per step.
@@ -155,130 +167,248 @@ impl Engine {
             self.run_pipeline(
                 &task_id,
                 idx,
-                &item,
+                item,
                 &name,
                 &fetched,
                 content_hash.as_deref(),
                 url_hash.as_deref(),
                 fresh_after,
                 &cancel,
+                &mut permit,
+                priority,
             )
             .await;
             return;
         }
 
-        for label in &item.models {
-            // Cancellation checkpoint between models.
-            if cancel.load(Ordering::SeqCst) {
-                self.cancel_item(&task_id, idx).await;
-                return;
-            }
-            if model_done(&item, label) {
-                continue;
-            }
-
-            // Content-cache fast path: identical bytes already classified by this
-            // model + revision -> reuse the stored output, skipping inference.
-            if let Some(ch) = content_hash.as_deref() {
-                let rev = self.model_revision(label);
-                match self
-                    .inner
-                    .storage
-                    .cache_lookup(ch, label, &rev, fresh_after)
-                    .await
-                {
-                    Ok(Some(output)) => {
-                        let _ = self
-                            .inner
-                            .storage
-                            .upsert_model_result(&task_id, idx, label, &ModelResult::done(output))
-                            .await;
-                        if let Some(uh) = url_hash.as_deref() {
-                            let _ = self
-                                .inner
-                                .storage
-                                .url_cache_store(uh, label, &rev, ch)
-                                .await;
-                        }
-                        tracing::debug!(task = %task_id, item = idx, model = %label, "cache hit");
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(task = %task_id, model = %label, error = %e, "cache lookup failed")
-                    }
-                }
-            }
-
-            let _ = self
-                .inner
-                .storage
-                .upsert_model_result(&task_id, idx, label, &ModelResult::processing())
-                .await;
-
-            tracing::debug!(task = %task_id, item = idx, model = %label, "running model");
-            // The model's `timeout` bounds each individual classification — a single
-            // image, or *each frame* of a video scan — not the whole video. run_model
-            // applies it internally per classification.
-            let result = match self
-                .run_model(&task_id, idx, label, &item, &fetched, &cancel)
-                .await
-            {
-                Ok(output) => {
-                    // Populate the cache on success (best-effort).
-                    if let Some(ch) = content_hash.as_deref() {
-                        let rev = self.model_revision(label);
-                        if let Err(e) = self
-                            .inner
-                            .storage
-                            .cache_store(ch, label, &rev, &output)
-                            .await
-                        {
-                            tracing::warn!(task = %task_id, model = %label, error = %e, "cache store failed");
-                        }
-                        if let Some(uh) = url_hash.as_deref() {
-                            let _ = self
-                                .inner
-                                .storage
-                                .url_cache_store(uh, label, &rev, ch)
-                                .await;
-                        }
-                    }
-                    ModelResult::done(output)
-                }
-                Err(EngineError::Cancelled) => {
+        // Parallel set: run every model; a model failure does not sink its
+        // siblings. Models that failed transiently are retried (only those —
+        // finished models are kept) up to `[app].max_retries`; after that the item
+        // completes with the per-model errors.
+        let mut permanent_failures: HashSet<String> = HashSet::new();
+        loop {
+            let mut retryable: Option<TaskError> = None;
+            for label in item.models.clone() {
+                // Cancellation checkpoint between models.
+                if cancel.load(Ordering::SeqCst) {
                     self.cancel_item(&task_id, idx).await;
                     return;
                 }
-                Err(e) => ModelResult::failed(TaskError::inference(e.to_string())),
-            };
-            let _ = self
-                .inner
-                .storage
-                .upsert_model_result(&task_id, idx, label, &result)
-                .await;
+                if model_done(&item, &label) || permanent_failures.contains(&label) {
+                    continue;
+                }
+
+                // Content-cache fast path: identical bytes already classified by
+                // this model + revision -> reuse the stored output, skip inference.
+                if let Some(ch) = content_hash.as_deref() {
+                    let rev = self.model_revision(&label);
+                    match self
+                        .inner
+                        .storage
+                        .cache_lookup(ch, &label, &rev, fresh_after)
+                        .await
+                    {
+                        Ok(Some(output)) => {
+                            let done = ModelResult::done(output);
+                            let _ = self
+                                .inner
+                                .storage
+                                .upsert_model_result(&task_id, idx, &label, &done)
+                                .await;
+                            if let Some(uh) = url_hash.as_deref() {
+                                let _ = self
+                                    .inner
+                                    .storage
+                                    .url_cache_store(uh, &label, &rev, ch)
+                                    .await;
+                            }
+                            item.results.insert(label.clone(), done);
+                            tracing::debug!(task = %task_id, item = idx, model = %label, "cache hit");
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(task = %task_id, model = %label, error = %e, "cache lookup failed")
+                        }
+                    }
+                }
+
+                let _ = self
+                    .inner
+                    .storage
+                    .upsert_model_result(&task_id, idx, &label, &ModelResult::processing())
+                    .await;
+
+                tracing::debug!(task = %task_id, item = idx, model = %label, "running model");
+                // The model's `timeout` bounds each individual classification — a
+                // single image, or *each frame* of a video scan — not the whole
+                // video, and not the time to load a cold model.
+                let result = match self
+                    .run_model(&task_id, idx, &label, &item, &fetched, &cancel)
+                    .await
+                {
+                    Ok(output) => {
+                        self.store_in_cache(
+                            &task_id,
+                            &label,
+                            content_hash.as_deref(),
+                            url_hash.as_deref(),
+                            &output,
+                        )
+                        .await;
+                        ModelResult::done(output)
+                    }
+                    Err(EngineError::Cancelled) => {
+                        self.cancel_item(&task_id, idx).await;
+                        return;
+                    }
+                    Err(e) => {
+                        let err = e.to_model_error();
+                        if e.is_transient() {
+                            retryable = Some(err.clone());
+                        } else {
+                            permanent_failures.insert(label.clone());
+                        }
+                        ModelResult::failed(err)
+                    }
+                };
+                let _ = self
+                    .inner
+                    .storage
+                    .upsert_model_result(&task_id, idx, &label, &result)
+                    .await;
+                item.results.insert(label.clone(), result);
+            }
+
+            match retryable {
+                Some(err) if item.retries < max_retries => {
+                    if !self
+                        .retry_after_failure(
+                            &task_id,
+                            idx,
+                            &mut item,
+                            err,
+                            &mut permit,
+                            priority,
+                            &cancel,
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                }
+                _ => break,
+            }
         }
 
         self.complete_item(&task_id, idx).await;
     }
 
+    /// Record a failed attempt that will be retried: bump and persist the retry
+    /// count, mark the item `Retrying` (keeping the error for diagnostics; the
+    /// wire still reports the task as processing), notify, and back off. The
+    /// concurrency slot is released during the backoff so a retrying item never
+    /// blocks other work. Returns `false` if the task was cancelled meanwhile (the
+    /// item is then already marked cancelled).
+    #[allow(clippy::too_many_arguments)]
+    async fn retry_after_failure(
+        &self,
+        task_id: &str,
+        idx: usize,
+        item: &mut Item,
+        err: TaskError,
+        permit: &mut Option<GatePermit>,
+        priority: i32,
+        cancel: &AtomicBool,
+    ) -> bool {
+        let max = self.inner.config.app.max_retries;
+        item.retries += 1;
+        let _ = self
+            .inner
+            .storage
+            .set_item_retries(task_id, idx, item.retries)
+            .await;
+        let _ = self
+            .inner
+            .storage
+            .set_item_state(task_id, idx, ItemState::Retrying, Some(&err))
+            .await;
+        tracing::warn!(
+            task = %task_id, item = idx, attempt = item.retries, max,
+            error = %err.message, "item attempt failed; will retry"
+        );
+        self.notify_item_change(task_id, idx).await;
+
+        permit.take();
+        tokio::time::sleep(retry_backoff(item.retries)).await;
+        if cancel.load(Ordering::SeqCst) {
+            self.cancel_item(task_id, idx).await;
+            return false;
+        }
+        *permit = Some(self.inner.gate.clone().acquire(priority).await);
+        if cancel.load(Ordering::SeqCst) {
+            self.cancel_item(task_id, idx).await;
+            return false;
+        }
+        let _ = self
+            .inner
+            .storage
+            .set_item_state(task_id, idx, ItemState::Processing, None)
+            .await;
+        true
+    }
+
+    /// Populate the content cache (and the url->content hint) after a successful
+    /// model run. Best-effort.
+    async fn store_in_cache(
+        &self,
+        task_id: &str,
+        label: &str,
+        content_hash: Option<&str>,
+        url_hash: Option<&str>,
+        output: &ModelOutput,
+    ) {
+        let Some(ch) = content_hash else {
+            return;
+        };
+        let rev = self.model_revision(label);
+        if let Err(e) = self
+            .inner
+            .storage
+            .cache_store(ch, label, &rev, output)
+            .await
+        {
+            tracing::warn!(task = %task_id, model = %label, error = %e, "cache store failed");
+        }
+        if let Some(uh) = url_hash {
+            let _ = self
+                .inner
+                .storage
+                .url_cache_store(uh, label, &rev, ch)
+                .await;
+        }
+    }
+
     /// Run an item through a named pipeline: its steps in `order`, each optionally
     /// gated by `stop_if`. A gate firing skips the remaining steps and completes
     /// the task normally (task webhook). A step *failure* fails the whole pipeline:
-    /// it is retried up to `[app].max_retries` (completed steps resume), then
-    /// dead-lettered. The input was fetched once by the caller and is reused.
+    /// a transient one is retried up to `[app].max_retries` (completed steps
+    /// resume), then the item is dead-lettered. The input was fetched once by the
+    /// caller and is reused.
     #[allow(clippy::too_many_arguments)]
     async fn run_pipeline(
         &self,
         task_id: &str,
         idx: usize,
-        item: &Item,
+        mut item: Item,
         pipeline: &str,
         fetched: &Fetched,
         content_hash: Option<&str>,
         url_hash: Option<&str>,
         fresh_after: i64,
         cancel: &AtomicBool,
+        permit: &mut Option<GatePermit>,
+        priority: i32,
     ) {
         let steps = match self.pipeline_steps(pipeline) {
             Some(s) => s,
@@ -286,7 +416,7 @@ impl Engine {
                 self.fail_item(
                     task_id,
                     idx,
-                    item,
+                    &item,
                     TaskError::internal(format!("unknown pipeline '{pipeline}'")),
                 )
                 .await;
@@ -294,7 +424,6 @@ impl Engine {
             }
         };
         let max_retries = self.inner.config.app.max_retries;
-        let mut item = item.clone();
 
         let stopped_at = 'attempt: loop {
             let mut stop_idx: Option<usize> = None;
@@ -366,24 +495,8 @@ impl Engine {
                     .await
                 {
                     Ok(output) => {
-                        if let Some(ch) = content_hash {
-                            let rev = self.model_revision(&step.model);
-                            if let Err(e) = self
-                                .inner
-                                .storage
-                                .cache_store(ch, &step.model, &rev, &output)
-                                .await
-                            {
-                                tracing::warn!(task = %task_id, model = %step.model, error = %e, "cache store failed");
-                            }
-                            if let Some(uh) = url_hash {
-                                let _ = self
-                                    .inner
-                                    .storage
-                                    .url_cache_store(uh, &step.model, &rev, ch)
-                                    .await;
-                            }
-                        }
+                        self.store_in_cache(task_id, &step.model, content_hash, url_hash, &output)
+                            .await;
                         let done = ModelResult::done(output.clone());
                         let _ = self
                             .inner
@@ -403,20 +516,8 @@ impl Engine {
                         return;
                     }
                     Err(e) => {
-                        // Strict: a step failure fails the whole pipeline. Retry the
-                        // attempt (completed steps resume) up to the limit, then
-                        // dead-letter via fail_item.
-                        if item.retries < max_retries {
-                            item.retries += 1;
-                            let _ = self
-                                .inner
-                                .storage
-                                .set_item_retries(task_id, idx, item.retries)
-                                .await;
-                            self.notify_item_change(task_id, idx).await;
-                            tokio::time::sleep(retry_backoff(item.retries)).await;
-                            continue 'attempt;
-                        }
+                        // Strict: a step failure fails the whole pipeline.
+                        let err = e.to_model_error();
                         let _ = self
                             .inner
                             .storage
@@ -424,11 +525,21 @@ impl Engine {
                                 task_id,
                                 idx,
                                 &step.model,
-                                &ModelResult::failed(TaskError::inference(e.to_string())),
+                                &ModelResult::failed(err.clone()),
                             )
                             .await;
-                        self.fail_item(task_id, idx, &item, TaskError::inference(e.to_string()))
-                            .await;
+                        if e.is_transient() && item.retries < max_retries {
+                            if !self
+                                .retry_after_failure(
+                                    task_id, idx, &mut item, err, permit, priority, cancel,
+                                )
+                                .await
+                            {
+                                return;
+                            }
+                            continue 'attempt;
+                        }
+                        self.fail_item(task_id, idx, &item, err).await;
                         return;
                     }
                 }
@@ -571,7 +682,7 @@ impl Engine {
 
     /// Mark the item (and its not-yet-done models) failed, then fire the webhook.
     /// Preserves results from models that already finished on a prior run.
-    async fn fail_item(&self, task_id: &str, idx: usize, item: &Item, err: TaskError) {
+    pub(crate) async fn fail_item(&self, task_id: &str, idx: usize, item: &Item, err: TaskError) {
         for label in &item.models {
             if model_done(item, label) {
                 continue;
@@ -594,27 +705,34 @@ impl Engine {
     /// Recompute the task's lifecycle state from its items and persist it when it
     /// changed. Called as each item reaches a terminal state, so the task flips to
     /// `Completed` exactly when its last item does (and the webhook payload then
-    /// carries the correct task state).
+    /// carries the correct task state). A task already in a terminal state
+    /// (cancelled, failed) keeps it.
     pub async fn rollup_task_state(&self, task_id: &str) {
         let task = match self.inner.storage.get_task(task_id).await {
             Ok(Some(t)) => t,
             _ => return,
         };
-        // A terminal state is final — never roll a Cancelled/Failed/Completed task
-        // back to Processing or Completed.
-        if aggregate::task_terminal(task.state) {
-            return;
-        }
-        let desired = aggregate::task_state_for(&task);
-        if desired != task.state
-            && let Err(e) = self.inner.storage.set_task_state(task_id, desired).await
+        let state = if aggregate::task_terminal(task.state) {
+            task.state
+        } else {
+            let desired = aggregate::task_state_for(&task);
+            if desired != task.state
+                && let Err(e) = self.inner.storage.set_task_state(task_id, desired).await
+            {
+                tracing::error!(task = %task_id, error = %e, "failed to roll up task state");
+            }
+            desired
+        };
+        // Once the task is finished for good and no item can still be reading
+        // them, remove any staged upload files. They persist across restarts (so
+        // resume can re-read them) and are cleaned exactly here — including for
+        // cancelled and failed tasks.
+        if aggregate::task_terminal(state)
+            && task
+                .items
+                .iter()
+                .all(|it| aggregate::item_terminal(it.state))
         {
-            tracing::error!(task = %task_id, error = %e, "failed to roll up task state");
-        }
-        // Once a task is terminal, remove any staged upload files. They persist
-        // across restarts (so resume can re-read them) and are cleaned exactly
-        // here, when the task is finished for good.
-        if aggregate::task_terminal(desired) {
             self.cleanup_uploads(&task.items);
         }
     }
@@ -653,6 +771,18 @@ impl Engine {
             .get(label)
             .ok_or_else(|| EngineError::UnknownModel(label.to_string()))?;
 
+        // Wait for a cold model to download/load before starting the per-
+        // classification clock, so first use is not reported as a timeout.
+        match tokio::time::timeout(MODEL_LOAD_TIMEOUT, handle.ensure_loaded()).await {
+            Ok(loaded) => loaded?,
+            Err(_) => {
+                return Err(EngineError::ModelUnavailable(format!(
+                    "model '{label}' did not load within {}s",
+                    MODEL_LOAD_TIMEOUT.as_secs()
+                )));
+            }
+        }
+
         let timeout = self.model_timeout(label);
         match (item.input.modality(), fetched) {
             (Modality::Image, Fetched::Image(img)) => {
@@ -686,29 +816,35 @@ impl Engine {
 
     /// Fetch the input once: download (with fallback), then decode an image or
     /// probe a video.
-    async fn fetch_item(&self, input: &Input) -> Result<(Fetched, Option<String>), EngineError> {
+    async fn fetch_item(&self, input: &Input) -> Result<FetchedInput, EngineError> {
         let want_hash = self.cache_enabled();
-        match input {
-            Input::Image(url) => {
-                let media = apollo_media::fetch(url, &self.inner.fetch_limits).await?;
-                self.image_from_media(media, want_hash).await
+        let (media, video) = match input {
+            Input::Image(url) => (
+                apollo_media::fetch(url, &self.inner.fetch_limits).await?,
+                false,
+            ),
+            Input::Video(url) => (
+                apollo_media::fetch(url, &self.inner.fetch_limits).await?,
+                true,
+            ),
+            Input::Bytes { path, video } => (LocalMedia::adopt(path.clone()), *video),
+            Input::Text(_) | Input::Audio(_) => {
+                return Err(EngineError::Incompatible(
+                    "text/audio inputs are not supported yet".into(),
+                ));
             }
-            Input::Video(url) => {
-                let media = apollo_media::fetch(url, &self.inner.fetch_limits).await?;
-                self.video_from_media(media, want_hash).await
-            }
-            Input::Bytes { path, video } => {
-                let media = LocalMedia::adopt(path.clone());
-                if *video {
-                    self.video_from_media(media, want_hash).await
-                } else {
-                    self.image_from_media(media, want_hash).await
-                }
-            }
-            Input::Text(_) | Input::Audio(_) => Err(EngineError::Incompatible(
-                "text/audio inputs are not supported yet".into(),
-            )),
-        }
+        };
+        let used_fallback = media.used_fallback();
+        let (fetched, content_hash) = if video {
+            self.video_from_media(media, want_hash).await?
+        } else {
+            self.image_from_media(media, want_hash).await?
+        };
+        Ok(FetchedInput {
+            fetched,
+            content_hash,
+            used_fallback,
+        })
     }
 
     /// Decode `media` as an image, hashing the raw bytes for the cache key when
@@ -746,6 +882,17 @@ impl Engine {
                 "video is {:.0}s, over the {max}s limit",
                 info.duration
             )));
+        }
+        // Reject oversized frames up front, before ffmpeg decodes (and PNG-encodes)
+        // any of them at full resolution.
+        if let Some(max_px) = self.inner.max_pixels {
+            let px = u64::from(info.width) * u64::from(info.height);
+            if px > max_px {
+                return Err(EngineError::Media(MediaError::Decode(format!(
+                    "video frames are {}x{} ({px} pixels), over the {max_px}-pixel limit",
+                    info.width, info.height
+                ))));
+            }
         }
         let hash = if want_hash {
             let p = media.path().to_path_buf();
@@ -789,9 +936,21 @@ impl Engine {
             .await
             .unwrap_or_default();
         let done_idx: HashSet<u32> = prior.iter().map(|f| f.index).collect();
-        let mut frames = prior;
-
         let early = early_exit_for(&strategy, &model);
+
+        // A resumed scan may already have hit its trigger before the interruption
+        // (crash after the frame checkpoint, before the result was written).
+        if let Some((labels, threshold)) = early.as_ref()
+            && prior
+                .iter()
+                .any(|f| apollo_media::triggered(&f.classification, labels, *threshold))
+        {
+            return Ok(ModelOutput::FrameScan(aggregate::frame_scan(
+                prior,
+                strategy.aggregation,
+            )));
+        }
+        let mut frames = prior;
         let batch = model.max_concurrent.max(1) as usize;
         let pending: Vec<FrameRef> = plan
             .into_iter()

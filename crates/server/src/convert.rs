@@ -4,7 +4,7 @@
 //! so the orphan rule rules out trait impls. Domain -> proto powers `GetTask` and
 //! webhook delivery; proto -> domain turns a request into an engine `Submission`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use apollo_domain as dom;
 use apollo_engine::Submission;
@@ -46,27 +46,42 @@ fn url_from_proto(u: pb::Url) -> dom::Url {
 /// exactly one input, which maps onto the `Task.result` oneof: a task-level error,
 /// a non-terminal/cancelled `state`, or the per-model `models` once finished.
 pub(crate) fn task_to_proto(t: dom::Task) -> pb::Task {
+    // `owner` is server-side access control, not part of the wire result.
     let dom::Task {
         id,
         state,
         mut items,
+        ..
     } = t;
     let result = (!items.is_empty()).then(|| task_result(state, items.remove(0)));
     pb::Task { id, result }
 }
 
 /// Map the (single) domain item + task state onto `Task.result`:
-///   * an item-level error, or a `Failed` task -> `error` (implicit "failed");
+///   * a cancelled task or item                -> `state: CANCELLED`;
+///   * a failed item, or a `Failed` task       -> `error` (implicit "failed");
 ///   * a `Completed` task                      -> `models` (implicit "completed");
-///   * otherwise                     -> `state` (queued / processing / cancelled).
+///   * otherwise                               -> `state` (queued / processing).
+///
+/// The item state decides, not the mere presence of `item.error`: an item that is
+/// `Retrying` keeps its last error for diagnostics but is still in progress, so it
+/// must not be reported as failed.
 fn task_result(state: dom::TaskState, it: dom::Item) -> pb::task::Result {
     use pb::task::Result as R;
-    if let Some(err) = it.error {
-        return R::Error(error_to_proto(err));
+    if state == dom::TaskState::Cancelled || it.state == dom::ItemState::Cancelled {
+        return R::State(pb::TaskState::Cancelled as i32);
+    }
+    if it.state == dom::ItemState::Failed || state == dom::TaskState::Failed {
+        // Failed with no attached error: surface a generic task-level error so
+        // the oneof still distinguishes failure from a live state.
+        return R::Error(it.error.map(error_to_proto).unwrap_or_else(|| pb::Error {
+            kind: pb::ErrorType::Unspecified as i32,
+            message: "task failed".to_string(),
+        }));
     }
     match state {
         dom::TaskState::Completed => {
-            let models: HashMap<String, pb::Model> = it
+            let models: BTreeMap<String, pb::Model> = it
                 .results
                 .into_iter()
                 .map(|(label, r)| (label, model_to_proto(r)))
@@ -76,15 +91,9 @@ fn task_result(state: dom::TaskState, it: dom::Item) -> pb::task::Result {
                 models,
             })
         }
-        // Failed with no attached error: surface a generic task-level error so the
-        // oneof still distinguishes failure from a live state.
-        dom::TaskState::Failed => R::Error(pb::Error {
-            kind: pb::ErrorType::Unspecified as i32,
-            message: "task failed".to_string(),
-        }),
         dom::TaskState::Queued => R::State(pb::TaskState::Queued as i32),
-        dom::TaskState::Processing => R::State(pb::TaskState::Processing as i32),
-        dom::TaskState::Cancelled => R::State(pb::TaskState::Cancelled as i32),
+        // Processing (Failed / Cancelled were handled above).
+        _ => R::State(pb::TaskState::Processing as i32),
     }
 }
 
@@ -289,6 +298,7 @@ mod tests {
                 None,
                 Some("p".into()),
             )],
+            owner: None,
         };
 
         let pt = task_to_proto(task);
@@ -320,6 +330,7 @@ mod tests {
                 Some(dom::TaskError::fetch("fetch failed")),
                 None,
             )],
+            owner: None,
         };
         let err = match task_to_proto(task).result {
             Some(pb::task::Result::Error(e)) => e,
@@ -327,6 +338,70 @@ mod tests {
         };
         assert_eq!(err.kind, pb::ErrorType::Fetch as i32);
         assert_eq!(err.message, "fetch failed");
+    }
+
+    #[test]
+    fn retrying_item_is_still_processing_not_failed() {
+        let task = dom::Task {
+            id: "t4".into(),
+            state: dom::TaskState::Processing,
+            items: vec![item(
+                dom::ItemState::Retrying,
+                std::collections::BTreeMap::new(),
+                Some(dom::TaskError::fetch("connection refused")),
+                None,
+            )],
+            owner: None,
+        };
+        match task_to_proto(task).result {
+            Some(pb::task::Result::State(s)) => assert_eq!(s, pb::TaskState::Processing as i32),
+            other => panic!("expected a Processing state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelled_task_maps_to_cancelled_state() {
+        for (task_state, item_state) in [
+            (dom::TaskState::Cancelled, dom::ItemState::Processing),
+            (dom::TaskState::Cancelled, dom::ItemState::Cancelled),
+        ] {
+            let task = dom::Task {
+                id: "t5".into(),
+                state: task_state,
+                items: vec![item(
+                    item_state,
+                    std::collections::BTreeMap::new(),
+                    Some(dom::TaskError::cancelled("cancelled")),
+                    None,
+                )],
+                owner: None,
+            };
+            match task_to_proto(task).result {
+                Some(pb::task::Result::State(s)) => {
+                    assert_eq!(s, pb::TaskState::Cancelled as i32)
+                }
+                other => panic!("expected a Cancelled state, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn failed_item_in_completed_task_maps_to_error() {
+        let task = dom::Task {
+            id: "t6".into(),
+            state: dom::TaskState::Completed,
+            items: vec![item(
+                dom::ItemState::Failed,
+                std::collections::BTreeMap::new(),
+                Some(dom::TaskError::new(dom::ErrorKind::Decode, "not an image")),
+                None,
+            )],
+            owner: None,
+        };
+        match task_to_proto(task).result {
+            Some(pb::task::Result::Error(e)) => assert_eq!(e.kind, pb::ErrorType::Decode as i32),
+            other => panic!("expected an Error result, got {other:?}"),
+        }
     }
 
     #[test]
@@ -340,6 +415,7 @@ mod tests {
                 None,
                 None,
             )],
+            owner: None,
         };
         match task_to_proto(task).result {
             Some(pb::task::Result::State(s)) => assert_eq!(s, pb::TaskState::Processing as i32),

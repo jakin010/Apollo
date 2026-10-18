@@ -19,7 +19,9 @@ pub struct Config {
     #[serde(default)]
     pub webhook: Option<WebhookConfig>,
     #[serde(default)]
-    pub auth: Option<AuthConfig>,
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
@@ -34,19 +36,68 @@ pub struct Config {
     pub models: BTreeMap<String, ModelConfig>,
 }
 
-/// Authentication for the `Inference` service. When this section is present,
-/// every Inference RPC must carry a valid PASETO v4 token signed by the matching
-/// secret key (mint tokens with `apollo token`). Health and reflection stay open.
+/// Authentication for the `Inference` service — **on by default**. Every
+/// Inference RPC must carry a valid PASETO v4 token signed by the matching secret
+/// key (mint tokens with `apollo token`). Health and reflection stay open.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
+    /// Require a token on every Inference RPC. Defaults to `true`; set `false`
+    /// only on a trusted network (anyone who can reach the port can then submit
+    /// work).
+    #[serde(default = "crate::defaults::auth_enabled")]
+    pub enabled: bool,
     /// PASERK-encoded v4 **public** key (`k4.public.…`) used to verify tokens.
-    pub public_key: String,
+    /// When unset, the server uses — creating on first start — a keypair kept in
+    /// an owner-only `auth.key` file in its state directory, which `apollo token`
+    /// also reads.
+    #[serde(default)]
+    pub public_key: Option<String>,
+    /// Token subjects (`sub`) that may read and cancel every task. Everyone else
+    /// only sees the tasks their own subject created.
+    #[serde(default)]
+    pub admin_subjects: Vec<String>,
+    /// File listing revoked token ids and subjects (written by `apollo revoke`,
+    /// re-read by running servers within seconds). Defaults to
+    /// `revoked_tokens` in the server's state directory. Relative paths resolve
+    /// from the config file's directory.
+    #[serde(default)]
+    pub revocation_file: Option<String>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: defaults::auth_enabled(),
+            public_key: None,
+            admin_subjects: Vec::new(),
+            revocation_file: None,
+        }
+    }
+}
+
+/// `[tls]` — serve the gRPC API over TLS. Omit the section to serve plaintext
+/// (e.g. behind a TLS-terminating proxy). Relative paths resolve from the config
+/// file's directory. Certificates are read at startup; restart to pick up a
+/// renewed certificate.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM certificate chain (leaf first) presented to clients.
+    pub cert_file: String,
+    /// PEM private key for `cert_file`.
+    pub key_file: String,
+    /// PEM CA bundle. When set, clients must present a certificate signed by it
+    /// (mutual TLS), in addition to any `[auth]` token.
+    #[serde(default)]
+    pub client_ca_file: Option<String>,
 }
 
 /// Result cache (optional). When present and `enabled`, model outputs are cached
 /// by content hash (with a url→content-hash hint) so identical inputs skip
 /// inference. A bare `[cache]` section turns it on.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     /// Master switch. Defaults to true so `[cache]` alone enables caching.
     #[serde(default = "crate::defaults::cache_enabled")]
@@ -141,7 +192,7 @@ pub struct WebhookConfig {
 
 /// Safety limits applied when fetching remote inputs (SSRF and resource guards).
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Max bytes downloaded for a single input (e.g. `512mb`; `0` = unlimited).
     pub max_download: String,
@@ -265,7 +316,7 @@ pub struct PostgresConfig {
     pub max_connections: u32,
 }
 
-/// `[database.surrealdb]` — future backend.
+/// `[database.surrealdb]` — remote SurrealDB backend.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurrealdbConfig {

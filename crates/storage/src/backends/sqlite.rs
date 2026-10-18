@@ -123,7 +123,7 @@ impl SqliteStorage {
 
     /// Shared reconstruction used by `get_task` and `load_incomplete_tasks`.
     async fn load_task(&self, id: &str) -> Result<Option<Task>> {
-        let Some(trow) = sqlx::query("SELECT state FROM tasks WHERE id = ?")
+        let Some(trow) = sqlx::query("SELECT state, owner FROM tasks WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -131,6 +131,7 @@ impl SqliteStorage {
             return Ok(None);
         };
         let state = trow.try_get::<String, _>("state")?.parse::<TaskState>()?;
+        let owner: Option<String> = trow.try_get("owner")?;
 
         let irows = sqlx::query(
             "SELECT idx, input_json, models_json, pipeline, state, error, retries
@@ -200,6 +201,7 @@ impl SqliteStorage {
             id: id.to_string(),
             state,
             items,
+            owner,
         }))
     }
 }
@@ -211,6 +213,18 @@ impl Storage for SqliteStorage {
         for stmt in SCHEMA {
             sqlx::query(*stmt).execute(&mut *tx).await?;
         }
+        // Columns added after the first release: `CREATE TABLE IF NOT EXISTS`
+        // does not extend an existing table, so add them when missing.
+        let has_owner: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'owner'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_owner == 0 {
+            sqlx::query("ALTER TABLE tasks ADD COLUMN owner TEXT")
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -219,12 +233,14 @@ impl Storage for SqliteStorage {
         let mut tx = self.pool.begin().await?;
         let ts = now();
         sqlx::query(
-            "INSERT INTO tasks (id, state, attempts, created_at, updated_at) VALUES (?, ?, 0, ?, ?)",
+            "INSERT INTO tasks (id, state, attempts, created_at, updated_at, owner)
+             VALUES (?, ?, 0, ?, ?, ?)",
         )
         .bind(&task.id)
         .bind(task.state.as_str())
         .bind(ts)
         .bind(ts)
+        .bind(task.owner.as_deref())
         .execute(&mut *tx)
         .await?;
 
@@ -282,6 +298,19 @@ impl Storage for SqliteStorage {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn cancel_task_if_active(&self, id: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE tasks SET state = ?, updated_at = ?
+             WHERE id = ? AND state IN ('queued', 'processing')",
+        )
+        .bind(TaskState::Cancelled.as_str())
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn set_item_state(
@@ -447,6 +476,16 @@ impl Storage for SqliteStorage {
         Ok(n as u32)
     }
 
+    async fn release_resume_attempts(&self) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE tasks SET attempts = attempts - 1
+             WHERE state IN ('queued', 'processing') AND attempts > 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>> {
         let rows = sqlx::query(
             "SELECT task_id, idx FROM items
@@ -587,6 +626,22 @@ impl Storage for SqliteStorage {
         .await?;
         Ok(())
     }
+
+    async fn purge_cache_before(&self, cutoff_unix_secs: i64) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let a = sqlx::query("DELETE FROM cache WHERE created_at < ?")
+            .bind(cutoff_unix_secs)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let b = sqlx::query("DELETE FROM url_cache WHERE created_at < ?")
+            .bind(cutoff_unix_secs)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(a + b)
+    }
 }
 
 #[cfg(test)]
@@ -638,6 +693,7 @@ mod tests {
             id: "task-1".into(),
             state: TaskState::Queued,
             items: vec![item],
+            owner: None,
         }
     }
 
@@ -730,6 +786,125 @@ mod tests {
             .unwrap();
         assert_eq!(store.purge_finished_before(now() + 10).await.unwrap(), 1);
         assert!(store.get_task("task-1").await.unwrap().is_none());
+
+        cleanup(&cfg);
+    }
+
+    #[tokio::test]
+    async fn owner_column_is_added_to_existing_databases() {
+        let cfg = temp_cfg();
+        // A database created before the `owner` column existed.
+        {
+            let store = SqliteStorage::connect(&cfg).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY, state TEXT NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL)",
+            )
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO tasks VALUES ('old', 'completed', 0, 1, 1)")
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        let store = SqliteStorage::connect(&cfg).await.unwrap();
+        store.migrate().await.unwrap();
+        store.migrate().await.unwrap(); // still idempotent
+        let old = store.get_task("old").await.unwrap().unwrap();
+        assert_eq!(old.owner, None);
+
+        let mut t = sample_task();
+        t.owner = Some("alice".into());
+        store.create_task(&t).await.unwrap();
+        let t = store.get_task("task-1").await.unwrap().unwrap();
+        assert_eq!(t.owner.as_deref(), Some("alice"));
+        cleanup(&cfg);
+    }
+
+    #[tokio::test]
+    async fn cancel_only_applies_to_active_tasks() {
+        let cfg = temp_cfg();
+        let store = SqliteStorage::connect(&cfg).await.unwrap();
+        store.migrate().await.unwrap();
+        store.create_task(&sample_task()).await.unwrap();
+
+        assert!(store.cancel_task_if_active("task-1").await.unwrap());
+        let t = store.get_task("task-1").await.unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Cancelled);
+
+        // A finished task is never flipped to cancelled.
+        store
+            .set_task_state("task-1", TaskState::Completed)
+            .await
+            .unwrap();
+        assert!(!store.cancel_task_if_active("task-1").await.unwrap());
+        let t = store.get_task("task-1").await.unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Completed);
+        assert!(!store.cancel_task_if_active("missing").await.unwrap());
+
+        cleanup(&cfg);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_releases_one_attempt() {
+        let cfg = temp_cfg();
+        let store = SqliteStorage::connect(&cfg).await.unwrap();
+        store.migrate().await.unwrap();
+        store.create_task(&sample_task()).await.unwrap();
+
+        // A never-resumed task stays at zero.
+        assert_eq!(store.release_resume_attempts().await.unwrap(), 0);
+        store.increment_attempts("task-1").await.unwrap();
+        store.increment_attempts("task-1").await.unwrap();
+        assert_eq!(store.release_resume_attempts().await.unwrap(), 1);
+        assert_eq!(store.increment_attempts("task-1").await.unwrap(), 2);
+
+        // Finished tasks are left alone.
+        store
+            .set_task_state("task-1", TaskState::Completed)
+            .await
+            .unwrap();
+        assert_eq!(store.release_resume_attempts().await.unwrap(), 0);
+
+        cleanup(&cfg);
+    }
+
+    #[tokio::test]
+    async fn cache_purge_drops_only_stale_entries() {
+        let cfg = temp_cfg();
+        let store = SqliteStorage::connect(&cfg).await.unwrap();
+        store.migrate().await.unwrap();
+        let out = ModelOutput::Classification(Classification::default());
+        store.cache_store("h", "m", "main", &out).await.unwrap();
+        store.url_cache_store("u", "m", "main", "h").await.unwrap();
+
+        // Nothing is older than an hour ago.
+        assert_eq!(store.purge_cache_before(now() - 3600).await.unwrap(), 0);
+        assert!(
+            store
+                .cache_lookup("h", "m", "main", 0)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(store.purge_cache_before(now() + 10).await.unwrap(), 2);
+        assert!(
+            store
+                .cache_lookup("h", "m", "main", 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .url_cache_lookup("u", "m", "main", 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         cleanup(&cfg);
     }

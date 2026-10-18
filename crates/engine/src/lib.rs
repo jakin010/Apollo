@@ -1,7 +1,7 @@
 //! `apollo-engine` — async orchestration core. Wires storage + inference + media
 //! into a runnable pipeline.
 //!
-//! - `queue`     — submission, startup recovery, retention timer
+//! - `queue`     — submission, startup recovery, maintenance timer
 //! - `scheduler` — per-task dispatch: fetch-once, fan-out, global concurrency cap
 //! - `worker`    — per-model dedicated-thread batching worker (idle-unload)
 //! - `registry`  — loaded-model registry + submission validation
@@ -31,6 +31,9 @@ mod registry;
 mod scheduler;
 mod webhook;
 mod worker;
+
+#[cfg(test)]
+mod tests;
 
 pub use error::EngineError;
 pub use webhook::{WebhookError, WebhookSink};
@@ -87,7 +90,7 @@ impl Drop for InFlightGuard {
 
 impl Engine {
     /// Build the engine: select the compute device, spawn one worker per enabled
-    /// model, and start the retention timer.
+    /// model, and start the maintenance timer.
     ///
     /// Must be called within a Tokio runtime (it spawns background tasks). Loading
     /// of model weights is lazy — workers load on first use, not here.
@@ -136,22 +139,40 @@ impl Engine {
                 cancels: Mutex::new(HashMap::new()),
             }),
         };
-        engine.spawn_retention();
+        engine.spawn_maintenance();
         engine.spawn_redelivery();
         engine
     }
 
-    /// Directory under which `ClassifyStream` uploads are staged: `[app].cache_dir`
-    /// (or the system temp dir if unset) joined with `uploads`. Not created here.
+    /// Directory under which `ClassifyStream` uploads are staged:
+    /// `[app].cache_dir/uploads` when set, otherwise a per-user cache directory
+    /// (`~/.cache/apollo/uploads` on Linux, `~/Library/Caches/apollo/uploads` on
+    /// macOS). Never the shared system temp dir, where another local user could
+    /// pre-create the directory and read or plant uploads. Not created here; see
+    /// [`Engine::ensure_upload_dir`].
     pub fn upload_dir(&self) -> PathBuf {
-        self.inner
-            .config
-            .app
-            .cache_dir
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("apollo"))
-            .join("uploads")
+        let base = match &self.inner.config.app.cache_dir {
+            Some(dir) => PathBuf::from(dir),
+            None => dirs::cache_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("apollo"),
+        };
+        base.join("uploads")
+    }
+
+    /// Create the upload directory if needed — owner-only (`0700`) on Unix — and
+    /// return it.
+    pub fn ensure_upload_dir(&self) -> std::io::Result<PathBuf> {
+        let dir = self.upload_dir();
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&dir)?;
+        Ok(dir)
     }
 
     /// Hard cap on accepted upload bytes, mirroring the remote-download cap
@@ -160,42 +181,21 @@ impl Engine {
         self.inner.fetch_limits.max_download_bytes
     }
 
-    /// Validate, persist, and start a task. Returns its id immediately; processing
-    /// continues in the background. Validation is synchronous, so a bad request is
-    /// rejected before anything is written.
-    pub async fn submit(&self, submissions: Vec<Submission>) -> Result<String, EngineError> {
+    /// Validate, persist, and start a task owned by `owner` (the submitting
+    /// token's subject; `None` when authentication is disabled). Returns its id
+    /// immediately; processing continues in the background. Validation is
+    /// synchronous, so a bad request is rejected before anything is written.
+    pub async fn submit(
+        &self,
+        submissions: Vec<Submission>,
+        owner: Option<String>,
+    ) -> Result<String, EngineError> {
         if submissions.is_empty() {
             return Err(EngineError::Incompatible("no items submitted".into()));
         }
-        // Resolve any named pipelines to their ordered model lists up front, so
-        // the resulting models get the same compatibility checks as a direct
-        // `models` list. Unknown pipeline names are rejected here.
         let mut resolved = Vec::with_capacity(submissions.len());
         for s in submissions {
-            let Submission {
-                input,
-                models,
-                pipeline,
-            } = s;
-            let (models, pipeline) = match pipeline {
-                Some(name) => {
-                    let p =
-                        self.inner.config.pipelines.get(&name).ok_or_else(|| {
-                            EngineError::Config(format!("unknown pipeline '{name}'"))
-                        })?;
-                    let mut steps = p.steps.clone();
-                    steps.sort_by_key(|x| x.order);
-                    (
-                        steps.into_iter().map(|x| x.model).collect::<Vec<_>>(),
-                        Some(name),
-                    )
-                }
-                None => (models, None),
-            };
-            self.inner
-                .registry
-                .validate_item(&self.inner.config, &input, &models)?;
-            resolved.push((input, models, pipeline));
+            resolved.push(self.resolve_submission(s)?);
         }
 
         // Backpressure: shed load instead of growing memory without bound.
@@ -227,6 +227,7 @@ impl Engine {
             id: id.clone(),
             state: TaskState::Queued,
             items,
+            owner,
         };
         if let Err(e) = self.inner.storage.create_task(&task).await {
             // Release the reservation: no run_items will be spawned to do it.
@@ -238,6 +239,68 @@ impl Engine {
         let engine = self.clone();
         tokio::spawn(async move { engine.run_task(task).await });
         Ok(id)
+    }
+
+    /// Check a submission without queueing it: model / pipeline / modality
+    /// validation plus a capacity check. Lets `ClassifyStream` reject a request
+    /// before accepting any upload bytes. `submit` repeats every check.
+    pub fn check_submission(&self, submission: Submission) -> Result<(), EngineError> {
+        self.resolve_submission(submission)?;
+        self.check_memory()?;
+        let pending = self.inner.in_flight.load(Ordering::SeqCst);
+        if self.inner.max_pending > 0 && pending >= self.inner.max_pending {
+            return Err(EngineError::Overloaded(format!(
+                "queue full ({pending} items in flight, limit {})",
+                self.inner.max_pending
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve a named pipeline to its ordered model list (so the models get the
+    /// same compatibility checks as a direct `models` list) and validate the
+    /// models against the input's modality.
+    fn resolve_submission(
+        &self,
+        submission: Submission,
+    ) -> Result<(Input, Vec<String>, Option<String>), EngineError> {
+        let Submission {
+            input,
+            models,
+            pipeline,
+        } = submission;
+        let (models, pipeline) =
+            match pipeline {
+                Some(name) => {
+                    let p =
+                        self.inner.config.pipelines.get(&name).ok_or_else(|| {
+                            EngineError::Config(format!("unknown pipeline '{name}'"))
+                        })?;
+                    let mut steps = p.steps.clone();
+                    steps.sort_by_key(|x| x.order);
+                    (
+                        steps.into_iter().map(|x| x.model).collect::<Vec<_>>(),
+                        Some(name),
+                    )
+                }
+                None => (models, None),
+            };
+        self.inner
+            .registry
+            .validate_item(&self.inner.config, &input, &models)?;
+        Ok((input, models, pipeline))
+    }
+
+    /// Graceful-shutdown hook, called once the server has stopped accepting
+    /// requests. Releases this run's resume attempt for every incomplete task, so
+    /// a clean restart (e.g. a deploy) never counts toward the poison-task cap —
+    /// only crashes do.
+    pub async fn shutdown(&self) {
+        match self.inner.storage.release_resume_attempts().await {
+            Ok(n) if n > 0 => tracing::info!(tasks = n, "released resume attempts on shutdown"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not release resume attempts"),
+        }
     }
 
     /// Fetch a task by id (backs the `GetTask` RPC).
@@ -268,10 +331,12 @@ impl Engine {
                 .clone();
             token.store(true, Ordering::SeqCst);
         }
-        self.inner
-            .storage
-            .set_task_state(task_id, TaskState::Cancelled)
-            .await?;
+        // Conditional write: if the task finished in the meantime it stays
+        // finished rather than being relabelled as cancelled.
+        if !self.inner.storage.cancel_task_if_active(task_id).await? {
+            self.inner.cancels.lock().unwrap().remove(task_id);
+            return Ok(());
+        }
         tracing::info!(task = %task_id, "task cancellation requested");
         Ok(())
     }

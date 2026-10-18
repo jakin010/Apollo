@@ -29,10 +29,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Generate Rust once from all three files: the shared messages plus both
-    // service stubs, all under the single `apollo.v1` module.
+    // service stubs, all under the single `apollo.v1` module. Maps are BTreeMaps
+    // so encoding is deterministic (entries sorted by key): webhook signatures
+    // cover the encoded bytes, and a receiver can reproduce them by re-encoding.
+    //
+    // `double_must_use` (clippy >= 1.99) flags the `#[must_use]` that
+    // `async_trait` puts on the generated service-trait methods; it is generated
+    // code we do not control, so the lint is allowed on those traits only.
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        .btree_map(".")
+        .trait_attribute(".", "#[allow(clippy::double_must_use)]")
         .compile_protos(
             &[common.clone(), inference.clone(), webhook.clone()],
             std::slice::from_ref(&proto_dir),

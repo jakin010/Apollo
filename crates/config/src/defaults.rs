@@ -30,6 +30,9 @@ pub(crate) fn enabled() -> bool {
 pub(crate) fn cache_enabled() -> bool {
     true
 }
+pub(crate) fn auth_enabled() -> bool {
+    true
+}
 pub(crate) fn model_max_concurrent() -> u32 {
     8
 }

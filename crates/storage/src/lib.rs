@@ -47,6 +47,9 @@ pub use resume::PendingWebhook;
 /// Persistence operations the rest of the app depends on. Task lifecycle is fully
 /// persisted (it survives restarts), tracked at per-(item, model) granularity so
 /// interrupted work can resume without redoing completed pieces.
+// `async_trait` marks the boxed-future methods `#[must_use]`; clippy >= 1.99
+// reports that as `double_must_use`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Apply pending schema migrations. Idempotent.
@@ -61,6 +64,11 @@ pub trait Storage: Send + Sync {
     async fn get_task(&self, id: &str) -> Result<Option<Task>, StorageError>;
 
     async fn set_task_state(&self, id: &str, state: TaskState) -> Result<(), StorageError>;
+
+    /// Mark a task `Cancelled` only if it is still `Queued` or `Processing`, in
+    /// one conditional write, so a cancel can never overwrite a task that has
+    /// just finished. Returns whether the state changed.
+    async fn cancel_task_if_active(&self, id: &str) -> Result<bool, StorageError>;
 
     async fn set_item_state(
         &self,
@@ -101,8 +109,9 @@ pub trait Storage: Send + Sync {
         label: &str,
     ) -> Result<Vec<Frame>, StorageError>;
 
-    /// Record how many sampling steps have fully completed, so resume can skip
-    /// cheap re-extraction.
+    /// Record how many sampling steps have fully completed. Reserved for skipping
+    /// finished steps on resume; the engine does not use it yet (resume relies on
+    /// the frame rows alone).
     async fn set_steps_completed(
         &self,
         task_id: &str,
@@ -127,6 +136,11 @@ pub trait Storage: Send + Sync {
     /// Bump and return the resume attempt count. The engine fails a task once
     /// this exceeds its cap, so a poison task can't crash-loop.
     async fn increment_attempts(&self, id: &str) -> Result<u32, StorageError>;
+
+    /// Undo one resume attempt for every incomplete task (never below zero).
+    /// Called on a graceful shutdown, so that only interruptions by a crash count
+    /// toward the poison-task cap. Returns the number of tasks adjusted.
+    async fn release_resume_attempts(&self) -> Result<u64, StorageError>;
 
     // -------------------------- webhook delivery -------------------------
 
@@ -190,6 +204,10 @@ pub trait Storage: Send + Sync {
         revision: &str,
         content_hash: &str,
     ) -> Result<(), StorageError>;
+
+    /// Delete content-cache and url-cache entries created before `cutoff` (unix
+    /// seconds). Returns the number of entries removed.
+    async fn purge_cache_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError>;
 }
 
 /// Open the configured backend and run migrations. Returns a trait object so the

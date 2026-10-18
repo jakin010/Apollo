@@ -3,7 +3,8 @@
 //! Two halves, matching the two services in `inference.proto`:
 //!
 //! * [`Client`] — call the `Inference` service: [`Client::classify`],
-//!   [`Client::get_task`].
+//!   [`Client::classify_stream`], [`Client::get_task`], [`Client::cancel_task`].
+//!   `https://` endpoints use TLS.
 //! * [`serve_webhook`] + [`WebhookHandler`] — stand up the `Webhook` receiver so
 //!   apollo can push per-item results to you. Point the apollo server's
 //!   `[webhook].url` at the address you serve on. Enable the `reflection` feature
@@ -17,7 +18,11 @@
 //! # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
 //! use apollo_client::{Client, item};
 //!
-//! let client = Client::connect("http://127.0.0.1:8080").await?;
+//! // The server requires a token by default (mint one with `apollo token`).
+//! let client = Client::builder("http://127.0.0.1:8080")
+//!     .token("v4.public.…")
+//!     .build()
+//!     .await?;
 //! let task_id = client
 //!     .classify(item::image("https://example.com/cat.jpg", ["resnet"]))
 //!     .await?;
@@ -62,6 +67,10 @@ pub use apollo_proto::{
     Ack, Classification, Error, ErrorType, Frame, FrameScan, InputItem, Model, ModelState, Models,
     Prediction, Task, TaskCreated, TaskState, Url,
 };
+
+/// The webhook signing scheme (header names, `sign`, `verify`), for verifying
+/// deliveries in a receiver you build yourself.
+pub use apollo_proto::webhook_signature;
 
 // `tonic::async_trait` is re-exported for implementing [`WebhookHandler`] without
 // taking a direct dependency on the `async-trait` crate.

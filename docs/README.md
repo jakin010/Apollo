@@ -64,7 +64,7 @@ There is **no separate video architecture** — video is always "an image classi
 2. The scheduler fetches the input **once**, then fans it out to each model's worker. A global concurrency cap (a priority‑ordered gate) bounds how many inferences run at once (your VRAM budget).
 3. Each model runs on its own dedicated worker thread that **lazily loads** weights on first use, **batches** concurrent requests into one forward pass, and **unloads** after an idle timeout (unless the model is pinned with `keep_in_memory`).
 4. Results are written per `(item, model)` as they complete. For video, each classified frame is checkpointed so an interrupted scan resumes without re‑doing frames.
-5. When every model for an item is done, the item reaches a terminal state, the webhook (if configured) fires, and `GetTask` reflects the final result. A failing item is **retried** up to `[app].max_retries` before being marked failed.
+5. When every model for an item is done, the item reaches a terminal state, the webhook (if configured) fires, and `GetTask` reflects the final result. Transient failures (network errors, model timeouts) are **retried** up to `[app].max_retries`; permanent ones (a refused URL, undecodable input) fail immediately.
 
 On startup the engine **recovers** any tasks left non‑terminal by a previous run and re‑queues them; a poison task that keeps crashing is failed once its resume‑attempt count exceeds the cap.
 
@@ -93,23 +93,21 @@ apollo config set app.port 8080
 apollo config set models.general.architecture vit
 apollo config set models.general.repo google/vit-base-patch16-224
 
-# 2. (Optional) enable authentication.
-apollo keygen                       # prints public_key + secret_key
-apollo config set auth.public_key "k4.public.…"
-export APOLLO_SECRET_KEY="k4.secret.…"
-apollo token --subject my-client --expires 30d   # prints an API token
+# 2. Start the server (add --daemon to detach). Authentication is on by default:
+#    the first start creates a signing keypair in the server's state directory.
+apollo start --daemon               # or: apollo start --config ./config.toml --port 8080
 
-# 3. Start the server (foreground; add --daemon to detach).
-apollo start                        # or: apollo start --config ./config.toml --port 8080
+# 3. Mint a token for your client.
+TOKEN=$(apollo token --subject my-client --expires 30d)
 
 # 4. Submit an image (reflection is enabled, so grpcurl needs no .proto files).
 grpcurl -plaintext \
-  -H "authorization: <token>" \
+  -H "authorization: $TOKEN" \
   -d '{"item": {"models": ["general"], "image_url": {"main": "https://example.com/cat.jpg"}}}' \
   localhost:8080 apollo.v1.Inference/Classify
 # → {"taskId": "…"}
 
-grpcurl -plaintext -d '{"task_id": "…"}' localhost:8080 apollo.v1.Inference/GetTask
+grpcurl -plaintext -H "authorization: $TOKEN" -d '{"task_id": "…"}' localhost:8080 apollo.v1.Inference/GetTask
 ```
 
 The server exits at startup if **no models are configured** — there would be nothing to serve.
@@ -119,6 +117,6 @@ The server exits at startup if **no models are configured** — there would be n
 | Document | Covers |
 |----------|--------|
 | [grpc-api.md](./grpc-api.md) | The `Inference` service: methods, messages, enums, error codes, auth, and examples. |
-| [webhooks.md](./webhooks.md) | The `Webhook` service you implement to receive results, delivery semantics, and HMAC signing. |
+| [webhooks.md](./webhooks.md) | The `Webhook` service you implement to receive results, delivery semantics, and payload signing. |
 | [configuration.md](./configuration.md) | Every config section and field, defaults, units, validation, and the CLI. |
 | [database.md](./database.md) | Persistence: backends, schema, migrations, retention, and the result cache. |

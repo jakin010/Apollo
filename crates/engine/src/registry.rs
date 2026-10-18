@@ -11,7 +11,7 @@ use apollo_config::Config;
 use apollo_domain::{Input, Modality};
 
 use crate::error::EngineError;
-use crate::worker::{ModelHandle, spawn_worker};
+use crate::worker::{Loader, ModelHandle, WorkerSpec, spawn_worker};
 
 /// Holds one worker per enabled model, keyed by label.
 pub(crate) struct Registry {
@@ -31,7 +31,19 @@ impl Registry {
             if !model.enabled {
                 continue;
             }
-            let handle = spawn_worker(model.clone(), device.clone(), cache_dir.clone(), idle);
+            let cfg = model.clone();
+            let dev = device.clone();
+            let dir = cache_dir.clone();
+            let loader: Loader = Box::new(move || {
+                apollo_inference::load(&cfg, &dev, dir.as_deref()).map_err(|e| e.to_string())
+            });
+            let spec = WorkerSpec {
+                name: label.clone(),
+                batch: model.max_concurrent.max(1) as usize,
+                keep_in_memory: model.keep_in_memory,
+                idle,
+            };
+            let handle = spawn_worker(spec, loader);
             workers.insert(label.clone(), Arc::new(handle));
             tracing::info!(model = %label, repo = %model.repo, "model worker started");
         }

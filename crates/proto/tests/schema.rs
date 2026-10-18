@@ -397,6 +397,32 @@ fn wire_tags_cover_each_type() {
 }
 
 #[test]
+fn encoding_is_deterministic() {
+    // Map entries are emitted in key order, so equal messages encode to equal
+    // bytes regardless of insertion order — webhook signatures rely on this.
+    let model = |label: u32| Model {
+        result: Some(model::Result::Classification(Classification {
+            predictions: vec![Prediction { label, score: 0.5 }],
+        })),
+    };
+    let task = |pairs: &[(&str, u32)]| Task {
+        id: "t".into(),
+        result: Some(task::Result::Models(Models {
+            pipeline: None,
+            models: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), model(*v)))
+                .collect(),
+        })),
+    };
+    let a = task(&[("zeta", 1), ("alpha", 2), ("mid", 3)]).encode_to_vec();
+    let b = task(&[("mid", 3), ("zeta", 1), ("alpha", 2)]).encode_to_vec();
+    assert_eq!(a, b);
+    // Re-encoding a decoded message reproduces the bytes exactly.
+    assert_eq!(Task::decode(&a[..]).unwrap().encode_to_vec(), a);
+}
+
+#[test]
 fn full_task_round_trips() {
     // A completed Task whose Models map holds two models — one done with a
     // classification, one failed with an Error — exercising both Model.result
@@ -405,7 +431,7 @@ fn full_task_round_trips() {
         id: "task-123".into(),
         result: Some(task::Result::Models(Models {
             pipeline: Some("default".into()),
-            models: std::collections::HashMap::from([
+            models: std::collections::BTreeMap::from([
                 (
                     "vit".to_string(),
                     Model {

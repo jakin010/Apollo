@@ -39,14 +39,28 @@ Because delivery is at‑least‑once and unordered across retries, treat each w
 
 ## Signing and authenticity
 
-When `[webhook].secret` is set, every delivery carries an HMAC signature in gRPC metadata so the receiver can confirm the call came from a holder of the secret:
+When `[webhook].secret` is set, every delivery is signed (scheme `v1`) with two gRPC metadata headers:
 
-- **Header:** `x-apollo-webhook-signature`
-- **Value:** lowercase‑hex **HMAC‑SHA256** of the **task id** (`Task.id`), keyed by the shared secret.
+| Header | Value |
+|--------|-------|
+| `x-apollo-webhook-timestamp` | Unix seconds when the delivery was sent (fresh on every retry). |
+| `x-apollo-webhook-signature` | `v1=` + lowercase‑hex **HMAC‑SHA256**(secret, `"<timestamp>."` ‖ `payload`) |
 
-To verify on the receiver: recompute `HMAC-SHA256(secret, task.id)`, hex‑encode it, and compare (ideally with a constant‑time comparison) against the header value.
+`payload` is the protobuf‑encoded `Task` **exactly as sent** — the gRPC message bytes, without gRPC's 5‑byte frame header. So the signature covers the whole delivery: a captured delivery cannot be altered (any change to the payload or timestamp breaks the signature), and an old one cannot be replayed later (the receiver rejects stale timestamps).
 
-The signature authenticates the caller and binds the delivery to a task id; it does **not** encrypt the payload. Pair it with a TLS `https://` webhook URL for transport confidentiality. (The signature does not cover the full message body, so don't rely on it for body integrity beyond the task id.)
+**To verify on the receiver:**
+
+1. Read both headers; reject the call if either is missing.
+2. Reject it if the timestamp is more than your tolerance (5 minutes recommended) away from your clock.
+3. Compute `HMAC-SHA256(secret, timestamp + "." + payload)` over the **raw message bytes**, hex‑encode it, and compare it to the header (after `v1=`) in constant time.
+
+If your gRPC framework only gives you the decoded message, re‑encode it with **deterministic** serialization (fields in number order, map entries sorted by key — e.g. Go `proto.MarshalOptions{Deterministic: true}`, Java `CodedOutputStream.useDeterministicSerialization()`). Apollo encodes that way, so the bytes match as long as both sides were generated from the same schema version; verifying raw bytes avoids even that caveat.
+
+The Rust SDK does all of this for you: `apollo_client::WebhookReceiver::new(handler).secret("…")` verifies the raw bytes before your handler runs (tolerance adjustable with `.signature_tolerance(…)`), and `apollo_client::webhook_signature::{sign, verify}` are available for custom receivers.
+
+The signature authenticates the sender and protects the payload's integrity; it does **not** encrypt it. Pair it with a TLS `https://` webhook URL for confidentiality.
+
+> **Changed from the original scheme:** the signature used to be HMAC‑SHA256 of the task id only, which let anyone holding one captured delivery forge any payload for that task. Receivers written against the old scheme reject `v1` deliveries (which Apollo then retries) until they are updated.
 
 ---
 
@@ -55,13 +69,14 @@ The signature authenticates the caller and binds the delivery to a task id; it d
 ```toml
 [webhook]
 url             = "https://hooks.example.com:443"   # gRPC target; scheme selects TLS (https) vs plaintext (http)
-secret          = "change-me"                        # optional; enables x-apollo-webhook-signature
+secret          = "change-me"                        # optional; signs every delivery (payload + timestamp)
 redelivery_secs = 60                                 # background retry interval for failed deliveries (0 = off)
 ```
 
 - `url` is a gRPC endpoint. The **scheme selects transport**: `https://` uses TLS, `http://` is plaintext. Any path component is ignored — the gRPC method path is fixed by the service definition.
 - The channel connects **lazily and reconnects automatically**, so the receiver need not be reachable when Apollo starts.
-- For a quick local override during `start`, use `--webhook-url http://127.0.0.1:9090` (run‑only; it does not persist to the file).
+- For a quick local override during `start`, use `--webhook-url http://127.0.0.1:9090` (run‑only; it does not persist to the file). It also enables delivery when the config has no `[webhook]` section.
+- Each delivery has a 10 s connect timeout and a 30 s request timeout; a call that exceeds them counts as a failed delivery and is retried.
 
 See [configuration.md → Webhook](./configuration.md#webhook--outbound-delivery) for field details.
 
@@ -74,7 +89,10 @@ Generate server stubs from `proto/webhook.proto` (which imports `common.proto`) 
 ```text
 service Webhook:
   rpc TaskStatus(task):
-      verify x-apollo-webhook-signature == hex(HMAC_SHA256(secret, task.id))   # if a secret is set
+      if a secret is set:                   # over the raw message bytes, see "Signing"
+          ts  = header x-apollo-webhook-timestamp;  reject if |now - ts| > 300s
+          sig = header x-apollo-webhook-signature
+          reject unless sig == "v1=" + hex(HMAC_SHA256(secret, ts + "." + raw_payload))
       if already_processed(task.id):        # idempotency / dedupe
           return Ack()
       switch task.result:

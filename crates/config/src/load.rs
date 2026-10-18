@@ -46,7 +46,8 @@ pub fn load(cli_config: Option<&Path>) -> Result<Config, ConfigError> {
 }
 
 /// Run-only overrides supplied on the `start` command line. These do not persist
-/// to the file (that is what `config set` is for).
+/// to the file (that is what `config set` is for). `webhook_url` replaces
+/// `[webhook].url`, or enables delivery to that URL when the section is absent.
 #[derive(Debug, Default, Clone)]
 pub struct Overrides {
     pub endpoint: Option<String>,
@@ -55,16 +56,29 @@ pub struct Overrides {
 }
 
 impl Config {
-    /// Resolve relative model `taxonomy_file` paths against `base` (the directory
-    /// of the config file), so downstream consumers can open them directly.
+    /// Resolve relative file paths (model `taxonomy_file`, the `[tls]` files, and
+    /// `[auth].revocation_file`) against `base` (the directory of the config
+    /// file), so downstream consumers can open them directly.
     fn resolve_paths(&mut self, base: &Path) {
-        for model in self.models.values_mut() {
-            if let Some(tf) = &model.taxonomy_file {
-                let p = Path::new(tf);
-                if p.is_relative() {
-                    model.taxonomy_file = Some(base.join(p).to_string_lossy().into_owned());
-                }
+        let resolve = |path: &mut String| {
+            if Path::new(path.as_str()).is_relative() {
+                *path = base.join(path.as_str()).to_string_lossy().into_owned();
             }
+        };
+        for model in self.models.values_mut() {
+            if let Some(tf) = model.taxonomy_file.as_mut() {
+                resolve(tf);
+            }
+        }
+        if let Some(tls) = self.tls.as_mut() {
+            resolve(&mut tls.cert_file);
+            resolve(&mut tls.key_file);
+            if let Some(ca) = tls.client_ca_file.as_mut() {
+                resolve(ca);
+            }
+        }
+        if let Some(file) = self.auth.revocation_file.as_mut() {
+            resolve(file);
         }
     }
 
@@ -76,10 +90,19 @@ impl Config {
         if let Some(p) = o.port {
             self.app.port = p;
         }
-        if let Some(u) = &o.webhook_url
-            && let Some(w) = self.webhook.as_mut()
-        {
-            w.url = u.clone();
+        if let Some(u) = &o.webhook_url {
+            match self.webhook.as_mut() {
+                Some(w) => w.url = u.clone(),
+                // No [webhook] section: the flag alone enables delivery for this
+                // run (unsigned, default redelivery interval).
+                None => {
+                    self.webhook = Some(crate::schema::WebhookConfig {
+                        url: u.clone(),
+                        secret: None,
+                        redelivery_secs: crate::defaults::redelivery_secs(),
+                    })
+                }
+            }
         }
     }
 }

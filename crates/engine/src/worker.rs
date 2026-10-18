@@ -1,36 +1,50 @@
 //! Per-model batching worker.
 //!
 //! Each enabled model gets one dedicated OS thread that owns the model's resident
-//! weights. The async control plane submits image-classification [`Job`]s over a
-//! channel; the thread loads the model lazily on first use, serves requests with
-//! no-wait-window dynamic batching (pending images are merged up to the model's
-//! batch size into a single forward pass), and unloads the model after an idle
-//! period unless the model sets `keep_in_memory`.
+//! weights. The async control plane submits [`Job`]s over a channel; the thread
+//! loads the model lazily on first use (or at startup when the model is pinned
+//! with `keep_in_memory`), serves requests with no-wait-window dynamic batching
+//! (pending images are merged up to the model's batch size into a single forward
+//! pass), and unloads the model after an idle period unless it is pinned.
+//!
+//! Loading is a separate job ([`ModelHandle::ensure_loaded`]) so callers can wait
+//! for a cold model without that wait counting against the per-classification
+//! timeout. A panic inside the model (load or forward pass) is caught: waiters get
+//! an error, the possibly-corrupt model is dropped, and the next job reloads it —
+//! the worker thread itself never dies.
 //!
 //! Video inputs are handled one frame at a time through this same image path
 //! (the scheduler samples frames and submits them as ordinary image jobs); there
 //! is no separate whole-clip path.
 
-use std::path::PathBuf;
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
-use candle_core::Device;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tokio::sync::oneshot;
 
-use apollo_config::ModelConfig;
 use apollo_domain::{Classification, DecodedImage};
 use apollo_inference::ImageClassifier;
 
 use crate::error::EngineError;
 
-type Reply = oneshot::Sender<Result<Classification, EngineError>>;
+type ClassifyReply = oneshot::Sender<Result<Classification, EngineError>>;
+type LoadReply = oneshot::Sender<Result<(), EngineError>>;
 
-/// A unit of inference work: one image, merged with other pending images into a
-/// single batched forward pass by the worker.
-pub(crate) struct Job {
-    image: DecodedImage,
-    reply: Reply,
+/// Builds a model on the worker thread. Errors are reported as text.
+pub(crate) type Loader = Box<dyn Fn() -> Result<Box<dyn ImageClassifier>, String> + Send>;
+
+/// A unit of work for a model worker.
+pub(crate) enum Job {
+    /// Classify one image, merged with other pending images into a single
+    /// batched forward pass.
+    Classify {
+        image: DecodedImage,
+        reply: ClassifyReply,
+    },
+    /// Make sure the weights are resident; replies once they are (or failed).
+    Load { reply: LoadReply },
 }
 
 /// Async-side handle to a model worker.
@@ -39,104 +53,305 @@ pub(crate) struct ModelHandle {
 }
 
 impl ModelHandle {
+    /// Wait until the model's weights are loaded. Cheap when already resident.
+    pub(crate) async fn ensure_loaded(&self) -> Result<(), EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Job::Load { reply })
+            .map_err(|_| EngineError::WorkerGone)?;
+        rx.await.map_err(|_| EngineError::WorkerGone)?
+    }
+
     pub(crate) async fn classify_image(
         &self,
         image: DecodedImage,
     ) -> Result<Classification, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Job { image, reply })
+            .send(Job::Classify { image, reply })
             .map_err(|_| EngineError::WorkerGone)?;
         rx.await.map_err(|_| EngineError::WorkerGone)?
     }
 }
 
-/// Spawn the worker thread for `cfg` and return its handle.
-pub(crate) fn spawn_worker(
-    cfg: ModelConfig,
-    device: Device,
-    cache_dir: Option<PathBuf>,
-    idle: Duration,
-) -> ModelHandle {
+/// Settings for one worker thread.
+pub(crate) struct WorkerSpec {
+    /// Thread / log name.
+    pub(crate) name: String,
+    /// Max images merged into one forward pass.
+    pub(crate) batch: usize,
+    /// Pin the weights: load at startup and never idle-unload.
+    pub(crate) keep_in_memory: bool,
+    /// Unload after this long without work (unless pinned).
+    pub(crate) idle: Duration,
+}
+
+/// Spawn the worker thread and return its handle.
+pub(crate) fn spawn_worker(spec: WorkerSpec, loader: Loader) -> ModelHandle {
     let (tx, rx) = crossbeam_channel::unbounded::<Job>();
-    let batch = cfg.max_concurrent.max(1) as usize;
-    let keep = cfg.keep_in_memory;
-    let name = format!("apollo-model-{}", cfg.repo);
     std::thread::Builder::new()
-        .name(name)
-        .spawn(move || worker_loop(cfg, device, cache_dir, idle, batch, keep, rx))
+        .name(format!("apollo-model-{}", spec.name))
+        .spawn(move || Worker::new(spec, loader).run(rx))
         .expect("failed to spawn model worker thread");
     ModelHandle { tx }
 }
 
-fn worker_loop(
-    cfg: ModelConfig,
-    device: Device,
-    cache_dir: Option<PathBuf>,
-    idle: Duration,
-    batch: usize,
-    keep: bool,
-    rx: Receiver<Job>,
-) {
-    let mut model: Option<Box<dyn ImageClassifier>> = None;
-    loop {
-        match rx.recv_timeout(idle) {
-            Ok(job) => {
-                if model.is_none() {
-                    match apollo_inference::load(&cfg, &device, cache_dir.as_deref()) {
-                        Ok(m) => {
-                            tracing::info!(model = %cfg.repo, "model loaded");
-                            model = Some(m);
-                        }
-                        Err(e) => {
-                            let _ = job.reply.send(Err(EngineError::Inference(format!(
-                                "model load failed: {e}"
-                            ))));
-                            continue;
-                        }
+struct Worker {
+    spec: WorkerSpec,
+    loader: Loader,
+    model: Option<Box<dyn ImageClassifier>>,
+}
+
+impl Worker {
+    fn new(spec: WorkerSpec, loader: Loader) -> Self {
+        Self {
+            spec,
+            loader,
+            model: None,
+        }
+    }
+
+    fn run(mut self, rx: Receiver<Job>) {
+        if self.spec.keep_in_memory
+            && let Err(e) = self.ensure_loaded()
+        {
+            tracing::warn!(model = %self.spec.name, error = %e, "preload failed; will retry on first use");
+        }
+        loop {
+            match rx.recv_timeout(self.spec.idle) {
+                Ok(Job::Load { reply }) => {
+                    let _ = reply.send(self.ensure_loaded());
+                }
+                Ok(Job::Classify { image, reply }) => match self.ensure_loaded() {
+                    Ok(()) => self.run_batch(image, reply, &rx),
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                },
+                // Idle: drop resident weights unless pinned.
+                Err(RecvTimeoutError::Timeout) => {
+                    if !self.spec.keep_in_memory && self.model.take().is_some() {
+                        tracing::debug!(model = %self.spec.name, "unloaded idle model");
                     }
                 }
-                run_batch(model.as_deref().unwrap(), job, &rx, batch);
+                // All handles dropped (engine shutting down).
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            // Idle: drop resident weights unless pinned.
-            Err(RecvTimeoutError::Timeout) => {
-                if !keep && model.take().is_some() {
-                    tracing::debug!(model = %cfg.repo, "unloaded idle model");
+        }
+    }
+
+    /// Load the model if it is not resident. A failure (or panic) leaves it
+    /// unloaded, so the next job tries again.
+    fn ensure_loaded(&mut self) -> Result<(), EngineError> {
+        if self.model.is_some() {
+            return Ok(());
+        }
+        match catch_unwind(AssertUnwindSafe(|| (self.loader)())) {
+            Ok(Ok(m)) => {
+                // Warm up with a 1x1 image: the first forward pass compiles GPU
+                // kernels / allocates buffers and can take seconds, which would
+                // otherwise eat into the first real request's timeout.
+                let started = std::time::Instant::now();
+                let warm = DecodedImage {
+                    width: 1,
+                    height: 1,
+                    data: vec![0; 3],
+                };
+                match catch_unwind(AssertUnwindSafe(|| m.classify(std::slice::from_ref(&warm)))) {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(model = %self.spec.name, error = %e, "warm-up inference failed")
+                    }
+                    Err(panic) => {
+                        return Err(EngineError::ModelUnavailable(format!(
+                            "model panicked during warm-up: {}",
+                            panic_message(&panic)
+                        )));
+                    }
                 }
+                tracing::info!(
+                    model = %self.spec.name,
+                    warmup_ms = started.elapsed().as_millis() as u64,
+                    "model loaded"
+                );
+                self.model = Some(m);
+                Ok(())
             }
-            // All handles dropped (engine shutting down).
-            Err(RecvTimeoutError::Disconnected) => break,
+            Ok(Err(e)) => Err(EngineError::ModelUnavailable(format!(
+                "model load failed: {e}"
+            ))),
+            Err(panic) => Err(EngineError::ModelUnavailable(format!(
+                "model load panicked: {}",
+                panic_message(&panic)
+            ))),
+        }
+    }
+
+    /// Merge `first` plus whatever else is queued (up to the batch size) into one
+    /// forward pass, then fan the per-image results back to each caller. Load
+    /// requests found while draining are answered immediately (the model is
+    /// resident).
+    fn run_batch(&mut self, first: DecodedImage, first_reply: ClassifyReply, rx: &Receiver<Job>) {
+        let batch = self.spec.batch.max(1);
+        let mut images = Vec::with_capacity(batch);
+        let mut replies = Vec::with_capacity(batch);
+        images.push(first);
+        replies.push(first_reply);
+        while images.len() < batch {
+            match rx.try_recv() {
+                Ok(Job::Classify { image, reply }) => {
+                    images.push(image);
+                    replies.push(reply);
+                }
+                Ok(Job::Load { reply }) => {
+                    let _ = reply.send(Ok(()));
+                }
+                Err(_) => break,
+            }
+        }
+
+        let Some(model) = self.model.as_deref() else {
+            for reply in replies {
+                let _ = reply.send(Err(EngineError::ModelUnavailable(
+                    "model is not loaded".into(),
+                )));
+            }
+            return;
+        };
+        let outcome = catch_unwind(AssertUnwindSafe(|| model.classify(&images)));
+        let err = match outcome {
+            Ok(Ok(results)) if results.len() == replies.len() => {
+                for (reply, c) in replies.into_iter().zip(results) {
+                    let _ = reply.send(Ok(c));
+                }
+                return;
+            }
+            Ok(Ok(results)) => format!(
+                "model returned {} results for {} images",
+                results.len(),
+                replies.len()
+            ),
+            Ok(Err(e)) => e.to_string(),
+            Err(panic) => {
+                // The model may be in a broken state after a panic: drop it so
+                // the next job reloads it fresh.
+                self.model = None;
+                let msg = panic_message(&panic);
+                tracing::error!(model = %self.spec.name, panic = %msg, "model panicked; unloaded");
+                format!("model panicked: {msg}")
+            }
+        };
+        for reply in replies {
+            let _ = reply.send(Err(EngineError::Inference(err.clone())));
         }
     }
 }
 
-/// Merge `first` plus whatever else is queued (up to `batch`) into one forward
-/// pass, then fan the per-image results back to each caller.
-fn run_batch(model: &dyn ImageClassifier, first: Job, rx: &Receiver<Job>, batch: usize) {
-    let mut images = Vec::with_capacity(batch);
-    let mut replies = Vec::with_capacity(batch);
-    images.push(first.image);
-    replies.push(first.reply);
-    while images.len() < batch {
-        match rx.try_recv() {
-            Ok(job) => {
-                images.push(job.image);
-                replies.push(job.reply);
-            }
-            Err(_) => break,
+fn panic_message(panic: &Box<dyn Any + Send>) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use apollo_domain::Prediction;
+    use apollo_inference::InferenceError;
+
+    /// Classifies every image as label = its width; panics on width 0.
+    struct Fake;
+
+    impl ImageClassifier for Fake {
+        fn classify(&self, images: &[DecodedImage]) -> Result<Vec<Classification>, InferenceError> {
+            Ok(images
+                .iter()
+                .map(|img| {
+                    assert!(img.width > 0, "boom");
+                    Classification {
+                        predictions: vec![Prediction {
+                            label: img.width,
+                            score: 1.0,
+                        }],
+                    }
+                })
+                .collect())
+        }
+        fn labels(&self) -> &[String] {
+            &[]
         }
     }
-    match model.classify(&images) {
-        Ok(results) => {
-            for (reply, c) in replies.into_iter().zip(results) {
-                let _ = reply.send(Ok(c));
-            }
+
+    fn img(width: u32) -> DecodedImage {
+        DecodedImage {
+            width,
+            height: 1,
+            data: vec![0; width as usize * 3],
         }
-        Err(e) => {
-            let msg = e.to_string();
-            for reply in replies {
-                let _ = reply.send(Err(EngineError::Inference(msg.clone())));
+    }
+
+    fn spawn(loads: Arc<AtomicUsize>, fail_first: bool, keep: bool) -> ModelHandle {
+        let loader: Loader = Box::new(move || {
+            let n = loads.fetch_add(1, Ordering::SeqCst);
+            if fail_first && n == 0 {
+                return Err("hub unreachable".into());
             }
-        }
+            Ok(Box::new(Fake) as Box<dyn ImageClassifier>)
+        });
+        spawn_worker(
+            WorkerSpec {
+                name: "test".into(),
+                batch: 4,
+                keep_in_memory: keep,
+                idle: Duration::from_secs(60),
+            },
+            loader,
+        )
+    }
+
+    #[tokio::test]
+    async fn loads_once_and_classifies() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let h = spawn(loads.clone(), false, false);
+        h.ensure_loaded().await.unwrap();
+        h.ensure_loaded().await.unwrap();
+        let c = h.classify_image(img(7)).await.unwrap();
+        assert_eq!(c.predictions[0].label, 7);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pinned_models_preload() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let h = spawn(loads.clone(), false, true);
+        h.ensure_loaded().await.unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn load_failure_is_reported_and_retried() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let h = spawn(loads.clone(), true, false);
+        let err = h.ensure_loaded().await.unwrap_err();
+        assert!(matches!(err, EngineError::ModelUnavailable(_)), "{err:?}");
+        h.ensure_loaded().await.unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn panic_is_contained_and_model_reloads() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let h = spawn(loads.clone(), false, false);
+        let err = h.classify_image(img(0)).await.unwrap_err();
+        assert!(matches!(err, EngineError::Inference(_)), "{err:?}");
+        // The worker survived, reloaded, and serves the next request.
+        let c = h.classify_image(img(3)).await.unwrap();
+        assert_eq!(c.predictions[0].label, 3);
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
     }
 }

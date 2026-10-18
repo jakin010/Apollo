@@ -6,9 +6,39 @@ use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
 
+/// Per-user directory for the PID file and the daemon log: the state dir on
+/// Linux (`~/.local/state/apollo`), the local data dir elsewhere
+/// (`~/Library/Application Support/apollo` on macOS), created owner-only.
+///
+/// Deliberately not the shared system temp dir: there another local user could
+/// pre-create `apollo.pid` (making `apollo stop` signal a PID of their choosing)
+/// or plant an `apollo.log` symlink that the daemon would append to.
+pub fn state_dir() -> anyhow::Result<PathBuf> {
+    let dir = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .ok_or_else(|| anyhow!("cannot determine a per-user state directory (is $HOME set?)"))?
+        .join("apollo");
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
 /// Path where a running instance records its PID.
-fn pid_path() -> PathBuf {
-    std::env::temp_dir().join("apollo.pid")
+fn pid_path() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("apollo.pid"))
+}
+
+/// Path the detached daemon logs to.
+pub fn log_path() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("apollo.log"))
 }
 
 /// Writes this process's PID on creation and removes the file when dropped, so a
@@ -20,7 +50,7 @@ pub struct PidFile {
 impl PidFile {
     /// Record the current process's PID.
     pub fn create() -> anyhow::Result<Self> {
-        let path = pid_path();
+        let path = pid_path()?;
         fs::write(&path, std::process::id().to_string())
             .with_context(|| format!("writing PID file {}", path.display()))?;
         Ok(Self { path })
@@ -28,7 +58,7 @@ impl PidFile {
 
     /// Read the recorded PID, if a PID file exists.
     pub fn read() -> anyhow::Result<Option<u32>> {
-        let path = pid_path();
+        let path = pid_path()?;
         match fs::read_to_string(&path) {
             Ok(s) => Ok(s.trim().parse::<u32>().ok()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),

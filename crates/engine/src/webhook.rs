@@ -28,6 +28,9 @@ impl From<String> for WebhookError {
 /// Receives item state-change notifications. Terminal notifications are
 /// at-least-once (a failed delivery is retried on the next startup); intermediate
 /// notifications (e.g. an item entering `Processing`) are best-effort.
+// `async_trait` marks the boxed-future methods `#[must_use]`; clippy >= 1.99
+// reports that as `double_must_use`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait WebhookSink: Send + Sync {
     /// Deliver routine task status (the `TaskStatus` call): the current `task`,

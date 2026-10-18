@@ -28,6 +28,8 @@ enum Command {
     Keygen(keys::KeygenArgs),
     /// Mint an API token signed with the secret key.
     Token(keys::TokenArgs),
+    /// Revoke a token (by id or the token itself) or every token of a subject.
+    Revoke(keys::RevokeArgs),
 }
 
 impl Cli {
@@ -38,6 +40,7 @@ impl Cli {
             Command::Config(cmd) => config::run(cmd),
             Command::Keygen(args) => keys::run_keygen(args),
             Command::Token(args) => keys::run_token(args),
+            Command::Revoke(args) => keys::run_revoke(args),
         }
     }
 }
@@ -66,6 +69,14 @@ mod tests {
     #[test]
     fn start_rejects_non_numeric_port() {
         assert!(Cli::try_parse_from(["apollo", "start", "--port", "nope"]).is_err());
+    }
+
+    #[test]
+    fn revoke_takes_exactly_one_target() {
+        assert!(Cli::try_parse_from(["apollo", "revoke", "--id", "abc"]).is_ok());
+        assert!(Cli::try_parse_from(["apollo", "revoke", "--subject", "ci"]).is_ok());
+        assert!(Cli::try_parse_from(["apollo", "revoke"]).is_err());
+        assert!(Cli::try_parse_from(["apollo", "revoke", "--id", "a", "--subject", "b"]).is_err());
     }
 
     #[test]

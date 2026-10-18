@@ -70,7 +70,8 @@ const SCHEMA: &str = "
 const CREATE_TASK: &str = "
     BEGIN TRANSACTION;
     CREATE type::record('task', $tid) SET
-        key = $tid, state = $tstate, attempts = 0, created_at = $ts, updated_at = $ts;
+        key = $tid, state = $tstate, attempts = 0, created_at = $ts, updated_at = $ts,
+        owner = $owner;
     FOR $it IN $items {
         CREATE type::record('item', [$tid, $it.idx]) SET
             task_id = $tid, idx = $it.idx, input_json = $it.input_json,
@@ -93,6 +94,7 @@ const CREATE_TASK: &str = "
 #[derive(SurrealValue)]
 struct TaskStateRow {
     state: String,
+    owner: Option<String>,
 }
 
 #[derive(SurrealValue)]
@@ -193,7 +195,7 @@ impl SurrealStorage {
     async fn load_task(&self, id: &str) -> Result<Option<Task>> {
         let mut resp = self
             .db
-            .query("SELECT state FROM type::record('task', $tid)")
+            .query("SELECT state, owner FROM type::record('task', $tid)")
             .bind(("tid", id.to_string()))
             .await?;
         let trows: Vec<TaskStateRow> = resp.take(0)?;
@@ -201,6 +203,7 @@ impl SurrealStorage {
             return Ok(None);
         };
         let state = trow.state.parse::<TaskState>()?;
+        let owner = trow.owner;
 
         let mut resp = self
             .db
@@ -262,6 +265,7 @@ impl SurrealStorage {
             id: id.to_string(),
             state,
             items,
+            owner,
         }))
     }
 }
@@ -304,6 +308,7 @@ impl Storage for SurrealStorage {
             .query(CREATE_TASK)
             .bind(("tid", task.id.clone()))
             .bind(("tstate", task.state.as_str().to_string()))
+            .bind(("owner", task.owner.clone()))
             .bind(("ts", ts))
             .bind(("items", items))
             .bind(("mrs", mrs))
@@ -325,6 +330,24 @@ impl Storage for SurrealStorage {
             .await?
             .check()?;
         Ok(())
+    }
+
+    async fn cancel_task_if_active(&self, id: &str) -> Result<bool> {
+        // Conditional on the current state, so a task that has just finished is
+        // never overwritten; RETURN VALUE yields a row only when it matched.
+        let mut resp = self
+            .db
+            .query(
+                "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts
+                 WHERE state IN ['queued', 'processing']
+                 RETURN VALUE state",
+            )
+            .bind(("tid", id.to_string()))
+            .bind(("state", TaskState::Cancelled.as_str().to_string()))
+            .bind(("ts", now()))
+            .await?;
+        let vals: Vec<String> = resp.take(0)?;
+        Ok(!vals.is_empty())
     }
 
     async fn set_item_state(
@@ -501,6 +524,19 @@ impl Storage for SurrealStorage {
         Ok(vals.into_iter().next().unwrap_or(0) as u32)
     }
 
+    async fn release_resume_attempts(&self) -> Result<u64> {
+        let mut resp = self
+            .db
+            .query(
+                "UPDATE task SET attempts -= 1
+                 WHERE state IN ['queued', 'processing'] AND attempts > 0
+                 RETURN VALUE attempts",
+            )
+            .await?;
+        let vals: Vec<i64> = resp.take(0)?;
+        Ok(vals.len() as u64)
+    }
+
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>> {
         let mut resp = self
             .db
@@ -663,5 +699,32 @@ impl Storage for SurrealStorage {
             .await?
             .check()?;
         Ok(())
+    }
+
+    async fn purge_cache_before(&self, cutoff_unix_secs: i64) -> Result<u64> {
+        // Count first, then delete the same predicate (mirrors
+        // purge_finished_before); an entry written in between is simply fresh.
+        let mut resp = self
+            .db
+            .query(
+                "SELECT VALUE created_at FROM cache WHERE created_at < $cutoff;
+                 SELECT VALUE created_at FROM url_cache WHERE created_at < $cutoff;",
+            )
+            .bind(("cutoff", cutoff_unix_secs))
+            .await?;
+        let content: Vec<i64> = resp.take(0)?;
+        let urls: Vec<i64> = resp.take(1)?;
+        if content.is_empty() && urls.is_empty() {
+            return Ok(0);
+        }
+        self.db
+            .query(
+                "DELETE cache WHERE created_at < $cutoff;
+                 DELETE url_cache WHERE created_at < $cutoff;",
+            )
+            .bind(("cutoff", cutoff_unix_secs))
+            .await?
+            .check()?;
+        Ok((content.len() + urls.len()) as u64)
     }
 }
