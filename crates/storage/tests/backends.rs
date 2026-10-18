@@ -141,6 +141,14 @@ async fn exercise(store: &dyn Storage) {
         2
     );
 
+    // --- counts by state (t1 processing, anon queued)
+    let mut counts = store.count_tasks_by_state().await.unwrap();
+    counts.sort_by_key(|(s, _)| s.as_str());
+    assert_eq!(
+        counts,
+        vec![(TaskState::Processing, 1), (TaskState::Queued, 1)]
+    );
+
     // --- conditional cancel: active -> cancelled; finished stays finished
     store.create_task(&sample_task("t2")).await.unwrap();
     assert!(store.cancel_task_if_active("t2").await.unwrap());

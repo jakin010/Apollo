@@ -145,6 +145,12 @@ struct ItemInsert {
 }
 
 #[derive(SurrealValue)]
+struct StateCountRow {
+    state: String,
+    n: i64,
+}
+
+#[derive(SurrealValue)]
 struct FrameInsert {
     frame_index: i64,
     timestamp: f64,
@@ -535,6 +541,17 @@ impl Storage for SurrealStorage {
             .next()
             .and_then(|r| r.steps_completed)
             .unwrap_or(0) as u32)
+    }
+
+    async fn count_tasks_by_state(&self) -> Result<Vec<(TaskState, u64)>> {
+        let mut resp = self
+            .db
+            .query("SELECT state, count() AS n FROM task GROUP BY state")
+            .await?;
+        let rows: Vec<StateCountRow> = resp.take(0)?;
+        rows.into_iter()
+            .map(|r| Ok((r.state.parse::<TaskState>()?, r.n.max(0) as u64)))
+            .collect()
     }
 
     async fn load_incomplete_tasks(&self) -> Result<Vec<Task>> {

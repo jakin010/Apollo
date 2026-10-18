@@ -3,6 +3,7 @@
 mod config;
 mod keys;
 mod start;
+mod status;
 mod stop;
 
 use clap::{Parser, Subcommand};
@@ -21,6 +22,9 @@ enum Command {
     Start(start::StartArgs),
     /// Gracefully stop a running daemon.
     Stop(stop::StopArgs),
+    /// Show whether the server is running, and its live state (queue, tasks,
+    /// models, memory).
+    Status(status::StatusArgs),
     /// Read or edit the config file.
     #[command(subcommand)]
     Config(config::ConfigCmd),
@@ -37,6 +41,7 @@ impl Cli {
         match self.command {
             Command::Start(args) => start::run(args),
             Command::Stop(args) => stop::run(args),
+            Command::Status(args) => status::run(args),
             Command::Config(cmd) => config::run(cmd),
             Command::Keygen(args) => keys::run_keygen(args),
             Command::Token(args) => keys::run_token(args),
@@ -77,6 +82,12 @@ mod tests {
         assert!(Cli::try_parse_from(["apollo", "revoke", "--subject", "ci"]).is_ok());
         assert!(Cli::try_parse_from(["apollo", "revoke"]).is_err());
         assert!(Cli::try_parse_from(["apollo", "revoke", "--id", "a", "--subject", "b"]).is_err());
+    }
+
+    #[test]
+    fn parses_status() {
+        assert!(Cli::try_parse_from(["apollo", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["apollo", "status", "--json"]).is_ok());
     }
 
     #[test]

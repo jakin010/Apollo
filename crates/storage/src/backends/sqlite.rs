@@ -485,6 +485,19 @@ impl Storage for SqliteStorage {
         Ok(v.unwrap_or(0) as u32)
     }
 
+    async fn count_tasks_by_state(&self) -> Result<Vec<(TaskState, u64)>> {
+        let rows = sqlx::query("SELECT state, COUNT(*) AS n FROM tasks GROUP BY state")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let state = r.try_get::<String, _>("state")?.parse::<TaskState>()?;
+            let n: i64 = r.try_get("n")?;
+            out.push((state, n as u64));
+        }
+        Ok(out)
+    }
+
     async fn load_incomplete_tasks(&self) -> Result<Vec<Task>> {
         let ids: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM tasks WHERE state IN ('queued', 'processing') ORDER BY created_at",

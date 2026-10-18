@@ -20,7 +20,8 @@
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tokio::sync::oneshot;
@@ -55,9 +56,50 @@ pub(crate) enum Job {
 /// Async-side handle to a model worker.
 pub(crate) struct ModelHandle {
     tx: Sender<Job>,
+    stats: Arc<WorkerStats>,
+}
+
+/// Live counters a worker keeps for `apollo status`.
+#[derive(Default)]
+struct WorkerStats {
+    loaded: AtomicBool,
+    /// Input size of the loaded model (0 until first loaded).
+    input_size: AtomicU32,
+    /// Times the weights were loaded (reloads after idle unload count again).
+    loads: AtomicU64,
+    /// Images classified successfully.
+    classified: AtomicU64,
+    /// Unix milliseconds of the last classification (0 = never).
+    last_used_ms: AtomicU64,
+}
+
+/// A point-in-time view of one worker.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WorkerSnapshot {
+    pub(crate) loaded: bool,
+    pub(crate) input_size: Option<u32>,
+    pub(crate) loads: u64,
+    pub(crate) classified: u64,
+    pub(crate) last_used: Option<SystemTime>,
+    /// Classification / load requests waiting for the worker.
+    pub(crate) queued_jobs: usize,
 }
 
 impl ModelHandle {
+    pub(crate) fn snapshot(&self) -> WorkerSnapshot {
+        let s = &self.stats;
+        let ms = s.last_used_ms.load(Ordering::Relaxed);
+        let size = s.input_size.load(Ordering::Relaxed);
+        WorkerSnapshot {
+            loaded: s.loaded.load(Ordering::Relaxed),
+            input_size: (size > 0).then_some(size),
+            loads: s.loads.load(Ordering::Relaxed),
+            classified: s.classified.load(Ordering::Relaxed),
+            last_used: (ms > 0).then(|| UNIX_EPOCH + Duration::from_millis(ms)),
+            queued_jobs: self.tx.len(),
+        }
+    }
+
     /// Wait until the model's weights are loaded and return its input size
     /// (square side in pixels). Cheap when already resident.
     pub(crate) async fn ensure_loaded(&self) -> Result<u32, EngineError> {
@@ -95,26 +137,36 @@ pub(crate) struct WorkerSpec {
 /// Spawn the worker thread and return its handle.
 pub(crate) fn spawn_worker(spec: WorkerSpec, loader: Loader) -> ModelHandle {
     let (tx, rx) = crossbeam_channel::unbounded::<Job>();
+    let stats = Arc::new(WorkerStats::default());
+    let worker_stats = Arc::clone(&stats);
     std::thread::Builder::new()
         .name(format!("apollo-model-{}", spec.name))
-        .spawn(move || Worker::new(spec, loader).run(rx))
+        .spawn(move || Worker::new(spec, loader, worker_stats).run(rx))
         .expect("failed to spawn model worker thread");
-    ModelHandle { tx }
+    ModelHandle { tx, stats }
 }
 
 struct Worker {
     spec: WorkerSpec,
     loader: Loader,
     model: Option<Box<dyn ImageClassifier>>,
+    stats: Arc<WorkerStats>,
 }
 
 impl Worker {
-    fn new(spec: WorkerSpec, loader: Loader) -> Self {
+    fn new(spec: WorkerSpec, loader: Loader, stats: Arc<WorkerStats>) -> Self {
         Self {
             spec,
             loader,
             model: None,
+            stats,
         }
+    }
+
+    /// Drop the resident model (idle unload or after a panic).
+    fn unload(&mut self) -> bool {
+        self.stats.loaded.store(false, Ordering::Relaxed);
+        self.model.take().is_some()
     }
 
     fn run(mut self, rx: Receiver<Job>) {
@@ -136,7 +188,7 @@ impl Worker {
                 },
                 // Idle: drop resident weights unless pinned.
                 Err(RecvTimeoutError::Timeout) => {
-                    if !self.spec.keep_in_memory && self.model.take().is_some() {
+                    if !self.spec.keep_in_memory && self.unload() {
                         tracing::debug!(model = %self.spec.name, "unloaded idle model");
                     }
                 }
@@ -182,6 +234,9 @@ impl Worker {
                 );
                 let size = m.input_size();
                 self.model = Some(m);
+                self.stats.input_size.store(size, Ordering::Relaxed);
+                self.stats.loads.fetch_add(1, Ordering::Relaxed);
+                self.stats.loaded.store(true, Ordering::Relaxed);
                 Ok(size)
             }
             Ok(Err(e)) => Err(EngineError::ModelUnavailable(format!(
@@ -241,6 +296,14 @@ impl Worker {
                 "model produced non-finite scores".to_string()
             }
             Ok(Ok(results)) if results.len() == replies.len() => {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                self.stats
+                    .classified
+                    .fetch_add(results.len() as u64, Ordering::Relaxed);
+                self.stats.last_used_ms.store(now_ms, Ordering::Relaxed);
                 for (reply, c) in replies.into_iter().zip(results) {
                     let _ = reply.send(Ok(c));
                 }
@@ -255,7 +318,7 @@ impl Worker {
             Err(panic) => {
                 // The model may be in a broken state after a panic: drop it so
                 // the next job reloads it fresh.
-                self.model = None;
+                self.unload();
                 let msg = panic_message(&panic);
                 tracing::error!(model = %self.spec.name, panic = %msg, "model panicked; unloaded");
                 format!("model panicked: {msg}")
@@ -354,6 +417,26 @@ mod tests {
         let c = h.classify_image(img(7)).await.unwrap();
         assert_eq!(c.predictions[0].label, 7);
         assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_live_counters() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let h = spawn(loads, false, false);
+        let before = h.snapshot();
+        assert!(!before.loaded && before.loads == 0 && before.classified == 0);
+        assert_eq!((before.input_size, before.last_used), (None, None));
+
+        h.classify_image(img(3)).await.unwrap();
+        h.classify_image(img(4)).await.unwrap();
+        let after = h.snapshot();
+        assert!(after.loaded);
+        assert_eq!(after.input_size, Some(224));
+        assert_eq!(
+            (after.loads, after.classified, after.queued_jobs),
+            (1, 2, 0)
+        );
+        assert!(after.last_used.is_some());
     }
 
     #[tokio::test]

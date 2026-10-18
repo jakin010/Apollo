@@ -18,6 +18,13 @@ pub fn state_dir() -> anyhow::Result<PathBuf> {
         .or_else(dirs::data_local_dir)
         .ok_or_else(|| anyhow!("cannot determine a per-user state directory (is $HOME set?)"))?
         .join("apollo");
+    create_private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// Create `dir` (and parents) if missing; a newly created directory is
+/// owner-only (`0700`) on Unix.
+pub fn create_private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -26,9 +33,9 @@ pub fn state_dir() -> anyhow::Result<PathBuf> {
         builder.mode(0o700);
     }
     builder
-        .create(&dir)
+        .create(dir)
         .with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
+    Ok(())
 }
 
 /// Path where a running instance records its PID.
@@ -71,6 +78,19 @@ impl Drop for PidFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// Whether a process with `pid` exists (signal 0 probes without signalling).
+#[cfg(unix)]
+pub fn is_alive(pid: u32) -> bool {
+    // Safe: kill() with signal 0 performs only the existence/permission check.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+pub fn is_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Send a graceful-shutdown signal (SIGTERM) to `pid`.

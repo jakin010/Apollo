@@ -1,9 +1,10 @@
 //! `apollo` — binary entrypoint. Parses the CLI and dispatches to
-//! `start` / `stop` / `config`. Each subcommand owns its own setup (the server
+//! `start` / `stop` / `status` / `config` / `keygen` / `token` / `revoke`. Each subcommand owns its own setup (the server
 //! builds a Tokio runtime; `config`/`stop` are synchronous).
 
 mod cli;
 mod daemon;
+mod status;
 
 use clap::Parser;
 

@@ -44,6 +44,7 @@ impl PartialOrd for Waiter {
 }
 
 struct GateInner {
+    total: usize,
     available: usize,
     next_seq: u64,
     waiters: BinaryHeap<Waiter>,
@@ -58,11 +59,18 @@ impl PriorityGate {
     pub(crate) fn new(slots: usize) -> Self {
         PriorityGate {
             inner: Mutex::new(GateInner {
+                total: slots.max(1),
                 available: slots.max(1),
                 next_seq: 0,
                 waiters: BinaryHeap::new(),
             }),
         }
+    }
+
+    /// `(total slots, slots in use, waiters)` right now.
+    pub(crate) fn snapshot(&self) -> (usize, usize, usize) {
+        let g = self.inner.lock().unwrap();
+        (g.total, g.total - g.available, g.waiters.len())
     }
 
     /// Acquire a slot, waiting if necessary. Higher `priority` is served first;

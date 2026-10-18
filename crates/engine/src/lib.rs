@@ -29,6 +29,7 @@ mod memory;
 mod queue;
 mod registry;
 mod scheduler;
+mod status;
 mod webhook;
 mod worker;
 
@@ -36,6 +37,7 @@ mod worker;
 mod tests;
 
 pub use error::EngineError;
+pub use status::{EngineStatus, ModelStatus, TaskCounts};
 pub use webhook::{WebhookError, WebhookSink};
 
 use crate::gate::PriorityGate;
@@ -58,6 +60,8 @@ pub struct Engine {
 
 struct Inner {
     storage: Arc<dyn Storage>,
+    /// Compute backend the workers run on.
+    device: apollo_inference::DeviceKind,
     config: Arc<Config>,
     registry: Registry,
     /// Priority-ordered global ceiling on concurrently processing items.
@@ -127,6 +131,7 @@ impl Engine {
         let engine = Engine {
             inner: Arc::new(Inner {
                 storage,
+                device: kind,
                 config,
                 registry,
                 gate,

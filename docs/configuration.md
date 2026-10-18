@@ -366,6 +366,7 @@ See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
 ```text
 apollo start [--config PATH] [--endpoint HOST] [--port N] [--webhook-url URL] [--daemon]
 apollo stop  [...]                       # gracefully stop a running daemon
+apollo status [--json]                   # is it running, and what is it doing
 apollo config get    <key> [--config PATH]
 apollo config set    <key> <value> [--config PATH]
 apollo config remove <key> [--config PATH]
@@ -375,6 +376,14 @@ apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
 ```
 
 - **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url`, or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
+- **`status`** reports whether the server is running and its live state:
+  - version, PID, uptime, listen address, TLS/auth, config file, database, and log file;
+  - resident memory against `max_memory`;
+  - the queue (items in flight, busy/waiting concurrency slots);
+  - task counts by state, and pending webhook deliveries;
+  - per model: loaded or not, input size, queued requests, batch size, images classified, and last use.
+
+  `--json` prints the same as JSON. The exit status is `0` when running and `3` when not (like `systemctl status`). The server answers on a Unix socket in its private per‑user directory (`$XDG_RUNTIME_DIR/apollo/` on Linux, otherwise the state directory), so only the same OS user can query it — run `apollo status` as that user.
 - **`config get|set|remove`** edit the file by **dotted key** (e.g. `models.nsfw.repo`), format‑preserving. `set` creates missing tables — and a default `[app]`‑only file — as needed.
 - **`keygen`** prints a fresh public/secret PASERK keypair.
 - **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` (a bare PASERK or `keygen` output), else the `APOLLO_SECRET_KEY` env var, else the server's local keypair file (`auth.key` in the state directory). `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key. The token goes to stdout (it goes in the client's `authorization` metadata) and its id to stderr.

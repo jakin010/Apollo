@@ -139,6 +139,10 @@ pub trait Storage: Send + Sync {
 
     // ------------------------------- resume ------------------------------
 
+    /// Number of tasks in each state (states with no tasks are omitted). Backs
+    /// `apollo status`.
+    async fn count_tasks_by_state(&self) -> Result<Vec<(TaskState, u64)>, StorageError>;
+
     /// All tasks still in a non-terminal state, fully reconstructed, for
     /// re-queueing on startup.
     async fn load_incomplete_tasks(&self) -> Result<Vec<Task>, StorageError>;

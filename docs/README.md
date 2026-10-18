@@ -100,7 +100,10 @@ apollo start --daemon               # or: apollo start --config ./config.toml --
 # 3. Mint a token for your client.
 TOKEN=$(apollo token --subject my-client --expires 30d)
 
-# 4. Submit an image (reflection is enabled, so grpcurl needs no .proto files).
+# 4. Check it is up (models, queue, tasks, memory).
+apollo status
+
+# 5. Submit an image (reflection is enabled, so grpcurl needs no .proto files).
 grpcurl -plaintext \
   -H "authorization: $TOKEN" \
   -d '{"item": {"models": ["general"], "image_url": {"main": "https://example.com/cat.jpg"}}}' \
