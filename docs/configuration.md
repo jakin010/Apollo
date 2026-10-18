@@ -335,6 +335,8 @@ A `taxonomy_file` defines grouped, prompt‑backed categories for a `siglip` mod
 
 SigLIP scores each prompt independently against the image; a child's score is the **aggregation of its own prompts** — `mean` (default), `average` (alias for mean), or `max`. Use `max` when the prompts are alternatives (any one matching should light the category); use `mean` when they're corroborating evidence for the same concept.
 
+All prompts (taxonomy or `labels`) are encoded when the model loads. That's the slow part of loading — about 35 s for ~1,000 prompts on an 8‑core CPU — so the result is cached in an `apollo-prompt-embeds` folder inside the model's Hub cache directory and reused on later loads (well under a second). Changing a prompt, the model revision, or the tokenizer starts a new cache entry automatically; deleting the folder is always safe.
+
 At inference, each child that scores at/above the model's `score_threshold` is returned as a flat `Prediction` whose `label` is the **child id**. (Parent grouping is not carried on the wire — reconstruct parent→child from the taxonomy file if you need it.) Parent ids and child ids live in separate namespaces; ids are arbitrary unique `u32`s.
 
 ```toml

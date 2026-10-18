@@ -243,6 +243,7 @@ dependencies = [
  "hf-hub",
  "image",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokenizers 0.23.1",
  "tracing",

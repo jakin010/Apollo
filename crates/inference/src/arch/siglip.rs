@@ -2,7 +2,8 @@
 //!
 //! Unlike the ViT head (fixed classes baked into the weights), SigLIP scores an
 //! image against a configured set of text prompts in a shared embedding space.
-//! The prompts are tokenized and encoded once at load; classification then
+//! The prompts are tokenized and encoded once at load (in chunks, and cached on
+//! disk next to the model so later loads skip the text tower); classification then
 //! encodes the image, takes its cosine similarity to each prompt embedding,
 //! applies SigLIP's learned scale + bias and a sigmoid — yielding an INDEPENDENT
 //! probability per prompt.
@@ -20,11 +21,14 @@
 //!     these children keyed by parent, reconstructable from the taxonomy. With no
 //!     `score_threshold` set, every child is kept.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use candle_core::{D, DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::siglip;
+use sha2::{Digest, Sha256};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use apollo_config::{Aggregation, ModelConfig, TaxonChild, Taxonomy};
@@ -39,6 +43,11 @@ use crate::preprocess::{self, Normalization};
 const DEFAULT_THRESHOLD: f32 = 0.5;
 /// SigLIP's canonical fixed text sequence length.
 const DEFAULT_MAX_TOKENS: usize = 64;
+/// Prompts per text-tower forward pass at load. Bounds activation memory: a
+/// ~1k-prompt taxonomy in one pass peaked at ~7 GB.
+const PROMPT_CHUNK: usize = 32;
+/// Bump when the cached embedding format or its inputs change.
+const EMBED_CACHE_VERSION: &str = "apollo-siglip-prompt-embeds-v1";
 
 /// How results are selected, decided at load from the config shape.
 enum Mode {
@@ -90,7 +99,7 @@ pub(crate) fn load(
         )
     })?;
     // SAFETY: mmap of a trusted, locally-cached safetensors file.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, device)? };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, device)? };
     let model = siglip::Model::new(&config, vb.clone())?;
     // SigLIP's learned temperature + bias sit at the top level of the weights.
     let logit_scale = vb.get(&[1], "logit_scale")?;
@@ -134,10 +143,33 @@ pub(crate) fn load(
     };
 
     // Encode the prompts once; reuse the embeddings for every image.
-    let tokenizer = load_tokenizer(hub, config.text_config.max_position_embeddings)?;
-    let input_ids = tokenize(&tokenizer, &text_inputs, device)?;
-    let text_features = model.get_text_features(&input_ids)?;
-    let text_embeds = l2_normalize(&text_features)?;
+    let tokenizer_path = hub.file("tokenizer.json").map_err(|_| {
+        InferenceError::Config(
+            "expected 'tokenizer.json' in the siglip repo (the fast tokenizer)".into(),
+        )
+    })?;
+    let max_len = config.text_config.max_position_embeddings;
+    let cache = EmbedCache::new(&weights, &tokenizer_path, max_len, &text_inputs);
+    let text_embeds = match cache
+        .as_ref()
+        .and_then(|c| c.load(text_inputs.len(), device))
+    {
+        Some(embeds) => embeds,
+        None => {
+            let started = Instant::now();
+            let tokenizer = load_tokenizer(&tokenizer_path, max_len)?;
+            let embeds = encode_prompts(&model, &tokenizer, &text_inputs, device)?;
+            tracing::info!(
+                prompts = text_inputs.len(),
+                ms = started.elapsed().as_millis() as u64,
+                "encoded siglip prompts"
+            );
+            if let Some(cache) = &cache {
+                cache.store(&embeds);
+            }
+            embeds
+        }
+    };
 
     let norm = preprocess::normalization_for(hub, config.vision_config.image_size);
 
@@ -262,12 +294,7 @@ fn build_prompts(labels: &[String], template: Option<&str>) -> Vec<String> {
 /// Load the repo's fast tokenizer and pin padding + truncation to SigLIP's fixed
 /// sequence length (the text tower pools the last position, so every prompt must
 /// be padded to the same length).
-fn load_tokenizer(hub: &Hub, max_len: usize) -> Result<Tokenizer, InferenceError> {
-    let path = hub.file("tokenizer.json").map_err(|_| {
-        InferenceError::Config(
-            "expected 'tokenizer.json' in the siglip repo (the fast tokenizer)".into(),
-        )
-    })?;
+fn load_tokenizer(path: &Path, max_len: usize) -> Result<Tokenizer, InferenceError> {
     let mut tokenizer = Tokenizer::from_file(path)
         .map_err(|e| InferenceError::Config(format!("tokenizer: {e}")))?;
     let len = if max_len == 0 {
@@ -304,6 +331,115 @@ fn tokenize(
         ids.extend_from_slice(enc.get_ids());
     }
     Tensor::from_vec(ids, (rows, seq), device).map_err(InferenceError::from)
+}
+
+/// L2-normalized text embeddings for `prompts`, shape `(num_prompts, dim)`,
+/// encoded [`PROMPT_CHUNK`] prompts at a time.
+fn encode_prompts(
+    model: &siglip::Model,
+    tokenizer: &Tokenizer,
+    prompts: &[String],
+    device: &Device,
+) -> Result<Tensor, InferenceError> {
+    if prompts.is_empty() {
+        return Err(InferenceError::Config(
+            "siglip: no prompts to encode".into(),
+        ));
+    }
+    let mut parts = Vec::with_capacity(prompts.len().div_ceil(PROMPT_CHUNK));
+    for chunk in prompts.chunks(PROMPT_CHUNK) {
+        let input_ids = tokenize(tokenizer, chunk, device)?;
+        parts.push(l2_normalize(&model.get_text_features(&input_ids)?)?);
+    }
+    Ok(Tensor::cat(&parts, 0)?)
+}
+
+/// On-disk cache of a model's encoded prompts, so a restart (or a reload after
+/// an idle unload) skips the text tower. It lives in an `apollo-prompt-embeds`
+/// folder in the model's Hub cache directory, keyed by everything the
+/// embeddings depend on: the model snapshot, the tokenizer, the sequence length,
+/// and the exact prompt list. Any read or write problem is logged and treated
+/// as a miss — the cache never fails a load.
+struct EmbedCache {
+    path: PathBuf,
+}
+
+impl EmbedCache {
+    /// `None` when the weights are not in a Hub snapshot directory
+    /// (`<repo dir>/snapshots/<revision>/model.safetensors`).
+    fn new(weights: &Path, tokenizer: &Path, max_len: usize, prompts: &[String]) -> Option<Self> {
+        let snapshot = weights.parent()?;
+        let snapshots = snapshot.parent()?;
+        if snapshots.file_name()? != "snapshots" {
+            return None;
+        }
+        let repo_dir = snapshots.parent()?;
+
+        let mut h = Sha256::new();
+        for part in [
+            EMBED_CACHE_VERSION,
+            &repo_dir.file_name()?.to_string_lossy(),
+        ] {
+            h.update(part.as_bytes());
+            h.update([0]);
+        }
+        h.update(snapshot.file_name()?.as_encoded_bytes());
+        h.update([0]);
+        // The tokenizer may differ from the weights' snapshot only if the files
+        // are swapped by hand; hashing its bytes makes that a miss too.
+        h.update(std::fs::read(tokenizer).ok()?);
+        h.update((max_len as u64).to_le_bytes());
+        h.update((prompts.len() as u64).to_le_bytes());
+        for prompt in prompts {
+            h.update((prompt.len() as u64).to_le_bytes());
+            h.update(prompt.as_bytes());
+        }
+        let key: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let path = repo_dir
+            .join("apollo-prompt-embeds")
+            .join(format!("{key}.safetensors"));
+        Some(Self { path })
+    }
+
+    /// The cached embeddings, if present and shaped for `num_prompts` prompts.
+    fn load(&self, num_prompts: usize, device: &Device) -> Option<Tensor> {
+        if !self.path.exists() {
+            return None;
+        }
+        let loaded = candle_core::safetensors::load(&self.path, device)
+            .ok()
+            .and_then(|mut m| m.remove("text_embeds"))
+            .filter(|t| t.dtype() == DType::F32)
+            .filter(|t| matches!(t.dims2(), Ok((n, _)) if n == num_prompts));
+        match &loaded {
+            Some(_) => tracing::info!(
+                prompts = num_prompts,
+                "loaded siglip prompt embeddings from cache"
+            ),
+            None => {
+                tracing::warn!(path = %self.path.display(), "ignoring unreadable siglip prompt cache")
+            }
+        }
+        loaded
+    }
+
+    /// Write `embeds` atomically (temp file + rename).
+    fn store(&self, embeds: &Tensor) {
+        let write = || -> Result<(), Box<dyn std::error::Error>> {
+            let dir = self.path.parent().ok_or("cache path has no parent")?;
+            std::fs::create_dir_all(dir)?;
+            let tmp = self
+                .path
+                .with_extension(format!("tmp-{}", std::process::id()));
+            let tensors = HashMap::from([("text_embeds".to_string(), embeds.clone())]);
+            candle_core::safetensors::save(&tensors, &tmp)?;
+            std::fs::rename(&tmp, &self.path)?;
+            Ok(())
+        };
+        if let Err(e) = write() {
+            tracing::warn!(error = %e, path = %self.path.display(), "could not cache siglip prompt embeddings");
+        }
+    }
 }
 
 /// L2-normalize each row (last dim) of a 2-D embedding tensor.
