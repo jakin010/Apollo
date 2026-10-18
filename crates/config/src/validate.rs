@@ -100,6 +100,11 @@ impl Config {
         }
 
         for (name, strat) in &self.strategies {
+            if strat.max_frames == Some(0) {
+                errs.push(format!(
+                    "strategy '{name}': max_frames must be at least 1 (omit it for no limit)"
+                ));
+            }
             if strat.confirm > MAX_CONFIRM {
                 errs.push(format!(
                     "strategy '{name}': confirm must be at most {MAX_CONFIRM} (got {})",

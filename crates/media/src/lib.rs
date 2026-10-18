@@ -18,6 +18,7 @@ pub mod extract;
 pub mod fetch;
 pub mod ffmpeg;
 pub mod sampling;
+pub mod share;
 pub mod strategy;
 
 pub use confirm::Confirm;
@@ -27,4 +28,5 @@ pub use extract::{FrameRequest, extract_frames_scaled};
 pub use fetch::{FetchLimits, LocalMedia, fetch};
 pub use ffmpeg::{VideoInfo, extract_frame, extract_frames, probe};
 pub use sampling::FrameRef;
+pub use share::{ShareStats, VideoShare};
 pub use strategy::{DEDUPE_TOLERANCE, aggregate, plan, refine_plan, trigger_score, triggered};

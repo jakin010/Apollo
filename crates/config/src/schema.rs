@@ -371,6 +371,13 @@ pub struct StrategyConfig {
     /// Seconds either side of a triggering frame that `confirm` looks in.
     #[serde(default = "crate::defaults::confirm_window")]
     pub confirm_window: f64,
+    /// Most frames the sampling (and `refine`) steps may classify per video,
+    /// for a predictable worst case. Steps take frames in order; the step that
+    /// does not fit is thinned (its strongest scene cuts, or an even spread),
+    /// and `refine` gets what is left. Frames sampled to `confirm` a trigger
+    /// do not count. Unset: no limit beyond the built-in safety cap.
+    #[serde(default)]
+    pub max_frames: Option<u32>,
     /// Ordered sampling methods (run in `step` order). Must be non-empty.
     #[serde(default)]
     pub sampling: Vec<SamplingStep>,

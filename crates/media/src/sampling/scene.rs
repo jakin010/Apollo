@@ -1,35 +1,41 @@
 //! Scene-change sampling (ffmpeg `select=gt(scene,T)`).
 
-use std::path::Path;
-
 use crate::error::MediaError;
-use crate::ffmpeg;
+use crate::share::VideoShare;
 
-/// Timestamps of scene changes above `threshold` (0..1), keeping a cut only if
-/// it is at least `min_gap` seconds after the previously kept one.
-pub async fn timestamps(path: &Path, threshold: f64, min_gap: f64) -> Result<Vec<f64>, MediaError> {
-    Ok(thin(
-        ffmpeg::scene_timestamps(path, threshold).await?,
-        min_gap,
-    ))
+/// Scene cuts above `threshold` as `(absolute timestamp, scene score)`, thinned
+/// so no two kept cuts are closer than `min_gap` seconds.
+pub async fn cuts(
+    share: &VideoShare,
+    threshold: f64,
+    min_gap: f64,
+) -> Result<Vec<(f64, f32)>, MediaError> {
+    Ok(thin(share.scene_cuts(threshold).await?, min_gap))
 }
 
-/// Drop cuts closer than `min_gap` to the last kept cut (the first of a burst
-/// is kept). A non-positive gap keeps everything.
-pub(crate) fn thin(mut cuts: Vec<f64>, min_gap: f64) -> Vec<f64> {
+/// Keep, of cuts closer together than `min_gap`, the strongest (highest scene
+/// score; the earlier on a tie). A non-positive gap keeps everything. Returned
+/// in time order.
+pub(crate) fn thin(mut cuts: Vec<(f64, f32)>, min_gap: f64) -> Vec<(f64, f32)> {
+    let by_time =
+        |a: &(f64, f32), b: &(f64, f32)| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
     if min_gap.is_nan() || min_gap <= 0.0 {
+        cuts.sort_by(by_time);
         return cuts;
     }
-    cuts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mut last = f64::NEG_INFINITY;
-    cuts.retain(|&t| {
-        let keep = t - last >= min_gap;
-        if keep {
-            last = t;
-        }
-        keep
+    cuts.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| by_time(a, b))
     });
-    cuts
+    let mut kept: Vec<(f64, f32)> = Vec::new();
+    for cut in cuts {
+        if kept.iter().all(|k| (k.0 - cut.0).abs() >= min_gap) {
+            kept.push(cut);
+        }
+    }
+    kept.sort_by(by_time);
+    kept
 }
 
 #[cfg(test)]
@@ -37,9 +43,17 @@ mod tests {
     use super::thin;
 
     #[test]
-    fn thin_keeps_first_of_each_burst() {
-        let cuts = vec![1.0, 1.4, 2.2, 5.0, 5.9, 6.1];
-        assert_eq!(thin(cuts.clone(), 1.0), vec![1.0, 2.2, 5.0, 6.1]);
-        assert_eq!(thin(cuts.clone(), 0.0), cuts);
+    fn thin_keeps_the_strongest_cut_of_each_close_group() {
+        let cuts = vec![
+            (1.0, 0.5),
+            (1.4, 0.9),
+            (2.2, 0.4),
+            (5.0, 0.6),
+            (5.9, 0.3),
+            (6.1, 0.7),
+        ];
+        let times = |c: Vec<(f64, f32)>| c.into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+        assert_eq!(times(thin(cuts.clone(), 1.0)), vec![1.4, 5.0, 6.1]);
+        assert_eq!(times(thin(cuts.clone(), 0.0)).len(), cuts.len());
     }
 }

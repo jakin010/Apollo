@@ -5,7 +5,6 @@
 //! and an interrupted video scan continues from its persisted frame checkpoint.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -15,7 +14,9 @@ use apollo_domain::{
     Classification, DecodedImage, Frame, Input, Item, ItemState, Modality, ModelOutput,
     ModelResult, ModelState, TaskError, Url,
 };
-use apollo_media::{Confirm, FrameRef, FrameRequest, LocalMedia, MediaError, VideoInfo};
+use apollo_media::{
+    Confirm, FrameRef, FrameRequest, LocalMedia, MediaError, VideoInfo, VideoShare,
+};
 
 use crate::Engine;
 use crate::aggregate;
@@ -33,8 +34,12 @@ enum Fetched {
     /// Shared so each model of the item classifies the same buffer, uncopied.
     Image(Arc<DecodedImage>),
     Video {
-        media: LocalMedia,
+        /// Owns the file `share` reads: a download is deleted when dropped.
+        _media: LocalMedia,
         info: VideoInfo,
+        /// Probes and decoded frames, shared by every model scanning this video
+        /// (and by retries), so each is done once.
+        share: Arc<VideoShare>,
     },
 }
 
@@ -74,7 +79,8 @@ struct FrameScanRun<'a> {
     idx: usize,
     label: &'a str,
     handle: &'a ModelHandle,
-    path: &'a Path,
+    /// The video, with the probes and frames other scans of it share.
+    share: &'a Arc<VideoShare>,
     info: &'a VideoInfo,
     /// The model's square input side; frames are extracted at this size.
     input_size: u32,
@@ -85,7 +91,7 @@ struct FrameScanRun<'a> {
 
 /// A frame chunk being extracted in the background. Dropping it (early exit,
 /// cancellation, error) aborts the extraction, which kills its ffmpeg process.
-struct Prefetch(tokio::task::JoinHandle<Result<Vec<DecodedImage>, apollo_media::MediaError>>);
+struct Prefetch(tokio::task::JoinHandle<Result<Vec<Arc<DecodedImage>>, apollo_media::MediaError>>);
 
 impl Drop for Prefetch {
     fn drop(&mut self) {
@@ -889,7 +895,7 @@ impl Engine {
                 .await?;
                 Ok(ModelOutput::Classification(c))
             }
-            (Modality::Video, Fetched::Video { media, info }) => {
+            (Modality::Video, Fetched::Video { info, share, .. }) => {
                 // Video: an image classifier over sampled frames, each frame bounded
                 // by `timeout` (applied inside run_frame_scan).
                 let scan = FrameScanRun {
@@ -897,7 +903,7 @@ impl Engine {
                     idx,
                     label,
                     handle: &handle,
-                    path: media.path(),
+                    share,
                     info,
                     input_size,
                     timeout,
@@ -1000,7 +1006,15 @@ impl Engine {
         } else {
             None
         };
-        Ok((Fetched::Video { media, info }, hash))
+        let share = Arc::new(VideoShare::new(media.path().to_path_buf(), info.clone()));
+        Ok((
+            Fetched::Video {
+                _media: media,
+                info,
+                share,
+            },
+            hash,
+        ))
     }
 
     /// Image-classifier over a video: plan frames per the model's strategy, skip
@@ -1016,7 +1030,7 @@ impl Engine {
             task_id,
             idx,
             label,
-            path,
+            share,
             info,
             ..
         } = *scan;
@@ -1032,7 +1046,8 @@ impl Engine {
             )))
         };
 
-        let plan = apollo_media::plan(path, info, &strategy.sampling).await?;
+        let budget = strategy.max_frames.map(|m| m as usize);
+        let plan = apollo_media::plan(share, &strategy.sampling, budget).await?;
 
         // Seed from frames already persisted on a previous run.
         let mut frames = self
@@ -1111,6 +1126,7 @@ impl Engine {
                 &scored,
                 t.threshold,
                 plan.len() as u32,
+                budget.map_or(usize::MAX, |b| b.saturating_sub(plan.len())),
             );
             let pending: Vec<FrameRef> = extra
                 .into_iter()
@@ -1121,6 +1137,15 @@ impl Engine {
                 .await?;
         }
 
+        let shared = share.stats();
+        tracing::debug!(
+            model = %label,
+            probes_run = shared.probes_run,
+            probes_shared = shared.probes_shared,
+            frames_decoded = shared.frames_decoded,
+            frames_shared = shared.frames_shared,
+            "frame scan done (video totals so far)"
+        );
         result(frames)
     }
 
@@ -1138,8 +1163,7 @@ impl Engine {
         frames: &mut Vec<Frame>,
     ) -> Result<bool, EngineError> {
         let FrameScanRun {
-            path,
-            info,
+            share,
             input_size,
             cancel,
             ..
@@ -1148,11 +1172,10 @@ impl Engine {
 
         let chunks: Vec<&[FrameRef]> = pending.chunks(EXTRACT_CHUNK.max(batch)).collect();
         let extract = |chunk: &[FrameRef]| {
-            let path = path.to_path_buf();
-            let info = info.clone();
+            let share = Arc::clone(share);
             let requests = frame_requests(chunk);
             Prefetch(tokio::spawn(async move {
-                apollo_media::extract_frames_scaled(&path, &info, &requests, input_size).await
+                share.frames(&requests, input_size).await
             }))
         };
 
@@ -1170,7 +1193,6 @@ impl Engine {
             };
             // Start extracting the next chunk while this one is classified.
             next = chunks.get(n + 1).map(|c| extract(c));
-            let images: Vec<Arc<DecodedImage>> = images.into_iter().map(Arc::new).collect();
 
             for (refs, imgs) in chunk.chunks(batch).zip(images.chunks(batch)) {
                 if cancel.load(Ordering::SeqCst) {
@@ -1291,14 +1313,10 @@ impl Engine {
             if scan.cancel.load(Ordering::SeqCst) {
                 return Err(EngineError::Cancelled);
             }
-            let images = apollo_media::extract_frames_scaled(
-                scan.path,
-                scan.info,
-                &frame_requests(chunk),
-                scan.input_size,
-            )
-            .await?;
-            let images: Vec<Arc<DecodedImage>> = images.into_iter().map(Arc::new).collect();
+            let images = scan
+                .share
+                .frames(&frame_requests(chunk), scan.input_size)
+                .await?;
             for (refs, imgs) in chunk.chunks(batch).zip(images.chunks(batch)) {
                 let (checkpoint, failure) = self.classify_batch(scan, refs, imgs).await;
                 self.save_checkpoint(scan, &checkpoint).await;
