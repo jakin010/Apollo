@@ -4,13 +4,13 @@
 //! Resume-aware throughout: a model already `Done` from a previous run is skipped,
 //! and an interrupted video scan continues from its persisted frame checkpoint.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use apollo_config::{EarlyExit, ModelConfig, PipelineStep, StrategyConfig};
+use apollo_config::{EarlyExit, ModelConfig, PipelineStep, SamplingKind, StrategyConfig};
 use apollo_domain::{
     Classification, DecodedImage, Frame, Input, Item, ItemState, Modality, ModelOutput,
     ModelResult, ModelState, TaskError, Url,
@@ -1004,27 +1004,21 @@ impl Engine {
     }
 
     /// Image-classifier over a video: plan frames per the model's strategy, skip
-    /// frames already classified (resume), and classify the rest. Frames are
-    /// extracted [`EXTRACT_CHUNK`] at a time by one ffmpeg pass at the model's
-    /// input size, the next chunk extracted while the current one is classified;
-    /// classification goes in worker-sized batches, each persisted as one
-    /// checkpoint, stopping early when a trigger fires. Rolls up into a
-    /// `FrameScan`.
+    /// frames already classified (resume), and classify the rest, stopping early
+    /// when a trigger fires. If none does and the strategy has `refine` steps,
+    /// frames around the ambiguous scores are planned from the results and
+    /// classified the same way. Rolls up into a `FrameScan`.
     async fn run_frame_scan(&self, scan: &FrameScanRun<'_>) -> Result<ModelOutput, EngineError> {
         let FrameScanRun {
             task_id,
             idx,
             label,
-            handle,
             path,
             info,
-            input_size,
-            timeout,
-            cancel,
+            ..
         } = *scan;
         let model = self.model_cfg(label)?;
         let strategy = self.strategy_for(&model)?;
-        let frame_timeout_msg = format!("model '{label}' timed out classifying a video frame");
 
         let plan = apollo_media::plan(path, info, &strategy.sampling).await?;
 
@@ -1051,18 +1045,89 @@ impl Engine {
             )));
         }
         let mut frames = prior;
-        let batch = model.max_concurrent.max(1) as usize;
         let pending: Vec<FrameRef> = plan
-            .into_iter()
+            .iter()
             .filter(|f| !done_idx.contains(&f.index))
+            .copied()
             .collect();
-
         tracing::debug!(
             model = %label,
-            planned = pending.len() + done_idx.len(),
+            planned = plan.len(),
             resuming_from = done_idx.len(),
             "frame scan planned"
         );
+        let stopped = self
+            .classify_frames(scan, &model, early.as_ref(), &pending, &mut frames)
+            .await?;
+
+        // Look closer around ambiguous scores. Planned only once every planned
+        // frame is classified, from their stored scores, so a resumed scan plans
+        // the same frames and skips the ones it already has.
+        let has_refine = strategy
+            .sampling
+            .iter()
+            .any(|s| s.method == SamplingKind::Refine);
+        if !stopped
+            && has_refine
+            && let Some(EarlyExit { labels, threshold }) = &model.early_exit
+        {
+            let by_index: HashMap<u32, &Frame> = frames.iter().map(|f| (f.index, f)).collect();
+            let scored: Vec<(FrameRef, f32)> = plan
+                .iter()
+                .filter_map(|f| {
+                    by_index
+                        .get(&f.index)
+                        .map(|fr| (*f, apollo_media::trigger_score(&fr.classification, labels)))
+                })
+                .collect();
+            let extra = apollo_media::refine_plan(
+                info,
+                &strategy.sampling,
+                &scored,
+                *threshold,
+                plan.len() as u32,
+            );
+            let pending: Vec<FrameRef> = extra
+                .into_iter()
+                .filter(|f| !done_idx.contains(&f.index))
+                .collect();
+            tracing::debug!(model = %label, frames = pending.len(), "frame scan refining");
+            self.classify_frames(scan, &model, early.as_ref(), &pending, &mut frames)
+                .await?;
+        }
+
+        Ok(ModelOutput::FrameScan(aggregate::frame_scan(
+            frames,
+            strategy.aggregation,
+        )))
+    }
+
+    /// Classify `pending` frames in order, appending results to `frames`.
+    /// Frames are extracted [`EXTRACT_CHUNK`] at a time by one ffmpeg pass at the
+    /// model's input size, the next chunk extracted while the current one is
+    /// classified; classification goes in worker-sized batches, each persisted as
+    /// one checkpoint. Returns whether a trigger fired (and so stopped the scan).
+    async fn classify_frames(
+        &self,
+        scan: &FrameScanRun<'_>,
+        model: &ModelConfig,
+        early: Option<&(Vec<u32>, f32)>,
+        pending: &[FrameRef],
+        frames: &mut Vec<Frame>,
+    ) -> Result<bool, EngineError> {
+        let FrameScanRun {
+            task_id,
+            idx,
+            label,
+            handle,
+            path,
+            info,
+            input_size,
+            timeout,
+            cancel,
+        } = *scan;
+        let frame_timeout_msg = format!("model '{label}' timed out classifying a video frame");
+        let batch = model.max_concurrent.max(1) as usize;
 
         let chunks: Vec<&[FrameRef]> = pending.chunks(EXTRACT_CHUNK.max(batch)).collect();
         let extract = |chunk: &[FrameRef]| {
@@ -1081,7 +1146,7 @@ impl Engine {
         };
 
         let mut next = chunks.first().map(|c| extract(c));
-        'scan: for (n, chunk) in chunks.iter().enumerate() {
+        for (n, chunk) in chunks.iter().enumerate() {
             // Cancellation checkpoint between extraction chunks.
             if cancel.load(Ordering::SeqCst) {
                 return Err(EngineError::Cancelled);
@@ -1127,7 +1192,7 @@ impl Engine {
                         index: fref.index,
                         classification,
                     };
-                    stop = early.as_ref().is_some_and(|(labels, threshold)| {
+                    stop = early.is_some_and(|(labels, threshold)| {
                         apollo_media::triggered(&frame.classification, labels, *threshold)
                     });
                     checkpoint.push(frame);
@@ -1150,15 +1215,11 @@ impl Engine {
                     return Err(e);
                 }
                 if stop {
-                    break 'scan;
+                    return Ok(true);
                 }
             }
         }
-
-        Ok(ModelOutput::FrameScan(aggregate::frame_scan(
-            frames,
-            strategy.aggregation,
-        )))
+        Ok(false)
     }
 
     // ------------------------- small config lookups -------------------------

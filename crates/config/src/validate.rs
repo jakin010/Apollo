@@ -25,18 +25,63 @@ impl Config {
                 if !seen.insert(s.step) {
                     errs.push(format!("strategy '{name}': duplicate step {}", s.step));
                 }
-                let missing = match s.method {
-                    SamplingKind::Fps => s.fps.is_none().then_some("fps"),
-                    SamplingKind::Uniform => s.count.is_none().then_some("count"),
-                    SamplingKind::EveryNth => s.nth.is_none().then_some("nth"),
-                    SamplingKind::Scene => s.threshold.is_none().then_some("threshold"),
-                    SamplingKind::Iframes => None,
+                let required: Vec<(&str, bool)> = match s.method {
+                    SamplingKind::Fps => vec![("fps", s.fps.is_some())],
+                    SamplingKind::Uniform => vec![("count", s.count.is_some())],
+                    SamplingKind::EveryNth => vec![("nth", s.nth.is_some())],
+                    SamplingKind::Scene => vec![("threshold", s.threshold.is_some())],
+                    SamplingKind::Refine => vec![
+                        ("min_score", s.min_score.is_some()),
+                        ("window", s.window.is_some()),
+                        ("fps", s.fps.is_some()),
+                    ],
+                    SamplingKind::Iframes => vec![],
                 };
-                if let Some(param) = missing {
+                for (param, _) in required.iter().filter(|(_, present)| !present) {
                     errs.push(format!(
                         "strategy '{name}' step {}: method '{:?}' requires '{param}'",
                         s.step, s.method
                     ));
+                }
+                if s.min_gap.is_some() && s.method != SamplingKind::Scene {
+                    errs.push(format!(
+                        "strategy '{name}' step {}: 'min_gap' only applies to method 'scene'",
+                        s.step
+                    ));
+                }
+                if let Some(g) = s.min_gap
+                    && (!g.is_finite() || g < 0.0)
+                {
+                    errs.push(format!(
+                        "strategy '{name}' step {}: min_gap must be a finite number of seconds >= 0 (got {g})",
+                        s.step
+                    ));
+                }
+                if s.method == SamplingKind::Refine {
+                    if let Some(m) = s.min_score
+                        && (!m.is_finite() || !(0.0..1.0).contains(&m))
+                    {
+                        errs.push(format!(
+                            "strategy '{name}' step {}: min_score must be within 0.0..1.0 (got {m})",
+                            s.step
+                        ));
+                    }
+                    if let Some(w) = s.window
+                        && (!w.is_finite() || w <= 0.0 || w > 60.0)
+                    {
+                        errs.push(format!(
+                            "strategy '{name}' step {}: window must be > 0 and at most 60 seconds (got {w})",
+                            s.step
+                        ));
+                    }
+                    if let Some(f) = s.fps
+                        && (!f.is_finite() || f <= 0.0 || f > 60.0)
+                    {
+                        errs.push(format!(
+                            "strategy '{name}' step {}: fps must be > 0 and at most 60 (got {f})",
+                            s.step
+                        ));
+                    }
                 }
                 if let SamplingKind::Scene = s.method
                     && let Some(t) = s.threshold
@@ -50,6 +95,27 @@ impl Config {
             }
         }
 
+        for (name, strat) in &self.strategies {
+            let last_planned = strat
+                .sampling
+                .iter()
+                .filter(|s| s.method != SamplingKind::Refine)
+                .map(|s| s.step)
+                .max();
+            for s in strat
+                .sampling
+                .iter()
+                .filter(|s| s.method == SamplingKind::Refine)
+            {
+                if last_planned.is_some_and(|last| s.step < last) {
+                    errs.push(format!(
+                        "strategy '{name}' step {}: a 'refine' step looks at the scores of the other steps, so it must come after all of them",
+                        s.step
+                    ));
+                }
+            }
+        }
+
         for (label, model) in &self.models {
             if let Some(vs) = &model.video_strategy
                 && !self.strategies.contains_key(vs)
@@ -57,6 +123,36 @@ impl Config {
                 errs.push(format!(
                     "model '{label}': video_strategy '{vs}' is not defined"
                 ));
+            }
+            // A refine step looks closer at frames scoring just below the
+            // model's trigger, so it needs the model to define one.
+            if let Some(strat) = model
+                .video_strategy
+                .as_ref()
+                .and_then(|vs| self.strategies.get(vs))
+            {
+                for s in strat
+                    .sampling
+                    .iter()
+                    .filter(|s| s.method == SamplingKind::Refine)
+                {
+                    match &model.early_exit {
+                        None => errs.push(format!(
+                            "model '{label}': strategy step {} is 'refine', which needs the model's [models.{label}.early_exit] labels and threshold",
+                            s.step
+                        )),
+                        Some(ee) => {
+                            if let Some(m) = s.min_score
+                                && m >= ee.threshold
+                            {
+                                errs.push(format!(
+                                    "model '{label}': refine min_score ({m}) must be below the early_exit threshold ({})",
+                                    ee.threshold
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             if let Some(ee) = &model.early_exit {
                 if ee.labels.is_empty() {

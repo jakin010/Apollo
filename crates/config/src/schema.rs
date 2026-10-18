@@ -381,7 +381,8 @@ pub struct SamplingStep {
     /// Execution order; lower runs first. Unique within a strategy.
     pub step: u32,
     pub method: SamplingKind,
-    /// Frames per second (`method = "fps"`).
+    /// Frames per second (`method = "fps"`, and the density around each
+    /// frame `method = "refine"` looks closer at).
     #[serde(default)]
     pub fps: Option<f64>,
     /// Total frames evenly spaced (`method = "uniform"`).
@@ -393,6 +394,19 @@ pub struct SamplingStep {
     /// Scene-change score threshold 0..1 (`method = "scene"`).
     #[serde(default)]
     pub threshold: Option<f64>,
+    /// Minimum seconds between scene frames (`method = "scene"`): a cut closer
+    /// than this to the previously kept cut is skipped. Caps the cost on
+    /// fast-cut video. Default 0 (keep every cut).
+    #[serde(default)]
+    pub min_gap: Option<f64>,
+    /// Lowest trigger-label score that counts as ambiguous (`method = "refine"`):
+    /// frames scoring from here up to the model's `early_exit` threshold get a
+    /// closer look.
+    #[serde(default)]
+    pub min_score: Option<f32>,
+    /// Seconds either side of an ambiguous frame to sample (`method = "refine"`).
+    #[serde(default)]
+    pub window: Option<f64>,
 }
 
 /// Frame-sampling method. New methods are added here and in `apollo-media`.
@@ -404,6 +418,10 @@ pub enum SamplingKind {
     Uniform,
     EveryNth,
     Scene,
+    /// Look closer: after every other step has run, sample densely around the
+    /// frames whose trigger-label score was ambiguous. Planned from the scores,
+    /// so it must come after all other steps.
+    Refine,
 }
 
 /// `[models.<label>]` — a registered model.

@@ -1,7 +1,8 @@
 //! Sampling-method dispatch. Each method is deterministic w.r.t. the input video,
 //! which is what makes frame-level resume exact. Pure methods (`uniform`, `fps`,
 //! `every_nth`) are computed from [`VideoInfo`]; `iframes` and `scene` probe the
-//! file with ffmpeg.
+//! file with ffmpeg. `refine` is planned later, from the classified frames'
+//! scores ([`crate::strategy::refine_plan`]), and is deterministic given those.
 
 pub mod every_nth;
 pub mod fps;
@@ -41,8 +42,16 @@ pub async fn step_timestamps(
         SamplingKind::Iframes => Ok(relative(info, iframes::timestamps(path).await?)),
         SamplingKind::Scene => Ok(relative(
             info,
-            scene::timestamps(path, req(step.threshold, "threshold")?).await?,
+            scene::timestamps(
+                path,
+                req(step.threshold, "threshold")?,
+                step.min_gap.unwrap_or(0.0),
+            )
+            .await?,
         )),
+        // Planned from the scores of the other steps' frames, after they are
+        // classified — see [`crate::strategy::refine_plan`].
+        SamplingKind::Refine => Ok(Vec::new()),
     }
 }
 

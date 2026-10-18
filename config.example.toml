@@ -92,7 +92,39 @@ step   = 1
 method = "uniform"
 count  = 16
 
+[strategies.coverage_scan]
+# Sparse but thorough: far fewer frames than a dense scan (10-25x on clean
+# video), while still catching short inserts at hard cuts and brief moments the
+# model is unsure about. Suited to CPU-only servers.
+aggregation = "max"
+early_exit  = true
+
+[[strategies.coverage_scan.sampling]]
+step   = 1
+method = "uniform"              # an early, spread-out look; finds long segments fast
+count  = 8
+
+[[strategies.coverage_scan.sampling]]
+step      = 2
+method    = "scene"             # a frame at every hard cut: catches short inserts
+threshold = 0.3
+min_gap   = 1.0                 # but at most one per second on fast-cut video
+
+[[strategies.coverage_scan.sampling]]
+step   = 3
+method = "fps"                  # gap filler: long single shots get a frame every 8 s
+fps    = 0.125
+
+[[strategies.coverage_scan.sampling]]
+step      = 4
+method    = "refine"            # look closer: dense frames around any frame the model was
+min_score = 0.1                 # unsure about (from here up to the model's early_exit
+window    = 4.0                 # threshold), +-window seconds at fps
+fps       = 5
+
 [strategies.progressive_scan]
+# Thorough: ends in a dense 5 fps pass, so it catches even brief moments inside a
+# continuous shot — at ~5 model runs per second of clean video. Best with a GPU.
 aggregation = "max"
 early_exit  = true              # stops the moment a model's trigger fires
 
@@ -145,7 +177,7 @@ video_strategy = "representative"
 [models.nsfw]
 architecture   = "vit"
 repo           = "Falconsai/nsfw_image_detection"
-video_strategy = "progressive_scan"
+video_strategy = "coverage_scan"
 
 [models.nsfw.early_exit]        # model-side: what counts as a trigger. Absent -> no early exit.
 labels    = [1]

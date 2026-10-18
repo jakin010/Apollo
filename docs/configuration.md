@@ -218,11 +218,46 @@ Steps run in ascending `step` order (cheapest first, typically). Each step's req
 | `fps` | `fps` (float) | Sample at N frames per second. |
 | `uniform` | `count` (u32) | N frames, evenly spaced across the clip. |
 | `every_nth` | `nth` (u32) | Take every Nth frame. |
-| `scene` | `threshold` (0..1) | One frame per shot change above the threshold. |
+| `scene` | `threshold` (0..1) | One frame per shot change above the threshold. Optional `min_gap` (seconds): skip a cut closer than this to the previous kept one, capping the cost on fast‑cut video. |
+| `refine` | `min_score` (0..1), `window` (s), `fps` | **Look closer.** After every other step has run without a trigger, sample at `fps` within `window` seconds either side of each frame whose trigger score was ambiguous — from `min_score` up to the model's `early_exit.threshold`. Needs the model's `early_exit` labels, and must be the last step(s). Clean, confidently scored video gets no extra frames. |
 
-Example:
+Frames closer than 0.05 s to one already chosen by an earlier step are skipped, and a resumed scan re-plans exactly the same frames (including `refine`'s, which are planned from the stored scores).
+
+Two strategies from `config.example.toml`, for different hardware:
 
 ```toml
+# Sparse but thorough — suited to CPU-only servers. On the test set it used
+# 10-25x fewer frames than progressive_scan on clean video, and still caught
+# 0.5-2 s inserts at hard cuts and brief moments inside a continuous shot.
+[strategies.coverage_scan]
+aggregation = "max"
+early_exit  = true
+
+[[strategies.coverage_scan.sampling]]
+step = 1
+method = "uniform"           # an early, spread-out look; finds long segments fast
+count = 8
+
+[[strategies.coverage_scan.sampling]]
+step = 2
+method = "scene"             # a frame at every hard cut: catches short inserts
+threshold = 0.3
+min_gap = 1.0
+
+[[strategies.coverage_scan.sampling]]
+step = 3
+method = "fps"               # gap filler: long single shots get a frame every 8 s
+fps = 0.125
+
+[[strategies.coverage_scan.sampling]]
+step = 4
+method = "refine"            # look closer around anything the model was unsure about
+min_score = 0.1
+window = 4.0
+fps = 5
+
+# Dense — ends in a 5 fps pass (~5 model runs per second of clean video), so it
+# misses nothing the model can see. Best with a GPU.
 [strategies.progressive_scan]
 aggregation = "max"
 early_exit  = true
@@ -241,6 +276,8 @@ step = 3
 method = "fps"               # densest; only reached if earlier steps didn't exit
 fps = 5
 ```
+
+Choosing a scene `threshold`: `0.3` found both cuts of every spliced‑in clip in testing, while `0.4` missed some of the cuts back out. Keyframes (`iframes`) are cheap but are usually placed at a fixed interval by the encoder, not at scene changes, so they are no substitute for `scene`.
 
 ---
 
@@ -357,7 +394,7 @@ See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
 
 `apollo start` validates the config before serving and reports **all** problems at once. Enforced rules include:
 
-- **Strategies:** at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`).
+- **Strategies:** at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`, `refine`→`min_score` + `window` + `fps`); `min_gap` only on `scene` and ≥ 0; `refine` steps after all others, with `min_score` in 0..1, `window` in (0, 60] s and `fps` in (0, 60]. A model using a strategy with `refine` must define `early_exit`, with a `threshold` above the step's `min_score`.
 - **Models:** `video_strategy` must name a defined strategy; `early_exit` must list at least one label **and** requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
 - **Pipelines:** at least one step; every `model` must be defined; unique `order`s; a `stop_if` must list at least one label id.
 - **Database:** selecting `postgres`/`surrealdb` requires the matching `[database.<backend>]` section.
