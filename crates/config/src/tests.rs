@@ -285,3 +285,47 @@ fn rejects_misplaced_or_incomplete_refine_and_min_gap() {
         assert!(err.contains(expected), "missing {expected:?} in {err}");
     }
 }
+
+#[test]
+fn confirm_parses_and_validates() {
+    let base = |strategy_extra: &str, model_extra: &str| {
+        format!(
+            r#"
+            [strategies.s]
+            early_exit = true
+            {strategy_extra}
+            [[strategies.s.sampling]]
+            step = 1
+            method = "uniform"
+            count = 8
+            [models.m]
+            architecture = "vit"
+            repo = "a/b"
+            video_strategy = "s"
+            {model_extra}
+            "#
+        )
+    };
+    let trigger = "[models.m.early_exit]\nlabels = [1]";
+
+    let cfg = load::from_str(&base("confirm = 1", trigger)).unwrap();
+    cfg.validate().unwrap();
+    assert_eq!(cfg.strategies["s"].confirm, 1);
+    assert!((cfg.strategies["s"].confirm_window - 0.25).abs() < 1e-9);
+    // Off by default.
+    assert_eq!(
+        load::from_str(&base("", trigger)).unwrap().strategies["s"].confirm,
+        0
+    );
+
+    let err = |strategy_extra: &str, model_extra: &str| {
+        load::from_str(&base(strategy_extra, model_extra))
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(err("confirm = 1", "").contains("sets confirm, which needs"));
+    assert!(err("confirm = 9", trigger).contains("confirm must be at most 8"));
+    assert!(err("confirm = 1\nconfirm_window = 0.01", trigger).contains("confirm_window"));
+}

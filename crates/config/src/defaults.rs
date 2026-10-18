@@ -42,6 +42,10 @@ pub(crate) fn timeout() -> u32 {
 pub(crate) fn early_exit_threshold() -> f32 {
     0.85
 }
+pub(crate) fn confirm_window() -> f64 {
+    0.25
+}
+
 pub(crate) fn aggregation() -> Aggregation {
     Aggregation::Mean
 }

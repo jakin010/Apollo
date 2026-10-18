@@ -127,7 +127,7 @@ pub fn trigger_score(class: &Classification, labels: &[u32]) -> f32 {
 /// variable frame rates mean a timestamp at (or fractionally beyond) `duration`
 /// decodes to nothing, so every sample stays at least one frame-duration short
 /// of the end.
-fn max_seek(info: &VideoInfo) -> f64 {
+pub(crate) fn max_seek(info: &VideoInfo) -> f64 {
     let guard = if info.fps > 0.0 {
         (1.0 / info.fps).max(1e-3)
     } else {

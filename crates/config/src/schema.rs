@@ -361,6 +361,16 @@ pub struct StrategyConfig {
     /// the model to define `early_exit.labels`, else it has no effect.
     #[serde(default)]
     pub early_exit: bool,
+    /// Don't trust a single frame: one reaching the model's `early_exit`
+    /// threshold only counts as a trigger if at least this many *other* frames
+    /// within `confirm_window` seconds of it reach it too (frames are sampled
+    /// there when the plan has none). An unconfirmed frame doesn't stop the scan
+    /// and doesn't flag the video. `0` (the default) trusts single frames.
+    #[serde(default)]
+    pub confirm: u32,
+    /// Seconds either side of a triggering frame that `confirm` looks in.
+    #[serde(default = "crate::defaults::confirm_window")]
+    pub confirm_window: f64,
     /// Ordered sampling methods (run in `step` order). Must be non-empty.
     #[serde(default)]
     pub sampling: Vec<SamplingStep>,

@@ -15,7 +15,7 @@ use apollo_domain::{
     Classification, DecodedImage, Frame, Input, Item, ItemState, Modality, ModelOutput,
     ModelResult, ModelState, TaskError, Url,
 };
-use apollo_media::{FrameRef, FrameRequest, LocalMedia, MediaError, VideoInfo};
+use apollo_media::{Confirm, FrameRef, FrameRequest, LocalMedia, MediaError, VideoInfo};
 
 use crate::Engine;
 use crate::aggregate;
@@ -1005,9 +1005,12 @@ impl Engine {
 
     /// Image-classifier over a video: plan frames per the model's strategy, skip
     /// frames already classified (resume), and classify the rest, stopping early
-    /// when a trigger fires. If none does and the strategy has `refine` steps,
-    /// frames around the ambiguous scores are planned from the results and
-    /// classified the same way. Rolls up into a `FrameScan`.
+    /// when a trigger fires. With the strategy's `confirm`, a frame reaching the
+    /// trigger only counts once enough frames close to it agree (frames are
+    /// sampled there when the plan has none). If nothing triggers and the
+    /// strategy has `refine` steps, frames around the ambiguous scores are
+    /// planned from the results and classified the same way. Rolls up into a
+    /// `FrameScan`.
     async fn run_frame_scan(&self, scan: &FrameScanRun<'_>) -> Result<ModelOutput, EngineError> {
         let FrameScanRun {
             task_id,
@@ -1019,32 +1022,48 @@ impl Engine {
         } = *scan;
         let model = self.model_cfg(label)?;
         let strategy = self.strategy_for(&model)?;
+        let trigger = Trigger::for_scan(&strategy, &model);
+        let result = |frames: Vec<Frame>| {
+            let confirming = trigger.as_ref().and_then(Trigger::confirming);
+            Ok(ModelOutput::FrameScan(aggregate::frame_scan(
+                frames,
+                strategy.aggregation,
+                confirming,
+            )))
+        };
 
         let plan = apollo_media::plan(path, info, &strategy.sampling).await?;
 
         // Seed from frames already persisted on a previous run.
-        let prior = self
+        let mut frames = self
             .inner
             .storage
             .load_frames(task_id, idx, label)
             .await
             .unwrap_or_default();
-        let done_idx: HashSet<u32> = prior.iter().map(|f| f.index).collect();
-        let early = early_exit_for(&strategy, &model);
+        let done_idx: HashSet<u32> = frames.iter().map(|f| f.index).collect();
 
         // A resumed scan may already have hit its trigger before the interruption
-        // (crash after the frame checkpoint, before the result was written).
-        if let Some((labels, threshold)) = early.as_ref()
-            && prior
-                .iter()
-                .any(|f| apollo_media::triggered(&f.classification, labels, *threshold))
-        {
-            return Ok(ModelOutput::FrameScan(aggregate::frame_scan(
-                prior,
-                strategy.aggregation,
-            )));
+        // (crash after the frame checkpoint, before the result was written), or
+        // been interrupted while confirming one.
+        if let Some(t) = trigger.as_ref() {
+            let fired = match t.rule {
+                None => frames.iter().any(|f| t.reached(f)),
+                Some(_) => {
+                    let candidates: Vec<FrameRef> = frames
+                        .iter()
+                        .filter(|f| t.candidate(f))
+                        .map(frame_ref)
+                        .collect();
+                    self.confirm_candidates(scan, &model, t, &candidates, &mut frames)
+                        .await?
+                }
+            };
+            if t.stop && fired {
+                return result(frames);
+            }
         }
-        let mut frames = prior;
+
         let pending: Vec<FrameRef> = plan
             .iter()
             .filter(|f| !done_idx.contains(&f.index))
@@ -1057,34 +1076,40 @@ impl Engine {
             "frame scan planned"
         );
         let stopped = self
-            .classify_frames(scan, &model, early.as_ref(), &pending, &mut frames)
+            .classify_frames(scan, &model, trigger.as_ref(), &pending, &mut frames)
             .await?;
 
         // Look closer around ambiguous scores. Planned only once every planned
         // frame is classified, from their stored scores, so a resumed scan plans
-        // the same frames and skips the ones it already has.
+        // the same frames and skips the ones it already has. With confirmation,
+        // an unconfirmed frame counts as its surroundings here too.
         let has_refine = strategy
             .sampling
             .iter()
             .any(|s| s.method == SamplingKind::Refine);
         if !stopped
             && has_refine
-            && let Some(EarlyExit { labels, threshold }) = &model.early_exit
+            && let Some(t) = trigger.as_ref()
         {
-            let by_index: HashMap<u32, &Frame> = frames.iter().map(|f| (f.index, f)).collect();
+            let all: Vec<(f64, f32)> = frames.iter().map(|f| (f.timestamp, t.score(f))).collect();
+            let effective = match t.rule {
+                Some(rule) => apollo_media::confirm::confirmed_scores(&all, t.threshold, rule),
+                None => all.iter().map(|&(_, s)| s).collect(),
+            };
+            let by_index: HashMap<u32, f32> = frames
+                .iter()
+                .zip(effective)
+                .map(|(f, score)| (f.index, score))
+                .collect();
             let scored: Vec<(FrameRef, f32)> = plan
                 .iter()
-                .filter_map(|f| {
-                    by_index
-                        .get(&f.index)
-                        .map(|fr| (*f, apollo_media::trigger_score(&fr.classification, labels)))
-                })
+                .filter_map(|f| by_index.get(&f.index).map(|&score| (*f, score)))
                 .collect();
             let extra = apollo_media::refine_plan(
                 info,
                 &strategy.sampling,
                 &scored,
-                *threshold,
+                t.threshold,
                 plan.len() as u32,
             );
             let pending: Vec<FrameRef> = extra
@@ -1092,54 +1117,40 @@ impl Engine {
                 .filter(|f| !done_idx.contains(&f.index))
                 .collect();
             tracing::debug!(model = %label, frames = pending.len(), "frame scan refining");
-            self.classify_frames(scan, &model, early.as_ref(), &pending, &mut frames)
+            self.classify_frames(scan, &model, Some(t), &pending, &mut frames)
                 .await?;
         }
 
-        Ok(ModelOutput::FrameScan(aggregate::frame_scan(
-            frames,
-            strategy.aggregation,
-        )))
+        result(frames)
     }
 
     /// Classify `pending` frames in order, appending results to `frames`.
     /// Frames are extracted [`EXTRACT_CHUNK`] at a time by one ffmpeg pass at the
     /// model's input size, the next chunk extracted while the current one is
     /// classified; classification goes in worker-sized batches, each persisted as
-    /// one checkpoint. Returns whether a trigger fired (and so stopped the scan).
+    /// one checkpoint. Returns whether a trigger fired and stopped the scan.
     async fn classify_frames(
         &self,
         scan: &FrameScanRun<'_>,
         model: &ModelConfig,
-        early: Option<&(Vec<u32>, f32)>,
+        trigger: Option<&Trigger>,
         pending: &[FrameRef],
         frames: &mut Vec<Frame>,
     ) -> Result<bool, EngineError> {
         let FrameScanRun {
-            task_id,
-            idx,
-            label,
-            handle,
             path,
             info,
             input_size,
-            timeout,
             cancel,
+            ..
         } = *scan;
-        let frame_timeout_msg = format!("model '{label}' timed out classifying a video frame");
         let batch = model.max_concurrent.max(1) as usize;
 
         let chunks: Vec<&[FrameRef]> = pending.chunks(EXTRACT_CHUNK.max(batch)).collect();
         let extract = |chunk: &[FrameRef]| {
             let path = path.to_path_buf();
             let info = info.clone();
-            let requests: Vec<FrameRequest> = chunk
-                .iter()
-                .map(|f| FrameRequest {
-                    timestamp: f.timestamp,
-                    keyframe: f.keyframe,
-                })
-                .collect();
+            let requests = frame_requests(chunk);
             Prefetch(tokio::spawn(async move {
                 apollo_media::extract_frames_scaled(&path, &info, &requests, input_size).await
             }))
@@ -1165,51 +1176,27 @@ impl Engine {
                 if cancel.load(Ordering::SeqCst) {
                     return Err(EngineError::Cancelled);
                 }
-                // Issue the batch concurrently so the worker merges it into one
-                // forward pass; each frame is bounded by the per-frame timeout.
-                let calls = imgs.iter().map(|img| {
-                    classify_with_timeout(
-                        timeout,
-                        handle.classify_image(Arc::clone(img)),
-                        &frame_timeout_msg,
-                    )
-                });
-                let results = futures::future::join_all(calls).await;
-
-                let mut checkpoint = Vec::with_capacity(refs.len());
-                let mut failure = None;
+                let (mut checkpoint, failure) = self.classify_batch(scan, refs, imgs).await;
+                // Without confirmation the first frame reaching the trigger stops
+                // the scan; the rest of the batch is not kept.
                 let mut stop = false;
-                for (fref, res) in refs.iter().zip(results) {
-                    let classification = match res {
-                        Ok(c) => c,
-                        Err(e) => {
-                            failure = Some(e);
-                            break;
-                        }
-                    };
-                    let frame = Frame {
-                        timestamp: fref.timestamp,
-                        index: fref.index,
-                        classification,
-                    };
-                    stop = early.is_some_and(|(labels, threshold)| {
-                        apollo_media::triggered(&frame.classification, labels, *threshold)
-                    });
-                    checkpoint.push(frame);
-                    if stop {
-                        break;
-                    }
+                if let Some(t) = trigger.filter(|t| t.stop && t.rule.is_none())
+                    && let Some(at) = checkpoint.iter().position(|f| t.reached(f))
+                {
+                    checkpoint.truncate(at + 1);
+                    stop = true;
                 }
                 // Persist what this batch produced, even if a frame failed, so a
                 // retry or resume does not redo it.
-                if let Err(e) = self
-                    .inner
-                    .storage
-                    .append_frames(task_id, idx, label, &checkpoint)
-                    .await
-                {
-                    tracing::warn!(task = %task_id, model = %label, error = %e, "frame checkpoint failed");
-                }
+                self.save_checkpoint(scan, &checkpoint).await;
+                let candidates: Vec<FrameRef> = match trigger {
+                    Some(t) if t.rule.is_some() => checkpoint
+                        .iter()
+                        .filter(|f| t.candidate(f))
+                        .map(frame_ref)
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 frames.extend(checkpoint);
                 if let Some(e) = failure {
                     return Err(e);
@@ -1217,9 +1204,157 @@ impl Engine {
                 if stop {
                     return Ok(true);
                 }
+                if let Some(t) = trigger
+                    && !candidates.is_empty()
+                    && self
+                        .confirm_candidates(scan, model, t, &candidates, frames)
+                        .await?
+                    && t.stop
+                {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
+    }
+
+    /// Decide `candidates` (frames that reached the trigger) under the strategy's
+    /// confirmation rule, first sampling around those the scan has no frames
+    /// near (see [`apollo_media::confirm::targets`]; frames already classified,
+    /// e.g. before a resume, are reused). Returns whether any is confirmed.
+    async fn confirm_candidates(
+        &self,
+        scan: &FrameScanRun<'_>,
+        model: &ModelConfig,
+        trigger: &Trigger,
+        candidates: &[FrameRef],
+        frames: &mut Vec<Frame>,
+    ) -> Result<bool, EngineError> {
+        let Some(rule) = trigger.rule else {
+            return Ok(false);
+        };
+        // Which candidates the frames so far already confirm.
+        let confirmed = |frames: &[Frame]| -> Vec<bool> {
+            let scored: Vec<(f64, f32)> = frames
+                .iter()
+                .map(|f| (f.timestamp, trigger.score(f)))
+                .collect();
+            candidates
+                .iter()
+                .map(|c| {
+                    frames
+                        .iter()
+                        .position(|f| f.index == c.index)
+                        .is_some_and(|i| {
+                            apollo_media::confirm::is_confirmed(&scored, i, trigger.threshold, rule)
+                        })
+                })
+                .collect()
+        };
+        let before = confirmed(frames);
+        if trigger.stop && before.contains(&true) {
+            return Ok(true);
+        }
+
+        // Sample around the others, where the scan has no frames yet.
+        let mut targets: Vec<FrameRef> = Vec::new();
+        for (c, _) in candidates.iter().zip(&before).filter(|(_, done)| !**done) {
+            for t in apollo_media::confirm::targets(scan.info, c, rule) {
+                let near = |u: f64| (u - t.timestamp).abs() <= apollo_media::DEDUPE_TOLERANCE;
+                let have = frames
+                    .iter()
+                    .any(|f| f.index == t.index || near(f.timestamp))
+                    || targets.iter().any(|x| near(x.timestamp));
+                if !have {
+                    targets.push(t);
+                }
+            }
+        }
+        if !targets.is_empty() {
+            tracing::debug!(model = %scan.label, frames = targets.len(), "confirming a trigger");
+            self.classify_refs(scan, model, &targets, frames).await?;
+        }
+        Ok(confirmed(frames).contains(&true))
+    }
+
+    /// Extract and classify `refs` (in worker-sized batches, each persisted as a
+    /// checkpoint), appending the results to `frames`.
+    async fn classify_refs(
+        &self,
+        scan: &FrameScanRun<'_>,
+        model: &ModelConfig,
+        refs: &[FrameRef],
+        frames: &mut Vec<Frame>,
+    ) -> Result<(), EngineError> {
+        let batch = model.max_concurrent.max(1) as usize;
+        for chunk in refs.chunks(EXTRACT_CHUNK.max(batch)) {
+            if scan.cancel.load(Ordering::SeqCst) {
+                return Err(EngineError::Cancelled);
+            }
+            let images = apollo_media::extract_frames_scaled(
+                scan.path,
+                scan.info,
+                &frame_requests(chunk),
+                scan.input_size,
+            )
+            .await?;
+            let images: Vec<Arc<DecodedImage>> = images.into_iter().map(Arc::new).collect();
+            for (refs, imgs) in chunk.chunks(batch).zip(images.chunks(batch)) {
+                let (checkpoint, failure) = self.classify_batch(scan, refs, imgs).await;
+                self.save_checkpoint(scan, &checkpoint).await;
+                frames.extend(checkpoint);
+                if let Some(e) = failure {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Classify one batch of extracted frames, issued concurrently so the worker
+    /// merges it into one forward pass; each frame is bounded by the per-frame
+    /// timeout. Returns the frames classified before the first failure, and that
+    /// failure.
+    async fn classify_batch(
+        &self,
+        scan: &FrameScanRun<'_>,
+        refs: &[FrameRef],
+        imgs: &[Arc<DecodedImage>],
+    ) -> (Vec<Frame>, Option<EngineError>) {
+        let timeout_msg = format!("model '{}' timed out classifying a video frame", scan.label);
+        let calls = imgs.iter().map(|img| {
+            classify_with_timeout(
+                scan.timeout,
+                scan.handle.classify_image(Arc::clone(img)),
+                &timeout_msg,
+            )
+        });
+        let results = futures::future::join_all(calls).await;
+        let mut out = Vec::with_capacity(refs.len());
+        for (fref, res) in refs.iter().zip(results) {
+            match res {
+                Ok(classification) => out.push(Frame {
+                    timestamp: fref.timestamp,
+                    index: fref.index,
+                    classification,
+                }),
+                Err(e) => return (out, Some(e)),
+            }
+        }
+        (out, None)
+    }
+
+    /// Persist classified frames as one checkpoint; a failure is logged, not
+    /// fatal (the frames are only re-done on resume).
+    async fn save_checkpoint(&self, scan: &FrameScanRun<'_>, frames: &[Frame]) {
+        if let Err(e) = self
+            .inner
+            .storage
+            .append_frames(scan.task_id, scan.idx, scan.label, frames)
+            .await
+        {
+            tracing::warn!(task = %scan.task_id, model = %scan.label, error = %e, "frame checkpoint failed");
+        }
     }
 
     // ------------------------- small config lookups -------------------------
@@ -1342,18 +1477,71 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// `(labels, threshold)` when both the strategy enables early-exit and the model
-/// defines trigger labels; otherwise `None` (early-exit needs both).
-fn early_exit_for(strategy: &StrategyConfig, model: &ModelConfig) -> Option<(Vec<u32>, f32)> {
-    if !strategy.early_exit {
-        return None;
-    }
-    match &model.early_exit {
-        Some(EarlyExit { labels, threshold }) if !labels.is_empty() => {
-            Some((labels.clone(), *threshold))
+/// How a frame scan treats triggers: the model's trigger labels and threshold
+/// (`[models.<l>.early_exit]`), whether the strategy stops on one, and its
+/// confirmation rule.
+struct Trigger {
+    labels: Vec<u32>,
+    threshold: f32,
+    /// Stop the scan on a (confirmed) trigger: the strategy's `early_exit`.
+    stop: bool,
+    rule: Option<Confirm>,
+}
+
+impl Trigger {
+    /// `None` when the model defines no trigger labels.
+    fn for_scan(strategy: &StrategyConfig, model: &ModelConfig) -> Option<Self> {
+        match &model.early_exit {
+            Some(EarlyExit { labels, threshold }) if !labels.is_empty() => Some(Self {
+                labels: labels.clone(),
+                threshold: *threshold,
+                stop: strategy.early_exit,
+                rule: Confirm::from_strategy(strategy),
+            }),
+            _ => None,
         }
-        _ => None,
     }
+
+    /// The frame's highest trigger-label score.
+    fn score(&self, frame: &Frame) -> f32 {
+        apollo_media::trigger_score(&frame.classification, &self.labels)
+    }
+
+    /// Whether the frame reaches the threshold on its own.
+    fn reached(&self, frame: &Frame) -> bool {
+        apollo_media::triggered(&frame.classification, &self.labels, self.threshold)
+    }
+
+    /// Whether the frame needs confirming: it reaches the threshold and was not
+    /// itself sampled to confirm another frame.
+    fn candidate(&self, frame: &Frame) -> bool {
+        self.reached(frame) && !apollo_media::confirm::is_confirmation_frame(frame.index)
+    }
+
+    fn confirming(&self) -> Option<aggregate::Confirming<'_>> {
+        self.rule.map(|rule| aggregate::Confirming {
+            labels: &self.labels,
+            threshold: self.threshold,
+            rule,
+        })
+    }
+}
+
+fn frame_ref(frame: &Frame) -> FrameRef {
+    FrameRef {
+        index: frame.index,
+        timestamp: frame.timestamp,
+        keyframe: false,
+    }
+}
+
+fn frame_requests(refs: &[FrameRef]) -> Vec<FrameRequest> {
+    refs.iter()
+        .map(|f| FrameRequest {
+            timestamp: f.timestamp,
+            keyframe: f.keyframe,
+        })
+        .collect()
 }
 
 /// Bound a single classification future by `timeout`; an elapse becomes a

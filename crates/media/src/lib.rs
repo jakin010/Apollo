@@ -11,6 +11,7 @@
 //! drives the scan — pull the plan from [`strategy::plan`], extract and classify
 //! frames in batches, persist, and stop on early-exit — using the helpers here.
 
+pub mod confirm;
 pub mod decode;
 pub mod error;
 pub mod extract;
@@ -19,6 +20,7 @@ pub mod ffmpeg;
 pub mod sampling;
 pub mod strategy;
 
+pub use confirm::Confirm;
 pub use decode::decode_image;
 pub use error::MediaError;
 pub use extract::{FrameRequest, extract_frames_scaled};

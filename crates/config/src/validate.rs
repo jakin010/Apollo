@@ -9,6 +9,10 @@ use crate::schema::{Backend, Config, SamplingKind};
 use std::collections::BTreeSet;
 use std::path::Path;
 
+/// Most frames `confirm` may ask for: twice this many are sampled around a
+/// candidate, and their frame indices are derived from its index.
+pub const MAX_CONFIRM: u32 = 8;
+
 impl Config {
     /// Collect all problems; `Ok` only if there are none.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -96,6 +100,18 @@ impl Config {
         }
 
         for (name, strat) in &self.strategies {
+            if strat.confirm > MAX_CONFIRM {
+                errs.push(format!(
+                    "strategy '{name}': confirm must be at most {MAX_CONFIRM} (got {})",
+                    strat.confirm
+                ));
+            }
+            let w = strat.confirm_window;
+            if strat.confirm > 0 && (!w.is_finite() || w <= 0.05 || w > 5.0) {
+                errs.push(format!(
+                    "strategy '{name}': confirm_window must be above 0.05 and at most 5 seconds (got {w})"
+                ));
+            }
             let last_planned = strat
                 .sampling
                 .iter()
@@ -131,6 +147,11 @@ impl Config {
                 .as_ref()
                 .and_then(|vs| self.strategies.get(vs))
             {
+                if strat.confirm > 0 && model.early_exit.is_none() {
+                    errs.push(format!(
+                        "model '{label}': its strategy sets confirm, which needs the model's [models.{label}.early_exit] labels and threshold"
+                    ));
+                }
                 for s in strat
                     .sampling
                     .iter()
