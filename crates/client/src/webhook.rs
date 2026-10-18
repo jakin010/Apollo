@@ -42,6 +42,9 @@ const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// Implement with `#[tonic::async_trait]` (re-exported as
 /// [`apollo_client::async_trait`](crate::async_trait)).
+// `async_trait` marks the boxed-future methods `#[must_use]`; clippy >= 1.99
+// reports that as `double_must_use`.
+#[allow(clippy::double_must_use)]
 #[tonic::async_trait]
 pub trait WebhookHandler: Send + Sync + 'static {
     async fn on_task_status(&self, task: Task) -> Result<Response<Ack>, Status>;

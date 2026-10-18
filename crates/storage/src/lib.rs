@@ -47,6 +47,9 @@ pub use resume::PendingWebhook;
 /// Persistence operations the rest of the app depends on. Task lifecycle is fully
 /// persisted (it survives restarts), tracked at per-(item, model) granularity so
 /// interrupted work can resume without redoing completed pieces.
+// `async_trait` marks the boxed-future methods `#[must_use]`; clippy >= 1.99
+// reports that as `double_must_use`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Apply pending schema migrations. Idempotent.
