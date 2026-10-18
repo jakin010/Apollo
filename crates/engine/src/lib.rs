@@ -103,7 +103,7 @@ impl Engine {
         storage: Arc<dyn Storage>,
         webhook: Option<Arc<dyn WebhookSink>>,
     ) -> Engine {
-        let (_probe, kind) = apollo_inference::select_device();
+        let (_probe, kind) = apollo_inference::select_device(config.app.device);
         tracing::info!(device = %kind, "selected compute device");
 
         let cache_dir = config.app.cache_dir.clone().map(PathBuf::from);

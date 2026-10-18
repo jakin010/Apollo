@@ -9,6 +9,9 @@
 //!   device initializes.
 //! * **CPU** — always available, the final fallback.
 //!
+//! `[app].device` can pin one backend instead (`cpu`, `metal`, `cuda`), e.g. to
+//! keep a GPU free or to measure CPU-only performance on a GPU machine.
+//!
 //! `select_device()` therefore drops to CPU whenever the preferred backend is
 //! compiled in but cannot bring up a device — no GPU present, driver mismatch,
 //! device busy. On macOS it runs regardless, since Metal ships with the OS.
@@ -23,6 +26,7 @@
 //! without `--features cuda`) — it links nothing CUDA-related and starts
 //! anywhere, selecting CPU here.
 
+use apollo_config::DevicePreference;
 use candle_core::Device;
 
 /// Which backend a device represents.
@@ -51,50 +55,55 @@ impl std::fmt::Display for DeviceKind {
 /// device used from several threads at once interleave each other's work and
 /// can return corrupted (NaN) results.
 pub fn open_device(kind: DeviceKind) -> Device {
-    let opened = match kind {
-        DeviceKind::Cpu => return Device::Cpu,
-        #[cfg(feature = "cuda")]
-        DeviceKind::Cuda => Device::new_cuda(0),
-        #[cfg(target_os = "macos")]
-        DeviceKind::Metal => Device::new_metal(0),
-        #[allow(unreachable_patterns)]
-        _ => return Device::Cpu,
-    };
-    opened.unwrap_or_else(|e| {
-        tracing::warn!(error = %e, device = %kind, "could not open a device; using CPU");
-        Device::Cpu
-    })
+    match try_open(kind) {
+        Some(Ok(device)) => device,
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, device = %kind, "could not open a device; using CPU");
+            Device::Cpu
+        }
+        None => Device::Cpu,
+    }
 }
 
-/// Pick the best device available right now, trying CUDA, then Metal, then CPU.
+/// Pick the device to run on. `Auto` tries CUDA, then Metal, then CPU; an
+/// explicit backend is tried alone and falls back to CPU if it cannot start.
 /// Only backends compiled into this binary are attempted.
-pub fn select_device() -> (Device, DeviceKind) {
-    #[cfg(feature = "cuda")]
-    {
-        match Device::new_cuda(0) {
-            Ok(device) => {
-                tracing::info!("selected CUDA device 0");
-                return (device, DeviceKind::Cuda);
+pub fn select_device(preference: DevicePreference) -> (Device, DeviceKind) {
+    let candidates: &[DeviceKind] = match preference {
+        DevicePreference::Auto => &[DeviceKind::Cuda, DeviceKind::Metal],
+        DevicePreference::Cuda => &[DeviceKind::Cuda],
+        DevicePreference::Metal => &[DeviceKind::Metal],
+        DevicePreference::Cpu => &[],
+    };
+    for &kind in candidates {
+        match try_open(kind) {
+            Some(Ok(device)) => {
+                tracing::info!(device = %kind, "selected device 0");
+                return (device, kind);
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "CUDA is compiled in but no device initialized; trying next backend");
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, device = %kind, "device did not initialize; trying the next backend");
             }
+            None if preference != DevicePreference::Auto => {
+                tracing::warn!(device = %kind, "this build has no support for the configured device; using CPU");
+            }
+            None => {}
         }
     }
-
-    #[cfg(target_os = "macos")]
-    {
-        match Device::new_metal(0) {
-            Ok(device) => {
-                tracing::info!("selected Metal device 0");
-                return (device, DeviceKind::Metal);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Metal did not initialize; falling back to CPU");
-            }
-        }
-    }
-
     tracing::info!("selected CPU device");
     (Device::Cpu, DeviceKind::Cpu)
+}
+
+/// Try to open device 0 of `kind`; `None` when that backend is not compiled
+/// into this binary.
+fn try_open(kind: DeviceKind) -> Option<candle_core::Result<Device>> {
+    match kind {
+        DeviceKind::Cpu => Some(Ok(Device::Cpu)),
+        #[cfg(feature = "cuda")]
+        DeviceKind::Cuda => Some(Device::new_cuda(0)),
+        #[cfg(target_os = "macos")]
+        DeviceKind::Metal => Some(Device::new_metal(0)),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
 }

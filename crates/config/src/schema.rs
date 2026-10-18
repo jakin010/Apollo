@@ -146,6 +146,24 @@ pub struct AppConfig {
     /// retries.
     #[serde(default = "crate::defaults::max_retries")]
     pub max_retries: u32,
+    /// Compute backend for the model workers. `auto` picks CUDA → Metal → CPU.
+    #[serde(default)]
+    pub device: DevicePreference,
+}
+
+/// Which compute backend to run models on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DevicePreference {
+    /// The best backend that initializes: CUDA, then Metal, then CPU.
+    #[default]
+    Auto,
+    /// Always the CPU, even when a GPU is available.
+    Cpu,
+    /// Metal (macOS); falls back to CPU if it cannot be initialized.
+    Metal,
+    /// CUDA (`cuda` builds); falls back to CPU if it cannot be initialized.
+    Cuda,
 }
 
 impl AppConfig {
@@ -168,6 +186,7 @@ impl Default for AppConfig {
             max_memory: defaults::max_memory(),
             max_pending: defaults::max_pending(),
             max_retries: defaults::max_retries(),
+            device: DevicePreference::Auto,
         }
     }
 }

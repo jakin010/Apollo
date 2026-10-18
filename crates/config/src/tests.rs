@@ -44,6 +44,19 @@ fn defaults_apply_to_minimal_model() {
 }
 
 #[test]
+fn device_defaults_to_auto_and_parses_overrides() {
+    use crate::DevicePreference;
+
+    assert_eq!(
+        load::from_str("").unwrap().app.device,
+        DevicePreference::Auto
+    );
+    let cfg = load::from_str("[app]\ndevice = \"cpu\"\n").unwrap();
+    assert_eq!(cfg.app.device, DevicePreference::Cpu);
+    assert!(load::from_str("[app]\ndevice = \"tpu\"\n").is_err());
+}
+
+#[test]
 fn rejects_unknown_strategy_reference() {
     let cfg = load::from_str(
         r#"

@@ -41,6 +41,7 @@ Relative `taxonomy_file` paths inside a model are resolved against the **config 
 | `max_memory` | size | `"4gb"` | Soft resident‑memory ceiling. New work is rejected with `RESOURCE_EXHAUSTED` while usage is above it (`0` = off). |
 | `max_pending` | u32 | `1024` | Max items queued or in‑flight before submissions are rejected with `RESOURCE_EXHAUSTED` (backpressure). `0` = off. |
 | `max_retries` | u32 | `3` | Times an item is retried after a **transient** failure (network error, HTTP 5xx/408/429, model timeout or load failure, inference error): a failed fetch is re‑fetched, failed models (or the failed pipeline step) re‑run while finished ones are kept. Permanent failures (refused URL, HTTP 4xx, undecodable or over‑limit input) are not retried. `0` = no retries. |
+| `device` | string | `"auto"` | Compute backend for the models. `auto` picks the first that initializes: CUDA (only in `cuda` builds), then Metal (macOS), then CPU. `cpu` always uses the CPU, even on a GPU machine. `metal` / `cuda` pin that backend and fall back to CPU, with a warning, if it can't be used. |
 
 ---
 

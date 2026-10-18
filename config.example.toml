@@ -9,6 +9,7 @@ idle_timeout   = 300                           # seconds a model stays resident 
 max_memory     = "4gb"                          # soft resident-memory cap; new work rejected above it (0 = off)
 max_pending    = 1024                           # max queued/in-flight items before backpressure (0 = off)
 max_retries    = 3                              # times a failed item is retried before it is marked failed (0 = off)
+device         = "auto"                         # auto (CUDA → Metal → CPU), or pin one: cpu / metal / cuda
 
 [webhook]
 url = "https://hooks.example.com:443"          # optional; omit the section to disable and let clients poll
