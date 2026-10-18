@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use apollo_config::{SamplingKind, SamplingStep};
 use apollo_domain::DecodedImage;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, OwnedMutexGuard};
 
@@ -44,6 +45,16 @@ pub struct ShareStats {
     pub frames_decoded: u64,
     /// Frames served without decoding them again.
     pub frames_shared: u64,
+}
+
+/// A probe started early by [`VideoShare::warm`]; dropping it cancels the probe
+/// if it is still running.
+pub struct Warmup(tokio::task::JoinHandle<()>);
+
+impl Drop for Warmup {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Shared probes and frames for one video file.
@@ -114,6 +125,42 @@ impl VideoShare {
         };
         self.probe_once(&cell, || ffmpeg::scene_cuts(&self.path, threshold))
             .await
+    }
+
+    /// Whether planning `step` would not wait on a probe: it needs none, or its
+    /// probe has already finished.
+    pub fn ready(&self, step: &SamplingStep) -> bool {
+        match step.method {
+            SamplingKind::Iframes => self.keyframes.initialized(),
+            SamplingKind::Scene => step.threshold.is_none_or(|t| {
+                let scenes = self.scenes.lock().unwrap_or_else(|e| e.into_inner());
+                scenes
+                    .get(&t.to_bits())
+                    .is_some_and(|cell| cell.initialized())
+            }),
+            _ => true,
+        }
+    }
+
+    /// Start the probe `step` will need (keyframes, scene detection) in the
+    /// background, so it is ready, or under way, when the step is planned.
+    /// `None` for steps that need none. Dropping the returned [`Warmup`] cancels
+    /// it — killing its ffmpeg — e.g. when the scan stops before the step.
+    pub fn warm(self: &Arc<Self>, step: &SamplingStep) -> Option<Warmup> {
+        let share = Arc::clone(self);
+        let task = match step.method {
+            SamplingKind::Iframes => tokio::spawn(async move {
+                let _ = share.keyframes().await;
+            }),
+            SamplingKind::Scene => {
+                let threshold = step.threshold?;
+                tokio::spawn(async move {
+                    let _ = share.scene_cuts(threshold).await;
+                })
+            }
+            _ => return None,
+        };
+        Some(Warmup(task))
     }
 
     async fn probe_once<T: Clone, F, Fut>(
@@ -240,10 +287,10 @@ fn frame_key(timestamp: f64, size: u32) -> FrameKey {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_support {
     use super::*;
 
-    fn have_ffmpeg() -> bool {
+    pub(super) fn have_ffmpeg() -> bool {
         std::process::Command::new("ffmpeg")
             .arg("-version")
             .output()
@@ -251,7 +298,7 @@ mod tests {
     }
 
     /// 6 s of 64x48 test pattern at 10 fps.
-    async fn sample(dir: &Path) -> Arc<VideoShare> {
+    pub(super) async fn sample(dir: &Path) -> Arc<VideoShare> {
         let path = dir.join("clip.mp4");
         let ok = std::process::Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
@@ -264,6 +311,12 @@ mod tests {
         let info = ffmpeg::probe(&path).await.unwrap();
         Arc::new(VideoShare::new(path, info))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::*;
+    use super::*;
 
     fn at(times: &[f64]) -> Vec<FrameRequest> {
         times
@@ -318,5 +371,83 @@ mod tests {
         // Another threshold is another probe.
         share.scene_cuts(0.5).await.unwrap();
         assert_eq!(share.stats().probes_run, 3);
+    }
+}
+
+#[cfg(test)]
+mod planner_tests {
+    use super::tests_support::*;
+    use super::*;
+    use crate::strategy::Planner;
+    use apollo_config::SamplingStep;
+
+    fn step(
+        n: u32,
+        method: SamplingKind,
+        count: Option<u32>,
+        threshold: Option<f64>,
+    ) -> SamplingStep {
+        SamplingStep {
+            step: n,
+            method,
+            fps: None,
+            count,
+            nth: None,
+            threshold,
+            min_gap: None,
+            min_score: None,
+            window: None,
+        }
+    }
+
+    fn steps() -> Vec<SamplingStep> {
+        vec![
+            step(1, SamplingKind::Uniform, Some(2), None),
+            step(2, SamplingKind::Scene, None, Some(0.3)),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_later_steps_probe_only_runs_when_the_scan_reaches_it() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let share = sample(dir.path()).await;
+        let mut planner = Planner::new(share.info(), &steps(), None);
+
+        let first = planner.next_step(&share).await.unwrap().unwrap();
+        assert_eq!(first.len(), 2);
+        // Planning the uniform step ran no scene detection.
+        assert_eq!(share.stats().probes_run, 0);
+        assert_eq!(
+            planner.upcoming().map(|s| s.method),
+            Some(SamplingKind::Scene)
+        );
+
+        planner.next_step(&share).await.unwrap().unwrap();
+        assert_eq!(share.stats().probes_run, 1);
+        assert!(planner.next_step(&share).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_warmed_probe_runs_once_and_frames_match_planning_up_front() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let share = sample(dir.path()).await;
+        let mut planner = Planner::new(share.info(), &steps(), None);
+        let mut lazy = planner.next_step(&share).await.unwrap().unwrap();
+        let warm = share.warm(planner.upcoming().unwrap());
+        assert!(warm.is_some());
+        lazy.extend(planner.next_step(&share).await.unwrap().unwrap());
+        // Warm-up and planner asked for the same probe; it ran once (whichever
+        // got there first ran it, the other waited for it).
+        assert_eq!(share.stats().probes_run, 1);
+        drop(warm);
+        // Same frames and indices as planning every step at once.
+        let eager = crate::strategy::plan(&share, &steps(), None).await.unwrap();
+        assert_eq!(lazy, eager);
     }
 }

@@ -226,6 +226,8 @@ Steps run in ascending `step` order (cheapest first, typically). Each step's req
 
 Frames closer than 0.05 s to one already chosen by an earlier step are skipped, and a resumed scan re-plans exactly the same frames (including `refine`'s, which are planned from the stored scores).
 
+Steps are planned **lazily**: a step that needs a probe — keyframes for `iframes`, a full decode for `scene` — is only planned once the steps before it were classified without a trigger, so a video that triggers early never pays for scene detection. The probe starts in the background while the earlier frames are classified (and is cancelled if they trigger), and steps that need no probe are planned and classified together with the step before them.
+
 All models scanning the same video share the work: keyframe and scene detection run once per video (per threshold), and each frame is decoded once per input size and handed to every model that samples it — also when they ask at the same moment, and on a retry. Recently decoded frames are kept briefly (up to 128 per video) for models that ask later.
 
 Two strategies from `config.example.toml`, for different hardware:

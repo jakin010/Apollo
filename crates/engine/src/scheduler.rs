@@ -1017,9 +1017,10 @@ impl Engine {
         ))
     }
 
-    /// Image-classifier over a video: plan frames per the model's strategy, skip
-    /// frames already classified (resume), and classify the rest, stopping early
-    /// when a trigger fires. With the strategy's `confirm`, a frame reaching the
+    /// Image-classifier over a video: plan frames per the model's strategy one
+    /// step at a time, skip frames already classified (resume), and classify the
+    /// rest, stopping early when a trigger fires (later steps are then never
+    /// planned). With the strategy's `confirm`, a frame reaching the
     /// trigger only counts once enough frames close to it agree (frames are
     /// sampled there when the plan has none). If nothing triggers and the
     /// strategy has `refine` steps, frames around the ambiguous scores are
@@ -1047,7 +1048,6 @@ impl Engine {
         };
 
         let budget = strategy.max_frames.map(|m| m as usize);
-        let plan = apollo_media::plan(share, &strategy.sampling, budget).await?;
 
         // Seed from frames already persisted on a previous run.
         let mut frames = self
@@ -1079,20 +1079,46 @@ impl Engine {
             }
         }
 
-        let pending: Vec<FrameRef> = plan
-            .iter()
-            .filter(|f| !done_idx.contains(&f.index))
-            .copied()
-            .collect();
-        tracing::debug!(
-            model = %label,
-            planned = plan.len(),
-            resuming_from = done_idx.len(),
-            "frame scan planned"
-        );
-        let stopped = self
-            .classify_frames(scan, &model, trigger.as_ref(), &pending, &mut frames)
-            .await?;
+        // Plan lazily: a step that needs a probe still running — like scene
+        // detection's full decode — is only planned once the steps before it
+        // were classified without a trigger. Steps that need no probe (or whose
+        // probe has finished) join the same batch, so frames still go through
+        // ffmpeg and the model together. While a batch is classified, the next
+        // step's probe runs in the background; it is cancelled if the scan stops
+        // first. Indices run on across steps, so a resumed scan plans the same
+        // frames and skips the ones it already has.
+        let mut planner = apollo_media::Planner::new(info, &strategy.sampling, budget);
+        let mut plan: Vec<FrameRef> = Vec::new();
+        let mut stopped = false;
+        // Held while the batch before its step is classified; dropping it cancels.
+        let mut _warmup: Option<apollo_media::Warmup> = None;
+        while let Some(mut batch) = planner.next_step(share).await? {
+            while planner.upcoming().is_some_and(|next| share.ready(next))
+                && let Some(more) = planner.next_step(share).await?
+            {
+                batch.extend(more);
+            }
+            _warmup = planner.upcoming().and_then(|next| share.warm(next));
+            let pending: Vec<FrameRef> = batch
+                .iter()
+                .filter(|f| !done_idx.contains(&f.index))
+                .copied()
+                .collect();
+            tracing::debug!(
+                model = %label,
+                frames = batch.len(),
+                resuming_from = batch.len() - pending.len(),
+                "frame scan steps planned"
+            );
+            plan.extend(batch);
+            if self
+                .classify_frames(scan, &model, trigger.as_ref(), &pending, &mut frames)
+                .await?
+            {
+                stopped = true;
+                break;
+            }
+        }
 
         // Look closer around ambiguous scores. Planned only once every planned
         // frame is classified, from their stored scores, so a resumed scan plans

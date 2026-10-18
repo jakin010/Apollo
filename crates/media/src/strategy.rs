@@ -1,11 +1,13 @@
 //! Multi-step planning + aggregation + early-exit decision.
 //!
-//! [`plan`] runs the sampling steps in `step` order, drops any frame within
-//! [`DEDUPE_TOLERANCE`] of one already chosen, and assigns indices in processing
-//! order (cheap steps first). The engine classifies in that order in batches and
-//! stops on the first [`triggered`] result. If none triggers, [`refine_plan`]
-//! adds the `refine` steps' frames around ambiguous scores, indexed after the
-//! plan. [`aggregate`] rolls the kept frames into one result.
+//! A [`Planner`] works out the sampling steps one at a time in `step` order —
+//! the engine classifies each step's frames before planning the next, so a scan
+//! that triggers early never pays for a later step's probe — dropping any frame
+//! within [`DEDUPE_TOLERANCE`] of one already chosen and assigning indices in
+//! processing order (cheap steps first). ([`plan`] gives all steps at once.) If
+//! nothing triggers, [`refine_plan`] adds the `refine` steps' frames around
+//! ambiguous scores, indexed after the plan. [`aggregate`] rolls the kept frames
+//! into one result.
 
 use std::cmp::Ordering;
 
@@ -26,36 +28,89 @@ pub const DEDUPE_TOLERANCE: f64 = 0.05;
 /// without limit. One hour at 5 fps is 18 000 frames.
 pub const MAX_PLANNED_FRAMES: usize = 100_000;
 
-/// Build the ordered, de-duplicated frame plan for a video. `refine` steps are
-/// left out: they are planned from the scores ([`refine_plan`]).
-///
-/// `budget` caps the frames planned ([`MAX_PLANNED_FRAMES`] always applies).
-/// Steps take frames in order; the step that does not fit is thinned to what is
-/// left — keeping its strongest scene cuts, or otherwise spreading its frames
-/// evenly across the video — and later steps get none.
+/// Build the whole ordered, de-duplicated frame plan for a video at once — the
+/// frames a [`Planner`] gives over all its steps. `refine` steps are left out:
+/// they are planned from the scores ([`refine_plan`]).
 pub async fn plan(
     share: &VideoShare,
     steps: &[SamplingStep],
     budget: Option<usize>,
 ) -> Result<Vec<FrameRef>, MediaError> {
-    let mut ordered: Vec<&SamplingStep> = steps
-        .iter()
-        .filter(|s| s.method != SamplingKind::Refine)
-        .collect();
-    ordered.sort_by_key(|s| s.step);
+    let mut planner = Planner::new(share.info(), steps, budget);
+    let mut frames = Vec::new();
+    while let Some(step) = planner.next_step(share).await? {
+        frames.extend(step);
+    }
+    Ok(frames)
+}
 
-    let max_seek = max_seek(share.info());
-    let mut remaining = budget.map_or(MAX_PLANNED_FRAMES, |b| b.min(MAX_PLANNED_FRAMES));
-    let mut picker = Picker::default();
-    for step in ordered {
-        if remaining == 0 {
-            break;
+/// Plans a strategy's sampling steps one at a time, in `step` order, so a step's
+/// frames — and any ffmpeg probe they need, like the full decode behind scene
+/// detection — are only worked out once a scan actually reaches that step.
+/// `refine` steps are left out ([`refine_plan`]).
+///
+/// Frames close to one an earlier step chose are skipped, and indices run on
+/// across steps in processing order, exactly as planning everything up front
+/// would give: the result depends only on the video and the steps, so a resumed
+/// scan plans the same frames.
+///
+/// `budget` caps the frames planned ([`MAX_PLANNED_FRAMES`] always applies).
+/// Steps take frames in order; the step that does not fit is thinned to what is
+/// left — keeping its strongest scene cuts, or otherwise spreading its frames
+/// evenly across the video — and later steps get none.
+pub struct Planner {
+    steps: Vec<SamplingStep>,
+    next: usize,
+    max_seek: f64,
+    remaining: usize,
+    picker: Picker,
+}
+
+impl Planner {
+    pub fn new(info: &VideoInfo, steps: &[SamplingStep], budget: Option<usize>) -> Self {
+        let mut steps: Vec<SamplingStep> = steps
+            .iter()
+            .filter(|s| s.method != SamplingKind::Refine)
+            .cloned()
+            .collect();
+        steps.sort_by_key(|s| s.step);
+        Self {
+            steps,
+            next: 0,
+            max_seek: max_seek(info),
+            remaining: budget.map_or(MAX_PLANNED_FRAMES, |b| b.min(MAX_PLANNED_FRAMES)),
+            picker: Picker::default(),
         }
+    }
+
+    /// The step the next [`Planner::next_step`] call plans, if there is one
+    /// and budget left for it (to start its probe early).
+    pub fn upcoming(&self) -> Option<&SamplingStep> {
+        self.steps.get(self.next).filter(|_| self.remaining > 0)
+    }
+
+    /// Frames planned so far — also the index the next one gets.
+    pub fn planned(&self) -> usize {
+        self.picker.chosen.len()
+    }
+
+    /// Plan the next step: its new frames in processing order, indexed after
+    /// those already planned (possibly none, when they all duplicate earlier
+    /// frames). `None` once every step is planned or the budget is spent.
+    pub async fn next_step(
+        &mut self,
+        share: &VideoShare,
+    ) -> Result<Option<Vec<FrameRef>>, MediaError> {
+        if self.remaining == 0 || self.next >= self.steps.len() {
+            return Ok(None);
+        }
+        let step = &self.steps[self.next];
+        self.next += 1;
         let mut samples: Vec<(f64, Option<f32>)> = sampling::step_samples(share, step)
             .await?
             .into_iter()
             .filter(|(t, _)| t.is_finite())
-            .map(|(t, score)| (t.clamp(0.0, max_seek), score))
+            .map(|(t, score)| (t.clamp(0.0, self.max_seek), score))
             .collect();
         samples.sort_by(|a, b| cmp_f64(&a.0, &b.0));
         // What this step would add: not near an earlier step's frame or another
@@ -65,18 +120,29 @@ pub async fn plan(
             let near_last = fresh
                 .last()
                 .is_some_and(|&(u, _)| t - u <= DEDUPE_TOLERANCE);
-            if !near_last && !picker.is_dup(t) {
+            if !near_last && !self.picker.is_dup(t) {
                 fresh.push((t, score));
             }
         }
         let keyframe = step.method == SamplingKind::Iframes;
-        let kept = within_budget(fresh, remaining);
-        remaining -= kept.len();
+        let kept = within_budget(fresh, self.remaining);
+        self.remaining -= kept.len();
+        let first = self.picker.chosen.len();
         for (t, _) in kept {
-            picker.add(t, keyframe);
+            self.picker.add(t, keyframe);
         }
+        Ok(Some(
+            self.picker.chosen[first..]
+                .iter()
+                .enumerate()
+                .map(|(i, &(timestamp, keyframe))| FrameRef {
+                    index: (first + i) as u32,
+                    timestamp,
+                    keyframe,
+                })
+                .collect(),
+        ))
     }
-    Ok(picker.into_frames(0))
 }
 
 /// The frames of one step that fit in `budget`, in time order: all of them if

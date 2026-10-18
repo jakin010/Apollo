@@ -28,5 +28,7 @@ pub use extract::{FrameRequest, extract_frames_scaled};
 pub use fetch::{FetchLimits, LocalMedia, fetch};
 pub use ffmpeg::{VideoInfo, extract_frame, extract_frames, probe};
 pub use sampling::FrameRef;
-pub use share::{ShareStats, VideoShare};
-pub use strategy::{DEDUPE_TOLERANCE, aggregate, plan, refine_plan, trigger_score, triggered};
+pub use share::{ShareStats, VideoShare, Warmup};
+pub use strategy::{
+    DEDUPE_TOLERANCE, Planner, aggregate, plan, refine_plan, trigger_score, triggered,
+};
