@@ -9,7 +9,6 @@ apollo-config    = { path = "../config" }
 apollo-storage   = { path = "../storage" }
 apollo-inference = { path = "../inference" }
 apollo-media     = { path = "../media" }
-candle-core = "0.10"
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
 async-trait = "0.1"
 crossbeam-channel = "0.5"

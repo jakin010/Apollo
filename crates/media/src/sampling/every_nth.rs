@@ -37,6 +37,7 @@ mod tests {
     fn absurd_frame_rates_are_clamped() {
         let info = VideoInfo {
             duration: 10.0,
+            start_time: 0.0,
             fps: 1.0e9,
             frame_count: None,
             width: 0,

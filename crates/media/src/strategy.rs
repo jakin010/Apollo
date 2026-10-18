@@ -9,7 +9,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
-use apollo_config::{Aggregation, SamplingStep};
+use apollo_config::{Aggregation, SamplingKind, SamplingStep};
 use apollo_domain::{Classification, Prediction, select_top};
 
 use crate::error::MediaError;
@@ -47,11 +47,12 @@ pub async fn plan(
 
     // `chosen` keeps processing order; `sorted` mirrors it in time order so the
     // duplicate check is a binary search against the two nearest neighbours.
-    let mut chosen: Vec<f64> = Vec::new();
+    let mut chosen: Vec<(f64, bool)> = Vec::new();
     let mut sorted: Vec<f64> = Vec::new();
     'steps: for step in &ordered {
         let mut times = sampling::step_timestamps(path, info, step).await?;
         times.sort_by(cmp_f64);
+        let keyframe = step.method == SamplingKind::Iframes;
         for t in times {
             if !t.is_finite() {
                 continue;
@@ -64,7 +65,7 @@ pub async fn plan(
                 continue;
             }
             sorted.insert(pos, t);
-            chosen.push(t);
+            chosen.push((t, keyframe));
             if chosen.len() >= MAX_PLANNED_FRAMES {
                 break 'steps;
             }
@@ -74,9 +75,10 @@ pub async fn plan(
     Ok(chosen
         .into_iter()
         .enumerate()
-        .map(|(i, timestamp)| FrameRef {
+        .map(|(i, (timestamp, keyframe))| FrameRef {
             index: i as u32,
             timestamp,
+            keyframe,
         })
         .collect())
 }
@@ -146,6 +148,7 @@ mod tests {
     fn info(duration: f64, fps: f64) -> VideoInfo {
         VideoInfo {
             duration,
+            start_time: 0.0,
             fps,
             frame_count: None,
             width: 0,

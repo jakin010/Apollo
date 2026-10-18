@@ -145,6 +145,13 @@ struct ItemInsert {
 }
 
 #[derive(SurrealValue)]
+struct FrameInsert {
+    frame_index: i64,
+    timestamp: f64,
+    class_json: String,
+}
+
+#[derive(SurrealValue)]
 struct ModelInsert {
     item_idx: i64,
     label: String,
@@ -418,6 +425,45 @@ impl Storage for SurrealStorage {
             .bind(("fidx", frame.index as i64))
             .bind(("ts", frame.timestamp))
             .bind(("cj", class_json))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn append_frames(
+        &self,
+        task_id: &str,
+        item: usize,
+        label: &str,
+        frames: &[Frame],
+    ) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let mut rows = Vec::with_capacity(frames.len());
+        for frame in frames {
+            rows.push(FrameInsert {
+                frame_index: frame.index as i64,
+                timestamp: frame.timestamp,
+                class_json: serde_json::to_string(&frame.classification)?,
+            });
+        }
+        // One round trip and one transaction for the whole batch.
+        self.db
+            .query(
+                "BEGIN TRANSACTION;
+                 FOR $f IN $frames {
+                     UPSERT type::record('frame', [$tid, $idx, $label, $f.frame_index]) SET
+                         task_id = $tid, item_idx = $idx, label = $label,
+                         frame_index = $f.frame_index, timestamp = $f.timestamp,
+                         class_json = $f.class_json;
+                 };
+                 COMMIT TRANSACTION;",
+            )
+            .bind(("tid", task_id.to_string()))
+            .bind(("idx", item as i64))
+            .bind(("label", label.to_string()))
+            .bind(("frames", rows))
             .await?
             .check()?;
         Ok(())

@@ -61,9 +61,9 @@ There is **no separate video architecture** — video is always "an image classi
 **Request lifecycle:**
 
 1. A `Classify` call is validated **synchronously** — unknown/disabled models and input/model modality mismatches are rejected before anything is queued (mapped to gRPC `InvalidArgument`). The task is persisted and a task id is returned.
-2. The scheduler fetches the input **once**, then fans it out to each model's worker. A global concurrency cap (a priority‑ordered gate) bounds how many inferences run at once (your VRAM budget).
+2. The scheduler fetches the input **once**, then fans it out to each model's worker — an item's models run **concurrently**. A global concurrency cap (a priority‑ordered gate) bounds how many inferences run at once (your VRAM budget).
 3. Each model runs on its own dedicated worker thread that **lazily loads** weights on first use, **batches** concurrent requests into one forward pass, and **unloads** after an idle timeout (unless the model is pinned with `keep_in_memory`).
-4. Results are written per `(item, model)` as they complete. For video, each classified frame is checkpointed so an interrupted scan resumes without re‑doing frames.
+4. Results are written per `(item, model)` as they complete. For video, frames are extracted in batches by a single ffmpeg pass (scaled to the model's input size, the next batch extracted while the current one is classified), and each classified batch is checkpointed so an interrupted scan resumes without re‑doing frames.
 5. When every model for an item is done, the item reaches a terminal state, the webhook (if configured) fires, and `GetTask` reflects the final result. Transient failures (network errors, model timeouts) are **retried** up to `[app].max_retries`; permanent ones (a refused URL, undecodable input) fail immediately.
 
 On startup the engine **recovers** any tasks left non‑terminal by a previous run and re‑queues them; a poison task that keeps crashing is failed once its resume‑attempt count exceeds the cap.

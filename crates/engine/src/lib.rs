@@ -99,12 +99,12 @@ impl Engine {
         storage: Arc<dyn Storage>,
         webhook: Option<Arc<dyn WebhookSink>>,
     ) -> Engine {
-        let (device, kind) = apollo_inference::select_device();
+        let (_probe, kind) = apollo_inference::select_device();
         tracing::info!(device = %kind, "selected compute device");
 
         let cache_dir = config.app.cache_dir.clone().map(PathBuf::from);
         let idle = Duration::from_secs(config.app.idle_timeout as u64);
-        let registry = Registry::build(&config, device, cache_dir, idle);
+        let registry = Registry::build(&config, kind, cache_dir, idle);
         let gate = Arc::new(PriorityGate::new(config.app.max_concurrent.max(1) as usize));
 
         let fetch_limits = FetchLimits {

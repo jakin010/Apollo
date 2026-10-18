@@ -19,6 +19,7 @@
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
@@ -30,7 +31,8 @@ use apollo_inference::ImageClassifier;
 use crate::error::EngineError;
 
 type ClassifyReply = oneshot::Sender<Result<Classification, EngineError>>;
-type LoadReply = oneshot::Sender<Result<(), EngineError>>;
+/// Answers a load request with the model's input size.
+type LoadReply = oneshot::Sender<Result<u32, EngineError>>;
 
 /// Builds a model on the worker thread. Errors are reported as text.
 pub(crate) type Loader = Box<dyn Fn() -> Result<Box<dyn ImageClassifier>, String> + Send>;
@@ -40,10 +42,13 @@ pub(crate) enum Job {
     /// Classify one image, merged with other pending images into a single
     /// batched forward pass.
     Classify {
-        image: DecodedImage,
+        /// Shared, so several models can classify one decoded image without
+        /// copying it.
+        image: Arc<DecodedImage>,
         reply: ClassifyReply,
     },
-    /// Make sure the weights are resident; replies once they are (or failed).
+    /// Make sure the weights are resident; replies with the model's input size
+    /// once they are (or the load error).
     Load { reply: LoadReply },
 }
 
@@ -53,8 +58,9 @@ pub(crate) struct ModelHandle {
 }
 
 impl ModelHandle {
-    /// Wait until the model's weights are loaded. Cheap when already resident.
-    pub(crate) async fn ensure_loaded(&self) -> Result<(), EngineError> {
+    /// Wait until the model's weights are loaded and return its input size
+    /// (square side in pixels). Cheap when already resident.
+    pub(crate) async fn ensure_loaded(&self) -> Result<u32, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Job::Load { reply })
@@ -64,7 +70,7 @@ impl ModelHandle {
 
     pub(crate) async fn classify_image(
         &self,
-        image: DecodedImage,
+        image: Arc<DecodedImage>,
     ) -> Result<Classification, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -123,7 +129,7 @@ impl Worker {
                     let _ = reply.send(self.ensure_loaded());
                 }
                 Ok(Job::Classify { image, reply }) => match self.ensure_loaded() {
-                    Ok(()) => self.run_batch(image, reply, &rx),
+                    Ok(_) => self.run_batch(image, reply, &rx),
                     Err(e) => {
                         let _ = reply.send(Err(e));
                     }
@@ -140,11 +146,11 @@ impl Worker {
         }
     }
 
-    /// Load the model if it is not resident. A failure (or panic) leaves it
-    /// unloaded, so the next job tries again.
-    fn ensure_loaded(&mut self) -> Result<(), EngineError> {
-        if self.model.is_some() {
-            return Ok(());
+    /// Load the model if it is not resident and return its input size. A failure
+    /// (or panic) leaves it unloaded, so the next job tries again.
+    fn ensure_loaded(&mut self) -> Result<u32, EngineError> {
+        if let Some(model) = &self.model {
+            return Ok(model.input_size());
         }
         match catch_unwind(AssertUnwindSafe(|| (self.loader)())) {
             Ok(Ok(m)) => {
@@ -157,7 +163,7 @@ impl Worker {
                     height: 1,
                     data: vec![0; 3],
                 };
-                match catch_unwind(AssertUnwindSafe(|| m.classify(std::slice::from_ref(&warm)))) {
+                match catch_unwind(AssertUnwindSafe(|| m.classify(&[&warm]))) {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         tracing::warn!(model = %self.spec.name, error = %e, "warm-up inference failed")
@@ -174,8 +180,9 @@ impl Worker {
                     warmup_ms = started.elapsed().as_millis() as u64,
                     "model loaded"
                 );
+                let size = m.input_size();
                 self.model = Some(m);
-                Ok(())
+                Ok(size)
             }
             Ok(Err(e)) => Err(EngineError::ModelUnavailable(format!(
                 "model load failed: {e}"
@@ -191,7 +198,12 @@ impl Worker {
     /// forward pass, then fan the per-image results back to each caller. Load
     /// requests found while draining are answered immediately (the model is
     /// resident).
-    fn run_batch(&mut self, first: DecodedImage, first_reply: ClassifyReply, rx: &Receiver<Job>) {
+    fn run_batch(
+        &mut self,
+        first: Arc<DecodedImage>,
+        first_reply: ClassifyReply,
+        rx: &Receiver<Job>,
+    ) {
         let batch = self.spec.batch.max(1);
         let mut images = Vec::with_capacity(batch);
         let mut replies = Vec::with_capacity(batch);
@@ -204,7 +216,7 @@ impl Worker {
                     replies.push(reply);
                 }
                 Ok(Job::Load { reply }) => {
-                    let _ = reply.send(Ok(()));
+                    let _ = reply.send(self.ensure_loaded());
                 }
                 Err(_) => break,
             }
@@ -218,8 +230,16 @@ impl Worker {
             }
             return;
         };
-        let outcome = catch_unwind(AssertUnwindSafe(|| model.classify(&images)));
+        let views: Vec<&DecodedImage> = images.iter().map(|img| img.as_ref()).collect();
+        let outcome = catch_unwind(AssertUnwindSafe(|| model.classify(&views)));
         let err = match outcome {
+            // A non-finite score means the forward pass went wrong (e.g. a GPU
+            // fault); never hand such a result on — it would be stored and break
+            // reads of the task. Failing the batch lets the scheduler retry it.
+            Ok(Ok(results)) if results.iter().any(has_non_finite) => {
+                tracing::warn!(model = %self.spec.name, "model produced non-finite scores; batch failed");
+                "model produced non-finite scores".to_string()
+            }
             Ok(Ok(results)) if results.len() == replies.len() => {
                 for (reply, c) in replies.into_iter().zip(results) {
                     let _ = reply.send(Ok(c));
@@ -247,6 +267,10 @@ impl Worker {
     }
 }
 
+fn has_non_finite(c: &Classification) -> bool {
+    c.predictions.iter().any(|p| !p.score.is_finite())
+}
+
 fn panic_message(panic: &Box<dyn Any + Send>) -> String {
     panic
         .downcast_ref::<&str>()
@@ -264,11 +288,15 @@ mod tests {
     use apollo_domain::Prediction;
     use apollo_inference::InferenceError;
 
-    /// Classifies every image as label = its width; panics on width 0.
+    /// Classifies every image as label = its width; panics on width 0 and scores
+    /// NaN on width 13.
     struct Fake;
 
     impl ImageClassifier for Fake {
-        fn classify(&self, images: &[DecodedImage]) -> Result<Vec<Classification>, InferenceError> {
+        fn classify(
+            &self,
+            images: &[&DecodedImage],
+        ) -> Result<Vec<Classification>, InferenceError> {
             Ok(images
                 .iter()
                 .map(|img| {
@@ -276,7 +304,7 @@ mod tests {
                     Classification {
                         predictions: vec![Prediction {
                             label: img.width,
-                            score: 1.0,
+                            score: if img.width == 13 { f32::NAN } else { 1.0 },
                         }],
                     }
                 })
@@ -285,14 +313,17 @@ mod tests {
         fn labels(&self) -> &[String] {
             &[]
         }
+        fn input_size(&self) -> u32 {
+            224
+        }
     }
 
-    fn img(width: u32) -> DecodedImage {
-        DecodedImage {
+    fn img(width: u32) -> Arc<DecodedImage> {
+        Arc::new(DecodedImage {
             width,
             height: 1,
             data: vec![0; width as usize * 3],
-        }
+        })
     }
 
     fn spawn(loads: Arc<AtomicUsize>, fail_first: bool, keep: bool) -> ModelHandle {
@@ -318,7 +349,7 @@ mod tests {
     async fn loads_once_and_classifies() {
         let loads = Arc::new(AtomicUsize::new(0));
         let h = spawn(loads.clone(), false, false);
-        h.ensure_loaded().await.unwrap();
+        assert_eq!(h.ensure_loaded().await.unwrap(), 224);
         h.ensure_loaded().await.unwrap();
         let c = h.classify_image(img(7)).await.unwrap();
         assert_eq!(c.predictions[0].label, 7);
@@ -341,6 +372,18 @@ mod tests {
         assert!(matches!(err, EngineError::ModelUnavailable(_)), "{err:?}");
         h.ensure_loaded().await.unwrap();
         assert_eq!(loads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn non_finite_scores_are_an_error() {
+        let h = spawn(Arc::new(AtomicUsize::new(0)), false, false);
+        let err = h.classify_image(img(13)).await.unwrap_err();
+        assert!(err.to_string().contains("non-finite"), "{err}");
+        assert!(err.is_transient());
+        assert_eq!(
+            h.classify_image(img(5)).await.unwrap().predictions[0].label,
+            5
+        );
     }
 
     #[tokio::test]

@@ -154,7 +154,7 @@ pub(crate) fn load(
 }
 
 impl ImageClassifier for SiglipClassifier {
-    fn classify(&self, images: &[DecodedImage]) -> Result<Vec<Classification>, InferenceError> {
+    fn classify(&self, images: &[&DecodedImage]) -> Result<Vec<Classification>, InferenceError> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
@@ -191,6 +191,10 @@ impl ImageClassifier for SiglipClassifier {
 
     fn labels(&self) -> &[String] {
         &self.labels
+    }
+
+    fn input_size(&self) -> u32 {
+        self.norm.size as u32
     }
 }
 

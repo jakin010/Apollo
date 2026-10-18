@@ -216,7 +216,6 @@ dependencies = [
  "apollo-media",
  "apollo-storage",
  "async-trait",
- "candle-core",
  "crossbeam-channel",
  "dirs",
  "futures",

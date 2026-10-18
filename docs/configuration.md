@@ -175,7 +175,7 @@ Each backend has its own sub‑table; the one matching `backend` is required (ex
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `path` | string | `"apollo.db"` | Database file path. |
-| `wal` | bool | `true` | Enable WAL so concurrent reads don't block. |
+| `wal` | bool | `true` | Enable WAL so concurrent reads don't block. With WAL, `synchronous = NORMAL` is used: commits skip the per‑transaction fsync and the database stays consistent after a crash or power loss, at the cost of possibly losing the last few writes (resume redoes them). Without WAL, `FULL`. |
 | `busy_timeout` | u32 (ms) | `5000` | How long to wait on a momentarily locked file. |
 | `max_connections` | u32 | `5` | Connection pool size. |
 

@@ -43,6 +43,29 @@ impl std::fmt::Display for DeviceKind {
     }
 }
 
+/// Open a fresh, independent device of `kind`, falling back to CPU if it cannot
+/// be initialized.
+///
+/// Each model worker must get its own: candle's Metal (and CUDA) devices keep
+/// their command stream and buffer pool behind shared handles, so clones of one
+/// device used from several threads at once interleave each other's work and
+/// can return corrupted (NaN) results.
+pub fn open_device(kind: DeviceKind) -> Device {
+    let opened = match kind {
+        DeviceKind::Cpu => return Device::Cpu,
+        #[cfg(feature = "cuda")]
+        DeviceKind::Cuda => Device::new_cuda(0),
+        #[cfg(target_os = "macos")]
+        DeviceKind::Metal => Device::new_metal(0),
+        #[allow(unreachable_patterns)]
+        _ => return Device::Cpu,
+    };
+    opened.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, device = %kind, "could not open a device; using CPU");
+        Device::Cpu
+    })
+}
+
 /// Pick the best device available right now, trying CUDA, then Metal, then CPU.
 /// Only backends compiled into this binary are attempted.
 pub fn select_device() -> (Device, DeviceKind) {

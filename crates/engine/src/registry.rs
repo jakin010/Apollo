@@ -5,8 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use candle_core::Device;
-
 use apollo_config::Config;
 use apollo_domain::{Input, Modality};
 
@@ -20,9 +18,11 @@ pub(crate) struct Registry {
 
 impl Registry {
     /// Spawn a worker for every enabled model. `device` is cloned per worker.
+    /// Spawn a worker per enabled model, each with its own `kind` device (never
+    /// a shared one — see [`apollo_inference::open_device`]).
     pub(crate) fn build(
         config: &Config,
-        device: Device,
+        kind: apollo_inference::DeviceKind,
         cache_dir: Option<PathBuf>,
         idle: Duration,
     ) -> Self {
@@ -32,7 +32,7 @@ impl Registry {
                 continue;
             }
             let cfg = model.clone();
-            let dev = device.clone();
+            let dev = apollo_inference::open_device(kind);
             let dir = cache_dir.clone();
             let loader: Loader = Box::new(move || {
                 apollo_inference::load(&cfg, &dev, dir.as_deref()).map_err(|e| e.to_string())

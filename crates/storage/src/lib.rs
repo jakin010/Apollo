@@ -100,6 +100,16 @@ pub trait Storage: Send + Sync {
         frame: &Frame,
     ) -> Result<(), StorageError>;
 
+    /// Append (or replace) a batch of classified frames atomically: one
+    /// transaction instead of one write per frame.
+    async fn append_frames(
+        &self,
+        task_id: &str,
+        item: usize,
+        label: &str,
+        frames: &[Frame],
+    ) -> Result<(), StorageError>;
+
     /// Frames already classified for a (item, model), ordered by index. Seeds the
     /// dedupe set on resume.
     async fn load_frames(
