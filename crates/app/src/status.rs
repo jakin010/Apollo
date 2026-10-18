@@ -191,8 +191,29 @@ pub fn fetch(path: &Path) -> anyhow::Result<StatusReport> {
 
 // ------------------------------- rendering -------------------------------
 
-/// Human-readable status, as printed by `apollo status`.
-pub fn render(r: &StatusReport, now: SystemTime) -> String {
+/// Images classified per second, per model label, between two reports.
+pub type Rates = std::collections::BTreeMap<String, f64>;
+
+/// Per-model throughput between `prev` and `cur`, taken `elapsed` apart. Empty
+/// when the server restarted in between (its counters started over).
+pub fn rates(prev: &StatusReport, cur: &StatusReport, elapsed: Duration) -> Rates {
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 || prev.pid != cur.pid {
+        return Rates::new();
+    }
+    cur.models
+        .iter()
+        .filter_map(|m| {
+            let before = prev.models.iter().find(|p| p.label == m.label)?;
+            let done = m.classified.checked_sub(before.classified)?;
+            Some((m.label.clone(), done as f64 / secs))
+        })
+        .collect()
+}
+
+/// Human-readable status, as printed by `apollo status`. With `rates` (watch
+/// mode) it adds live throughput.
+pub fn render(r: &StatusReport, now: SystemTime, rates: Option<&Rates>) -> String {
     let now_secs = unix_secs(now);
     let mut out = String::new();
     let mut line = |s: String| {
@@ -260,10 +281,14 @@ pub fn render(r: &StatusReport, now: SystemTime) -> String {
             thousands(w.pending as u64)
         ));
     }
+    if let Some(rates) = rates {
+        let total: f64 = rates.values().sum();
+        line(format!("throughput {} images/s", rate(total)));
+    }
 
     line(String::new());
     line(format!("models ({})", r.models.len()));
-    let rows: Vec<[String; 8]> = r
+    let rows: Vec<Vec<String>> = r
         .models
         .iter()
         .map(|m| {
@@ -278,7 +303,7 @@ pub fn render(r: &StatusReport, now: SystemTime) -> String {
             } else {
                 "unloaded".to_string()
             };
-            [
+            let mut row = vec![
                 m.label.clone(),
                 m.architecture.clone(),
                 m.repo.clone(),
@@ -286,13 +311,21 @@ pub fn render(r: &StatusReport, now: SystemTime) -> String {
                 m.input_size.map_or("-".into(), |s| format!("{s}px")),
                 format!("{}/{}", m.queued_jobs, m.batch),
                 thousands(m.classified),
-                m.last_used.map_or("never".into(), |t| {
-                    format!("{} ago", duration(now_secs.saturating_sub(t)))
-                }),
-            ]
+            ];
+            if let Some(rates) = rates {
+                row.push(
+                    rates
+                        .get(&m.label)
+                        .map_or("-".into(), |r| format!("{}/s", rate(*r))),
+                );
+            }
+            row.push(m.last_used.map_or("never".into(), |t| {
+                format!("{} ago", duration(now_secs.saturating_sub(t)))
+            }));
+            row
         })
         .collect();
-    let header = [
+    let mut header = vec![
         "LABEL",
         "ARCH",
         "REPO",
@@ -300,8 +333,11 @@ pub fn render(r: &StatusReport, now: SystemTime) -> String {
         "INPUT",
         "QUEUE/BATCH",
         "CLASSIFIED",
-        "LAST USED",
     ];
+    if rates.is_some() {
+        header.push("RATE");
+    }
+    header.push("LAST USED");
     let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
     for row in &rows {
         for (w, cell) in widths.iter_mut().zip(row) {
@@ -318,11 +354,20 @@ pub fn render(r: &StatusReport, now: SystemTime) -> String {
         }
         s
     };
-    line(fmt_row(header.to_vec()));
+    line(fmt_row(header.clone()));
     for row in &rows {
         line(fmt_row(row.iter().map(String::as_str).collect()));
     }
     out
+}
+
+/// Images per second: one decimal below 100, whole numbers above.
+fn rate(r: f64) -> String {
+    if r < 100.0 {
+        format!("{r:.1}")
+    } else {
+        format!("{r:.0}")
+    }
 }
 
 /// `1h 2m`, `3m 4s`, `5s`, `2d 3h`.
@@ -438,7 +483,11 @@ mod tests {
     #[test]
     fn renders_a_readable_summary() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000_000 + 8_000);
-        let text = render(&sample(), now);
+        let text = render(&sample(), now, None);
+        assert!(
+            !text.contains("RATE") && !text.contains("throughput"),
+            "{text}"
+        );
         assert!(
             text.starts_with("apollo 1.0.0 — running (pid 4242), up 2h 13m"),
             "{text}"
@@ -452,6 +501,26 @@ mod tests {
         assert!(text.contains("loaded (pinned)"));
         assert!(text.contains("12,402"));
         assert!(text.contains("3s ago"), "{text}");
+    }
+
+    #[test]
+    fn rates_come_from_counter_deltas() {
+        let prev = sample();
+        let mut cur = sample();
+        cur.models[0].classified += 90;
+        let r = rates(&prev, &cur, Duration::from_secs(2));
+        assert_eq!(r.get("general"), Some(&45.0));
+
+        // A restarted server (new pid) has reset counters: no rates.
+        cur.pid += 1;
+        assert!(rates(&prev, &cur, Duration::from_secs(2)).is_empty());
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000 + 8_000);
+        let mut live = Rates::new();
+        live.insert("general".into(), 45.0);
+        let text = render(&sample(), now, Some(&live));
+        assert!(text.contains("throughput 45.0 images/s"), "{text}");
+        assert!(text.contains("RATE") && text.contains("45.0/s"), "{text}");
     }
 
     #[cfg(unix)]

@@ -88,6 +88,13 @@ mod tests {
     fn parses_status() {
         assert!(Cli::try_parse_from(["apollo", "status"]).is_ok());
         assert!(Cli::try_parse_from(["apollo", "status", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["apollo", "status", "--watch"]).is_ok());
+        assert!(Cli::try_parse_from(["apollo", "status", "-w", "-n", "0.5"]).is_ok());
+        assert!(Cli::try_parse_from(["apollo", "status", "-w", "--json"]).is_ok());
+        // An interval only makes sense with --watch, and must be sane.
+        assert!(Cli::try_parse_from(["apollo", "status", "-n", "2"]).is_err());
+        assert!(Cli::try_parse_from(["apollo", "status", "-w", "-n", "0"]).is_err());
+        assert!(Cli::try_parse_from(["apollo", "status", "-w", "-n", "soon"]).is_err());
     }
 
     #[test]

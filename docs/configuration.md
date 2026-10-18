@@ -366,7 +366,7 @@ See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
 ```text
 apollo start [--config PATH] [--endpoint HOST] [--port N] [--webhook-url URL] [--daemon]
 apollo stop  [...]                       # gracefully stop a running daemon
-apollo status [--json]                   # is it running, and what is it doing
+apollo status [--json] [--watch [-n SECONDS]]   # is it running, and what is it doing
 apollo config get    <key> [--config PATH]
 apollo config set    <key> <value> [--config PATH]
 apollo config remove <key> [--config PATH]
@@ -383,7 +383,9 @@ apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
   - task counts by state, and pending webhook deliveries;
   - per model: loaded or not, input size, queued requests, batch size, images classified, and last use.
 
-  `--json` prints the same as JSON. The exit status is `0` when running and `3` when not (like `systemctl status`). The server answers on a Unix socket in its private per‑user directory (`$XDG_RUNTIME_DIR/apollo/` on Linux, otherwise the state directory), so only the same OS user can query it — run `apollo status` as that user.
+  `--json` prints the same as JSON. The exit status is `0` when running and `3` when not (like `systemctl status`).
+
+  `--watch` (`-w`) keeps the view open and refreshes it in place every second (`-n 0.5` for twice a second; minimum 0.2) until Ctrl‑C, adding live throughput: images per second per model and in total. If the server stops or restarts, it shows that and waits for it. With `--json`, `--watch` prints one JSON object per line per refresh (`time`, `running`, `status`, `rates`, `error`); when the output is not a terminal, each refresh is printed in sequence instead of redrawn. The server answers on a Unix socket in its private per‑user directory (`$XDG_RUNTIME_DIR/apollo/` on Linux, otherwise the state directory), so only the same OS user can query it — run `apollo status` as that user.
 - **`config get|set|remove`** edit the file by **dotted key** (e.g. `models.nsfw.repo`), format‑preserving. `set` creates missing tables — and a default `[app]`‑only file — as needed.
 - **`keygen`** prints a fresh public/secret PASERK keypair.
 - **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` (a bare PASERK or `keygen` output), else the `APOLLO_SECRET_KEY` env var, else the server's local keypair file (`auth.key` in the state directory). `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key. The token goes to stdout (it goes in the client's `authorization` metadata) and its id to stderr.
