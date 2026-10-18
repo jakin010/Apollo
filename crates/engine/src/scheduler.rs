@@ -4,18 +4,18 @@
 //! Resume-aware throughout: a model already `Done` from a previous run is skipped,
 //! and an interrupted video scan continues from its persisted frame checkpoint.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use apollo_config::{EarlyExit, ModelConfig, PipelineStep, StrategyConfig};
+use apollo_config::{EarlyExit, ModelConfig, PipelineStep, SamplingKind, StrategyConfig};
 use apollo_domain::{
     Classification, DecodedImage, Frame, Input, Item, ItemState, Modality, ModelOutput,
     ModelResult, ModelState, TaskError, Url,
 };
-use apollo_media::{FrameRef, LocalMedia, MediaError, VideoInfo};
+use apollo_media::{FrameRef, FrameRequest, LocalMedia, MediaError, VideoInfo};
 
 use crate::Engine;
 use crate::aggregate;
@@ -30,8 +30,67 @@ const MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// A fetched, decoded/probed input ready for inference.
 enum Fetched {
-    Image(DecodedImage),
-    Video { media: LocalMedia, info: VideoInfo },
+    /// Shared so each model of the item classifies the same buffer, uncopied.
+    Image(Arc<DecodedImage>),
+    Video {
+        media: LocalMedia,
+        info: VideoInfo,
+    },
+}
+
+/// What every model of an item's parallel set shares.
+struct ModelRun<'a> {
+    task_id: &'a str,
+    idx: usize,
+    item: &'a Item,
+    fetched: &'a Fetched,
+    content_hash: Option<&'a str>,
+    url_hash: Option<&'a str>,
+    fresh_after: i64,
+    cancel: &'a AtomicBool,
+}
+
+/// How one model of a parallel set ended.
+enum SetOutcome {
+    /// Done (or served from cache); already persisted.
+    Finished(ModelResult),
+    /// Failed; already persisted. `transient` failures may be retried.
+    Failed {
+        result: ModelResult,
+        transient: bool,
+    },
+    /// The task was cancelled mid-run.
+    Cancelled,
+}
+
+/// Frames extracted per ffmpeg batch. The next batch is extracted while the
+/// current one is classified.
+const EXTRACT_CHUNK: usize = 32;
+
+/// One model's frame scan over a fetched video.
+#[derive(Clone, Copy)]
+struct FrameScanRun<'a> {
+    task_id: &'a str,
+    idx: usize,
+    label: &'a str,
+    handle: &'a ModelHandle,
+    path: &'a Path,
+    info: &'a VideoInfo,
+    /// The model's square input side; frames are extracted at this size.
+    input_size: u32,
+    /// Per-frame classification deadline.
+    timeout: Duration,
+    cancel: &'a AtomicBool,
+}
+
+/// A frame chunk being extracted in the background. Dropping it (early exit,
+/// cancellation, error) aborts the extraction, which kills its ffmpeg process.
+struct Prefetch(tokio::task::JoinHandle<Result<Vec<DecodedImage>, apollo_media::MediaError>>);
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The result of fetching an item's input once.
@@ -181,103 +240,59 @@ impl Engine {
             return;
         }
 
-        // Parallel set: run every model; a model failure does not sink its
-        // siblings. Models that failed transiently are retried (only those —
-        // finished models are kept) up to `[app].max_retries`; after that the item
-        // completes with the per-model errors.
+        // Parallel set: the models run concurrently (each has its own worker
+        // thread, and a video scan's frame extraction overlaps the others'
+        // inference); a model failure does not sink its siblings. Models that
+        // failed transiently are retried (only those — finished models are kept)
+        // up to `[app].max_retries`; after that the item completes with the
+        // per-model errors.
         let mut permanent_failures: HashSet<String> = HashSet::new();
         loop {
-            let mut retryable: Option<TaskError> = None;
-            for label in item.models.clone() {
-                // Cancellation checkpoint between models.
-                if cancel.load(Ordering::SeqCst) {
-                    self.cancel_item(&task_id, idx).await;
-                    return;
-                }
-                if model_done(&item, &label) || permanent_failures.contains(&label) {
-                    continue;
-                }
-
-                // Content-cache fast path: identical bytes already classified by
-                // this model + revision -> reuse the stored output, skip inference.
-                if let Some(ch) = content_hash.as_deref() {
-                    let rev = self.model_revision(&label);
-                    match self
-                        .inner
-                        .storage
-                        .cache_lookup(ch, &label, &rev, fresh_after)
-                        .await
-                    {
-                        Ok(Some(output)) => {
-                            let done = ModelResult::done(output);
-                            let _ = self
-                                .inner
-                                .storage
-                                .upsert_model_result(&task_id, idx, &label, &done)
-                                .await;
-                            if let Some(uh) = url_hash.as_deref() {
-                                let _ = self
-                                    .inner
-                                    .storage
-                                    .url_cache_store(uh, &label, &rev, ch)
-                                    .await;
-                            }
-                            item.results.insert(label.clone(), done);
-                            tracing::debug!(task = %task_id, item = idx, model = %label, "cache hit");
-                            continue;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(task = %task_id, model = %label, error = %e, "cache lookup failed")
-                        }
-                    }
-                }
-
-                let _ = self
-                    .inner
-                    .storage
-                    .upsert_model_result(&task_id, idx, &label, &ModelResult::processing())
+            if cancel.load(Ordering::SeqCst) {
+                self.cancel_item(&task_id, idx).await;
+                return;
+            }
+            let todo: Vec<String> = item
+                .models
+                .iter()
+                .filter(|label| !model_done(&item, label) && !permanent_failures.contains(*label))
+                .cloned()
+                .collect();
+            let ctx = ModelRun {
+                task_id: &task_id,
+                idx,
+                item: &item,
+                fetched: &fetched,
+                content_hash: content_hash.as_deref(),
+                url_hash: url_hash.as_deref(),
+                fresh_after,
+                cancel: &cancel,
+            };
+            let outcomes =
+                futures::future::join_all(todo.iter().map(|label| self.run_set_model(&ctx, label)))
                     .await;
 
-                tracing::debug!(task = %task_id, item = idx, model = %label, "running model");
-                // The model's `timeout` bounds each individual classification — a
-                // single image, or *each frame* of a video scan — not the whole
-                // video, and not the time to load a cold model.
-                let result = match self
-                    .run_model(&task_id, idx, &label, &item, &fetched, &cancel)
-                    .await
-                {
-                    Ok(output) => {
-                        self.store_in_cache(
-                            &task_id,
-                            &label,
-                            content_hash.as_deref(),
-                            url_hash.as_deref(),
-                            &output,
-                        )
-                        .await;
-                        ModelResult::done(output)
+            let mut retryable: Option<TaskError> = None;
+            let mut cancelled = false;
+            for (label, outcome) in todo.into_iter().zip(outcomes) {
+                match outcome {
+                    SetOutcome::Finished(result) => {
+                        item.results.insert(label, result);
                     }
-                    Err(EngineError::Cancelled) => {
-                        self.cancel_item(&task_id, idx).await;
-                        return;
-                    }
-                    Err(e) => {
-                        let err = e.to_model_error();
-                        if e.is_transient() {
-                            retryable = Some(err.clone());
+                    SetOutcome::Failed { result, transient } => {
+                        if transient {
+                            retryable = result.error.clone();
                         } else {
                             permanent_failures.insert(label.clone());
                         }
-                        ModelResult::failed(err)
+                        item.results.insert(label, result);
                     }
-                };
-                let _ = self
-                    .inner
-                    .storage
-                    .upsert_model_result(&task_id, idx, &label, &result)
-                    .await;
-                item.results.insert(label.clone(), result);
+                    SetOutcome::Cancelled => cancelled = true,
+                }
+            }
+            if cancelled {
+                self.cancel_item(&task_id, idx).await;
+                return;
             }
 
             match retryable {
@@ -356,6 +371,83 @@ impl Engine {
             .set_item_state(task_id, idx, ItemState::Processing, None)
             .await;
         true
+    }
+
+    /// Run one model of a parallel set: content-cache fast path, else run it,
+    /// cache its output, and persist the result. Runs concurrently with the
+    /// item's other models.
+    async fn run_set_model(&self, ctx: &ModelRun<'_>, label: &str) -> SetOutcome {
+        let (task_id, idx) = (ctx.task_id, ctx.idx);
+
+        // Content-cache fast path: identical bytes already classified by this
+        // model + revision -> reuse the stored output, skip inference.
+        if let Some(ch) = ctx.content_hash {
+            let rev = self.model_revision(label);
+            match self
+                .inner
+                .storage
+                .cache_lookup(ch, label, &rev, ctx.fresh_after)
+                .await
+            {
+                Ok(Some(output)) => {
+                    let done = ModelResult::done(output);
+                    let _ = self
+                        .inner
+                        .storage
+                        .upsert_model_result(task_id, idx, label, &done)
+                        .await;
+                    if let Some(uh) = ctx.url_hash {
+                        let _ = self
+                            .inner
+                            .storage
+                            .url_cache_store(uh, label, &rev, ch)
+                            .await;
+                    }
+                    tracing::debug!(task = %task_id, item = idx, model = %label, "cache hit");
+                    return SetOutcome::Finished(done);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(task = %task_id, model = %label, error = %e, "cache lookup failed")
+                }
+            }
+        }
+
+        let _ = self
+            .inner
+            .storage
+            .upsert_model_result(task_id, idx, label, &ModelResult::processing())
+            .await;
+
+        tracing::debug!(task = %task_id, item = idx, model = %label, "running model");
+        // The model's `timeout` bounds each individual classification — a single
+        // image, or *each frame* of a video scan — not the whole video, and not
+        // the time to load a cold model.
+        let outcome = match self
+            .run_model(task_id, idx, label, ctx.item, ctx.fetched, ctx.cancel)
+            .await
+        {
+            Ok(output) => {
+                self.store_in_cache(task_id, label, ctx.content_hash, ctx.url_hash, &output)
+                    .await;
+                SetOutcome::Finished(ModelResult::done(output))
+            }
+            Err(EngineError::Cancelled) => return SetOutcome::Cancelled,
+            Err(e) => SetOutcome::Failed {
+                result: ModelResult::failed(e.to_model_error()),
+                transient: e.is_transient(),
+            },
+        };
+        let result = match &outcome {
+            SetOutcome::Finished(r) | SetOutcome::Failed { result: r, .. } => r,
+            SetOutcome::Cancelled => unreachable!("returned above"),
+        };
+        let _ = self
+            .inner
+            .storage
+            .upsert_model_result(task_id, idx, label, result)
+            .await;
+        outcome
     }
 
     /// Populate the content cache (and the url->content hint) after a successful
@@ -773,40 +865,45 @@ impl Engine {
 
         // Wait for a cold model to download/load before starting the per-
         // classification clock, so first use is not reported as a timeout.
-        match tokio::time::timeout(MODEL_LOAD_TIMEOUT, handle.ensure_loaded()).await {
-            Ok(loaded) => loaded?,
-            Err(_) => {
-                return Err(EngineError::ModelUnavailable(format!(
-                    "model '{label}' did not load within {}s",
-                    MODEL_LOAD_TIMEOUT.as_secs()
-                )));
-            }
-        }
+        let input_size =
+            match tokio::time::timeout(MODEL_LOAD_TIMEOUT, handle.ensure_loaded()).await {
+                Ok(loaded) => loaded?,
+                Err(_) => {
+                    return Err(EngineError::ModelUnavailable(format!(
+                        "model '{label}' did not load within {}s",
+                        MODEL_LOAD_TIMEOUT.as_secs()
+                    )));
+                }
+            };
 
         let timeout = self.model_timeout(label);
         match (item.input.modality(), fetched) {
             (Modality::Image, Fetched::Image(img)) => {
                 // One image: the whole classification is bounded by `timeout`.
                 let on_timeout = format!("model '{label}' timed out classifying image");
-                let c =
-                    classify_with_timeout(timeout, handle.classify_image(img.clone()), &on_timeout)
-                        .await?;
+                let c = classify_with_timeout(
+                    timeout,
+                    handle.classify_image(Arc::clone(img)),
+                    &on_timeout,
+                )
+                .await?;
                 Ok(ModelOutput::Classification(c))
             }
             (Modality::Video, Fetched::Video { media, info }) => {
                 // Video: an image classifier over sampled frames, each frame bounded
                 // by `timeout` (applied inside run_frame_scan).
-                self.run_frame_scan(
+                let scan = FrameScanRun {
                     task_id,
                     idx,
                     label,
-                    &handle,
-                    media.path(),
+                    handle: &handle,
+                    path: media.path(),
                     info,
+                    input_size,
                     timeout,
                     cancel,
-                )
-                .await
+                };
+                self.run_frame_scan(&scan).await
             }
             _ => Err(EngineError::Incompatible(format!(
                 "input/model mismatch for '{label}'"
@@ -865,7 +962,7 @@ impl Engine {
             tokio::task::spawn_blocking(move || apollo_media::decode_image(&bytes, max_pixels))
                 .await
                 .map_err(|e| EngineError::Join(e.to_string()))??;
-        Ok((Fetched::Image(img), hash))
+        Ok((Fetched::Image(Arc::new(img)), hash))
     }
 
     /// Probe `media` as a video, hashing the file for the cache key when
@@ -907,24 +1004,21 @@ impl Engine {
     }
 
     /// Image-classifier over a video: plan frames per the model's strategy, skip
-    /// frames already classified (resume), classify the rest in worker-batched
-    /// chunks (persisting each as a checkpoint), and early-exit when a trigger
-    /// fires. Rolls up into a `FrameScan`.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_frame_scan(
-        &self,
-        task_id: &str,
-        idx: usize,
-        label: &str,
-        handle: &ModelHandle,
-        path: &Path,
-        info: &VideoInfo,
-        timeout: Duration,
-        cancel: &AtomicBool,
-    ) -> Result<ModelOutput, EngineError> {
+    /// frames already classified (resume), and classify the rest, stopping early
+    /// when a trigger fires. If none does and the strategy has `refine` steps,
+    /// frames around the ambiguous scores are planned from the results and
+    /// classified the same way. Rolls up into a `FrameScan`.
+    async fn run_frame_scan(&self, scan: &FrameScanRun<'_>) -> Result<ModelOutput, EngineError> {
+        let FrameScanRun {
+            task_id,
+            idx,
+            label,
+            path,
+            info,
+            ..
+        } = *scan;
         let model = self.model_cfg(label)?;
         let strategy = self.strategy_for(&model)?;
-        let frame_timeout_msg = format!("model '{label}' timed out classifying a video frame");
 
         let plan = apollo_media::plan(path, info, &strategy.sampling).await?;
 
@@ -951,63 +1045,181 @@ impl Engine {
             )));
         }
         let mut frames = prior;
-        let batch = model.max_concurrent.max(1) as usize;
         let pending: Vec<FrameRef> = plan
-            .into_iter()
+            .iter()
             .filter(|f| !done_idx.contains(&f.index))
+            .copied()
             .collect();
-
         tracing::debug!(
             model = %label,
-            planned = pending.len() + done_idx.len(),
+            planned = plan.len(),
             resuming_from = done_idx.len(),
             "frame scan planned"
         );
-        let mut stop = false;
-        'scan: for chunk in pending.chunks(batch) {
-            // Cancellation checkpoint between sampled-frame batches.
-            if cancel.load(Ordering::SeqCst) {
-                return Err(EngineError::Cancelled);
-            }
-            let timestamps: Vec<f64> = chunk.iter().map(|f| f.timestamp).collect();
-            let images =
-                apollo_media::extract_frames(path, &timestamps, self.inner.max_pixels).await?;
+        let stopped = self
+            .classify_frames(scan, &model, early.as_ref(), &pending, &mut frames)
+            .await?;
 
-            // Issue the whole chunk concurrently so the worker merges it into one
-            // forward pass; each frame is bounded by the model's per-frame timeout.
-            let calls = images.into_iter().map(|img| {
-                classify_with_timeout(timeout, handle.classify_image(img), &frame_timeout_msg)
-            });
-            let results = futures::future::join_all(calls).await;
-
-            for (fref, res) in chunk.iter().zip(results) {
-                let classification = res?;
-                let frame = Frame {
-                    timestamp: fref.timestamp,
-                    index: fref.index,
-                    classification,
-                };
-                let _ = self
-                    .inner
-                    .storage
-                    .append_frame(task_id, idx, label, &frame)
-                    .await;
-                if let Some((labels, threshold)) = early.as_ref()
-                    && apollo_media::triggered(&frame.classification, labels, *threshold)
-                {
-                    stop = true;
-                }
-                frames.push(frame);
-                if stop {
-                    break 'scan;
-                }
-            }
+        // Look closer around ambiguous scores. Planned only once every planned
+        // frame is classified, from their stored scores, so a resumed scan plans
+        // the same frames and skips the ones it already has.
+        let has_refine = strategy
+            .sampling
+            .iter()
+            .any(|s| s.method == SamplingKind::Refine);
+        if !stopped
+            && has_refine
+            && let Some(EarlyExit { labels, threshold }) = &model.early_exit
+        {
+            let by_index: HashMap<u32, &Frame> = frames.iter().map(|f| (f.index, f)).collect();
+            let scored: Vec<(FrameRef, f32)> = plan
+                .iter()
+                .filter_map(|f| {
+                    by_index
+                        .get(&f.index)
+                        .map(|fr| (*f, apollo_media::trigger_score(&fr.classification, labels)))
+                })
+                .collect();
+            let extra = apollo_media::refine_plan(
+                info,
+                &strategy.sampling,
+                &scored,
+                *threshold,
+                plan.len() as u32,
+            );
+            let pending: Vec<FrameRef> = extra
+                .into_iter()
+                .filter(|f| !done_idx.contains(&f.index))
+                .collect();
+            tracing::debug!(model = %label, frames = pending.len(), "frame scan refining");
+            self.classify_frames(scan, &model, early.as_ref(), &pending, &mut frames)
+                .await?;
         }
 
         Ok(ModelOutput::FrameScan(aggregate::frame_scan(
             frames,
             strategy.aggregation,
         )))
+    }
+
+    /// Classify `pending` frames in order, appending results to `frames`.
+    /// Frames are extracted [`EXTRACT_CHUNK`] at a time by one ffmpeg pass at the
+    /// model's input size, the next chunk extracted while the current one is
+    /// classified; classification goes in worker-sized batches, each persisted as
+    /// one checkpoint. Returns whether a trigger fired (and so stopped the scan).
+    async fn classify_frames(
+        &self,
+        scan: &FrameScanRun<'_>,
+        model: &ModelConfig,
+        early: Option<&(Vec<u32>, f32)>,
+        pending: &[FrameRef],
+        frames: &mut Vec<Frame>,
+    ) -> Result<bool, EngineError> {
+        let FrameScanRun {
+            task_id,
+            idx,
+            label,
+            handle,
+            path,
+            info,
+            input_size,
+            timeout,
+            cancel,
+        } = *scan;
+        let frame_timeout_msg = format!("model '{label}' timed out classifying a video frame");
+        let batch = model.max_concurrent.max(1) as usize;
+
+        let chunks: Vec<&[FrameRef]> = pending.chunks(EXTRACT_CHUNK.max(batch)).collect();
+        let extract = |chunk: &[FrameRef]| {
+            let path = path.to_path_buf();
+            let info = info.clone();
+            let requests: Vec<FrameRequest> = chunk
+                .iter()
+                .map(|f| FrameRequest {
+                    timestamp: f.timestamp,
+                    keyframe: f.keyframe,
+                })
+                .collect();
+            Prefetch(tokio::spawn(async move {
+                apollo_media::extract_frames_scaled(&path, &info, &requests, input_size).await
+            }))
+        };
+
+        let mut next = chunks.first().map(|c| extract(c));
+        for (n, chunk) in chunks.iter().enumerate() {
+            // Cancellation checkpoint between extraction chunks.
+            if cancel.load(Ordering::SeqCst) {
+                return Err(EngineError::Cancelled);
+            }
+            let images = match next.take() {
+                Some(mut prefetch) => (&mut prefetch.0)
+                    .await
+                    .map_err(|e| EngineError::Join(e.to_string()))??,
+                None => break,
+            };
+            // Start extracting the next chunk while this one is classified.
+            next = chunks.get(n + 1).map(|c| extract(c));
+            let images: Vec<Arc<DecodedImage>> = images.into_iter().map(Arc::new).collect();
+
+            for (refs, imgs) in chunk.chunks(batch).zip(images.chunks(batch)) {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(EngineError::Cancelled);
+                }
+                // Issue the batch concurrently so the worker merges it into one
+                // forward pass; each frame is bounded by the per-frame timeout.
+                let calls = imgs.iter().map(|img| {
+                    classify_with_timeout(
+                        timeout,
+                        handle.classify_image(Arc::clone(img)),
+                        &frame_timeout_msg,
+                    )
+                });
+                let results = futures::future::join_all(calls).await;
+
+                let mut checkpoint = Vec::with_capacity(refs.len());
+                let mut failure = None;
+                let mut stop = false;
+                for (fref, res) in refs.iter().zip(results) {
+                    let classification = match res {
+                        Ok(c) => c,
+                        Err(e) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    };
+                    let frame = Frame {
+                        timestamp: fref.timestamp,
+                        index: fref.index,
+                        classification,
+                    };
+                    stop = early.is_some_and(|(labels, threshold)| {
+                        apollo_media::triggered(&frame.classification, labels, *threshold)
+                    });
+                    checkpoint.push(frame);
+                    if stop {
+                        break;
+                    }
+                }
+                // Persist what this batch produced, even if a frame failed, so a
+                // retry or resume does not redo it.
+                if let Err(e) = self
+                    .inner
+                    .storage
+                    .append_frames(task_id, idx, label, &checkpoint)
+                    .await
+                {
+                    tracing::warn!(task = %task_id, model = %label, error = %e, "frame checkpoint failed");
+                }
+                frames.extend(checkpoint);
+                if let Some(e) = failure {
+                    return Err(e);
+                }
+                if stop {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     // ------------------------- small config lookups -------------------------

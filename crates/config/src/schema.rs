@@ -134,7 +134,9 @@ pub struct AppConfig {
     /// built-in default in [`crate::load`].
     #[serde(default)]
     pub config_file: Option<String>,
-    /// Soft ceiling on resident process memory (e.g. `4gb`, `512mb`; `0` = off).
+    /// Soft ceiling on process memory (e.g. `4gb`, `512mb`; `0` = off): the
+    /// physical footprint on macOS (including Metal buffers), resident set size
+    /// elsewhere.
     /// New work is rejected with RESOURCE_EXHAUSTED while usage is above this.
     #[serde(default = "crate::defaults::max_memory")]
     pub max_memory: String,
@@ -146,6 +148,24 @@ pub struct AppConfig {
     /// retries.
     #[serde(default = "crate::defaults::max_retries")]
     pub max_retries: u32,
+    /// Compute backend for the model workers. `auto` picks CUDA → Metal → CPU.
+    #[serde(default)]
+    pub device: DevicePreference,
+}
+
+/// Which compute backend to run models on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DevicePreference {
+    /// The best backend that initializes: CUDA, then Metal, then CPU.
+    #[default]
+    Auto,
+    /// Always the CPU, even when a GPU is available.
+    Cpu,
+    /// Metal (macOS); falls back to CPU if it cannot be initialized.
+    Metal,
+    /// CUDA (`cuda` builds); falls back to CPU if it cannot be initialized.
+    Cuda,
 }
 
 impl AppConfig {
@@ -168,6 +188,7 @@ impl Default for AppConfig {
             max_memory: defaults::max_memory(),
             max_pending: defaults::max_pending(),
             max_retries: defaults::max_retries(),
+            device: DevicePreference::Auto,
         }
     }
 }
@@ -362,7 +383,8 @@ pub struct SamplingStep {
     /// Execution order; lower runs first. Unique within a strategy.
     pub step: u32,
     pub method: SamplingKind,
-    /// Frames per second (`method = "fps"`).
+    /// Frames per second (`method = "fps"`, and the density around each
+    /// frame `method = "refine"` looks closer at).
     #[serde(default)]
     pub fps: Option<f64>,
     /// Total frames evenly spaced (`method = "uniform"`).
@@ -374,6 +396,19 @@ pub struct SamplingStep {
     /// Scene-change score threshold 0..1 (`method = "scene"`).
     #[serde(default)]
     pub threshold: Option<f64>,
+    /// Minimum seconds between scene frames (`method = "scene"`): a cut closer
+    /// than this to the previously kept cut is skipped. Caps the cost on
+    /// fast-cut video. Default 0 (keep every cut).
+    #[serde(default)]
+    pub min_gap: Option<f64>,
+    /// Lowest trigger-label score that counts as ambiguous (`method = "refine"`):
+    /// frames scoring from here up to the model's `early_exit` threshold get a
+    /// closer look.
+    #[serde(default)]
+    pub min_score: Option<f32>,
+    /// Seconds either side of an ambiguous frame to sample (`method = "refine"`).
+    #[serde(default)]
+    pub window: Option<f64>,
 }
 
 /// Frame-sampling method. New methods are added here and in `apollo-media`.
@@ -385,6 +420,10 @@ pub enum SamplingKind {
     Uniform,
     EveryNth,
     Scene,
+    /// Look closer: after every other step has run, sample densely around the
+    /// frames whose trigger-label score was ambiguous. Planned from the scores,
+    /// so it must come after all other steps.
+    Refine,
 }
 
 /// `[models.<label>]` — a registered model.

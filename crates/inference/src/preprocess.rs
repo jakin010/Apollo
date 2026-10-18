@@ -29,7 +29,7 @@ impl Normalization {
 /// Resize each image to `size`×`size`, convert to CHW f32 in [0,1], normalize, and
 /// stack into a batch tensor `(B, 3, size, size)`.
 pub(crate) fn preprocess(
-    images: &[DecodedImage],
+    images: &[&DecodedImage],
     norm: &Normalization,
     device: &Device,
 ) -> Result<Tensor, InferenceError> {
@@ -49,12 +49,27 @@ pub(crate) fn preprocess(
     Ok(Tensor::stack(&tensors, 0)?)
 }
 
+/// The pixels at `size`×`size`: copied as-is when the image already has that
+/// size (e.g. video frames extracted at the model size), else resized from a
+/// borrowed view of the buffer (no copy of the full-resolution image).
 fn resize_rgb(img: &DecodedImage, size: u32) -> Result<Vec<u8>, InferenceError> {
-    let buf =
-        image::RgbImage::from_raw(img.width, img.height, img.data.clone()).ok_or_else(|| {
-            InferenceError::Preprocess("image buffer length does not match dimensions".into())
-        })?;
-    let resized = image::imageops::resize(&buf, size, size, image::imageops::FilterType::Triangle);
+    if img.width == size && img.height == size {
+        if img.data.len() != img.pixel_count() * 3 {
+            return Err(InferenceError::Preprocess(
+                "image buffer length does not match dimensions".into(),
+            ));
+        }
+        return Ok(img.data.clone());
+    }
+    let view = image::ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(
+        img.width,
+        img.height,
+        img.data.as_slice(),
+    )
+    .ok_or_else(|| {
+        InferenceError::Preprocess("image buffer length does not match dimensions".into())
+    })?;
+    let resized = image::imageops::resize(&view, size, size, image::imageops::FilterType::Triangle);
     Ok(resized.into_raw())
 }
 
@@ -116,7 +131,7 @@ mod tests {
             data: vec![0u8; 2 * 2 * 3],
         };
         let norm = Normalization::centered(4);
-        let batch = preprocess(&[img.clone(), img], &norm, &Device::Cpu).unwrap();
+        let batch = preprocess(&[&img, &img], &norm, &Device::Cpu).unwrap();
         assert_eq!(batch.dims(), &[2, 3, 4, 4]);
     }
 }

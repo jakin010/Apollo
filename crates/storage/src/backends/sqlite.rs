@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 
 use apollo_config::SqliteConfig;
@@ -94,15 +94,21 @@ pub struct SqliteStorage {
 impl SqliteStorage {
     /// Open (creating if missing) and configure the pool from `[database.sqlite]`.
     pub async fn connect(cfg: &SqliteConfig) -> Result<Self> {
-        let journal = if cfg.wal {
-            SqliteJournalMode::Wal
+        // With WAL, `synchronous = NORMAL` is the recommended setting: commits
+        // skip the per-transaction fsync, the database stays consistent after a
+        // crash or power loss, and at worst the last few transactions (frame
+        // checkpoints, which resume simply redoes) are lost. Without WAL keep
+        // FULL.
+        let (journal, synchronous) = if cfg.wal {
+            (SqliteJournalMode::Wal, SqliteSynchronous::Normal)
         } else {
-            SqliteJournalMode::Delete
+            (SqliteJournalMode::Delete, SqliteSynchronous::Full)
         };
         let opts = SqliteConnectOptions::new()
             .filename(&cfg.path)
             .create_if_missing(true)
             .journal_mode(journal)
+            .synchronous(synchronous)
             .busy_timeout(Duration::from_millis(cfg.busy_timeout as u64))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
@@ -386,6 +392,36 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    async fn append_frames(
+        &self,
+        task_id: &str,
+        item: usize,
+        label: &str,
+        frames: &[Frame],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for frame in frames {
+            let class_json = serde_json::to_string(&frame.classification)?;
+            sqlx::query(
+                "INSERT INTO frames (task_id, item_idx, label, frame_index, timestamp, class_json)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(task_id, item_idx, label, frame_index) DO UPDATE SET
+                    timestamp = excluded.timestamp,
+                    class_json = excluded.class_json",
+            )
+            .bind(task_id)
+            .bind(item as i64)
+            .bind(label)
+            .bind(frame.index as i64)
+            .bind(frame.timestamp)
+            .bind(class_json)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn load_frames(&self, task_id: &str, item: usize, label: &str) -> Result<Vec<Frame>> {
         let rows = sqlx::query(
             "SELECT frame_index, timestamp, class_json
@@ -447,6 +483,19 @@ impl Storage for SqliteStorage {
         .fetch_optional(&self.pool)
         .await?;
         Ok(v.unwrap_or(0) as u32)
+    }
+
+    async fn count_tasks_by_state(&self) -> Result<Vec<(TaskState, u64)>> {
+        let rows = sqlx::query("SELECT state, COUNT(*) AS n FROM tasks GROUP BY state")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let state = r.try_get::<String, _>("state")?.parse::<TaskState>()?;
+            let n: i64 = r.try_get("n")?;
+            out.push((state, n as u64));
+        }
+        Ok(out)
     }
 
     async fn load_incomplete_tasks(&self) -> Result<Vec<Task>> {

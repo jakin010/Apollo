@@ -38,9 +38,10 @@ Relative `taxonomy_file` paths inside a model are resolved against the **config 
 | `max_concurrent` | u32 | `20` | Global ceiling on items being processed at once — fetching their input and running models (your VRAM budget). A slot is released while an item backs off between retries. |
 | `idle_timeout` | u32 (secs) | `300` | How long a model stays resident while idle before its weights are unloaded, unless it sets `keep_in_memory`. |
 | `log_level` | string | `"info"` | `trace`/`debug`/`info`/`warn`/`error`. The `RUST_LOG` env var overrides this at startup. |
-| `max_memory` | size | `"4gb"` | Soft resident‑memory ceiling. New work is rejected with `RESOURCE_EXHAUSTED` while usage is above it (`0` = off). |
+| `max_memory` | size | `"4gb"` | Soft ceiling on the server process's memory. New work is rejected with `RESOURCE_EXHAUSTED` while usage is above it (`0` = off). On macOS usage is the process's physical footprint (what Activity Monitor and `footprint` show), which includes Metal GPU buffers; on Apple Silicon these hold the model weights and activations and are not part of the resident set size. Elsewhere it is the resident set size, so CUDA device memory is not counted. |
 | `max_pending` | u32 | `1024` | Max items queued or in‑flight before submissions are rejected with `RESOURCE_EXHAUSTED` (backpressure). `0` = off. |
 | `max_retries` | u32 | `3` | Times an item is retried after a **transient** failure (network error, HTTP 5xx/408/429, model timeout or load failure, inference error): a failed fetch is re‑fetched, failed models (or the failed pipeline step) re‑run while finished ones are kept. Permanent failures (refused URL, HTTP 4xx, undecodable or over‑limit input) are not retried. `0` = no retries. |
+| `device` | string | `"auto"` | Compute backend for the models. `auto` picks the first that initializes: CUDA (only in `cuda` builds), then Metal (macOS), then CPU. `cpu` always uses the CPU, even on a GPU machine. `metal` / `cuda` pin that backend and fall back to CPU, with a warning, if it can't be used. |
 
 ---
 
@@ -175,7 +176,7 @@ Each backend has its own sub‑table; the one matching `backend` is required (ex
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `path` | string | `"apollo.db"` | Database file path. |
-| `wal` | bool | `true` | Enable WAL so concurrent reads don't block. |
+| `wal` | bool | `true` | Enable WAL so concurrent reads don't block. With WAL, `synchronous = NORMAL` is used: commits skip the per‑transaction fsync and the database stays consistent after a crash or power loss, at the cost of possibly losing the last few writes (resume redoes them). Without WAL, `FULL`. |
 | `busy_timeout` | u32 (ms) | `5000` | How long to wait on a momentarily locked file. |
 | `max_connections` | u32 | `5` | Connection pool size. |
 
@@ -217,11 +218,46 @@ Steps run in ascending `step` order (cheapest first, typically). Each step's req
 | `fps` | `fps` (float) | Sample at N frames per second. |
 | `uniform` | `count` (u32) | N frames, evenly spaced across the clip. |
 | `every_nth` | `nth` (u32) | Take every Nth frame. |
-| `scene` | `threshold` (0..1) | One frame per shot change above the threshold. |
+| `scene` | `threshold` (0..1) | One frame per shot change above the threshold. Optional `min_gap` (seconds): skip a cut closer than this to the previous kept one, capping the cost on fast‑cut video. |
+| `refine` | `min_score` (0..1), `window` (s), `fps` | **Look closer.** After every other step has run without a trigger, sample at `fps` within `window` seconds either side of each frame whose trigger score was ambiguous — from `min_score` up to the model's `early_exit.threshold`. Needs the model's `early_exit` labels, and must be the last step(s). Clean, confidently scored video gets no extra frames. |
 
-Example:
+Frames closer than 0.05 s to one already chosen by an earlier step are skipped, and a resumed scan re-plans exactly the same frames (including `refine`'s, which are planned from the stored scores).
+
+Two strategies from `config.example.toml`, for different hardware:
 
 ```toml
+# Sparse but thorough — suited to CPU-only servers. On the test set it used
+# 10-25x fewer frames than progressive_scan on clean video, and still caught
+# 0.5-2 s inserts at hard cuts and brief moments inside a continuous shot.
+[strategies.coverage_scan]
+aggregation = "max"
+early_exit  = true
+
+[[strategies.coverage_scan.sampling]]
+step = 1
+method = "uniform"           # an early, spread-out look; finds long segments fast
+count = 8
+
+[[strategies.coverage_scan.sampling]]
+step = 2
+method = "scene"             # a frame at every hard cut: catches short inserts
+threshold = 0.3
+min_gap = 1.0
+
+[[strategies.coverage_scan.sampling]]
+step = 3
+method = "fps"               # gap filler: long single shots get a frame every 8 s
+fps = 0.125
+
+[[strategies.coverage_scan.sampling]]
+step = 4
+method = "refine"            # look closer around anything the model was unsure about
+min_score = 0.1
+window = 4.0
+fps = 5
+
+# Dense — ends in a 5 fps pass (~5 model runs per second of clean video), so it
+# misses nothing the model can see. Best with a GPU.
 [strategies.progressive_scan]
 aggregation = "max"
 early_exit  = true
@@ -240,6 +276,8 @@ step = 3
 method = "fps"               # densest; only reached if earlier steps didn't exit
 fps = 5
 ```
+
+Choosing a scene `threshold`: `0.3` found both cuts of every spliced‑in clip in testing, while `0.4` missed some of the cuts back out. Keyframes (`iframes`) are cheap but are usually placed at a fixed interval by the encoder, not at scene changes, so they are no substitute for `scene`.
 
 ---
 
@@ -334,6 +372,8 @@ A `taxonomy_file` defines grouped, prompt‑backed categories for a `siglip` mod
 
 SigLIP scores each prompt independently against the image; a child's score is the **aggregation of its own prompts** — `mean` (default), `average` (alias for mean), or `max`. Use `max` when the prompts are alternatives (any one matching should light the category); use `mean` when they're corroborating evidence for the same concept.
 
+All prompts (taxonomy or `labels`) are encoded when the model loads. That's the slow part of loading — about 35 s for ~1,000 prompts on an 8‑core CPU — so the result is cached in an `apollo-prompt-embeds` folder inside the model's Hub cache directory and reused on later loads (well under a second). Changing a prompt, the model revision, or the tokenizer starts a new cache entry automatically; deleting the folder is always safe.
+
 At inference, each child that scores at/above the model's `score_threshold` is returned as a flat `Prediction` whose `label` is the **child id**. (Parent grouping is not carried on the wire — reconstruct parent→child from the taxonomy file if you need it.) Parent ids and child ids live in separate namespaces; ids are arbitrary unique `u32`s.
 
 ```toml
@@ -354,7 +394,7 @@ See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
 
 `apollo start` validates the config before serving and reports **all** problems at once. Enforced rules include:
 
-- **Strategies:** at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`).
+- **Strategies:** at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`, `refine`→`min_score` + `window` + `fps`); `min_gap` only on `scene` and ≥ 0; `refine` steps after all others, with `min_score` in 0..1, `window` in (0, 60] s and `fps` in (0, 60]. A model using a strategy with `refine` must define `early_exit`, with a `threshold` above the step's `min_score`.
 - **Models:** `video_strategy` must name a defined strategy; `early_exit` must list at least one label **and** requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
 - **Pipelines:** at least one step; every `model` must be defined; unique `order`s; a `stop_if` must list at least one label id.
 - **Database:** selecting `postgres`/`surrealdb` requires the matching `[database.<backend>]` section.
@@ -366,6 +406,7 @@ See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
 ```text
 apollo start [--config PATH] [--endpoint HOST] [--port N] [--webhook-url URL] [--daemon]
 apollo stop  [...]                       # gracefully stop a running daemon
+apollo status [--json] [--watch [-n SECONDS]]   # is it running, and what is it doing
 apollo config get    <key> [--config PATH]
 apollo config set    <key> <value> [--config PATH]
 apollo config remove <key> [--config PATH]
@@ -375,6 +416,16 @@ apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
 ```
 
 - **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url`, or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
+- **`status`** reports whether the server is running and its live state:
+  - version, PID, uptime, listen address, TLS/auth, config file, database, and log file;
+  - memory in use against `max_memory` (measured as for `max_memory`: physical footprint on macOS, resident set size elsewhere);
+  - the queue (items in flight, busy/waiting concurrency slots);
+  - task counts by state, and pending webhook deliveries;
+  - per model: loaded or not, input size, queued requests, batch size, images classified, and last use.
+
+  `--json` prints the same as JSON; memory in use is `memory.used_bytes` (earlier builds named it `memory.rss_bytes`). The exit status is `0` when running and `3` when not (like `systemctl status`).
+
+  `--watch` (`-w`) keeps the view open and refreshes it in place every second (`-n 0.5` for twice a second; minimum 0.2) until Ctrl‑C, adding live throughput: images per second per model and in total. If the server stops or restarts, it shows that and waits for it. With `--json`, `--watch` prints one JSON object per line per refresh (`time`, `running`, `status`, `rates`, `error`); when the output is not a terminal, each refresh is printed in sequence instead of redrawn. The server answers on a Unix socket in its private per‑user directory (`$XDG_RUNTIME_DIR/apollo/` on Linux, otherwise the state directory), so only the same OS user can query it — run `apollo status` as that user.
 - **`config get|set|remove`** edit the file by **dotted key** (e.g. `models.nsfw.repo`), format‑preserving. `set` creates missing tables — and a default `[app]`‑only file — as needed.
 - **`keygen`** prints a fresh public/secret PASERK keypair.
 - **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` (a bare PASERK or `keygen` output), else the `APOLLO_SECRET_KEY` env var, else the server's local keypair file (`auth.key` in the state directory). `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key. The token goes to stdout (it goes in the client's `authorization` metadata) and its id to stderr.

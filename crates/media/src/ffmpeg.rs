@@ -28,13 +28,17 @@ const SHORT_TIMEOUT: Duration = Duration::from_secs(60);
 const FULL_PASS_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Input options applied to every ffmpeg / ffprobe call (see module docs).
-const INPUT_GUARD: [&str; 2] = ["-protocol_whitelist", "file"];
+pub(crate) const INPUT_GUARD: [&str; 2] = ["-protocol_whitelist", "file"];
 
 /// Video metadata from `ffprobe`.
 #[derive(Debug, Clone)]
 pub struct VideoInfo {
     /// Duration in seconds.
     pub duration: f64,
+    /// Presentation time of the first frame, in seconds (non-zero e.g. for many
+    /// MPEG-TS files). Frame timestamps reported by ffmpeg are absolute; sampling
+    /// works in time relative to this.
+    pub start_time: f64,
     /// Average frame rate (frames per second).
     pub fps: f64,
     /// Total frame count, if ffprobe reported it.
@@ -176,7 +180,7 @@ async fn capture_stderr(
 
 /// Run `cmd` to completion within `timeout`, killing it if the deadline passes,
 /// and fail on a non-zero exit.
-async fn run(
+pub(crate) async fn run(
     name: &str,
     cmd: &mut Command,
     timeout: Duration,
@@ -247,6 +251,14 @@ fn parse_probe(stdout: &[u8]) -> Result<VideoInfo, MediaError> {
         .filter(|d| d.is_finite() && *d >= 0.0)
         .unwrap_or(0.0);
 
+    let start_time = v
+        .get("format")
+        .and_then(|f| f.get("start_time"))
+        .and_then(|s| s.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|s| s.is_finite())
+        .unwrap_or(0.0);
+
     let frame_count = video
         .get("nb_frames")
         .and_then(|n| n.as_str())
@@ -271,6 +283,7 @@ fn parse_probe(stdout: &[u8]) -> Result<VideoInfo, MediaError> {
 
     Ok(VideoInfo {
         duration,
+        start_time,
         fps,
         frame_count,
         width,
@@ -313,13 +326,16 @@ fn parse_float_lines(bytes: &[u8]) -> Vec<f64> {
 }
 
 /// Scan ffmpeg `showinfo` stderr for `pts_time:<n>` and collect the times.
-fn parse_showinfo_pts(bytes: &[u8]) -> Vec<f64> {
+pub(crate) fn parse_showinfo_pts(bytes: &[u8]) -> Vec<f64> {
     let text = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
     for chunk in text.split("pts_time:").skip(1) {
         let num: String = chunk
+            .trim_start()
             .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .enumerate()
+            .take_while(|(i, c)| c.is_ascii_digit() || *c == '.' || (*i == 0 && *c == '-'))
+            .map(|(_, c)| c)
             .collect();
         if let Ok(t) = num.parse::<f64>() {
             out.push(t);
@@ -331,6 +347,23 @@ fn parse_showinfo_pts(bytes: &[u8]) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::{parse_float_lines, parse_probe};
+
+    #[test]
+    fn showinfo_times_parse_including_negative() {
+        let err = b"n:   0 pts:  153600 pts_time:10      duration: 512 duration_time:0.0333\n\
+                    n:   1 pts:   -1024 pts_time:-0.0667 pos: 1\n";
+        assert_eq!(super::parse_showinfo_pts(err), vec![10.0, -0.0667]);
+    }
+
+    #[test]
+    fn probe_reads_start_time() {
+        let json =
+            br#"{"streams":[{"codec_type":"video","codec_name":"h264","width":64,"height":64,
+            "avg_frame_rate":"25/1"}],
+            "format":{"format_name":"mpegts","duration":"10.0","start_time":"1.400000"}}"#;
+        let info = parse_probe(json).unwrap();
+        assert_eq!(info.start_time, 1.4);
+    }
 
     #[test]
     fn probe_rejects_non_finite_metadata() {

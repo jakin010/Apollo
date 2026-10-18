@@ -9,7 +9,6 @@ apollo-config    = { path = "../config" }
 apollo-storage   = { path = "../storage" }
 apollo-inference = { path = "../inference" }
 apollo-media     = { path = "../media" }
-candle-core = "0.10"
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
 async-trait = "0.1"
 crossbeam-channel = "0.5"
@@ -18,8 +17,15 @@ tracing = { workspace = true }
 sha2 = "0.10"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
-memory-stats = "1"
 dirs = "6"
+
+# Process memory for the soft cap: `phys_footprint` via mach `task_info` on
+# macOS (counts Metal buffers, which RSS misses), resident set size elsewhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+memory-stats = "1"
 
 [dev-dependencies]
 tempfile = "3"

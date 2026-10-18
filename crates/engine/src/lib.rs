@@ -29,6 +29,7 @@ mod memory;
 mod queue;
 mod registry;
 mod scheduler;
+mod status;
 mod webhook;
 mod worker;
 
@@ -36,6 +37,7 @@ mod worker;
 mod tests;
 
 pub use error::EngineError;
+pub use status::{EngineStatus, ModelStatus, TaskCounts};
 pub use webhook::{WebhookError, WebhookSink};
 
 use crate::gate::PriorityGate;
@@ -58,6 +60,8 @@ pub struct Engine {
 
 struct Inner {
     storage: Arc<dyn Storage>,
+    /// Compute backend the workers run on.
+    device: apollo_inference::DeviceKind,
     config: Arc<Config>,
     registry: Registry,
     /// Priority-ordered global ceiling on concurrently processing items.
@@ -67,7 +71,7 @@ struct Inner {
     fetch_limits: FetchLimits,
     /// Max decoded pixels (`width * height`) per image; `None` disables the cap.
     max_pixels: Option<u64>,
-    /// Soft resident-memory cap in bytes; `None` disables the check.
+    /// Soft memory cap in bytes (see [`memory`]); `None` disables the check.
     max_memory_bytes: Option<u64>,
     /// Max items queued or in-flight before submissions are rejected; `0` = off.
     max_pending: usize,
@@ -99,12 +103,12 @@ impl Engine {
         storage: Arc<dyn Storage>,
         webhook: Option<Arc<dyn WebhookSink>>,
     ) -> Engine {
-        let (device, kind) = apollo_inference::select_device();
+        let (_probe, kind) = apollo_inference::select_device(config.app.device);
         tracing::info!(device = %kind, "selected compute device");
 
         let cache_dir = config.app.cache_dir.clone().map(PathBuf::from);
         let idle = Duration::from_secs(config.app.idle_timeout as u64);
-        let registry = Registry::build(&config, device, cache_dir, idle);
+        let registry = Registry::build(&config, kind, cache_dir, idle);
         let gate = Arc::new(PriorityGate::new(config.app.max_concurrent.max(1) as usize));
 
         let fetch_limits = FetchLimits {
@@ -127,6 +131,7 @@ impl Engine {
         let engine = Engine {
             inner: Arc::new(Inner {
                 storage,
+                device: kind,
                 config,
                 registry,
                 gate,
@@ -341,19 +346,19 @@ impl Engine {
         Ok(())
     }
 
-    /// Reject new work while resident memory is over the configured soft cap.
+    /// Reject new work while process memory is over the configured soft cap.
     fn check_memory(&self) -> Result<(), EngineError> {
         let Some(limit) = self.inner.max_memory_bytes else {
             return Ok(());
         };
-        let Some(rss) = memory::current_rss_bytes() else {
+        let Some(used) = memory::current_memory_bytes() else {
             return Ok(());
         };
-        if rss >= limit {
+        if used >= limit {
             const MIB: u64 = 1024 * 1024;
             return Err(EngineError::Overloaded(format!(
-                "memory limit reached ({} MiB resident >= {} MiB cap)",
-                rss / MIB,
+                "memory limit reached ({} MiB in use >= {} MiB cap)",
+                used / MIB,
                 limit / MIB
             )));
         }

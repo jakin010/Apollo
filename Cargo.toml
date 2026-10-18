@@ -21,3 +21,18 @@ edition = "2024"
 tonic = { version = "0.14" }
 tracing = { version = "0.1" }
 tokio = { version = "1.52", default-features = false }
+
+# `cargo build --profile profiling` / `cargo flamegraph --profile profiling`:
+# release optimizations with full debug info, so profilers and flamegraphs show
+# real function names and source lines. Output goes to target/profiling/.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
+# candle's Metal strided kernels (copies, broadcast ops) use 64-bit index math,
+# which makes ViT inference on Metal ~2x slower. Our fork switches them to
+# 32-bit; drop this once candle ships the fix (upstream PR pending).
+# Only affects macOS builds: the crate is not compiled on Linux/CUDA targets.
+[patch.crates-io]
+candle-metal-kernels = { git = "https://github.com/jakin010/candle", branch = "metal-strided-u32-index" }

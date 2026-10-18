@@ -56,10 +56,16 @@ pub fn run(args: StartArgs) -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("building the Tokio runtime")?;
-    runtime.block_on(serve(config))
+    let config_file = args
+        .config
+        .clone()
+        .unwrap_or_else(load::default_path)
+        .canonicalize()
+        .ok();
+    runtime.block_on(serve(config, config_file))
 }
 
-async fn serve(config: Config) -> anyhow::Result<()> {
+async fn serve(config: Config, config_file: Option<PathBuf>) -> anyhow::Result<()> {
     init_tracing(&config.app.log_level);
 
     let addr = (config.app.endpoint.as_str(), config.app.port)
@@ -105,6 +111,20 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         );
     }
 
+    // Answer `apollo status` on a local socket for as long as the server runs.
+    let info = ServerInfo {
+        started_at: std::time::SystemTime::now(),
+        listen: addr.to_string(),
+        tls: tls.is_some(),
+        mutual_tls: tls.as_ref().is_some_and(|t| t.client_ca_pem.is_some()),
+        auth: auth.is_enabled(),
+        config_file: config_file.map(|p| p.display().to_string()),
+        database: describe_database(&config.database),
+        log_file: std::env::var(DAEMON_LOG_ENV).ok(),
+        webhook_url: config.webhook.as_ref().map(|w| w.url.clone()),
+    };
+    let _status_socket = start_status_socket(engine.clone(), info);
+
     tracing::info!(%addr, models = config.model_count(), "apollo listening");
     apollo_server::serve_with_shutdown(
         engine.clone(),
@@ -122,6 +142,135 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     tracing::info!("apollo shut down cleanly");
     Ok(())
+}
+
+/// Set by `start --daemon` for the detached child: the log file it writes to.
+const DAEMON_LOG_ENV: &str = "APOLLO_DAEMON_LOG";
+
+/// Static facts about this server, reported by `apollo status`.
+#[derive(Clone)]
+struct ServerInfo {
+    started_at: std::time::SystemTime,
+    listen: String,
+    tls: bool,
+    mutual_tls: bool,
+    auth: bool,
+    config_file: Option<String>,
+    database: String,
+    log_file: Option<String>,
+    webhook_url: Option<String>,
+}
+
+/// The configured database, without credentials.
+fn describe_database(db: &apollo_config::DatabaseConfig) -> String {
+    use apollo_config::Backend;
+    match db.backend {
+        Backend::Sqlite => format!("sqlite {}", db.sqlite.clone().unwrap_or_default().path),
+        Backend::Surrealdb => match &db.surrealdb {
+            Some(s) => format!("surrealdb {} ({}/{})", s.url, s.namespace, s.database),
+            None => "surrealdb".into(),
+        },
+        Backend::Postgres => "postgres".into(),
+    }
+}
+
+/// Serve `apollo status` on the local status socket. Failure is logged, not
+/// fatal: the server works without it.
+#[cfg(unix)]
+fn start_status_socket(engine: Engine, info: ServerInfo) -> Option<crate::status::SocketGuard> {
+    let path = match crate::status::socket_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "status socket disabled");
+            return None;
+        }
+    };
+    let report = move || {
+        let engine = engine.clone();
+        let info = info.clone();
+        async move { build_report(&engine, &info).await }
+    };
+    match crate::status::serve_socket(&path, report) {
+        Ok(guard) => {
+            tracing::info!(socket = %path.display(), "status socket ready (`apollo status`)");
+            Some(guard)
+        }
+        Err(e) => {
+            tracing::warn!(socket = %path.display(), error = %e, "status socket disabled");
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn start_status_socket(_engine: Engine, _info: ServerInfo) -> Option<()> {
+    None
+}
+
+/// Combine the static server facts with the engine's live state.
+#[cfg(unix)]
+async fn build_report(
+    engine: &Engine,
+    info: &ServerInfo,
+) -> anyhow::Result<crate::status::StatusReport> {
+    use crate::status::{self as st, unix_secs};
+    let s = engine.status().await?;
+    Ok(st::StatusReport {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        pid: std::process::id(),
+        started_at: unix_secs(info.started_at),
+        listen: info.listen.clone(),
+        tls: info.tls,
+        mutual_tls: info.mutual_tls,
+        auth: info.auth,
+        config_file: info.config_file.clone(),
+        database: info.database.clone(),
+        log_file: info.log_file.clone(),
+        device: s.device,
+        memory: st::Memory {
+            used_bytes: s.memory_bytes,
+            limit_bytes: s.max_memory_bytes,
+        },
+        queue: st::Queue {
+            items_in_flight: s.items_in_flight,
+            max_pending: s.max_pending,
+            slots_total: s.slots_total,
+            slots_busy: s.slots_busy,
+            slots_waiting: s.slots_waiting,
+        },
+        tasks: st::Tasks {
+            queued: s.tasks.queued,
+            processing: s.tasks.processing,
+            completed: s.tasks.completed,
+            failed: s.tasks.failed,
+            cancelled: s.tasks.cancelled,
+        },
+        webhook: match (&info.webhook_url, s.webhooks_pending) {
+            (Some(url), Some(pending)) => Some(st::Webhook {
+                url: url.clone(),
+                pending,
+            }),
+            _ => None,
+        },
+        models: s
+            .models
+            .into_iter()
+            .map(|m| st::Model {
+                label: m.label,
+                repo: m.repo,
+                architecture: m.architecture,
+                enabled: m.enabled,
+                loaded: m.loaded,
+                keep_in_memory: m.keep_in_memory,
+                batch: m.batch,
+                input_size: m.input_size,
+                queued_jobs: m.queued_jobs,
+                loads: m.loads,
+                classified: m.classified,
+                last_used: m.last_used.map(unix_secs),
+            })
+            .collect(),
+    })
 }
 
 /// How often a running server re-checks the token revocation file.
@@ -216,6 +365,8 @@ fn spawn_detached(args: &StartArgs) -> anyhow::Result<()> {
     let log_err = log.try_clone().context("cloning log handle")?;
 
     let mut cmd = Command::new(exe);
+    // Lets the detached server report its log file in `apollo status`.
+    cmd.env(DAEMON_LOG_ENV, &log_path);
     cmd.arg("start");
     if let Some(c) = &args.config {
         cmd.arg("--config").arg(c);

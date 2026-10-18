@@ -98,7 +98,7 @@ One row per `(item, model)`. `PRIMARY KEY (task_id, item_idx, label)`, cascading
 
 ### `frames`
 
-The **video‑scan checkpoint**: one row per classified frame, written incrementally so an interrupted scan resumes without re‑classifying frames. `PRIMARY KEY (task_id, item_idx, label, frame_index)`, cascading from `model_results`.
+The **video‑scan checkpoint**: one row per classified frame, written one batch (one transaction) at a time so an interrupted scan resumes without re‑classifying frames. `PRIMARY KEY (task_id, item_idx, label, frame_index)`, cascading from `model_results`.
 
 | Column | Type | Notes |
 |--------|------|-------|

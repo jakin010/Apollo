@@ -16,10 +16,16 @@ fn parses_and_validates_example() {
     assert_eq!(cfg.database.backend, Backend::Sqlite);
 
     let nsfw = cfg.models.get("nsfw").expect("nsfw model");
-    assert_eq!(nsfw.video_strategy.as_deref(), Some("progressive_scan"));
+    assert_eq!(nsfw.video_strategy.as_deref(), Some("coverage_scan"));
     let ee = nsfw.early_exit.as_ref().expect("nsfw early_exit");
     assert_eq!(ee.labels, vec![1u32]);
 
+    let coverage = cfg.strategies.get("coverage_scan").expect("strategy");
+    assert!(coverage.early_exit);
+    assert_eq!(
+        coverage.sampling.last().map(|s| s.method),
+        Some(SamplingKind::Refine)
+    );
     let scan = cfg.strategies.get("progressive_scan").expect("strategy");
     assert_eq!(scan.sampling[0].method, SamplingKind::Iframes);
     assert!(scan.early_exit);
@@ -41,6 +47,19 @@ fn defaults_apply_to_minimal_model() {
     assert_eq!(m.max_concurrent, 8);
     assert_eq!(m.timeout, 30);
     assert_eq!(cfg.app.port, 8080);
+}
+
+#[test]
+fn device_defaults_to_auto_and_parses_overrides() {
+    use crate::DevicePreference;
+
+    assert_eq!(
+        load::from_str("").unwrap().app.device,
+        DevicePreference::Auto
+    );
+    let cfg = load::from_str("[app]\ndevice = \"cpu\"\n").unwrap();
+    assert_eq!(cfg.app.device, DevicePreference::Cpu);
+    assert!(load::from_str("[app]\ndevice = \"tpu\"\n").is_err());
 }
 
 #[test]
@@ -164,4 +183,105 @@ fn tls_and_auth_paths_resolve_from_the_config_dir() {
         "{err}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A coverage-scan strategy with a scene `min_gap` and a final `refine` step,
+/// used by `model` with an early-exit trigger at 0.85. `extra` is appended.
+fn coverage_scan(extra: &str) -> String {
+    format!(
+        r#"
+        [strategies.cs]
+        early_exit = true
+        [[strategies.cs.sampling]]
+        step = 1
+        method = "uniform"
+        count = 8
+        [[strategies.cs.sampling]]
+        step = 2
+        method = "scene"
+        threshold = 0.3
+        min_gap = 1.0
+        [[strategies.cs.sampling]]
+        step = 3
+        method = "refine"
+        min_score = 0.1
+        window = 2.0
+        fps = 5
+        [models.m]
+        architecture = "vit"
+        repo = "a/b"
+        video_strategy = "cs"
+        {extra}
+        "#
+    )
+}
+
+#[test]
+fn accepts_scene_min_gap_and_a_final_refine_step() {
+    let cfg = load::from_str(&coverage_scan(
+        "[models.m.early_exit]\nlabels = [1]\nthreshold = 0.85",
+    ))
+    .unwrap();
+    cfg.validate().unwrap();
+    let steps = &cfg.strategies["cs"].sampling;
+    assert_eq!(steps[1].min_gap, Some(1.0));
+    assert_eq!(steps[2].method, SamplingKind::Refine);
+}
+
+#[test]
+fn refine_needs_the_models_trigger_below_its_min_score() {
+    // No early_exit on the model: refine has nothing to look closer at.
+    let err = load::from_str(&coverage_scan(""))
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("needs the model's"), "{err}");
+
+    // min_score at or above the trigger threshold can never be ambiguous.
+    let err = load::from_str(&coverage_scan(
+        "[models.m.early_exit]\nlabels = [1]\nthreshold = 0.05",
+    ))
+    .unwrap()
+    .validate()
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("must be below the early_exit threshold"),
+        "{err}"
+    );
+}
+
+#[test]
+fn rejects_misplaced_or_incomplete_refine_and_min_gap() {
+    let cfg = load::from_str(
+        r#"
+        [strategies.s]
+        [[strategies.s.sampling]]
+        step = 1
+        method = "refine"
+        min_score = 0.1
+        [[strategies.s.sampling]]
+        step = 2
+        method = "fps"
+        fps = 1
+        min_gap = 2.0
+        [[strategies.s.sampling]]
+        step = 3
+        method = "scene"
+        threshold = 0.3
+        min_gap = -1.0
+        "#,
+    )
+    .unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    for expected in [
+        "requires 'window'",
+        "requires 'fps'",
+        "must come after all of them",
+        "'min_gap' only applies to method 'scene'",
+        "min_gap must be a finite number",
+    ] {
+        assert!(err.contains(expected), "missing {expected:?} in {err}");
+    }
 }

@@ -197,3 +197,42 @@ async fn upload_dir_is_private() {
     }
     assert!(dir.ends_with("uploads"));
 }
+
+#[tokio::test]
+async fn status_reports_tasks_queue_and_models() {
+    let f = fixture().await;
+    f.storage
+        .create_task(&task("q", TaskState::Queued, ItemState::Queued, None))
+        .await
+        .unwrap();
+    f.storage
+        .create_task(&task("c", TaskState::Completed, ItemState::Completed, None))
+        .await
+        .unwrap();
+    f.storage
+        .create_task(&task(
+            "c2",
+            TaskState::Completed,
+            ItemState::Completed,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    let s = f.engine.status().await.unwrap();
+    assert_eq!(
+        s.tasks,
+        crate::TaskCounts {
+            queued: 1,
+            completed: 2,
+            ..Default::default()
+        }
+    );
+    assert_eq!(
+        (s.items_in_flight, s.slots_busy, s.slots_waiting),
+        (0, 0, 0)
+    );
+    assert!(s.slots_total >= 1);
+    assert_eq!(s.webhooks_pending, None, "no webhook configured");
+    assert!(s.models.is_empty(), "fixture configures no models");
+}

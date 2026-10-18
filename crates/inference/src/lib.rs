@@ -23,7 +23,7 @@ mod error;
 mod loader;
 mod preprocess;
 
-pub use device::{DeviceKind, select_device};
+pub use device::{DeviceKind, open_device, select_device};
 pub use error::InferenceError;
 pub use preprocess::Normalization;
 
@@ -32,9 +32,12 @@ pub trait ImageClassifier: Send + Sync {
     /// Classify a batch of images, one [`Classification`] per input. Label
     /// selection is architecture-specific (vit: top-5 ∪ >0.90; siglip: a sigmoid
     /// threshold).
-    fn classify(&self, images: &[DecodedImage]) -> Result<Vec<Classification>, InferenceError>;
+    fn classify(&self, images: &[&DecodedImage]) -> Result<Vec<Classification>, InferenceError>;
     /// The model's label set, ordered by class index.
     fn labels(&self) -> &[String];
+    /// Side of the square input the model is fed; images of exactly this size
+    /// skip resizing (video frames are extracted at this size).
+    fn input_size(&self) -> u32;
 }
 
 /// Download (if not cached) and load the model named by `cfg` onto `device`.

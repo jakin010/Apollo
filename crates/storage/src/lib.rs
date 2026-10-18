@@ -100,6 +100,16 @@ pub trait Storage: Send + Sync {
         frame: &Frame,
     ) -> Result<(), StorageError>;
 
+    /// Append (or replace) a batch of classified frames atomically: one
+    /// transaction instead of one write per frame.
+    async fn append_frames(
+        &self,
+        task_id: &str,
+        item: usize,
+        label: &str,
+        frames: &[Frame],
+    ) -> Result<(), StorageError>;
+
     /// Frames already classified for a (item, model), ordered by index. Seeds the
     /// dedupe set on resume.
     async fn load_frames(
@@ -128,6 +138,10 @@ pub trait Storage: Send + Sync {
     ) -> Result<u32, StorageError>;
 
     // ------------------------------- resume ------------------------------
+
+    /// Number of tasks in each state (states with no tasks are omitted). Backs
+    /// `apollo status`.
+    async fn count_tasks_by_state(&self) -> Result<Vec<(TaskState, u64)>, StorageError>;
 
     /// All tasks still in a non-terminal state, fully reconstructed, for
     /// re-queueing on startup.

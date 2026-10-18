@@ -98,11 +98,28 @@ async fn exercise(store: &dyn Storage) {
             .await
             .unwrap();
     }
+    // A batch: replaces frame 2, adds 3 and 4.
+    let batch: Vec<Frame> = (2..5u32)
+        .map(|i| Frame {
+            timestamp: i as f64 + 0.5,
+            index: i,
+            classification: Classification {
+                predictions: vec![Prediction {
+                    label: i,
+                    score: 0.1,
+                }],
+            },
+        })
+        .collect();
+    store.append_frames("t1", 0, "nsfw", &batch).await.unwrap();
+    store.append_frames("t1", 0, "nsfw", &[]).await.unwrap();
     let frames = store.load_frames("t1", 0, "nsfw").await.unwrap();
     assert_eq!(
         frames.iter().map(|f| f.index).collect::<Vec<_>>(),
-        vec![0, 1, 2]
+        vec![0, 1, 2, 3, 4]
     );
+    assert_eq!(frames[2].timestamp, 2.5);
+    assert_eq!(frames[4].classification.predictions[0].label, 4);
     let t = store.get_task("t1").await.unwrap().unwrap();
     assert_eq!(t.items[0].results["general"].output, Some(out.clone()));
     assert_eq!(t.items[0].results["nsfw"].state, ModelState::Processing);
@@ -122,6 +139,14 @@ async fn exercise(store: &dyn Storage) {
     assert_eq!(
         store.get_task("t1").await.unwrap().unwrap().items[0].retries,
         2
+    );
+
+    // --- counts by state (t1 processing, anon queued)
+    let mut counts = store.count_tasks_by_state().await.unwrap();
+    counts.sort_by_key(|(s, _)| s.as_str());
+    assert_eq!(
+        counts,
+        vec![(TaskState::Processing, 1), (TaskState::Queued, 1)]
     );
 
     // --- conditional cancel: active -> cancelled; finished stays finished

@@ -48,7 +48,7 @@ pub(crate) fn load(hub: &Hub, device: &Device) -> Result<VitClassifier, Inferenc
 }
 
 impl ImageClassifier for VitClassifier {
-    fn classify(&self, images: &[DecodedImage]) -> Result<Vec<Classification>, InferenceError> {
+    fn classify(&self, images: &[&DecodedImage]) -> Result<Vec<Classification>, InferenceError> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
@@ -76,5 +76,9 @@ impl ImageClassifier for VitClassifier {
 
     fn labels(&self) -> &[String] {
         &self.labels
+    }
+
+    fn input_size(&self) -> u32 {
+        self.norm.size as u32
     }
 }

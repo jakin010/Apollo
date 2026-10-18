@@ -16,6 +16,7 @@ __*
 *.log
 *egg-info
 .*.lock
+.claude
 
 # database
 *.db
