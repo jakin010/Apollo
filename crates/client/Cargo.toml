@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # The wire contract. Pulls tonic + prost; needs `protoc` at build time.
 apollo-proto = { path = "../proto" }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-ring", "tls-native-roots", "tls-webpki-roots"] }
 thiserror = "2"
 futures = "0.3"
 pasetors = "0.7"

@@ -8,19 +8,14 @@ import "common.proto";
 // Webhook service — implemented by the RECEIVER, called by the apollo server.
 //
 // The apollo server is the client here, calling the receiver configured by
-// [webhook].url. Fired once per item as that item reaches a terminal state; the
-// message carries the full current Task. Delivery is at-least-once, so receivers
-// should dedupe (e.g. by Task.id + the index of the terminal item). When the
-// server is configured with a secret, each call carries an
-// `x-apollo-webhook-signature` metadata header (lowercase-hex HMAC-SHA256 of the
-// task id) so the receiver can verify authenticity.
-//
-// Two methods, same endpoint, same signing, same bare-Task payload:
-//   * TaskStatus — every item reaching a terminal state (queued→…→completed/
-//     failed/cancelled), including intermediate transitions like `retrying`.
-//   * ItemFailed — additionally called for an item that has exhausted all retries
-//     (a dead-letter signal). The permanently-failed item is the one in the
-//     FAILED state; dedupe the same way.
+// [webhook].url. TaskStatus fires when the task's input reaches a terminal state
+// (Task.result is `models`, `error`, or `state: CANCELLED`) and, best-effort, on
+// intermediate transitions (processing, retrying — reported as PROCESSING). The
+// message always carries the full current Task. Delivery of the terminal update
+// is at-least-once, so receivers should dedupe by Task.id. When the server is
+// configured with a secret, each call carries an `x-apollo-webhook-signature`
+// metadata header (lowercase-hex HMAC-SHA256 of the task id) so the receiver can
+// verify the caller; it does not cover the payload.
 // =============================================================================
 
 service Webhook {

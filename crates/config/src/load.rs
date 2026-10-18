@@ -46,7 +46,8 @@ pub fn load(cli_config: Option<&Path>) -> Result<Config, ConfigError> {
 }
 
 /// Run-only overrides supplied on the `start` command line. These do not persist
-/// to the file (that is what `config set` is for).
+/// to the file (that is what `config set` is for). `webhook_url` replaces
+/// `[webhook].url`, or enables delivery to that URL when the section is absent.
 #[derive(Debug, Default, Clone)]
 pub struct Overrides {
     pub endpoint: Option<String>,
@@ -76,10 +77,19 @@ impl Config {
         if let Some(p) = o.port {
             self.app.port = p;
         }
-        if let Some(u) = &o.webhook_url
-            && let Some(w) = self.webhook.as_mut()
-        {
-            w.url = u.clone();
+        if let Some(u) = &o.webhook_url {
+            match self.webhook.as_mut() {
+                Some(w) => w.url = u.clone(),
+                // No [webhook] section: the flag alone enables delivery for this
+                // run (unsigned, default redelivery interval).
+                None => {
+                    self.webhook = Some(crate::schema::WebhookConfig {
+                        url: u.clone(),
+                        secret: None,
+                        redelivery_secs: crate::defaults::redelivery_secs(),
+                    })
+                }
+            }
         }
     }
 }

@@ -45,7 +45,7 @@ Submits one input as a byte stream instead of a URL — useful for local content
 - The **first** message MUST be the `init` frame (`ClassifyStreamInit`): the models **or** a `pipeline` to run (set one, exactly as with `Classify`), and whether the bytes are a `video` (`true`) or a single image (`false`).
 - Every subsequent message carries `data` bytes, **in order**. Send **as many `data` frames as you like** — keep streaming until you close the request; you don't have to send the whole input in one frame. The server appends each frame to the staging file as it arrives, so neither side needs to hold the entire input in memory.
 
-The server streams the bytes to a staging file, enforcing the upload byte cap (`[limits].max_download`) **incrementally** as frames arrive, then submits it exactly like `Classify`. A second `init`, a stream with no data, an `init` frame that sets neither `models` nor `pipeline`, or exceeding the cap is rejected (`InvalidArgument` / `ResourceExhausted`) and the staging file is cleaned up. The staged file is removed automatically once the task reaches a terminal state.
+The `init` frame is validated (models or pipeline, modality, server capacity) **before** any content is accepted, so a bad request fails fast without uploading anything. The server then streams the bytes to an owner‑only staging file (under `[app].cache_dir/uploads`, or a per‑user cache directory), enforcing the upload byte cap (`[limits].max_download`) **incrementally** as frames arrive, then submits it exactly like `Classify`. A second `init`, a stream with no data, an `init` frame that sets neither `models` nor `pipeline`, or exceeding the cap is rejected (`InvalidArgument` / `ResourceExhausted`) and the staging file is cleaned up. The staged file is removed automatically once the task reaches a terminal state.
 
 ---
 
@@ -150,7 +150,7 @@ message Prediction { uint32 label = 1; float score = 2; }
 
 **Result semantics:**
 
-- A `Task` reports its outcome through a single `result` oneof: `error` for a task‑level failure, `state` while it is queued / processing (or cancelled), or `models` once it finishes. The presence of `models` is itself the "completed" signal and `error` the "failed" signal — there is no explicit `COMPLETED`/`FAILED` state. Each `Model` likewise carries exactly one of an `error`, a live `state`, or a result payload (`classification` / `frame_scan`).
+- A `Task` reports its outcome through a single `result` oneof: `error` for a task‑level failure, `state` while it is queued / processing (or cancelled), or `models` once it finishes. A task whose input is being **retried** after a transient failure still reports `state: PROCESSING` — `error` only ever means it has failed for good. The presence of `models` is itself the "completed" signal and `error` the "failed" signal — there is no explicit `COMPLETED`/`FAILED` state. Each `Model` likewise carries exactly one of an `error`, a live `state`, or a result payload (`classification` / `frame_scan`).
 - A `Classification` returns the **top 5 predictions unioned with any label scoring above 0.90** — so a confident sixth label is never dropped, and you always get at least the top few.
 - `label` is an integer id, never a name: a class index for `vit`, a label‑list index for `siglip` with a plain `labels` list, or a **taxonomy child‑category id** for `siglip` with a taxonomy. Map ids back to names using your `labels`/taxonomy definition.
 - For `siglip`, `score` is an independent **sigmoid probability**; the `score_threshold` on the model controls which labels are kept.
@@ -176,6 +176,8 @@ enum ErrorType {
   ERROR_TYPE_INTERNAL          = 7;   // an unexpected server error
 }
 ```
+
+When each kind is used: `FETCH` — the input could not be retrieved (unreachable, refused by the SSRF / local‑file policy, HTTP error); `DECODE` — it was retrieved but could not be decoded or probed, or exceeds `max_pixels` / `max_video_seconds`; `INFERENCE` — the model failed on it; `TIMEOUT` — one classification exceeded the model's `timeout`; `MODEL_UNAVAILABLE` — the model's weights could not be loaded; `INTERNAL` — anything else (e.g. a task abandoned after repeated crashes).
 
 `Error` appears at two levels: on `Task.result` (a task‑wide failure such as an unfetchable input) and on `Model.result` (a single model's failure). Switch on `kind` for programmatic handling; `message` carries the detail (for a purely ad‑hoc error, `kind` is `UNSPECIFIED` and everything is in `message`).
 
@@ -276,4 +278,4 @@ grpcurl -plaintext -H "authorization: v4.public.…" \
   -d '{"task_id": "01H…"}' localhost:8080 apollo.v1.Inference/GetTask
 ```
 
-`ClassifyStream` is a client‑streaming RPC (init frame, then data frames); it is normally driven from the generated client (`apollo-client`). Its `Client::classify_stream` takes a `StreamInit` (models or pipeline, plus `video`) and an async stream of byte chunks, so you can feed a large file or live source incrementally; `Client::classify_stream_bytes` is the convenience for content already in memory.
+`ClassifyStream` is a client‑streaming RPC (init frame, then data frames); it is normally driven from the generated client (`apollo-client`, which also connects to `https://` endpoints over TLS). Its `Client::classify_stream` takes a `StreamInit` (models or pipeline, plus `video`) and an async stream of byte chunks, so you can feed a large file or live source incrementally; `Client::classify_stream_bytes` is the convenience for content already in memory.

@@ -284,6 +284,19 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    async fn cancel_task_if_active(&self, id: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE tasks SET state = ?, updated_at = ?
+             WHERE id = ? AND state IN ('queued', 'processing')",
+        )
+        .bind(TaskState::Cancelled.as_str())
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn set_item_state(
         &self,
         task_id: &str,
@@ -447,6 +460,16 @@ impl Storage for SqliteStorage {
         Ok(n as u32)
     }
 
+    async fn release_resume_attempts(&self) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE tasks SET attempts = attempts - 1
+             WHERE state IN ('queued', 'processing') AND attempts > 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>> {
         let rows = sqlx::query(
             "SELECT task_id, idx FROM items
@@ -586,6 +609,22 @@ impl Storage for SqliteStorage {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn purge_cache_before(&self, cutoff_unix_secs: i64) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let a = sqlx::query("DELETE FROM cache WHERE created_at < ?")
+            .bind(cutoff_unix_secs)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let b = sqlx::query("DELETE FROM url_cache WHERE created_at < ?")
+            .bind(cutoff_unix_secs)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(a + b)
     }
 }
 
@@ -730,6 +769,92 @@ mod tests {
             .unwrap();
         assert_eq!(store.purge_finished_before(now() + 10).await.unwrap(), 1);
         assert!(store.get_task("task-1").await.unwrap().is_none());
+
+        cleanup(&cfg);
+    }
+
+    #[tokio::test]
+    async fn cancel_only_applies_to_active_tasks() {
+        let cfg = temp_cfg();
+        let store = SqliteStorage::connect(&cfg).await.unwrap();
+        store.migrate().await.unwrap();
+        store.create_task(&sample_task()).await.unwrap();
+
+        assert!(store.cancel_task_if_active("task-1").await.unwrap());
+        let t = store.get_task("task-1").await.unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Cancelled);
+
+        // A finished task is never flipped to cancelled.
+        store
+            .set_task_state("task-1", TaskState::Completed)
+            .await
+            .unwrap();
+        assert!(!store.cancel_task_if_active("task-1").await.unwrap());
+        let t = store.get_task("task-1").await.unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Completed);
+        assert!(!store.cancel_task_if_active("missing").await.unwrap());
+
+        cleanup(&cfg);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_releases_one_attempt() {
+        let cfg = temp_cfg();
+        let store = SqliteStorage::connect(&cfg).await.unwrap();
+        store.migrate().await.unwrap();
+        store.create_task(&sample_task()).await.unwrap();
+
+        // A never-resumed task stays at zero.
+        assert_eq!(store.release_resume_attempts().await.unwrap(), 0);
+        store.increment_attempts("task-1").await.unwrap();
+        store.increment_attempts("task-1").await.unwrap();
+        assert_eq!(store.release_resume_attempts().await.unwrap(), 1);
+        assert_eq!(store.increment_attempts("task-1").await.unwrap(), 2);
+
+        // Finished tasks are left alone.
+        store
+            .set_task_state("task-1", TaskState::Completed)
+            .await
+            .unwrap();
+        assert_eq!(store.release_resume_attempts().await.unwrap(), 0);
+
+        cleanup(&cfg);
+    }
+
+    #[tokio::test]
+    async fn cache_purge_drops_only_stale_entries() {
+        let cfg = temp_cfg();
+        let store = SqliteStorage::connect(&cfg).await.unwrap();
+        store.migrate().await.unwrap();
+        let out = ModelOutput::Classification(Classification::default());
+        store.cache_store("h", "m", "main", &out).await.unwrap();
+        store.url_cache_store("u", "m", "main", "h").await.unwrap();
+
+        // Nothing is older than an hour ago.
+        assert_eq!(store.purge_cache_before(now() - 3600).await.unwrap(), 0);
+        assert!(
+            store
+                .cache_lookup("h", "m", "main", 0)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(store.purge_cache_before(now() + 10).await.unwrap(), 2);
+        assert!(
+            store
+                .cache_lookup("h", "m", "main", 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .url_cache_lookup("u", "m", "main", 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         cleanup(&cfg);
     }

@@ -4,6 +4,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use tokio::io::AsyncWriteExt;
 use tonic::service::interceptor::InterceptedService;
@@ -97,15 +98,36 @@ impl Inference for InferenceService {
             ));
         }
 
-        // Stage the streamed bytes to a file under the upload dir.
-        let dir = self.engine.upload_dir();
-        tokio::fs::create_dir_all(&dir)
+        // Validate models / pipeline and capacity before accepting a single byte,
+        // so a bad or unservable request cannot make the server stage a large
+        // upload first. `submit` re-checks everything below.
+        let probe = Submission {
+            input: Input::Bytes {
+                path: PathBuf::new(),
+                video: init.video,
+            },
+            models: init.models.clone(),
+            pipeline: init.pipeline.clone(),
+        };
+        self.engine
+            .check_submission(probe)
+            .map_err(engine_to_status)?;
+
+        // Stage the streamed bytes to an owner-only file in the private upload dir.
+        let engine = self.engine.clone();
+        let dir = tokio::task::spawn_blocking(move || engine.ensure_upload_dir())
             .await
+            .map_err(|e| Status::internal(format!("creating upload dir: {e}")))?
             .map_err(|e| Status::internal(format!("creating upload dir: {e}")))?;
         let path = dir.join(format!("{}.bin", uuid::Uuid::new_v4()));
         let cap = self.engine.max_upload_bytes();
 
-        let mut file = tokio::fs::File::create(&path)
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
             .await
             .map_err(|e| Status::internal(format!("creating upload file: {e}")))?;
         let mut total: u64 = 0;

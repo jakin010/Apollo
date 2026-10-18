@@ -61,7 +61,7 @@ One row per submission.
 |--------|------|-------|
 | `id` | TEXT | Primary key (the task id). |
 | `state` | TEXT | `TaskState` token. |
-| `attempts` | INTEGER | Resume‑attempt count; a task is failed once this exceeds the cap (poison‑task guard). |
+| `attempts` | INTEGER | Crash‑interrupted resume count; a task is failed once this exceeds the cap (poison‑task guard). A graceful shutdown gives the attempt back, so restarts and deploys never count. |
 | `created_at` / `updated_at` | INTEGER | UNIX seconds. |
 
 Indexed on `state` (`idx_tasks_state`) for fast recovery scans.
@@ -93,7 +93,7 @@ One row per `(item, model)`. `PRIMARY KEY (task_id, item_idx, label)`, cascading
 | `state` | TEXT | `ModelState` token. |
 | `output_json` | TEXT | Serialized `ModelOutput` (`Classification`/`FrameScan`), when done. |
 | `error` | TEXT | Model‑level error as JSON, if failed. |
-| `steps_completed` | INTEGER | How many video sampling steps have fully finished (lets resume skip cheap re‑extraction). |
+| `steps_completed` | INTEGER | Reserved for skipping finished sampling steps on resume; not used yet (resume relies on the `frames` rows). |
 
 ### `frames`
 
@@ -138,8 +138,8 @@ Records use composite record ids (e.g. `item:[task_id, idx]`, `model_result:[tas
 On startup the engine loads every task still in a non‑terminal state, fully reconstructed from these tables, and re‑queues it. Recovery relies on:
 
 - `tasks.state` (indexed) to find incomplete work,
-- `model_results.state` + `frames` + `steps_completed` to skip already‑finished models and frames,
-- `tasks.attempts` (bumped per resume) to **fail a poison task** once it exceeds its cap instead of crash‑looping,
+- `model_results.state` + `frames` to skip already‑finished models and frames,
+- `tasks.attempts` (bumped per resume, given back on graceful shutdown) to **fail a poison task** once it exceeds its cap instead of crash‑looping — its items are marked failed, its webhook fires, and its staged upload is removed,
 - `items.webhook_delivered` to redeliver any `TaskStatus` webhook that a crash left un‑acknowledged.
 
 ---
@@ -157,4 +157,4 @@ When `[cache]` is enabled, model outputs are cached so identical inputs skip inf
 - **Content cache** (`cache` table): keyed by the input's **content hash** + model + revision. A hit returns the stored `ModelOutput` directly.
 - **URL→content hint** (`url_cache` table): maps a URL's hash to the content hash it last resolved to, so a repeated URL can reach the content cache without re‑downloading.
 
-Freshness is controlled by `[cache].ttl_secs`: a lookup passes a lower bound on `created_at`, so entries older than the TTL are ignored (and become eligible for purge). Omit `ttl_secs` for entries that never expire. Keying on `revision` means bumping a model's revision naturally invalidates its cached outputs.
+Freshness is controlled by `[cache].ttl_secs`: a lookup passes a lower bound on `created_at`, so entries older than the TTL are ignored, and an hourly job deletes them. Omit `ttl_secs` for entries that never expire. Keying on `revision` means bumping a model's revision naturally invalidates its cached outputs.

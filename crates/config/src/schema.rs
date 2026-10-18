@@ -38,6 +38,7 @@ pub struct Config {
 /// every Inference RPC must carry a valid PASETO v4 token signed by the matching
 /// secret key (mint tokens with `apollo token`). Health and reflection stay open.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// PASERK-encoded v4 **public** key (`k4.public.…`) used to verify tokens.
     pub public_key: String,
@@ -47,6 +48,7 @@ pub struct AuthConfig {
 /// by content hash (with a url→content-hash hint) so identical inputs skip
 /// inference. A bare `[cache]` section turns it on.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     /// Master switch. Defaults to true so `[cache]` alone enables caching.
     #[serde(default = "crate::defaults::cache_enabled")]
@@ -141,7 +143,7 @@ pub struct WebhookConfig {
 
 /// Safety limits applied when fetching remote inputs (SSRF and resource guards).
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Max bytes downloaded for a single input (e.g. `512mb`; `0` = unlimited).
     pub max_download: String,
@@ -265,7 +267,7 @@ pub struct PostgresConfig {
     pub max_connections: u32,
 }
 
-/// `[database.surrealdb]` — future backend.
+/// `[database.surrealdb]` — remote SurrealDB backend.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurrealdbConfig {

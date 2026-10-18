@@ -20,6 +20,11 @@ use crate::sampling::{self, FrameRef};
 /// duplicates across steps.
 pub const DEDUPE_TOLERANCE: f64 = 0.05;
 
+/// Upper bound on frames planned for one video. Keyframe and scene lists come
+/// from the (untrusted) file, so the plan is capped rather than allowed to grow
+/// without limit. One hour at 5 fps is 18 000 frames.
+pub const MAX_PLANNED_FRAMES: usize = 100_000;
+
 /// Build the ordered, de-duplicated frame plan for a video.
 pub async fn plan(
     path: &Path,
@@ -40,14 +45,28 @@ pub async fn plan(
     };
     let max_seek = (info.duration - guard).max(0.0);
 
+    // `chosen` keeps processing order; `sorted` mirrors it in time order so the
+    // duplicate check is a binary search against the two nearest neighbours.
     let mut chosen: Vec<f64> = Vec::new();
-    for step in &ordered {
+    let mut sorted: Vec<f64> = Vec::new();
+    'steps: for step in &ordered {
         let mut times = sampling::step_timestamps(path, info, step).await?;
         times.sort_by(cmp_f64);
         for t in times {
+            if !t.is_finite() {
+                continue;
+            }
             let t = t.clamp(0.0, max_seek);
-            if !chosen.iter().any(|&c| (c - t).abs() <= DEDUPE_TOLERANCE) {
-                chosen.push(t);
+            let pos = sorted.partition_point(|&c| c < t);
+            let near_prev = pos > 0 && t - sorted[pos - 1] <= DEDUPE_TOLERANCE;
+            let near_next = pos < sorted.len() && sorted[pos] - t <= DEDUPE_TOLERANCE;
+            if near_prev || near_next {
+                continue;
+            }
+            sorted.insert(pos, t);
+            chosen.push(t);
+            if chosen.len() >= MAX_PLANNED_FRAMES {
+                break 'steps;
             }
         }
     }
@@ -204,6 +223,19 @@ mod tests {
         let max_seek = 60.0 - 1.0 / 30.0;
         assert!(!frames.is_empty());
         assert!(frames.iter().all(|f| f.timestamp <= max_seek + 1e-9));
+    }
+
+    #[tokio::test]
+    async fn plan_is_capped() {
+        // 200k well-separated frames would all survive dedupe; the cap holds.
+        let frames = plan(
+            Path::new("unused"),
+            &info(10_000_000.0, 30.0),
+            &[step(1, SamplingKind::Uniform, Some(200_000), None)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(frames.len(), MAX_PLANNED_FRAMES);
     }
 
     #[test]

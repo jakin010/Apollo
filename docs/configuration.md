@@ -35,12 +35,12 @@ Relative `taxonomy_file` paths inside a model are resolved against the **config 
 | `endpoint` | string | `"0.0.0.0"` | Bind host/IP. (The example uses `127.0.0.1` for local‑only.) |
 | `port` | u16 | `8080` | Bind port. |
 | `cache_dir` | string | *(none)* | Optional directory for model/download caches. |
-| `max_concurrent` | u32 | `20` | Global ceiling on concurrent in‑flight inferences (your VRAM budget). |
+| `max_concurrent` | u32 | `20` | Global ceiling on items being processed at once — fetching their input and running models (your VRAM budget). A slot is released while an item backs off between retries. |
 | `idle_timeout` | u32 (secs) | `300` | How long a model stays resident while idle before its weights are unloaded, unless it sets `keep_in_memory`. |
 | `log_level` | string | `"info"` | `trace`/`debug`/`info`/`warn`/`error`. The `RUST_LOG` env var overrides this at startup. |
 | `max_memory` | size | `"4gb"` | Soft resident‑memory ceiling. New work is rejected with `RESOURCE_EXHAUSTED` while usage is above it (`0` = off). |
 | `max_pending` | u32 | `1024` | Max items queued or in‑flight before submissions are rejected with `RESOURCE_EXHAUSTED` (backpressure). `0` = off. |
-| `max_retries` | u32 | `3` | Times a failed item is retried before it is marked failed. `0` = no retries. |
+| `max_retries` | u32 | `3` | Times an item is retried after a **transient** failure (network error, HTTP 5xx/408/429, model timeout or load failure, inference error): a failed fetch is re‑fetched, failed models (or the failed pipeline step) re‑run while finished ones are kept. Permanent failures (refused URL, HTTP 4xx, undecodable or over‑limit input) are not retried. `0` = no retries. |
 
 ---
 
@@ -91,18 +91,22 @@ Guards applied to inputs: SSRF protection when fetching remote URLs, a gate on l
 | `local_roots` | list | `[]` | Directories a local‑file input may resolve inside (checked after canonicalization, so `..`/symlinks can't escape). Empty means no local path is permitted, even with `allow_local_files = true`. |
 | `max_pixels` | u64 | `50000000` | Max decoded image pixels (width × height), rejecting decompression bombs before the pixel buffer is allocated. `0` = unlimited. Applies to still images and to sampled video frames. |
 
+> Video inputs are probed and decoded by ffmpeg restricted to the local `file` protocol, so a crafted container or playlist cannot make ffmpeg open network URLs. Downloads are stored under a fixed name (keeping only a known media extension), and frame dimensions are checked against `max_pixels` before any frame is decoded.
+>
+> If `HTTP_PROXY`/`HTTPS_PROXY` are set, remote fetches go through that proxy and the proxy resolves hostnames, so `block_private_ips` can only vet what Apollo itself resolves — enforce egress rules on the proxy too.
+
 > `max_download` caps the *encoded* bytes; `max_pixels` caps the *decoded* resolution — a small, highly compressible image can blow past memory even under the download cap, so both matter. Local‑file inputs (`file://` / bare paths) are refused unless you explicitly opt in via `allow_local_files` **and** list `local_roots`; this keeps an untrusted request from reading arbitrary files off the server.
 
 ---
 
 ## `[cache]` — result cache
 
-Optional. A bare `[cache]` section turns it on (`enabled` defaults to `true`). When enabled, model outputs are cached by **content hash** (with a URL→content‑hash hint) so identical inputs skip inference. See [database.md → Result cache](./database.md#result-cache).
+Optional. A bare `[cache]` section turns it on (`enabled` defaults to `true`). When enabled, model outputs are cached by **content hash** (with a URL→content‑hash hint) so identical inputs skip inference. The URL hint assumes a URL's content does not change within `ttl_secs` (forever, without a TTL); set a TTL if your URLs can serve different content over time. The hint is only recorded when the content came from `main`, not from `fallback`. See [database.md → Result cache](./database.md#result-cache).
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `enabled` | bool | `true` | Master switch (so `[cache]` alone enables caching). |
-| `ttl_secs` | u64 | *(none)* | Freshness window in seconds; older entries are ignored and eligible for purge. Omit for entries that never expire. |
+| `ttl_secs` | u64 | *(none)* | Freshness window in seconds; older entries are ignored and deleted by an hourly purge. Omit for entries that never expire. |
 
 ---
 
@@ -200,9 +204,9 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 | `repo` | string | *(required)* | Hugging Face repo. |
 | `revision` | string | `"main"` | Repo revision/branch/tag. |
 | `enabled` | bool | `true` | If `false`, the model is rejected at submit time. |
-| `keep_in_memory` | bool | `false` | Pin the weights resident (skip idle‑unload). |
+| `keep_in_memory` | bool | `false` | Load the weights at startup and keep them resident (skip idle‑unload). |
 | `max_concurrent` | u32 | `8` | GPU **batch size** for this model's worker. |
-| `timeout` | u32 (secs) | `30` | Max **processing** time per `(input, model)`; queue wait excluded. |
+| `timeout` | u32 (secs) | `30` | Max time for one classification — one image, or one sampled video frame — measured from when it is handed to the model's batch queue. Excludes waiting for an admission slot and loading a cold model (loading has its own 30‑minute limit). |
 | `priority` | i32 | `0` | Scheduling priority; higher is admitted from the queue ahead of earlier‑submitted lower‑priority work. May be negative. |
 | `video_strategy` | string | *(none)* | Opts an image classifier into **video** input via the named strategy. |
 | `early_exit` | table | *(none)* | Video‑scan trigger for this model (see below). |
@@ -252,7 +256,7 @@ score_threshold = 0.1        # low, so frame‑scan peaks survive aggregation
 
 ## `[pipelines.<name>]` — ordered, gated model execution
 
-A pipeline runs its steps in ascending `order` for one input, instead of running `models` as a parallel set. If a step's optional `stop_if` gate fires (any listed category id at/above the threshold on that model's output), the pipeline **early‑exits** and later steps are marked `SKIPPED` — the task completes normally and fires the task webhook. A step **failure** (inference error) instead fails the whole pipeline, which is retried up to `[app].max_retries` and then marked failed.
+A pipeline runs its steps in ascending `order` for one input, instead of running `models` as a parallel set. If a step's optional `stop_if` gate fires (any listed category id at/above the threshold on that model's output), the pipeline **early‑exits** and later steps are marked `SKIPPED` — the task completes normally and fires the task webhook. A step **failure** instead fails the whole pipeline: a transient one is retried up to `[app].max_retries` (finished steps are kept), then the item is marked failed.
 
 A request opts in by setting `pipeline = "<name>"` on its item (instead of `models`).
 
@@ -320,7 +324,7 @@ apollo keygen                            # print a PASETO v4 keypair (PASERK)
 apollo token --subject NAME [--expires 30d] [--secret-key-file PATH]
 ```
 
-- **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--daemon` re‑executes the binary detached, writing a PID file and logging to `apollo.log` in the temp dir.
+- **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url`, or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
 - **`config get|set|remove`** edit the file by **dotted key** (e.g. `models.nsfw.repo`), format‑preserving. `set` creates missing tables — and a default `[app]`‑only file — as needed.
 - **`keygen`** prints a fresh public/secret PASERK keypair.
 - **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` or the `APOLLO_SECRET_KEY` env var. `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key (revoke by rotating the keypair). The token goes in the client's `authorization` metadata.

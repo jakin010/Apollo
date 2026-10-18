@@ -13,7 +13,8 @@ use apollo_engine::{Engine, WebhookSink};
 
 #[derive(Args)]
 pub struct StartArgs {
-    /// Config file path (default: /etc/apollo/config.toml).
+    /// Config file path (default: the per-user config dir, e.g.
+    /// ~/.config/apollo/config.toml on Linux).
     #[arg(long)]
     pub config: Option<PathBuf>,
     /// Override the bind host/IP for this run only.
@@ -22,7 +23,8 @@ pub struct StartArgs {
     /// Override the port for this run only.
     #[arg(long)]
     pub port: Option<u16>,
-    /// Override the webhook receiver URL (e.g. http://127.0.0.1:9090).
+    /// Override the webhook receiver URL (e.g. http://127.0.0.1:9090); enables
+    /// delivery for this run even without a [webhook] section.
     #[arg(long = "webhook-url")]
     pub webhook_url: Option<String>,
     /// Detach and run in the background, writing a PID file.
@@ -100,9 +102,18 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
 
     tracing::info!(%addr, models = config.model_count(), "apollo listening");
-    apollo_server::serve_with_shutdown(engine, addr, crate::daemon::shutdown_signal(), auth)
-        .await
-        .context("gRPC server error")?;
+    apollo_server::serve_with_shutdown(
+        engine.clone(),
+        addr,
+        crate::daemon::shutdown_signal(),
+        auth,
+    )
+    .await
+    .context("gRPC server error")?;
+
+    // A clean stop must not count toward the poison-task cap for whatever was
+    // still in flight; those tasks resume on the next start.
+    engine.shutdown().await;
 
     tracing::info!("apollo shut down cleanly");
     Ok(())
@@ -120,10 +131,15 @@ fn init_tracing(level: &str) {
 /// The child process writes and owns the PID file once it is serving.
 fn spawn_detached(args: &StartArgs) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locating current executable")?;
-    let log_path = std::env::temp_dir().join("apollo.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let log_path = crate::daemon::log_path()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let log = options
         .open(&log_path)
         .with_context(|| format!("opening log file {}", log_path.display()))?;
     let log_err = log.try_clone().context("cloning log handle")?;

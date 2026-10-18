@@ -92,3 +92,26 @@ fn set_get_remove_roundtrip() {
     assert!(edit::remove(&mut doc, "app.port").unwrap());
     assert!(edit::get(&doc, "app.port").is_none());
 }
+
+#[test]
+fn webhook_url_override_creates_section() {
+    let mut cfg = load::from_str("[models.m]\narchitecture = \"vit\"\nrepo = \"a/b\"\n").unwrap();
+    assert!(cfg.webhook.is_none());
+    cfg.apply_overrides(&crate::Overrides {
+        webhook_url: Some("http://127.0.0.1:9090".into()),
+        ..Default::default()
+    });
+    let w = cfg.webhook.expect("override should enable the webhook");
+    assert_eq!(w.url, "http://127.0.0.1:9090");
+    assert!(w.secret.is_none());
+    assert_eq!(w.redelivery_secs, 60);
+}
+
+#[test]
+fn rejects_typos_in_security_sections() {
+    // A misspelt key must fail loudly rather than silently keep the default.
+    assert!(load::from_str("[limits]\nallow_local_file = true\n").is_err());
+    assert!(load::from_str("[cache]\nttl = 60\n").is_err());
+    assert!(load::from_str("[auth]\npublic_key = \"k\"\nextra = 1\n").is_err());
+    assert!(load::from_str("[limits]\nallow_local_files = true\n").is_ok());
+}

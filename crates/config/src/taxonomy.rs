@@ -100,8 +100,8 @@ impl Taxonomy {
                 }
 
                 let aggregation = match child_tbl.get("aggregation").and_then(|v| v.as_str()) {
-                    None | Some("max") => Aggregation::Max,
-                    Some("mean") | Some("average") => Aggregation::Mean,
+                    None | Some("mean") | Some("average") => Aggregation::Mean,
+                    Some("max") => Aggregation::Max,
                     Some(other) => {
                         return Err(ConfigError::Parse(format!(
                             "taxonomy: '{qualified}' has unknown aggregation '{other}' \
@@ -178,6 +178,12 @@ aggregation = "max"
                 .aggregation,
             Aggregation::Mean
         );
+    }
+
+    #[test]
+    fn aggregation_defaults_to_mean() {
+        let t = Taxonomy::parse("[p]\nid = 1\n[p.c]\nid = 10\nprompts = [\"x\"]\n").unwrap();
+        assert_eq!(t.children[0].aggregation, Aggregation::Mean);
     }
 
     #[test]

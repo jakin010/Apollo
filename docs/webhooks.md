@@ -61,7 +61,8 @@ redelivery_secs = 60                                 # background retry interval
 
 - `url` is a gRPC endpoint. The **scheme selects transport**: `https://` uses TLS, `http://` is plaintext. Any path component is ignored — the gRPC method path is fixed by the service definition.
 - The channel connects **lazily and reconnects automatically**, so the receiver need not be reachable when Apollo starts.
-- For a quick local override during `start`, use `--webhook-url http://127.0.0.1:9090` (run‑only; it does not persist to the file).
+- For a quick local override during `start`, use `--webhook-url http://127.0.0.1:9090` (run‑only; it does not persist to the file). It also enables delivery when the config has no `[webhook]` section.
+- Each delivery has a 10 s connect timeout and a 30 s request timeout; a call that exceeds them counts as a failed delivery and is retried.
 
 See [configuration.md → Webhook](./configuration.md#webhook--outbound-delivery) for field details.
 

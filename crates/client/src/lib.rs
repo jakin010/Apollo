@@ -3,7 +3,8 @@
 //! Two halves, matching the two services in `inference.proto`:
 //!
 //! * [`Client`] — call the `Inference` service: [`Client::classify`],
-//!   [`Client::get_task`].
+//!   [`Client::classify_stream`], [`Client::get_task`], [`Client::cancel_task`].
+//!   `https://` endpoints use TLS.
 //! * [`serve_webhook`] + [`WebhookHandler`] — stand up the `Webhook` receiver so
 //!   apollo can push per-item results to you. Point the apollo server's
 //!   `[webhook].url` at the address you serve on. Enable the `reflection` feature

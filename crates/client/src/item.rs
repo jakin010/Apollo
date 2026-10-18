@@ -43,8 +43,8 @@ pub fn image_with_fallback(
     }
 }
 
-/// A video fetched from `url`. Run image-classifiers (frame scan) or a
-/// video-classifier (whole clip) on it.
+/// A video fetched from `url`. Each model (an image classifier with a
+/// `video_strategy`) runs over sampled frames.
 pub fn video(
     url: impl Into<String>,
     models: impl IntoIterator<Item = impl Into<String>>,
@@ -66,6 +66,25 @@ pub fn video_with_fallback(
         models: models_of(models),
         pipeline: None,
         input: Some(Input::VideoUrl(url(main, Some(fallback.into())))),
+    }
+}
+
+/// An image fetched from `url`, run through the named `[pipelines.<name>]`
+/// instead of a parallel set of models.
+pub fn image_pipeline(url: impl Into<String>, pipeline: impl Into<String>) -> InputItem {
+    InputItem {
+        models: Vec::new(),
+        pipeline: Some(pipeline.into()),
+        input: Some(Input::ImageUrl(self::url(url, None))),
+    }
+}
+
+/// A video fetched from `url`, run through the named `[pipelines.<name>]`.
+pub fn video_pipeline(url: impl Into<String>, pipeline: impl Into<String>) -> InputItem {
+    InputItem {
+        models: Vec::new(),
+        pipeline: Some(pipeline.into()),
+        input: Some(Input::VideoUrl(self::url(url, None))),
     }
 }
 
@@ -126,6 +145,18 @@ mod tests {
     fn video_and_audio_variants() {
         assert!(matches!(video("v", ["m"]).input, Some(Input::VideoUrl(_))));
         assert!(matches!(audio("a", ["m"]).input, Some(Input::AudioUrl(_))));
+    }
+
+    #[test]
+    fn pipeline_helpers_set_pipeline_not_models() {
+        let it = image_pipeline("a.png", "moderation");
+        assert!(it.models.is_empty());
+        assert_eq!(it.pipeline.as_deref(), Some("moderation"));
+        assert!(matches!(it.input, Some(Input::ImageUrl(_))));
+        assert!(matches!(
+            video_pipeline("v.mp4", "p").input,
+            Some(Input::VideoUrl(_))
+        ));
     }
 
     #[test]

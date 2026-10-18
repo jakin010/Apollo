@@ -7,8 +7,9 @@
 # scores combine into a single child score.
 #
 # SigLIP scores every prompt independently; a child's score is the aggregation of
-# its own prompts. Results come back grouped as parent-id -> [(child-id, score)],
-# with every child included (no thresholding). Reference it from a model with
+# its own prompts. Results come back as flat predictions whose label is the child
+# id, keeping children at/above the model's `score_threshold` (every child when it
+# is unset). Reference it from a model with
 #   taxonomy_file = "taxonomy.toml"
 # (a relative path resolves from the config file's directory).
 #

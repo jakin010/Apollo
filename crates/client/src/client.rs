@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tonic::Request;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use apollo_proto::classify_chunk::Payload;
 use apollo_proto::inference_client::InferenceClient;
 use apollo_proto::{
-    ClassifyChunk, ClassifyRequest, ClassifyStreamInit, GetTaskRequest, InputItem, Task,
+    CancelRequest, ClassifyChunk, ClassifyRequest, ClassifyStreamInit, GetTaskRequest, InputItem,
+    Task,
 };
 
 use pasetors::claims::Claims;
@@ -19,6 +20,19 @@ use pasetors::version4::V4;
 /// Bytes per `ClassifyStream` data frame. Well under the default 4 MiB gRPC
 /// message ceiling.
 const STREAM_CHUNK: usize = 64 * 1024;
+
+/// Default lifetime of a minted auth token. A fresh token is signed per request,
+/// so a short lifetime costs nothing and limits the damage of a leaked token.
+const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Parse `endpoint`, enabling TLS (system + webpki trust roots) for `https://`.
+fn endpoint(endpoint: impl Into<String>) -> Result<Endpoint, ClientError> {
+    let ep = Endpoint::from_shared(endpoint.into())?;
+    if ep.uri().scheme_str() == Some("https") {
+        return Ok(ep.tls_config(ClientTlsConfig::new().with_enabled_roots())?);
+    }
+    Ok(ep)
+}
 
 /// Opening parameters for a [`Client::classify_stream`] / [`Client::classify_stream_bytes`]
 /// call: which models (or a `pipeline`) to run, and whether the streamed bytes
@@ -105,9 +119,9 @@ impl Client {
     }
 
     /// Connect eagerly with no authentication; errors immediately if the server
-    /// is unreachable.
+    /// is unreachable. `https://` endpoints use TLS.
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self, ClientError> {
-        let channel = Endpoint::from_shared(endpoint.into())?.connect().await?;
+        let channel = self::endpoint(endpoint)?.connect().await?;
         Ok(Self {
             inner: InferenceClient::new(channel),
             auth: None,
@@ -115,9 +129,9 @@ impl Client {
     }
 
     /// Build a client that connects on first use and reconnects automatically,
-    /// with no authentication.
+    /// with no authentication. `https://` endpoints use TLS.
     pub fn connect_lazy(endpoint: impl Into<String>) -> Result<Self, ClientError> {
-        let channel = Endpoint::from_shared(endpoint.into())?.connect_lazy();
+        let channel = self::endpoint(endpoint)?.connect_lazy();
         Ok(Self {
             inner: InferenceClient::new(channel),
             auth: None,
@@ -203,12 +217,22 @@ impl Client {
             .await
     }
 
-    /// Poll a task's state and per-item / per-model results.
+    /// Poll a task's state and per-model results.
     pub async fn get_task(&self, task_id: impl Into<String>) -> Result<Task, ClientError> {
         let req = self.request(GetTaskRequest {
             task_id: task_id.into(),
         })?;
         let resp = self.inner.clone().get_task(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Request cooperative cancellation of a task. Returns the task as it stands
+    /// after the request: `CANCELLED`, unless it had already finished.
+    pub async fn cancel_task(&self, task_id: impl Into<String>) -> Result<Task, ClientError> {
+        let req = self.request(CancelRequest {
+            task_id: task_id.into(),
+        })?;
+        let resp = self.inner.clone().cancel_task(req).await?;
         Ok(resp.into_inner())
     }
 }
@@ -221,7 +245,7 @@ impl Client {
 /// let client = apollo_client::Client::builder("http://127.0.0.1:8080")
 ///     .secret_key("k4.secret.…")
 ///     .subject("ingest-worker")
-///     .token_ttl(Duration::from_secs(300))
+///     .token_ttl(Duration::from_secs(60))
 ///     .build()
 ///     .await?;
 /// # Ok(()) }
@@ -241,7 +265,7 @@ impl ClientBuilder {
             lazy: false,
             secret_key: None,
             subject: "apollo-client".to_string(),
-            ttl: None,
+            ttl: Some(DEFAULT_TOKEN_TTL),
         }
     }
 
@@ -265,16 +289,24 @@ impl ClientBuilder {
         self
     }
 
-    /// Expiry for minted tokens. Omit for non-expiring tokens; either way a fresh
-    /// token is signed per request, so short TTLs are cheap and safe.
+    /// Expiry for minted tokens (default 5 minutes). A fresh token is signed per
+    /// request, so short TTLs are cheap and safe.
     pub fn token_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
     }
 
-    /// Resolve the endpoint, parse the secret key (if any), and connect.
+    /// Mint tokens without an expiry. Not recommended: a leaked non-expiring
+    /// token stays valid until the server's keypair is rotated.
+    pub fn non_expiring_tokens(mut self) -> Self {
+        self.ttl = None;
+        self
+    }
+
+    /// Resolve the endpoint (TLS for `https://`), parse the secret key (if any),
+    /// and connect.
     pub async fn build(self) -> Result<Client, ClientError> {
-        let endpoint = Endpoint::from_shared(self.endpoint)?;
+        let endpoint = endpoint(self.endpoint)?;
         let channel = if self.lazy {
             endpoint.connect_lazy()
         } else {

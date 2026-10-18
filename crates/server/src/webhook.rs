@@ -8,11 +8,13 @@
 //! confidentiality). The engine decides *when* to fire and owns the persisted
 //! delivered-flag; this type only performs the gRPC call.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tonic::metadata::MetadataValue;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use apollo_domain::Task;
 use apollo_engine::{WebhookError, WebhookSink};
@@ -23,6 +25,12 @@ use crate::convert::task_to_proto;
 /// Metadata header carrying the delivery signature.
 const SIGNATURE_HEADER: &str = "x-apollo-webhook-signature";
 
+/// Deadline for establishing a connection to the receiver.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for one delivery call. A hung receiver must not pin delivery tasks
+/// forever (the redelivery loop would otherwise keep stacking them up).
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A [`WebhookSink`] that delivers task status to a gRPC `Webhook` receiver.
 pub struct GrpcWebhookSink {
     channel: Channel,
@@ -30,12 +38,21 @@ pub struct GrpcWebhookSink {
 }
 
 impl GrpcWebhookSink {
-    /// Target `url` (e.g. `http://127.0.0.1:9090`); `secret`, when set, enables
-    /// HMAC signing. The channel connects lazily, so the receiver need not be
+    /// Target `url` (e.g. `http://127.0.0.1:9090`, or `https://…` for TLS with
+    /// the system / webpki trust roots); `secret`, when set, enables HMAC
+    /// signing. The channel connects lazily, so the receiver need not be
     /// reachable at construction time.
     pub fn new(url: &str, secret: Option<String>) -> Result<Self, tonic::transport::Error> {
-        let channel = Endpoint::from_shared(url.to_string())?.connect_lazy();
-        Ok(Self { channel, secret })
+        let mut endpoint = Endpoint::from_shared(url.to_string())?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT);
+        if endpoint.uri().scheme_str() == Some("https") {
+            endpoint = endpoint.tls_config(ClientTlsConfig::new().with_enabled_roots())?;
+        }
+        Ok(Self {
+            channel: endpoint.connect_lazy(),
+            secret,
+        })
     }
 }
 
@@ -84,4 +101,33 @@ fn sign(key: &[u8], msg: &[u8]) -> String {
         let _ = write!(hex, "{b:02x}");
     }
     hex
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn https_receivers_use_tls() {
+        // Nothing listens on port 1: the delivery must fail at the network layer,
+        // not with tonic's "HTTPS without TLS enabled" (which meant TLS was never
+        // compiled in and every https:// webhook silently failed).
+        let sink = GrpcWebhookSink::new("https://127.0.0.1:1", None).unwrap();
+        let task = Task {
+            id: "t".into(),
+            state: apollo_domain::TaskState::Completed,
+            items: vec![],
+        };
+        let err = sink.deliver(&task, 0).await.unwrap_err().to_string();
+        assert!(!err.contains("without TLS"), "{err}");
+    }
+
+    #[test]
+    fn signature_is_lowercase_hex_hmac() {
+        // RFC 4231 test case 2.
+        assert_eq!(
+            sign(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
 }
