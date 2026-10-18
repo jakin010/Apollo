@@ -23,6 +23,16 @@ url = "https://hooks.example.com:443"          # optional; omit the section to d
 # [auth]
 # enabled    = true                                   # false = no authentication (trusted networks only)
 # public_key = "k4.public.REPLACE_WITH_GENERATED_PUBLIC_KEY"
+# admin_subjects  = ["ops"]                         # may read/cancel every task (others see only their own)
+# revocation_file = "/var/lib/apollo/revoked_tokens" # `apollo revoke` writes here; default: state dir
+
+# TLS (optional). Without it the API is plaintext — fine on loopback or behind a
+# TLS-terminating proxy. With client_ca_file, clients must present a certificate
+# signed by that CA (mutual TLS).
+# [tls]
+# cert_file      = "/etc/apollo/tls/fullchain.pem"
+# key_file       = "/etc/apollo/tls/privkey.pem"
+# client_ca_file = "/etc/apollo/tls/clients-ca.pem"
 
 # Result cache (optional). With [cache] present, model outputs are cached by
 # content hash (with a url->content-hash hint) so identical inputs skip inference.

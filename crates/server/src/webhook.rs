@@ -116,6 +116,7 @@ mod tests {
             id: id.into(),
             state: TaskState::Completed,
             items: vec![],
+            owner: None,
         }
     }
 

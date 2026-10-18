@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -51,6 +53,16 @@ pub struct AuthConfig {
     /// also reads.
     #[serde(default)]
     pub public_key: Option<String>,
+    /// Token subjects (`sub`) that may read and cancel every task. Everyone else
+    /// only sees the tasks their own subject created.
+    #[serde(default)]
+    pub admin_subjects: Vec<String>,
+    /// File listing revoked token ids and subjects (written by `apollo revoke`,
+    /// re-read by running servers within seconds). Defaults to
+    /// `revoked_tokens` in the server's state directory. Relative paths resolve
+    /// from the config file's directory.
+    #[serde(default)]
+    pub revocation_file: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -58,8 +70,27 @@ impl Default for AuthConfig {
         Self {
             enabled: defaults::auth_enabled(),
             public_key: None,
+            admin_subjects: Vec::new(),
+            revocation_file: None,
         }
     }
+}
+
+/// `[tls]` — serve the gRPC API over TLS. Omit the section to serve plaintext
+/// (e.g. behind a TLS-terminating proxy). Relative paths resolve from the config
+/// file's directory. Certificates are read at startup; restart to pick up a
+/// renewed certificate.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM certificate chain (leaf first) presented to clients.
+    pub cert_file: String,
+    /// PEM private key for `cert_file`.
+    pub key_file: String,
+    /// PEM CA bundle. When set, clients must present a certificate signed by it
+    /// (mutual TLS), in addition to any `[auth]` token.
+    #[serde(default)]
+    pub client_ca_file: Option<String>,
 }
 
 /// Result cache (optional). When present and `enabled`, model outputs are cached

@@ -64,6 +64,8 @@ Optional. Omit the whole section to disable delivery and let clients poll. See [
 |-------|------|---------|---------|
 | `enabled` | bool | `true` | Require a token on every `Inference` RPC. Set `false` only on a trusted network — anyone who can reach the port can then submit work and read results (the server logs a warning at startup). |
 | `public_key` | string | *(none)* | PASERK‑encoded v4 **public** key (`k4.public.…`) used to verify tokens. When unset, the server uses a **local keypair** (below). |
+| `admin_subjects` | list | `[]` | Token subjects that may read and cancel **every** task. Everyone else only sees tasks created by their own subject. |
+| `revocation_file` | string | `<state dir>/revoked_tokens` | Revoked token ids / subjects, written by `apollo revoke` and re‑read by running servers within ~10 s. Relative paths resolve from the config file's directory. |
 
 **Zero‑config (local keypair).** Without `public_key`, the server creates a signing keypair on first start and keeps it in `auth.key` in its private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS; owner‑only). `apollo token` reads that file when no other secret key is given, so the minimal setup is:
 
@@ -85,7 +87,42 @@ apollo token --subject ci-runner --expires 30d
 
 To turn authentication off: `apollo config set auth.enabled false`.
 
+**Task ownership.** Every task records the subject (`sub`) of the token that submitted it. `GetTask` and `CancelTask` from any other subject return `NOT_FOUND` — the same answer as for an id that does not exist — unless the caller's subject is in `admin_subjects`. Tasks submitted while authentication was disabled have no owner and are visible only to admins once it is on. Give each client (or tenant) its own subject.
+
+**Revoking tokens.** `apollo token` gives every token a random id and prints it on stderr. To revoke without rotating the keypair:
+
+```bash
+apollo revoke --id 3f9c…             # one token, by the id `apollo token` printed
+apollo revoke --token "v4.public.…"  # one token, reading its id from the token
+apollo revoke --subject ci-runner    # every token of a subject (incl. tokens minted before ids existed)
+```
+
+Each command appends a line (`id <id>` or `subject <name>`) to the revocation file; running servers pick it up within about 10 seconds. The file is plain text: delete a line to un‑revoke. Run `apollo revoke` as the server's OS user (or pass `--config` when `revocation_file` is set there). If the file becomes unreadable, the server keeps the last list it loaded.
+
 Clients send the token in the **`authorization`** metadata header (with or without a `Bearer ` prefix). See [grpc-api.md → Authentication](./grpc-api.md#authentication).
+
+---
+
+## `[tls]` — serve over TLS
+
+Optional. With this section the gRPC API is served over TLS (HTTP/2 + ALPN); without it Apollo speaks plaintext, which is fine on loopback or behind a TLS‑terminating proxy. The server logs a warning when it serves plaintext on a non‑loopback address.
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `cert_file` | string | *(required)* | PEM certificate chain, leaf first. |
+| `key_file` | string | *(required)* | PEM private key for the certificate. |
+| `client_ca_file` | string | *(none)* | PEM CA bundle. When set, **mutual TLS** is required: clients must present a certificate signed by it (in addition to any `[auth]` token). |
+
+Relative paths resolve from the config file's directory; startup fails if a file is missing. Certificates are read at startup — restart after renewing them.
+
+```toml
+[tls]
+cert_file = "/etc/apollo/tls/fullchain.pem"
+key_file  = "/etc/apollo/tls/privkey.pem"
+# client_ca_file = "/etc/apollo/tls/clients-ca.pem"   # require client certificates
+```
+
+Clients then connect to `https://host:port`. With `apollo-client`, a private or self‑signed CA is trusted via `.ca_certificate(pem)`, a client certificate for mutual TLS is set via `.client_identity(cert_pem, key_pem)`, and `.tls_domain_name(name)` overrides the name checked against the certificate.
 
 ---
 
@@ -334,9 +371,11 @@ apollo config set    <key> <value> [--config PATH]
 apollo config remove <key> [--config PATH]
 apollo keygen                            # print a PASETO v4 keypair (PASERK)
 apollo token --subject NAME [--expires 30d] [--secret-key-file PATH]
+apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
 ```
 
 - **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url`, or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
 - **`config get|set|remove`** edit the file by **dotted key** (e.g. `models.nsfw.repo`), format‑preserving. `set` creates missing tables — and a default `[app]`‑only file — as needed.
 - **`keygen`** prints a fresh public/secret PASERK keypair.
-- **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` (a bare PASERK or `keygen` output), else the `APOLLO_SECRET_KEY` env var, else the server's local keypair file (`auth.key` in the state directory). `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key (revoke by rotating the keypair). The token goes in the client's `authorization` metadata.
+- **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` (a bare PASERK or `keygen` output), else the `APOLLO_SECRET_KEY` env var, else the server's local keypair file (`auth.key` in the state directory). `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key. The token goes to stdout (it goes in the client's `authorization` metadata) and its id to stderr.
+- **`revoke`** adds a token id or a subject to the revocation file (see [Authentication](#auth--authentication)); running servers apply it within ~10 s.

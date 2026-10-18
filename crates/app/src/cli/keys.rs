@@ -10,17 +10,26 @@
 //! keypair stored in `<state dir>/auth.key` (owner-only, same format `keygen`
 //! prints), created on first start. `token` reads that file when no other secret
 //! key is given.
+//!
+//! Every minted token carries a random id (`jti`), printed to stderr. `revoke`
+//! appends that id — or a whole subject — to the revocation file, which running
+//! servers re-read within seconds; no keypair rotation needed.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use clap::Args;
+use clap::{ArgGroup, Args};
+use pasetors::Public;
 use pasetors::claims::Claims;
 use pasetors::keys::{AsymmetricKeyPair, AsymmetricPublicKey, AsymmetricSecretKey, Generate};
 use pasetors::paserk::FormatAsPaserk;
+use pasetors::token::UntrustedToken;
 use pasetors::version4::V4;
+
+use apollo_config::AuthConfig;
+use apollo_server::Revocation;
 
 #[derive(Args)]
 pub struct KeygenArgs {}
@@ -72,10 +81,14 @@ pub fn run_token(args: TokenArgs) -> Result<()> {
         },
     };
 
+    let token_id = uuid::Uuid::new_v4().simple().to_string();
     let mut claims = Claims::new().map_err(|e| anyhow!("building claims: {e}"))?;
     claims
         .subject(&args.subject)
         .map_err(|e| anyhow!("setting subject: {e}"))?;
+    claims
+        .token_identifier(&token_id)
+        .map_err(|e| anyhow!("setting token id: {e}"))?;
     match &args.expires {
         Some(spec) => {
             let d = parse_duration(spec)?;
@@ -88,8 +101,103 @@ pub fn run_token(args: TokenArgs) -> Result<()> {
 
     let token = pasetors::public::sign(&secret, &claims, None, None)
         .map_err(|e| anyhow!("signing token: {e}"))?;
+    // The id goes to stderr so `TOKEN=$(apollo token …)` captures only the token.
+    eprintln!("token id: {token_id} (revoke with `apollo revoke --id {token_id}`)");
     println!("{token}");
     Ok(())
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("target").required(true).args(["id", "token", "subject"])))]
+pub struct RevokeArgs {
+    /// Token id, as printed by `apollo token`.
+    #[arg(long)]
+    id: Option<String>,
+    /// The token itself (its id is read from it).
+    #[arg(long)]
+    token: Option<String>,
+    /// Revoke every token issued to this subject, including tokens minted before
+    /// token ids existed.
+    #[arg(long)]
+    subject: Option<String>,
+    /// Config file whose `[auth].revocation_file` to use (default: the standard
+    /// config path; falls back to the state directory).
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+/// Append a revocation entry to the revocation file that running servers watch.
+pub fn run_revoke(args: RevokeArgs) -> Result<()> {
+    let entry = match (args.id, args.token, args.subject) {
+        (Some(id), _, _) => Revocation::Id(id.trim().to_string()),
+        (_, Some(token), _) => Revocation::Id(token_id_of(&token)?),
+        (_, _, Some(subject)) => Revocation::Subject(subject.trim().to_string()),
+        _ => unreachable!("clap requires one target"),
+    };
+    // An explicitly named config must load; the default path may not exist.
+    let auth = match &args.config {
+        Some(path) => {
+            apollo_config::load::load(Some(path))
+                .with_context(|| format!("loading {}", path.display()))?
+                .auth
+        }
+        None => apollo_config::load::load(None)
+            .map(|c| c.auth)
+            .unwrap_or_default(),
+    };
+    let path = revocation_file(&auth)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    writeln!(file, "{entry}").with_context(|| format!("writing {}", path.display()))?;
+    println!(
+        "revoked {entry} in {} (running servers apply it within ~10s)",
+        path.display()
+    );
+    Ok(())
+}
+
+/// The revocation file: `[auth].revocation_file`, else `revoked_tokens` in the
+/// state directory.
+pub fn revocation_file(auth: &AuthConfig) -> Result<PathBuf> {
+    match &auth.revocation_file {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Ok(crate::daemon::state_dir()?.join("revoked_tokens")),
+    }
+}
+
+/// Read the id (`jti`) out of a token without verifying it (revoking is safe
+/// either way: at worst an unknown id is listed).
+fn token_id_of(token: &str) -> Result<String> {
+    let raw = token.trim();
+    let raw = raw.strip_prefix("Bearer ").unwrap_or(raw);
+    let untrusted = UntrustedToken::<Public, V4>::try_from(raw)
+        .map_err(|_| anyhow!("not a v4.public token"))?;
+    let claims = Claims::from_string(
+        std::str::from_utf8(untrusted.untrusted_payload()).context("token payload is not UTF-8")?,
+    )
+    .map_err(|e| anyhow!("reading token claims: {e}"))?;
+    match claims.get_claim("jti").and_then(|v| v.as_str()) {
+        Some(id) => Ok(id.to_string()),
+        None => {
+            let subject = claims
+                .get_claim("sub")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            Err(anyhow!(
+                "this token has no id (minted before token ids existed); revoke its subject \
+                 instead: apollo revoke --subject {subject}"
+            ))
+        }
+    }
 }
 
 /// Path of the server's local signing keypair (used when `[auth].public_key` is
@@ -194,6 +302,28 @@ fn parse_duration(s: &str) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_id_is_read_from_the_token() {
+        let (_, secret) = generate_keypair().unwrap();
+        let secret = parse_secret(&secret).unwrap();
+        let mint = |id: Option<&str>| {
+            let mut claims = Claims::new().unwrap();
+            claims.subject("ci").unwrap();
+            if let Some(id) = id {
+                claims.token_identifier(id).unwrap();
+            }
+            pasetors::public::sign(&secret, &claims, None, None).unwrap()
+        };
+        assert_eq!(token_id_of(&mint(Some("abc123"))).unwrap(), "abc123");
+        assert_eq!(
+            token_id_of(&format!("Bearer {}", mint(Some("x")))).unwrap(),
+            "x"
+        );
+        let err = token_id_of(&mint(None)).unwrap_err().to_string();
+        assert!(err.contains("--subject ci"), "{err}");
+        assert!(token_id_of("garbage").is_err());
+    }
 
     #[test]
     fn secret_parses_from_bare_or_keygen_output() {

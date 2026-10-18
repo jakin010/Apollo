@@ -24,6 +24,7 @@ async fn fixture() -> Fixture {
         app: Default::default(),
         webhook: None,
         auth: Default::default(),
+        tls: None,
         limits: Default::default(),
         database: DatabaseConfig {
             sqlite: Some(SqliteConfig {
@@ -67,6 +68,7 @@ fn task(id: &str, state: TaskState, item_state: ItemState, upload: Option<PathBu
             error: None,
             retries: 0,
         }],
+        owner: None,
     }
 }
 

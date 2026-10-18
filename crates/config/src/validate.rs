@@ -114,6 +114,21 @@ impl Config {
             }
         }
 
+        if let Some(tls) = &self.tls {
+            let files = [
+                ("cert_file", Some(&tls.cert_file)),
+                ("key_file", Some(&tls.key_file)),
+                ("client_ca_file", tls.client_ca_file.as_ref()),
+            ];
+            for (field, path) in files {
+                if let Some(path) = path
+                    && !Path::new(path).is_file()
+                {
+                    errs.push(format!("tls.{field} `{path}` does not exist"));
+                }
+            }
+        }
+
         match self.database.backend {
             Backend::Postgres if self.database.postgres.is_none() => {
                 errs.push("database.backend = 'postgres' but [database.postgres] is missing".into())

@@ -123,7 +123,7 @@ impl SqliteStorage {
 
     /// Shared reconstruction used by `get_task` and `load_incomplete_tasks`.
     async fn load_task(&self, id: &str) -> Result<Option<Task>> {
-        let Some(trow) = sqlx::query("SELECT state FROM tasks WHERE id = ?")
+        let Some(trow) = sqlx::query("SELECT state, owner FROM tasks WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -131,6 +131,7 @@ impl SqliteStorage {
             return Ok(None);
         };
         let state = trow.try_get::<String, _>("state")?.parse::<TaskState>()?;
+        let owner: Option<String> = trow.try_get("owner")?;
 
         let irows = sqlx::query(
             "SELECT idx, input_json, models_json, pipeline, state, error, retries
@@ -200,6 +201,7 @@ impl SqliteStorage {
             id: id.to_string(),
             state,
             items,
+            owner,
         }))
     }
 }
@@ -211,6 +213,18 @@ impl Storage for SqliteStorage {
         for stmt in SCHEMA {
             sqlx::query(*stmt).execute(&mut *tx).await?;
         }
+        // Columns added after the first release: `CREATE TABLE IF NOT EXISTS`
+        // does not extend an existing table, so add them when missing.
+        let has_owner: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'owner'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_owner == 0 {
+            sqlx::query("ALTER TABLE tasks ADD COLUMN owner TEXT")
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -219,12 +233,14 @@ impl Storage for SqliteStorage {
         let mut tx = self.pool.begin().await?;
         let ts = now();
         sqlx::query(
-            "INSERT INTO tasks (id, state, attempts, created_at, updated_at) VALUES (?, ?, 0, ?, ?)",
+            "INSERT INTO tasks (id, state, attempts, created_at, updated_at, owner)
+             VALUES (?, ?, 0, ?, ?, ?)",
         )
         .bind(&task.id)
         .bind(task.state.as_str())
         .bind(ts)
         .bind(ts)
+        .bind(task.owner.as_deref())
         .execute(&mut *tx)
         .await?;
 
@@ -677,6 +693,7 @@ mod tests {
             id: "task-1".into(),
             state: TaskState::Queued,
             items: vec![item],
+            owner: None,
         }
     }
 
@@ -770,6 +787,39 @@ mod tests {
         assert_eq!(store.purge_finished_before(now() + 10).await.unwrap(), 1);
         assert!(store.get_task("task-1").await.unwrap().is_none());
 
+        cleanup(&cfg);
+    }
+
+    #[tokio::test]
+    async fn owner_column_is_added_to_existing_databases() {
+        let cfg = temp_cfg();
+        // A database created before the `owner` column existed.
+        {
+            let store = SqliteStorage::connect(&cfg).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE tasks (id TEXT PRIMARY KEY, state TEXT NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL)",
+            )
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO tasks VALUES ('old', 'completed', 0, 1, 1)")
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        let store = SqliteStorage::connect(&cfg).await.unwrap();
+        store.migrate().await.unwrap();
+        store.migrate().await.unwrap(); // still idempotent
+        let old = store.get_task("old").await.unwrap().unwrap();
+        assert_eq!(old.owner, None);
+
+        let mut t = sample_task();
+        t.owner = Some("alice".into());
+        store.create_task(&t).await.unwrap();
+        let t = store.get_task("task-1").await.unwrap().unwrap();
+        assert_eq!(t.owner.as_deref(), Some("alice"));
         cleanup(&cfg);
     }
 

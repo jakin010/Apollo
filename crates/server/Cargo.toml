@@ -10,6 +10,10 @@ apollo-proto  = { path = "../proto" }
 tonic = { workspace = true, features = ["tls-ring", "tls-native-roots", "tls-webpki-roots"] }
 tonic-reflection = "0.14"
 tonic-health = "0.14"
+# TLS serving: the dependency tree compiles both rustls backends (ring via
+# tonic, aws-lc-rs via reqwest/surrealdb), so a process default must be chosen
+# explicitly before tonic builds a server config.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 prost = "0.14"
 pasetors = "0.7"
 thiserror = "2"
@@ -22,6 +26,12 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
 # End-to-end webhook tests deliver to the SDK's signature-verifying receiver.
 apollo-client = { path = "../client" }
+# Service tests run a real engine over a temp SQLite database.
+apollo-config  = { path = "../config" }
+apollo-storage = { path = "../storage" }
+tempfile = "3"
+# Throwaway certificates for the TLS / mutual-TLS tests.
+rcgen = "0.14"
 
 [features]
 # Forward GPU backends down to the inference crate.

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tonic::Request;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use apollo_proto::classify_chunk::Payload;
 use apollo_proto::inference_client::InferenceClient;
@@ -27,9 +27,18 @@ const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Parse `endpoint`, enabling TLS (system + webpki trust roots) for `https://`.
 fn endpoint(endpoint: impl Into<String>) -> Result<Endpoint, ClientError> {
+    endpoint_with_tls(endpoint, ClientTlsConfig::new())
+}
+
+/// Parse `endpoint`; for `https://`, apply `tls` on top of the system + webpki
+/// trust roots.
+fn endpoint_with_tls(
+    endpoint: impl Into<String>,
+    tls: ClientTlsConfig,
+) -> Result<Endpoint, ClientError> {
     let ep = Endpoint::from_shared(endpoint.into())?;
     if ep.uri().scheme_str() == Some("https") {
-        return Ok(ep.tls_config(ClientTlsConfig::new().with_enabled_roots())?);
+        return Ok(ep.tls_config(tls.with_enabled_roots())?);
     }
     Ok(ep)
 }
@@ -72,6 +81,8 @@ pub enum ClientError {
     Status(#[from] tonic::Status),
     #[error("auth error: {0}")]
     Auth(String),
+    #[error("invalid client configuration: {0}")]
+    Config(String),
 }
 
 /// How requests are authenticated.
@@ -271,6 +282,9 @@ pub struct ClientBuilder {
     secret_key: Option<String>,
     subject: String,
     ttl: Option<Duration>,
+    ca_pem: Option<Vec<u8>>,
+    identity: Option<(Vec<u8>, Vec<u8>)>,
+    tls_domain: Option<String>,
 }
 
 impl ClientBuilder {
@@ -282,7 +296,37 @@ impl ClientBuilder {
             secret_key: None,
             subject: "apollo-client".to_string(),
             ttl: Some(DEFAULT_TOKEN_TTL),
+            ca_pem: None,
+            identity: None,
+            tls_domain: None,
         }
+    }
+
+    /// Also trust this PEM CA certificate for an `https://` endpoint (e.g. a
+    /// private CA or a self-signed server certificate). The system and webpki
+    /// roots stay trusted.
+    pub fn ca_certificate(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.ca_pem = Some(pem.into());
+        self
+    }
+
+    /// Present this PEM certificate + private key to the server (mutual TLS, for
+    /// servers configured with `[tls].client_ca_file`).
+    pub fn client_identity(
+        mut self,
+        cert_pem: impl Into<Vec<u8>>,
+        key_pem: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.identity = Some((cert_pem.into(), key_pem.into()));
+        self
+    }
+
+    /// Verify the server certificate against this name instead of the
+    /// endpoint's host (e.g. connecting by IP to a certificate issued for a
+    /// hostname).
+    pub fn tls_domain_name(mut self, name: impl Into<String>) -> Self {
+        self.tls_domain = Some(name.into());
+        self
     }
 
     /// Connect on first use (and reconnect automatically) instead of eagerly.
@@ -330,7 +374,25 @@ impl ClientBuilder {
     /// Resolve the endpoint (TLS for `https://`), set up authentication, and
     /// connect.
     pub async fn build(self) -> Result<Client, ClientError> {
-        let endpoint = endpoint(self.endpoint)?;
+        let custom_tls =
+            self.ca_pem.is_some() || self.identity.is_some() || self.tls_domain.is_some();
+        if custom_tls && !self.endpoint.starts_with("https://") {
+            return Err(ClientError::Config(
+                "TLS options (CA certificate, client identity, domain name) need an https:// endpoint"
+                    .into(),
+            ));
+        }
+        let mut tls = ClientTlsConfig::new();
+        if let Some(ca) = &self.ca_pem {
+            tls = tls.ca_certificate(Certificate::from_pem(ca));
+        }
+        if let Some((cert, key)) = &self.identity {
+            tls = tls.identity(Identity::from_pem(cert, key));
+        }
+        if let Some(domain) = self.tls_domain {
+            tls = tls.domain_name(domain);
+        }
+        let endpoint = endpoint_with_tls(self.endpoint, tls)?;
         let channel = if self.lazy {
             endpoint.connect_lazy()
         } else {

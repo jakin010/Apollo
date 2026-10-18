@@ -56,16 +56,29 @@ pub struct Overrides {
 }
 
 impl Config {
-    /// Resolve relative model `taxonomy_file` paths against `base` (the directory
-    /// of the config file), so downstream consumers can open them directly.
+    /// Resolve relative file paths (model `taxonomy_file`, the `[tls]` files, and
+    /// `[auth].revocation_file`) against `base` (the directory of the config
+    /// file), so downstream consumers can open them directly.
     fn resolve_paths(&mut self, base: &Path) {
-        for model in self.models.values_mut() {
-            if let Some(tf) = &model.taxonomy_file {
-                let p = Path::new(tf);
-                if p.is_relative() {
-                    model.taxonomy_file = Some(base.join(p).to_string_lossy().into_owned());
-                }
+        let resolve = |path: &mut String| {
+            if Path::new(path.as_str()).is_relative() {
+                *path = base.join(path.as_str()).to_string_lossy().into_owned();
             }
+        };
+        for model in self.models.values_mut() {
+            if let Some(tf) = model.taxonomy_file.as_mut() {
+                resolve(tf);
+            }
+        }
+        if let Some(tls) = self.tls.as_mut() {
+            resolve(&mut tls.cert_file);
+            resolve(&mut tls.key_file);
+            if let Some(ca) = tls.client_ca_file.as_mut() {
+                resolve(ca);
+            }
+        }
+        if let Some(file) = self.auth.revocation_file.as_mut() {
+            resolve(file);
         }
     }
 

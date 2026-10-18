@@ -181,10 +181,15 @@ impl Engine {
         self.inner.fetch_limits.max_download_bytes
     }
 
-    /// Validate, persist, and start a task. Returns its id immediately; processing
-    /// continues in the background. Validation is synchronous, so a bad request is
-    /// rejected before anything is written.
-    pub async fn submit(&self, submissions: Vec<Submission>) -> Result<String, EngineError> {
+    /// Validate, persist, and start a task owned by `owner` (the submitting
+    /// token's subject; `None` when authentication is disabled). Returns its id
+    /// immediately; processing continues in the background. Validation is
+    /// synchronous, so a bad request is rejected before anything is written.
+    pub async fn submit(
+        &self,
+        submissions: Vec<Submission>,
+        owner: Option<String>,
+    ) -> Result<String, EngineError> {
         if submissions.is_empty() {
             return Err(EngineError::Incompatible("no items submitted".into()));
         }
@@ -222,6 +227,7 @@ impl Engine {
             id: id.clone(),
             state: TaskState::Queued,
             items,
+            owner,
         };
         if let Err(e) = self.inner.storage.create_task(&task).await {
             // Release the reservation: no run_items will be spawned to do it.

@@ -46,10 +46,12 @@ fn url_from_proto(u: pb::Url) -> dom::Url {
 /// exactly one input, which maps onto the `Task.result` oneof: a task-level error,
 /// a non-terminal/cancelled `state`, or the per-model `models` once finished.
 pub(crate) fn task_to_proto(t: dom::Task) -> pb::Task {
+    // `owner` is server-side access control, not part of the wire result.
     let dom::Task {
         id,
         state,
         mut items,
+        ..
     } = t;
     let result = (!items.is_empty()).then(|| task_result(state, items.remove(0)));
     pb::Task { id, result }
@@ -296,6 +298,7 @@ mod tests {
                 None,
                 Some("p".into()),
             )],
+            owner: None,
         };
 
         let pt = task_to_proto(task);
@@ -327,6 +330,7 @@ mod tests {
                 Some(dom::TaskError::fetch("fetch failed")),
                 None,
             )],
+            owner: None,
         };
         let err = match task_to_proto(task).result {
             Some(pb::task::Result::Error(e)) => e,
@@ -347,6 +351,7 @@ mod tests {
                 Some(dom::TaskError::fetch("connection refused")),
                 None,
             )],
+            owner: None,
         };
         match task_to_proto(task).result {
             Some(pb::task::Result::State(s)) => assert_eq!(s, pb::TaskState::Processing as i32),
@@ -369,6 +374,7 @@ mod tests {
                     Some(dom::TaskError::cancelled("cancelled")),
                     None,
                 )],
+                owner: None,
             };
             match task_to_proto(task).result {
                 Some(pb::task::Result::State(s)) => {
@@ -390,6 +396,7 @@ mod tests {
                 Some(dom::TaskError::new(dom::ErrorKind::Decode, "not an image")),
                 None,
             )],
+            owner: None,
         };
         match task_to_proto(task).result {
             Some(pb::task::Result::Error(e)) => assert_eq!(e.kind, pb::ErrorType::Decode as i32),
@@ -408,6 +415,7 @@ mod tests {
                 None,
                 None,
             )],
+            owner: None,
         };
         match task_to_proto(task).result {
             Some(pb::task::Result::State(s)) => assert_eq!(s, pb::TaskState::Processing as i32),

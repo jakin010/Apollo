@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use clap::Args;
 
-use apollo_config::{AuthConfig, Config, Overrides, load};
+use apollo_config::{AuthConfig, Config, Overrides, TlsConfig, load};
 use apollo_engine::{Engine, WebhookSink};
 
 #[derive(Args)]
@@ -95,6 +95,15 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let _pidfile = crate::daemon::PidFile::create()?;
 
     let auth = configure_auth(&config.auth)?;
+    auth.watch_revocations(REVOCATION_POLL);
+    let tls = load_tls(config.tls.as_ref())?;
+    if tls.is_none() && !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "serving plaintext gRPC on a non-loopback address: tokens, media and results \
+             cross the network unencrypted — configure [tls] or put a TLS proxy in front"
+        );
+    }
 
     tracing::info!(%addr, models = config.model_count(), "apollo listening");
     apollo_server::serve_with_shutdown(
@@ -102,6 +111,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         addr,
         crate::daemon::shutdown_signal(),
         auth,
+        tls,
     )
     .await
     .context("gRPC server error")?;
@@ -114,6 +124,28 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How often a running server re-checks the token revocation file.
+const REVOCATION_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read the `[tls]` PEM files, if configured.
+fn load_tls(tls: Option<&TlsConfig>) -> anyhow::Result<Option<apollo_server::TlsSettings>> {
+    let Some(tls) = tls else {
+        return Ok(None);
+    };
+    let read = |what: &str, path: &str| {
+        std::fs::read(path).with_context(|| format!("reading [tls].{what} {path}"))
+    };
+    Ok(Some(apollo_server::TlsSettings {
+        cert_pem: read("cert_file", &tls.cert_file)?,
+        key_pem: read("key_file", &tls.key_file)?,
+        client_ca_pem: tls
+            .client_ca_file
+            .as_deref()
+            .map(|p| read("client_ca_file", p))
+            .transpose()?,
+    }))
+}
+
 /// Build the auth interceptor. Authentication is on unless the config says
 /// `[auth] enabled = false`; without a configured `public_key` the server uses
 /// (creating it on first start) the local keypair that `apollo token` reads.
@@ -123,7 +155,7 @@ fn configure_auth(auth: &AuthConfig) -> anyhow::Result<apollo_server::AuthInterc
             "authentication is DISABLED ([auth] enabled = false): anyone who can reach this \
              port can submit work and read results"
         );
-        return apollo_server::AuthInterceptor::new(None).context("configuring authentication");
+        return Ok(apollo_server::AuthInterceptor::disabled());
     }
     let public_key = match &auth.public_key {
         Some(key) => {
@@ -144,7 +176,18 @@ fn configure_auth(auth: &AuthConfig) -> anyhow::Result<apollo_server::AuthInterc
             key
         }
     };
-    apollo_server::AuthInterceptor::new(Some(&public_key)).context("configuring authentication")
+    let revocation_file = super::keys::revocation_file(auth)?;
+    if !auth.admin_subjects.is_empty() {
+        tracing::info!(admins = ?auth.admin_subjects, "admin subjects may access every task");
+    }
+    let interceptor = apollo_server::AuthInterceptor::new(apollo_server::AuthSettings {
+        public_key,
+        admin_subjects: auth.admin_subjects.clone(),
+        revocation_file: Some(revocation_file.clone()),
+    })
+    .context("configuring authentication")?;
+    tracing::info!(file = %revocation_file.display(), "token revocation list (watched for changes)");
+    Ok(interceptor)
 }
 
 fn init_tracing(level: &str) {

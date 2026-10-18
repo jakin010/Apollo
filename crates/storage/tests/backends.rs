@@ -41,6 +41,7 @@ fn sample_task(id: &str) -> Task {
             error: None,
             retries: 0,
         }],
+        owner: Some(format!("owner-of-{id}")),
     }
 }
 
@@ -55,7 +56,17 @@ async fn exercise(store: &dyn Storage) {
     assert_eq!(t.state, TaskState::Queued);
     assert_eq!(t.items[0].pipeline.as_deref(), Some("moderation"));
     assert_eq!(t.items[0].results["general"].state, ModelState::Queued);
+    assert_eq!(t.owner.as_deref(), Some("owner-of-t1"));
     assert!(store.get_task("missing").await.unwrap().is_none());
+    // Ownerless tasks (submitted with auth disabled) round-trip as None.
+    store
+        .create_task(&Task {
+            owner: None,
+            ..sample_task("anon")
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.get_task("anon").await.unwrap().unwrap().owner, None);
 
     // --- per-model results + frame checkpoints
     let out = ModelOutput::Classification(Classification {
@@ -181,7 +192,11 @@ async fn exercise(store: &dyn Storage) {
     );
 
     // --- retention: finished tasks (and their children) are purged
-    assert_eq!(store.purge_finished_before(now() + 10).await.unwrap(), 2);
+    store
+        .set_task_state("anon", TaskState::Completed)
+        .await
+        .unwrap();
+    assert_eq!(store.purge_finished_before(now() + 10).await.unwrap(), 3);
     assert!(store.get_task("t1").await.unwrap().is_none());
     assert!(store.load_frames("t1", 0, "nsfw").await.unwrap().is_empty());
 }

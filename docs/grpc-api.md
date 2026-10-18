@@ -3,7 +3,7 @@
 Apollo exposes one gRPC service that clients call: **`apollo.v1.Inference`**. It is defined in `proto/inference.proto` and shares its message types with `proto/common.proto`.
 
 - **Transport:** gRPC over HTTP/2.
-- **TLS:** terminated at the transport (use `https://`/a TLS proxy in front); the examples below use `-plaintext` for a local server.
+- **TLS:** served natively when `[tls]` is configured (optionally with mutual TLS), or terminate it at a proxy in front. The examples below use `-plaintext` for a local server; with `[tls]`, drop `-plaintext` (add `-cacert ca.pem` for a private CA).
 - **Server reflection** is enabled, so tools like `grpcurl` and Postman can discover the schema without a local copy of the `.proto` files.
 - **Health checking** (`grpc.health.v1.Health`) is enabled; the server reports the `Inference` service as `SERVING`.
 - **Authentication** is **on by default** and applies to every `Inference` RPC (health and reflection stay open). See [Authentication](#authentication).
@@ -243,7 +243,8 @@ By default every `Inference` RPC must carry a valid **PASETO v4** token; health 
 - Clients send the token in the **`authorization`** metadata header, with or without a `Bearer ` prefix.
 - The server verifies the signature and any `iat`/`nbf`/`exp` claims; non‑expiring tokens are accepted (revoke by rotating the keypair).
 - With `apollo-client`, pass the token via `Client::builder(url).token("v4.public.…")`.
-- A missing or invalid token is rejected with `UNAUTHENTICATED`.
+- A missing, invalid, or **revoked** token is rejected with `UNAUTHENTICATED`. Tokens carry an id; `apollo revoke --id …` (or `--subject …`) revokes them without rotating the keypair, effective within ~10 s.
+- Tasks belong to the token subject that submitted them: `GetTask` / `CancelTask` by any other subject return `NOT_FOUND` (as for an unknown id), unless that subject is listed in `[auth].admin_subjects`.
 
 See [configuration.md → Authentication](./configuration.md#auth--authentication) for the full setup.
 

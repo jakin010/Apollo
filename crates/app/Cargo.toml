@@ -20,6 +20,7 @@ anyhow = "1"
 libc = "0.2"
 pasetors = "0.7"
 dirs = "6"
+uuid = { version = "1", features = ["v4"] }
 
 [features]
 # Build the binary with GPU support: `cargo build -p apollo --features cuda`.

@@ -70,7 +70,8 @@ const SCHEMA: &str = "
 const CREATE_TASK: &str = "
     BEGIN TRANSACTION;
     CREATE type::record('task', $tid) SET
-        key = $tid, state = $tstate, attempts = 0, created_at = $ts, updated_at = $ts;
+        key = $tid, state = $tstate, attempts = 0, created_at = $ts, updated_at = $ts,
+        owner = $owner;
     FOR $it IN $items {
         CREATE type::record('item', [$tid, $it.idx]) SET
             task_id = $tid, idx = $it.idx, input_json = $it.input_json,
@@ -93,6 +94,7 @@ const CREATE_TASK: &str = "
 #[derive(SurrealValue)]
 struct TaskStateRow {
     state: String,
+    owner: Option<String>,
 }
 
 #[derive(SurrealValue)]
@@ -193,7 +195,7 @@ impl SurrealStorage {
     async fn load_task(&self, id: &str) -> Result<Option<Task>> {
         let mut resp = self
             .db
-            .query("SELECT state FROM type::record('task', $tid)")
+            .query("SELECT state, owner FROM type::record('task', $tid)")
             .bind(("tid", id.to_string()))
             .await?;
         let trows: Vec<TaskStateRow> = resp.take(0)?;
@@ -201,6 +203,7 @@ impl SurrealStorage {
             return Ok(None);
         };
         let state = trow.state.parse::<TaskState>()?;
+        let owner = trow.owner;
 
         let mut resp = self
             .db
@@ -262,6 +265,7 @@ impl SurrealStorage {
             id: id.to_string(),
             state,
             items,
+            owner,
         }))
     }
 }
@@ -304,6 +308,7 @@ impl Storage for SurrealStorage {
             .query(CREATE_TASK)
             .bind(("tid", task.id.clone()))
             .bind(("tstate", task.state.as_str().to_string()))
+            .bind(("owner", task.owner.clone()))
             .bind(("ts", ts))
             .bind(("items", items))
             .bind(("mrs", mrs))

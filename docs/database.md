@@ -61,6 +61,7 @@ One row per submission.
 |--------|------|-------|
 | `id` | TEXT | Primary key (the task id). |
 | `state` | TEXT | `TaskState` token. |
+| `owner` | TEXT | Subject of the token that submitted the task (`NULL` when auth was disabled). Only that subject or an admin can read / cancel it. Added to existing databases automatically. |
 | `attempts` | INTEGER | Crash‑interrupted resume count; a task is failed once this exceeds the cap (poison‑task guard). A graceful shutdown gives the attempt back, so restarts and deploys never count. |
 | `created_at` / `updated_at` | INTEGER | UNIX seconds. |
 
