@@ -10,8 +10,7 @@ apollo-proto  = { path = "../proto" }
 tonic = { workspace = true, features = ["tls-ring", "tls-native-roots", "tls-webpki-roots"] }
 tonic-reflection = "0.14"
 tonic-health = "0.14"
-hmac = "0.13.0"
-sha2 = "0.11.0"
+prost = "0.14"
 pasetors = "0.7"
 thiserror = "2"
 tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
@@ -20,7 +19,9 @@ async-trait = "0.1"
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
+# End-to-end webhook tests deliver to the SDK's signature-verifying receiver.
+apollo-client = { path = "../client" }
 
 [features]
 # Forward GPU backends down to the inference crate.

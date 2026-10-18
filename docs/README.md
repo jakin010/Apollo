@@ -93,23 +93,21 @@ apollo config set app.port 8080
 apollo config set models.general.architecture vit
 apollo config set models.general.repo google/vit-base-patch16-224
 
-# 2. (Optional) enable authentication.
-apollo keygen                       # prints public_key + secret_key
-apollo config set auth.public_key "k4.public.…"
-export APOLLO_SECRET_KEY="k4.secret.…"
-apollo token --subject my-client --expires 30d   # prints an API token
+# 2. Start the server (add --daemon to detach). Authentication is on by default:
+#    the first start creates a signing keypair in the server's state directory.
+apollo start --daemon               # or: apollo start --config ./config.toml --port 8080
 
-# 3. Start the server (foreground; add --daemon to detach).
-apollo start                        # or: apollo start --config ./config.toml --port 8080
+# 3. Mint a token for your client.
+TOKEN=$(apollo token --subject my-client --expires 30d)
 
 # 4. Submit an image (reflection is enabled, so grpcurl needs no .proto files).
 grpcurl -plaintext \
-  -H "authorization: <token>" \
+  -H "authorization: $TOKEN" \
   -d '{"item": {"models": ["general"], "image_url": {"main": "https://example.com/cat.jpg"}}}' \
   localhost:8080 apollo.v1.Inference/Classify
 # → {"taskId": "…"}
 
-grpcurl -plaintext -d '{"task_id": "…"}' localhost:8080 apollo.v1.Inference/GetTask
+grpcurl -plaintext -H "authorization: $TOKEN" -d '{"task_id": "…"}' localhost:8080 apollo.v1.Inference/GetTask
 ```
 
 The server exits at startup if **no models are configured** — there would be nothing to serve.
@@ -119,6 +117,6 @@ The server exits at startup if **no models are configured** — there would be n
 | Document | Covers |
 |----------|--------|
 | [grpc-api.md](./grpc-api.md) | The `Inference` service: methods, messages, enums, error codes, auth, and examples. |
-| [webhooks.md](./webhooks.md) | The `Webhook` service you implement to receive results, delivery semantics, and HMAC signing. |
+| [webhooks.md](./webhooks.md) | The `Webhook` service you implement to receive results, delivery semantics, and payload signing. |
 | [configuration.md](./configuration.md) | Every config section and field, defaults, units, validation, and the CLI. |
 | [database.md](./database.md) | Persistence: backends, schema, migrations, retention, and the result cache. |

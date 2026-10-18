@@ -8,6 +8,10 @@ build = "build.rs"
 tonic = { workspace = true }
 tonic-prost = "0.14"
 prost = "0.14"
+# Webhook delivery signing (see `webhook_signature`).
+hmac = "0.13.0"
+sha2 = "0.11.0"
+thiserror = "2"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

@@ -51,27 +51,39 @@ Optional. Omit the whole section to disable delivery and let clients poll. See [
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `url` | string | *(required if section present)* | gRPC receiver target. Scheme selects transport: `https` = TLS, `http` = plaintext. Path is ignored. |
-| `secret` | string | *(none)* | Shared secret. When set, each delivery carries `x-apollo-webhook-signature` = hex HMAC‑SHA256 of the task id. |
+| `secret` | string | *(none)* | Shared secret. When set, each delivery is signed: `x-apollo-webhook-signature` = `v1=` + hex HMAC‑SHA256 over the delivery timestamp and the exact payload bytes (see [webhooks.md → Signing](./webhooks.md#signing-and-authenticity)). |
 | `redelivery_secs` | u32 | `60` | Background retry interval for failed deliveries. `0` disables periodic retry (still retried on restart). |
 
 ---
 
 ## `[auth]` — authentication
 
-Optional. When present, **every `Inference` RPC** must carry a valid PASETO v4 token (health and reflection stay open).
+**On by default.** Every `Inference` RPC must carry a valid PASETO v4 token (health and reflection stay open). The section is optional: with no `[auth]` at all, authentication is still enabled.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `public_key` | string | *(required if section present)* | PASERK‑encoded v4 **public** key (`k4.public.…`) used to verify tokens. |
+| `enabled` | bool | `true` | Require a token on every `Inference` RPC. Set `false` only on a trusted network — anyone who can reach the port can then submit work and read results (the server logs a warning at startup). |
+| `public_key` | string | *(none)* | PASERK‑encoded v4 **public** key (`k4.public.…`) used to verify tokens. When unset, the server uses a **local keypair** (below). |
 
-Setup:
+**Zero‑config (local keypair).** Without `public_key`, the server creates a signing keypair on first start and keeps it in `auth.key` in its private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS; owner‑only). `apollo token` reads that file when no other secret key is given, so the minimal setup is:
+
+```bash
+apollo start --daemon                                   # first start creates the keypair
+apollo token --subject my-client --expires 30d           # prints a token for a client to present
+```
+
+Run `apollo token` as the same OS user as the server (it looks in that user's state directory).
+
+**Explicit keypair** (e.g. several servers sharing one key, or keys managed by your secret store):
 
 ```bash
 apollo keygen                                 # prints public_key + secret_key (PASERK)
-# put public_key in [auth].public_key; keep secret_key safe
+apollo config set auth.public_key "k4.public.…"   # keep secret_key safe
 export APOLLO_SECRET_KEY="k4.secret.…"
-apollo token --subject ci-runner --expires 30d   # prints a token for a client to present
+apollo token --subject ci-runner --expires 30d
 ```
+
+To turn authentication off: `apollo config set auth.enabled false`.
 
 Clients send the token in the **`authorization`** metadata header (with or without a `Bearer ` prefix). See [grpc-api.md → Authentication](./grpc-api.md#authentication).
 
@@ -327,4 +339,4 @@ apollo token --subject NAME [--expires 30d] [--secret-key-file PATH]
 - **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url`, or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
 - **`config get|set|remove`** edit the file by **dotted key** (e.g. `models.nsfw.repo`), format‑preserving. `set` creates missing tables — and a default `[app]`‑only file — as needed.
 - **`keygen`** prints a fresh public/secret PASERK keypair.
-- **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` or the `APOLLO_SECRET_KEY` env var. `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key (revoke by rotating the keypair). The token goes in the client's `authorization` metadata.
+- **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` (a bare PASERK or `keygen` output), else the `APOLLO_SECRET_KEY` env var, else the server's local keypair file (`auth.key` in the state directory). `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key (revoke by rotating the keypair). The token goes in the client's `authorization` metadata.

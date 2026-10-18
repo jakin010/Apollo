@@ -12,13 +12,16 @@ max_retries    = 3                              # times a failed item is retried
 
 [webhook]
 url = "https://hooks.example.com:443"          # optional; omit the section to disable and let clients poll
-# secret          = "change-me"                 # optional shared secret; HMAC-signs the task id on each delivery (verify on the receiver)
+# secret          = "change-me"                 # optional shared secret; signs each delivery's payload + timestamp (verify on the receiver)
 # redelivery_secs = 60                           # background retry interval for failed deliveries (0 = off)
 
-# Authentication (optional). With [auth] present, every Inference RPC must carry a
-# valid PASETO v4 token. Run `apollo keygen`, put the public key here, and mint
-# client tokens with `apollo token --subject NAME`.
+# Authentication is ON by default: every Inference RPC must carry a valid PASETO
+# v4 token (mint one with `apollo token --subject NAME`). Without a public_key the
+# server creates and uses a local keypair (auth.key in its state directory), which
+# `apollo token` reads. To share a key across servers, run `apollo keygen` and set
+# the public key here.
 # [auth]
+# enabled    = true                                   # false = no authentication (trusted networks only)
 # public_key = "k4.public.REPLACE_WITH_GENERATED_PUBLIC_KEY"
 
 # Result cache (optional). With [cache] present, model outputs are cached by

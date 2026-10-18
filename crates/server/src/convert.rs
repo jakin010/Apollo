@@ -4,7 +4,7 @@
 //! so the orphan rule rules out trait impls. Domain -> proto powers `GetTask` and
 //! webhook delivery; proto -> domain turns a request into an engine `Submission`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use apollo_domain as dom;
 use apollo_engine::Submission;
@@ -79,7 +79,7 @@ fn task_result(state: dom::TaskState, it: dom::Item) -> pb::task::Result {
     }
     match state {
         dom::TaskState::Completed => {
-            let models: HashMap<String, pb::Model> = it
+            let models: BTreeMap<String, pb::Model> = it
                 .results
                 .into_iter()
                 .map(|(label, r)| (label, model_to_proto(r)))

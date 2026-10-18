@@ -177,10 +177,11 @@ version = "1.0.0"
 dependencies = [
  "apollo-proto",
  "futures",
- "hmac 0.13.0",
+ "http-body-util",
  "pasetors",
- "sha2 0.11.0",
+ "prost",
  "thiserror 2.0.18",
+ "tokio",
  "tonic",
  "tonic-reflection",
 ]
@@ -262,8 +263,11 @@ dependencies = [
 name = "apollo-proto"
 version = "1.0.0"
 dependencies = [
+ "hmac 0.13.0",
  "prost",
  "prost-types",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -273,13 +277,13 @@ dependencies = [
 name = "apollo-server"
 version = "1.0.0"
 dependencies = [
+ "apollo-client",
  "apollo-domain",
  "apollo-engine",
  "apollo-proto",
  "async-trait",
- "hmac 0.13.0",
  "pasetors",
- "sha2 0.11.0",
+ "prost",
  "thiserror 2.0.18",
  "tokio",
  "tonic",

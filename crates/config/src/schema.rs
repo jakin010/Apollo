@@ -19,7 +19,7 @@ pub struct Config {
     #[serde(default)]
     pub webhook: Option<WebhookConfig>,
     #[serde(default)]
-    pub auth: Option<AuthConfig>,
+    pub auth: AuthConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
@@ -34,14 +34,32 @@ pub struct Config {
     pub models: BTreeMap<String, ModelConfig>,
 }
 
-/// Authentication for the `Inference` service. When this section is present,
-/// every Inference RPC must carry a valid PASETO v4 token signed by the matching
-/// secret key (mint tokens with `apollo token`). Health and reflection stay open.
+/// Authentication for the `Inference` service — **on by default**. Every
+/// Inference RPC must carry a valid PASETO v4 token signed by the matching secret
+/// key (mint tokens with `apollo token`). Health and reflection stay open.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
+    /// Require a token on every Inference RPC. Defaults to `true`; set `false`
+    /// only on a trusted network (anyone who can reach the port can then submit
+    /// work).
+    #[serde(default = "crate::defaults::auth_enabled")]
+    pub enabled: bool,
     /// PASERK-encoded v4 **public** key (`k4.public.…`) used to verify tokens.
-    pub public_key: String,
+    /// When unset, the server uses — creating on first start — a keypair kept in
+    /// an owner-only `auth.key` file in its state directory, which `apollo token`
+    /// also reads.
+    #[serde(default)]
+    pub public_key: Option<String>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: defaults::auth_enabled(),
+            public_key: None,
+        }
+    }
 }
 
 /// Result cache (optional). When present and `enabled`, model outputs are cached

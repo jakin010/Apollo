@@ -217,12 +217,15 @@ pub fn inference_service(
 }
 
 /// Build the gRPC reflection service advertising the `Inference` service (and the
-/// shared messages) only. Panics only if the compiled-in descriptor is malformed.
+/// shared messages) plus the standard health service, so tools like grpcurl can
+/// call both without local `.proto` files. Panics only if a compiled-in
+/// descriptor is malformed.
 fn reflection_service() -> tonic_reflection::server::v1::ServerReflectionServer<
     impl tonic_reflection::server::v1::ServerReflection,
 > {
     tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(apollo_proto::INFERENCE_DESCRIPTOR_SET)
+        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("embedded gRPC reflection descriptor must be valid")
 }

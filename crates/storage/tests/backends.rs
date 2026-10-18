@@ -1,10 +1,12 @@
 //! One storage contract, run against every backend.
 //!
-//! SQLite always runs (against a temp file). SurrealDB runs only when
+//! SQLite always runs (against a temp file). SurrealDB runs when
 //! `APOLLO_TEST_SURREAL_URL` is set (e.g. `ws://127.0.0.1:8000`), with optional
-//! `APOLLO_TEST_SURREAL_USER` / `APOLLO_TEST_SURREAL_PASS`. It uses a fresh,
-//! uniquely named database in the `apollo_test` namespace and removes that
-//! database afterwards, so it never touches existing data.
+//! `APOLLO_TEST_SURREAL_USER` / `APOLLO_TEST_SURREAL_PASS`; otherwise it is
+//! skipped — unless `APOLLO_TEST_REQUIRE_SURREAL` is set (as in CI), which turns
+//! the skip into a failure. It uses a fresh, uniquely named database in the
+//! `apollo_test` namespace and removes that database afterwards, so it never
+//! touches existing data.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -199,6 +201,10 @@ async fn sqlite_backend_contract() {
 #[tokio::test]
 async fn surreal_backend_contract() {
     let Ok(url) = std::env::var("APOLLO_TEST_SURREAL_URL") else {
+        assert!(
+            std::env::var_os("APOLLO_TEST_REQUIRE_SURREAL").is_none(),
+            "APOLLO_TEST_REQUIRE_SURREAL is set but APOLLO_TEST_SURREAL_URL is not"
+        );
         eprintln!("skipping: set APOLLO_TEST_SURREAL_URL to run against SurrealDB");
         return;
     };

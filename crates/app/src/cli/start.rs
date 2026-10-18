@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use clap::Args;
 
-use apollo_config::{Config, Overrides, load};
+use apollo_config::{AuthConfig, Config, Overrides, load};
 use apollo_engine::{Engine, WebhookSink};
 
 #[derive(Args)]
@@ -94,12 +94,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // Owns the PID file for this process; removed on graceful shutdown.
     let _pidfile = crate::daemon::PidFile::create()?;
 
-    let auth =
-        apollo_server::AuthInterceptor::new(config.auth.as_ref().map(|a| a.public_key.as_str()))
-            .context("configuring authentication")?;
-    if auth.is_enabled() {
-        tracing::info!("PASETO authentication enabled on the Inference service");
-    }
+    let auth = configure_auth(&config.auth)?;
 
     tracing::info!(%addr, models = config.model_count(), "apollo listening");
     apollo_server::serve_with_shutdown(
@@ -117,6 +112,39 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     tracing::info!("apollo shut down cleanly");
     Ok(())
+}
+
+/// Build the auth interceptor. Authentication is on unless the config says
+/// `[auth] enabled = false`; without a configured `public_key` the server uses
+/// (creating it on first start) the local keypair that `apollo token` reads.
+fn configure_auth(auth: &AuthConfig) -> anyhow::Result<apollo_server::AuthInterceptor> {
+    if !auth.enabled {
+        tracing::warn!(
+            "authentication is DISABLED ([auth] enabled = false): anyone who can reach this \
+             port can submit work and read results"
+        );
+        return apollo_server::AuthInterceptor::new(None).context("configuring authentication");
+    }
+    let public_key = match &auth.public_key {
+        Some(key) => {
+            tracing::info!("PASETO authentication enabled (configured public key)");
+            key.clone()
+        }
+        None => {
+            let (key, path, created) = super::keys::load_or_create_local_keypair()
+                .context("preparing the local signing keypair")?;
+            if created {
+                tracing::info!(path = %path.display(), "generated a new signing keypair");
+            }
+            tracing::info!(
+                path = %path.display(),
+                "PASETO authentication enabled (local keypair); mint client tokens with \
+                 `apollo token --subject NAME`"
+            );
+            key
+        }
+    };
+    apollo_server::AuthInterceptor::new(Some(&public_key)).context("configuring authentication")
 }
 
 fn init_tracing(level: &str) {

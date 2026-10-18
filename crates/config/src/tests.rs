@@ -115,3 +115,17 @@ fn rejects_typos_in_security_sections() {
     assert!(load::from_str("[auth]\npublic_key = \"k\"\nextra = 1\n").is_err());
     assert!(load::from_str("[limits]\nallow_local_files = true\n").is_ok());
 }
+
+#[test]
+fn auth_is_on_by_default() {
+    let cfg = load::from_str("").unwrap();
+    assert!(cfg.auth.enabled);
+    assert!(cfg.auth.public_key.is_none());
+
+    let cfg = load::from_str("[auth]\npublic_key = \"k4.public.x\"\n").unwrap();
+    assert!(cfg.auth.enabled);
+    assert_eq!(cfg.auth.public_key.as_deref(), Some("k4.public.x"));
+
+    let cfg = load::from_str("[auth]\nenabled = false\n").unwrap();
+    assert!(!cfg.auth.enabled);
+}

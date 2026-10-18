@@ -74,28 +74,42 @@ pub enum ClientError {
     Auth(String),
 }
 
-/// Held secret key + claim settings used to sign a fresh PASETO v4 token for
-/// each request.
-struct Auth {
-    secret: AsymmetricSecretKey<V4>,
-    subject: String,
-    ttl: Option<Duration>,
+/// How requests are authenticated.
+enum Auth {
+    /// A pre-minted token (e.g. from `apollo token`), sent as-is.
+    Token(String),
+    /// A secret key + claim settings used to sign a fresh PASETO v4 token for
+    /// each request.
+    Mint {
+        secret: AsymmetricSecretKey<V4>,
+        subject: String,
+        ttl: Option<Duration>,
+    },
 }
 
 impl Auth {
-    fn mint(&self) -> Result<String, ClientError> {
+    /// The bearer token for the next request.
+    fn token(&self) -> Result<String, ClientError> {
+        let (secret, subject, ttl) = match self {
+            Auth::Token(token) => return Ok(token.clone()),
+            Auth::Mint {
+                secret,
+                subject,
+                ttl,
+            } => (secret, subject, ttl),
+        };
         let mut claims =
             Claims::new().map_err(|e| ClientError::Auth(format!("building claims: {e}")))?;
         claims
-            .subject(&self.subject)
+            .subject(subject)
             .map_err(|e| ClientError::Auth(format!("setting subject: {e}")))?;
-        match &self.ttl {
+        match ttl {
             Some(d) => claims
                 .set_expires_in(d)
                 .map_err(|e| ClientError::Auth(format!("setting expiry: {e}")))?,
             None => claims.non_expiring(),
         }
-        pasetors::public::sign(&self.secret, &claims, None, None)
+        pasetors::public::sign(secret, &claims, None, None)
             .map_err(|e| ClientError::Auth(format!("signing token: {e}")))
     }
 }
@@ -152,7 +166,7 @@ impl Client {
     fn request<T>(&self, msg: T) -> Result<Request<T>, ClientError> {
         let mut req = Request::new(msg);
         if let Some(auth) = &self.auth {
-            let token = auth.mint()?;
+            let token = auth.token()?;
             let value = format!("Bearer {token}")
                 .parse()
                 .map_err(|_| ClientError::Auth("minted token is not valid metadata".into()))?;
@@ -237,15 +251,15 @@ impl Client {
     }
 }
 
-/// Builder for [`Client`], including optional automatic token minting.
+/// Builder for [`Client`], including authentication. The server requires a
+/// token by default; give the client either a token minted by `apollo token`
+/// (preferred — the client never holds the signing key) or the secret key, in
+/// which case a short-lived token is minted per request.
 ///
 /// ```no_run
 /// # async fn f() -> Result<(), apollo_client::ClientError> {
-/// use std::time::Duration;
-/// let client = apollo_client::Client::builder("http://127.0.0.1:8080")
-///     .secret_key("k4.secret.…")
-///     .subject("ingest-worker")
-///     .token_ttl(Duration::from_secs(60))
+/// let client = apollo_client::Client::builder("https://apollo.internal:8080")
+///     .token("v4.public.…") // from `apollo token --subject ingest-worker`
 ///     .build()
 ///     .await?;
 /// # Ok(()) }
@@ -253,6 +267,7 @@ impl Client {
 pub struct ClientBuilder {
     endpoint: String,
     lazy: bool,
+    token: Option<String>,
     secret_key: Option<String>,
     subject: String,
     ttl: Option<Duration>,
@@ -263,6 +278,7 @@ impl ClientBuilder {
         Self {
             endpoint: endpoint.into(),
             lazy: false,
+            token: None,
             secret_key: None,
             subject: "apollo-client".to_string(),
             ttl: Some(DEFAULT_TOKEN_TTL),
@@ -275,9 +291,17 @@ impl ClientBuilder {
         self
     }
 
+    /// Authenticate with a pre-minted token (from `apollo token`), sent on every
+    /// request. Takes precedence over [`secret_key`](Self::secret_key).
+    pub fn token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
     /// Authenticate by minting a PASETO token from this PASERK secret key
-    /// (`k4.secret.…`) on every request. Without it, requests are sent
-    /// unauthenticated.
+    /// (`k4.secret.…`) on every request. Prefer [`token`](Self::token) where
+    /// possible: whoever holds the secret key can mint tokens for any subject.
+    /// Without a token or key, requests are sent unauthenticated.
     pub fn secret_key(mut self, paserk: impl Into<String>) -> Self {
         self.secret_key = Some(paserk.into());
         self
@@ -303,8 +327,8 @@ impl ClientBuilder {
         self
     }
 
-    /// Resolve the endpoint (TLS for `https://`), parse the secret key (if any),
-    /// and connect.
+    /// Resolve the endpoint (TLS for `https://`), set up authentication, and
+    /// connect.
     pub async fn build(self) -> Result<Client, ClientError> {
         let endpoint = endpoint(self.endpoint)?;
         let channel = if self.lazy {
@@ -312,17 +336,18 @@ impl ClientBuilder {
         } else {
             endpoint.connect().await?
         };
-        let auth = match self.secret_key {
-            Some(paserk) => {
+        let auth = match (self.token, self.secret_key) {
+            (Some(token), _) => Some(Arc::new(Auth::Token(token.trim().to_string()))),
+            (None, Some(paserk)) => {
                 let secret = AsymmetricSecretKey::<V4>::try_from(paserk.trim())
                     .map_err(|e| ClientError::Auth(format!("parsing secret key: {e}")))?;
-                Some(Arc::new(Auth {
+                Some(Arc::new(Auth::Mint {
                     secret,
                     subject: self.subject,
                     ttl: self.ttl,
                 }))
             }
-            None => None,
+            (None, None) => None,
         };
         Ok(Client {
             inner: InferenceClient::new(channel),

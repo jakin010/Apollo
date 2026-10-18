@@ -9,6 +9,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "proto/**"
+      - ".github/workflows/ci.yml"
   pull_request:
     branches: [main]
     paths:
@@ -17,6 +18,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "proto/**"
+      - ".github/workflows/ci.yml"
 
 
 # Cancel a stale run when new commits land on the same branch/PR.
@@ -26,10 +28,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # SurrealDB version the storage contract test runs against. Keep in step with
+  # the `surrealdb` SDK version in crates/storage/Cargo.toml.
+  SURREALDB_VERSION: v3.3.4
 
 jobs:
   test:
-    name: fmt, clippy, test
+    name: fmt, clippy, test (SQLite + SurrealDB)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +45,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
+
+      # Every implemented storage backend is tested: SQLite runs from a temp file
+      # inside the test itself; SurrealDB runs against this throwaway in-memory
+      # server. (Postgres has no backend yet.) Started early so it is up by the
+      # time the build finishes. A step, not a service container, because the
+      # image needs `start` arguments that services cannot pass.
+      - name: Start SurrealDB
+        run: |
+          docker run -d --name surrealdb -p 8000:8000 \
+            "surrealdb/surrealdb:${SURREALDB_VERSION}" \
+            start --bind 0.0.0.0:8000 --username root --password root memory
 
       - name: Install Rust (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
@@ -54,5 +70,25 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Wait for SurrealDB
+        run: |
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8000/health && exit 0
+            sleep 1
+          done
+          echo "SurrealDB did not become healthy" >&2
+          docker logs surrealdb
+          exit 1
+
       - name: cargo test
+        env:
+          APOLLO_TEST_SURREAL_URL: ws://127.0.0.1:8000
+          APOLLO_TEST_SURREAL_USER: root
+          APOLLO_TEST_SURREAL_PASS: root
+          # Fail (instead of skipping) if the SurrealDB settings above go missing.
+          APOLLO_TEST_REQUIRE_SURREAL: "1"
         run: cargo test --workspace --all-targets
+
+      - name: SurrealDB logs
+        if: failure()
+        run: docker logs surrealdb || true

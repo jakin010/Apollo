@@ -23,7 +23,7 @@ async fn fixture() -> Fixture {
     let mut config = Config {
         app: Default::default(),
         webhook: None,
-        auth: None,
+        auth: Default::default(),
         limits: Default::default(),
         database: DatabaseConfig {
             sqlite: Some(SqliteConfig {

@@ -6,7 +6,7 @@ Apollo exposes one gRPC service that clients call: **`apollo.v1.Inference`**. It
 - **TLS:** terminated at the transport (use `https://`/a TLS proxy in front); the examples below use `-plaintext` for a local server.
 - **Server reflection** is enabled, so tools like `grpcurl` and Postman can discover the schema without a local copy of the `.proto` files.
 - **Health checking** (`grpc.health.v1.Health`) is enabled; the server reports the `Inference` service as `SERVING`.
-- **Authentication** is optional and, when enabled, applies to every `Inference` RPC (health and reflection stay open). See [Authentication](#authentication).
+- **Authentication** is **on by default** and applies to every `Inference` RPC (health and reflection stay open). See [Authentication](#authentication).
 
 The service is asynchronous: `Classify`/`ClassifyStream` return a task id right away, and you retrieve results with `GetTask`.
 
@@ -237,11 +237,13 @@ Submit‑time validation failures are client errors; everything else is internal
 
 ## Authentication
 
-When `[auth]` is configured, every `Inference` RPC must carry a valid **PASETO v4** token; health and reflection remain open.
+By default every `Inference` RPC must carry a valid **PASETO v4** token; health and reflection remain open. (Set `[auth] enabled = false` to turn this off on a trusted network.)
 
-- Generate a keypair with `apollo keygen`, put the **public** key in `[auth].public_key`, and mint tokens with `apollo token --subject NAME`.
+- Mint tokens with `apollo token --subject NAME [--expires 30d]`. Without `[auth].public_key` the server uses a local keypair it creates on first start, which `apollo token` reads; or generate one with `apollo keygen` and configure its public key.
 - Clients send the token in the **`authorization`** metadata header, with or without a `Bearer ` prefix.
 - The server verifies the signature and any `iat`/`nbf`/`exp` claims; non‑expiring tokens are accepted (revoke by rotating the keypair).
+- With `apollo-client`, pass the token via `Client::builder(url).token("v4.public.…")`.
+- A missing or invalid token is rejected with `UNAUTHENTICATED`.
 
 See [configuration.md → Authentication](./configuration.md#auth--authentication) for the full setup.
 
@@ -249,33 +251,31 @@ See [configuration.md → Authentication](./configuration.md#auth--authenticatio
 
 ## Examples (grpcurl)
 
-Reflection is enabled, so no `-import-path`/`-proto` flags are needed.
+Reflection is enabled, so no `-import-path`/`-proto` flags are needed. Authentication is on by default, so every call carries a token from `apollo token`.
 
 ```bash
+TOKEN=$(apollo token --subject grpcurl --expires 1h)
+
 # Classify an image with two models.
-grpcurl -plaintext \
+grpcurl -plaintext -H "authorization: $TOKEN" \
   -d '{"item": {"models": ["general", "nsfw"],
                 "image_url": {"main": "https://example.com/cat.jpg",
                               "fallback": "file:///tmp/cat.jpg"}}}' \
   localhost:8080 apollo.v1.Inference/Classify
 
 # Classify a video through a pipeline instead of a model set.
-grpcurl -plaintext \
+grpcurl -plaintext -H "authorization: $TOKEN" \
   -d '{"item": {"pipeline": "moderation",
                 "video_url": {"main": "https://example.com/clip.mp4"}}}' \
   localhost:8080 apollo.v1.Inference/Classify
 
 # Poll for the result.
-grpcurl -plaintext -d '{"task_id": "01H…"}' \
+grpcurl -plaintext -H "authorization: $TOKEN" -d '{"task_id": "01H…"}' \
   localhost:8080 apollo.v1.Inference/GetTask
 
 # Cancel a task.
-grpcurl -plaintext -d '{"task_id": "01H…"}' \
+grpcurl -plaintext -H "authorization: $TOKEN" -d '{"task_id": "01H…"}' \
   localhost:8080 apollo.v1.Inference/CancelTask
-
-# With authentication enabled:
-grpcurl -plaintext -H "authorization: v4.public.…" \
-  -d '{"task_id": "01H…"}' localhost:8080 apollo.v1.Inference/GetTask
 ```
 
 `ClassifyStream` is a client‑streaming RPC (init frame, then data frames); it is normally driven from the generated client (`apollo-client`, which also connects to `https://` endpoints over TLS). Its `Client::classify_stream` takes a `StreamInit` (models or pipeline, plus `video`) and an async stream of byte chunks, so you can feed a large file or live source incrementally; `Client::classify_stream_bytes` is the convenience for content already in memory.

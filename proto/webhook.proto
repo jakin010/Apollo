@@ -13,9 +13,10 @@ import "common.proto";
 // intermediate transitions (processing, retrying — reported as PROCESSING). The
 // message always carries the full current Task. Delivery of the terminal update
 // is at-least-once, so receivers should dedupe by Task.id. When the server is
-// configured with a secret, each call carries an `x-apollo-webhook-signature`
-// metadata header (lowercase-hex HMAC-SHA256 of the task id) so the receiver can
-// verify the caller; it does not cover the payload.
+// configured with a secret, each call is signed: `x-apollo-webhook-timestamp`
+// (unix seconds) and `x-apollo-webhook-signature` = "v1=" + lowercase-hex
+// HMAC-SHA256(secret, "<timestamp>." + the encoded Task bytes as sent). See
+// docs/webhooks.md for verification.
 // =============================================================================
 
 service Webhook {

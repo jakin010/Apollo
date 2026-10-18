@@ -29,10 +29,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Generate Rust once from all three files: the shared messages plus both
-    // service stubs, all under the single `apollo.v1` module.
+    // service stubs, all under the single `apollo.v1` module. Maps are BTreeMaps
+    // so encoding is deterministic (entries sorted by key): webhook signatures
+    // cover the encoded bytes, and a receiver can reproduce them by re-encoding.
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        .btree_map(".")
         .compile_protos(
             &[common.clone(), inference.clone(), webhook.clone()],
             std::slice::from_ref(&proto_dir),
