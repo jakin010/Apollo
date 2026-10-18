@@ -206,6 +206,9 @@ A named, reusable recipe: how to sample frames, how to aggregate their scores, a
 |-------|------|---------|---------|
 | `aggregation` | enum | `mean` | How per‑frame scores roll up into one video result: `max` or `mean` (alias: `average`). |
 | `early_exit` | bool | `false` | Stop the scan as soon as a model's trigger fires (requires the model to define `early_exit.labels`, else no effect). |
+| `confirm` | u32 | `0` | Don't trust a single frame. A frame reaching the model's `early_exit.threshold` only counts as a trigger if at least this many **other** frames within `confirm_window` seconds of it reach it too; when the scan has no frames there, it samples `confirm` frames either side of it. An unconfirmed frame doesn't stop the scan, and in the video's aggregated result it counts as its surroundings (the highest score below the threshold around it), so a lone spike can't flag the video. Per‑frame results are reported as classified. Needs the model's `early_exit`; at most `8`. `0` trusts single frames. |
+| `max_frames` | u32 | *(none)* | Most frames the sampling and `refine` steps may classify per video, for a predictable worst case on small servers. Steps take frames in order; the step that doesn't fit is thinned to what's left — keeping its **strongest** scene cuts, or otherwise spreading its frames evenly across the video — and later steps get none; `refine` gets the remainder, looking at the most ambiguous frames first. Frames sampled to `confirm` a trigger don't count. |
+| `confirm_window` | float (s) | `0.25` | How far either side of a triggering frame `confirm` looks. Above `0.05`, at most `5`. Keep it short: real content lasts longer than a frame, while a model flickering on one frame doesn't. |
 | `sampling` | list | *(required, non‑empty)* | Ordered sampling steps (see below). |
 
 ### `[[strategies.<name>.sampling]]` — a sampling step
@@ -218,10 +221,14 @@ Steps run in ascending `step` order (cheapest first, typically). Each step's req
 | `fps` | `fps` (float) | Sample at N frames per second. |
 | `uniform` | `count` (u32) | N frames, evenly spaced across the clip. |
 | `every_nth` | `nth` (u32) | Take every Nth frame. |
-| `scene` | `threshold` (0..1) | One frame per shot change above the threshold. Optional `min_gap` (seconds): skip a cut closer than this to the previous kept one, capping the cost on fast‑cut video. |
+| `scene` | `threshold` (0..1) | One frame per shot change above the threshold. Optional `min_gap` (seconds): of cuts closer together than this, keep only the strongest (highest scene score), capping the cost on fast‑cut video. Detection decodes with non‑reference frames and the deblocking filter skipped, which is about a third cheaper and still finds the cuts that matter. |
 | `refine` | `min_score` (0..1), `window` (s), `fps` | **Look closer.** After every other step has run without a trigger, sample at `fps` within `window` seconds either side of each frame whose trigger score was ambiguous — from `min_score` up to the model's `early_exit.threshold`. Needs the model's `early_exit` labels, and must be the last step(s). Clean, confidently scored video gets no extra frames. |
 
 Frames closer than 0.05 s to one already chosen by an earlier step are skipped, and a resumed scan re-plans exactly the same frames (including `refine`'s, which are planned from the stored scores).
+
+Steps are planned **lazily**: a step that needs a probe — keyframes for `iframes`, a full decode for `scene` — is only planned once the steps before it were classified without a trigger, so a video that triggers early never pays for scene detection. The probe starts in the background while the earlier frames are classified (and is cancelled if they trigger), and steps that need no probe are planned and classified together with the step before them.
+
+All models scanning the same video share the work: keyframe and scene detection run once per video (per threshold), and each frame is decoded once per input size and handed to every model that samples it — also when they ask at the same moment, and on a retry. Recently decoded frames are kept briefly (up to 128 per video) for models that ask later.
 
 Two strategies from `config.example.toml`, for different hardware:
 
@@ -394,7 +401,7 @@ See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
 
 `apollo start` validates the config before serving and reports **all** problems at once. Enforced rules include:
 
-- **Strategies:** at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`, `refine`→`min_score` + `window` + `fps`); `min_gap` only on `scene` and ≥ 0; `refine` steps after all others, with `min_score` in 0..1, `window` in (0, 60] s and `fps` in (0, 60]. A model using a strategy with `refine` must define `early_exit`, with a `threshold` above the step's `min_score`.
+- **Strategies:** `confirm` at most 8 with `confirm_window` in (0.05, 5] s, and only for models that define `early_exit`; at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`, `refine`→`min_score` + `window` + `fps`); `min_gap` only on `scene` and ≥ 0; `refine` steps after all others, with `min_score` in 0..1, `window` in (0, 60] s and `fps` in (0, 60]. A model using a strategy with `refine` must define `early_exit`, with a `threshold` above the step's `min_score`.
 - **Models:** `video_strategy` must name a defined strategy; `early_exit` must list at least one label **and** requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
 - **Pipelines:** at least one step; every `model` must be defined; unique `order`s; a `stop_if` must list at least one label id.
 - **Database:** selecting `postgres`/`surrealdb` requires the matching `[database.<backend>]` section.

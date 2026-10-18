@@ -11,18 +11,24 @@
 //! drives the scan — pull the plan from [`strategy::plan`], extract and classify
 //! frames in batches, persist, and stop on early-exit — using the helpers here.
 
+pub mod confirm;
 pub mod decode;
 pub mod error;
 pub mod extract;
 pub mod fetch;
 pub mod ffmpeg;
 pub mod sampling;
+pub mod share;
 pub mod strategy;
 
+pub use confirm::Confirm;
 pub use decode::decode_image;
 pub use error::MediaError;
 pub use extract::{FrameRequest, extract_frames_scaled};
 pub use fetch::{FetchLimits, LocalMedia, fetch};
 pub use ffmpeg::{VideoInfo, extract_frame, extract_frames, probe};
 pub use sampling::FrameRef;
-pub use strategy::{DEDUPE_TOLERANCE, aggregate, plan, refine_plan, trigger_score, triggered};
+pub use share::{ShareStats, VideoShare, Warmup};
+pub use strategy::{
+    DEDUPE_TOLERANCE, Planner, aggregate, plan, refine_plan, trigger_score, triggered,
+};

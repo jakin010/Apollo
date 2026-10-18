@@ -1,11 +1,9 @@
 //! Keyframe-only sampling — cheapest, no full decode (ffprobe `-skip_frame nokey`).
 
-use std::path::Path;
-
 use crate::error::MediaError;
-use crate::ffmpeg;
+use crate::share::VideoShare;
 
-/// Keyframe presentation timestamps.
-pub async fn timestamps(path: &Path) -> Result<Vec<f64>, MediaError> {
-    ffmpeg::keyframe_timestamps(path).await
+/// Keyframe presentation timestamps (absolute).
+pub async fn timestamps(share: &VideoShare) -> Result<Vec<f64>, MediaError> {
+    share.keyframes().await
 }

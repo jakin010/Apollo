@@ -10,12 +10,11 @@ pub mod iframes;
 pub mod scene;
 pub mod uniform;
 
-use std::path::Path;
-
 use apollo_config::{SamplingKind, SamplingStep};
 
 use crate::error::MediaError;
 use crate::ffmpeg::VideoInfo;
+use crate::share::VideoShare;
 
 /// A frame to classify: its ordinal `index` (assigned after cross-step dedupe in
 /// [`crate::strategy::plan`]), `timestamp` in seconds, and whether it is a
@@ -27,28 +26,34 @@ pub struct FrameRef {
     pub keyframe: bool,
 }
 
-/// The (unindexed) timestamps a single configured sampling step selects.
-pub async fn step_timestamps(
-    path: &Path,
-    info: &VideoInfo,
+/// The (unindexed) frames a single configured sampling step selects, as
+/// `(timestamp, priority)`: scene cuts carry their scene score (used to keep the
+/// strongest when a frame budget cannot fit them all); other methods none.
+pub async fn step_samples(
+    share: &VideoShare,
     step: &SamplingStep,
-) -> Result<Vec<f64>, MediaError> {
+) -> Result<Vec<(f64, Option<f32>)>, MediaError> {
+    let info = share.info();
+    let plain = |times: Vec<f64>| times.into_iter().map(|t| (t, None)).collect();
     match step.method {
-        SamplingKind::Uniform => Ok(uniform::timestamps(info, req(step.count, "count")?)),
-        SamplingKind::Fps => Ok(fps::timestamps(info, req(step.fps, "fps")?)),
-        SamplingKind::EveryNth => Ok(every_nth::timestamps(info, req(step.nth, "nth")?)),
+        SamplingKind::Uniform => Ok(plain(uniform::timestamps(info, req(step.count, "count")?))),
+        SamplingKind::Fps => Ok(plain(fps::timestamps(info, req(step.fps, "fps")?))),
+        SamplingKind::EveryNth => Ok(plain(every_nth::timestamps(info, req(step.nth, "nth")?))),
         // ffmpeg reports these as absolute presentation times; sampling works
         // relative to the stream start (like `duration` and the other methods).
-        SamplingKind::Iframes => Ok(relative(info, iframes::timestamps(path).await?)),
-        SamplingKind::Scene => Ok(relative(
-            info,
-            scene::timestamps(
-                path,
+        SamplingKind::Iframes => Ok(plain(relative(info, iframes::timestamps(share).await?))),
+        SamplingKind::Scene => {
+            let cuts = scene::cuts(
+                share,
                 req(step.threshold, "threshold")?,
                 step.min_gap.unwrap_or(0.0),
             )
-            .await?,
-        )),
+            .await?;
+            Ok(cuts
+                .into_iter()
+                .map(|(t, score)| ((t - info.start_time).max(0.0), Some(score)))
+                .collect())
+        }
         // Planned from the scores of the other steps' frames, after they are
         // classified — see [`crate::strategy::refine_plan`].
         SamplingKind::Refine => Ok(Vec::new()),
