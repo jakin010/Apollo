@@ -397,6 +397,16 @@ impl Engine {
             }
         };
         live.registry.validate_item(&live.config, input, &models)?;
+        // Inline text is checked now; an uploaded one when it is read.
+        if let Input::Text(text) = input
+            && let Some(max) = live.config.limits.max_text_bytes()
+            && text.len() as u64 > max
+        {
+            return Err(EngineError::Incompatible(format!(
+                "the text is {} bytes, over the {max}-byte limit ([limits].max_text)",
+                text.len()
+            )));
+        }
         Ok((models, pipeline))
     }
 

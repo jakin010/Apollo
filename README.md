@@ -1,6 +1,6 @@
 # Apollo - This application has been made 95% by AI and 5% by me
 
-Apollo is a gRPC service that runs machine‑learning **classification models over images and video**. You submit an input (an image or video URL, its bytes inline, or a stream of raw bytes) together with the names of the models to run on it; Apollo returns the **task** immediately and does the work asynchronously. You then wait for it in the same call, watch it, poll it, or receive it over a webhook.
+Apollo is a gRPC service that runs machine‑learning **classification models over images, video and text**. You submit an input (an image or video URL, its bytes inline, or a stream of raw bytes) together with the names of the models to run on it; Apollo returns the **task** immediately and does the work asynchronously. You then wait for it in the same call, watch it, poll it, or receive it over a webhook.
 
 Models are loaded from [Hugging Face](https://huggingface.co/) and executed with the [candle](https://github.com/huggingface/candle) inference framework. The service is built to be operated as a long‑running daemon: task state is fully persisted, so work survives restarts, and interrupted video scans resume from where they stopped.
 

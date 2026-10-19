@@ -70,7 +70,7 @@ Requests cooperative cancellation and returns the task **after** the request: `C
 
 ### `ListModels(ListModelsRequest) → ListModelsResponse`
 
-The configured models and pipelines, so clients need not hard-code them. Each model lists the input kinds it accepts, whether it is enabled and currently loaded, its labels (id and name, as in predictions), its trigger (`[models.<name>.early_exit]`) and its video strategy. Labels are read without loading or downloading the model: from the config for `siglip` and `pdq` (its `categories`), from the cached `config.json` for `vit`. A `vit` model that was never downloaded has no labels listed until its first use.
+The configured models and pipelines, so clients need not hard-code them. Each model lists the input kinds it accepts, whether it is enabled and currently loaded, its labels (id and name, as in predictions), its trigger (`[models.<name>.early_exit]`) and its video strategy. Labels are read without loading or downloading the model: from the config for `siglip` and `pdq` (its `categories`), from the cached `config.json` for `vit` and the text models. A `vit` or text model that was never downloaded has no labels listed until its first use.
 
 ---
 
@@ -78,7 +78,10 @@ The configured models and pipelines, so clients need not hard-code them. Each mo
 
 ```protobuf
 message ClassifyRequest {
-  oneof input { Media media = 1; }          // what to classify
+  oneof input {                             // what to classify
+    Media  media = 1;
+    string text  = 8;                       // UTF-8 text, for text models
+  }
   oneof run {                               // what to run on it
     ModelList models   = 2;                 // these models, concurrently
     string    pipeline = 3;                 // a named [pipelines.<name>]
@@ -90,7 +93,7 @@ message ClassifyRequest {
 }
 
 message Media {
-  MediaKind kind = 1;                       // IMAGE, VIDEO or AUDIO (required)
+  MediaKind kind = 1;                       // IMAGE, VIDEO, AUDIO or TEXT (required)
   oneof source {
     string url  = 2;                        // local path, file://, or http(s)://
     bytes  data = 3;                        // the content itself
@@ -130,6 +133,7 @@ Notes:
 - `models` run as a **set**, concurrently; a pipeline runs its **steps** in order, each step's models concurrently, gated by `stop_if` (see [configuration → pipelines](./configuration.md#pipelinesname--ordered-gated-model-execution)).
 - `metadata`: at most 16 entries; keys 1–64 bytes, values up to 512 bytes. Use it for your own record id, batch name, and so on.
 - `request_id`: up to 128 bytes.
+- **Text:** send it as `text`, as `media` with `kind = TEXT` and the UTF-8 bytes in `data`, or with `ClassifyStream` (`kind = TEXT`). A text cannot come from a `url`. It is limited to `[limits].max_text` (100 KB by default): inline text over it is rejected with `INVALID_ARGUMENT`, and uploaded text fails the task with `ERROR_TYPE_DECODE`, as does text that is not UTF-8.
 - `AUDIO` is accepted by the schema but no audio models exist yet, so audio input is rejected as incompatible.
 
 ---
@@ -197,7 +201,7 @@ message Segment {
 - A task whose input is being **retried** after a transient failure stays `PROCESSING`, with `retries` counting the attempts; `error` is only set once it has failed for good.
 - `results` has one entry per model **in run order**: the pipeline's step order, or the order you listed `models`. Results of models that have not started are `QUEUED`.
 - A `Classification` returns the **top 5 predictions unioned with any label scoring above 0.90**, so a confident sixth label is never dropped (models with a `score_threshold` return the labels at or above it instead).
-- Each prediction has the label's `id` (a class index for `vit`, a label‑list index for `siglip` with `labels`, a taxonomy child id for `siglip` with a taxonomy, a category id for `pdq`) and its `name` (e.g. `nsfw`, or `food_and_drink.drinks` for a taxonomy child). `ListModels` lists every label a model can predict.
+- Each prediction has the label's `id` (a class index for `vit` and the text models, a label‑list index for `siglip` with `labels`, a taxonomy child id for `siglip` with a taxonomy, a category id for `pdq`) and its `name` (e.g. `nsfw`, or `food_and_drink.drinks` for a taxonomy child). `ListModels` lists every label a model can predict.
 - For `siglip`, `score` is an independent **sigmoid probability**.
 - Video results come back as a `Scan`: `aggregated` is the roll-up across the classified frames (the strategy's `max` or `mean`), `segments` the stretches where a trigger label fired, and `samples` the individual frames (`FULL` view only). A scan that stopped early (`early_exit`) has only the frames classified up to then.
 
@@ -274,7 +278,7 @@ message ListModelsResponse { repeated ModelInfo models = 1; repeated PipelineInf
 
 message ModelInfo {
   string name = 1;  string architecture = 2;  string repo = 3;
-  repeated MediaKind accepts = 4;           // IMAGE, plus VIDEO with a video strategy
+  repeated MediaKind accepts = 4;           // IMAGE (+ VIDEO with a video strategy), or TEXT
   bool enabled = 5;  bool loaded = 6;       // loaded = weights in memory now
   repeated Label labels = 7;                // empty if not readable offline
   Trigger trigger = 8;                      // the model's early_exit, if any
@@ -297,7 +301,8 @@ The input's kind fixes which models are valid for it. Invalid combinations are r
 | Input | Valid models |
 |-------|--------------|
 | image | any image model (`vit`, `siglip`, `pdq`) |
-| video | any image classifier that has a `video_strategy` configured (it is run over sampled frames) |
+| video | any image model that has a `video_strategy` configured (it is run over sampled frames) |
+| text | any text model (`bert`, `distilbert`, `xlm_roberta`, `modernbert`, `deberta_v2`) |
 | audio | none yet |
 
 Runtime failures (an unfetchable URL, a decode error, an inference error, a timeout) are **not** rejected up front; they are reported on the task and its model results.
@@ -359,6 +364,11 @@ grpcurl -plaintext -H "authorization: $TOKEN" \
 grpcurl -plaintext -H "authorization: $TOKEN" \
   -d "{\"media\": {\"kind\": \"MEDIA_KIND_IMAGE\", \"data\": \"$(base64 < cat.jpg)\"},
        \"models\": {\"names\": [\"general\"]}, \"wait_seconds\": 30}" \
+  localhost:8080 apollo.v1.Inference/Classify
+
+# Classify a text with a text model.
+grpcurl -plaintext -H "authorization: $TOKEN" \
+  -d '{"text": "You are a wonderful person.", "models": {"names": ["toxicity"]}, "wait_seconds": 30}' \
   localhost:8080 apollo.v1.Inference/Classify
 
 # Follow a task until it finishes, with every classified frame.

@@ -11,8 +11,10 @@ import "google/protobuf/timestamp.proto";
 // A request names one input and the models to run on it, either as a set (run
 // concurrently) or as a named pipeline (run in steps). The input's kind fixes
 // which models are valid:
-//   image -> any image classifier
-//   video -> any image classifier with a video_strategy (sampled-frame scan)
+//   image -> any image model (vit, siglip, pdq)
+//   video -> any image model with a video_strategy (sampled-frame scan)
+//   text  -> any text model (bert, distilbert, xlm_roberta, modernbert,
+//            deberta_v2)
 // Invalid combinations are rejected synchronously (INVALID_ARGUMENT) before
 // anything is queued. Runtime failures (unfetchable URL, inference error,
 // timeout) are reported on the task and its model results instead.
@@ -58,6 +60,8 @@ message ClassifyRequest {
   // What to classify.
   oneof input {
     Media media = 1;
+    // UTF-8 text, up to the server's [limits].max_text (100 KB by default).
+    string text = 8;
   }
   // What to run on it: a set of models (concurrently) or a named pipeline.
   oneof run {
@@ -143,11 +147,12 @@ message ListModelsResponse {
 
 message ModelInfo {
   string name = 1;
-  // e.g. "vit", "siglip".
+  // e.g. "vit", "siglip", "pdq", "bert".
   string architecture = 2;
   // Hugging Face repo the weights come from.
   string repo = 3;
-  // Input kinds the model accepts (video only with a video strategy).
+  // Input kinds the model accepts: IMAGE (and VIDEO, with a video
+  // strategy), or TEXT.
   repeated MediaKind accepts = 4;
   // Disabled models are rejected at submit time.
   bool enabled = 5;

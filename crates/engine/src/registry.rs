@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use apollo_config::{Config, ModelConfig};
-use apollo_domain::{Input, Modality};
+use apollo_domain::{Input, Modality, ModelInput};
 
 use crate::error::EngineError;
 use crate::metrics::Metrics;
@@ -153,11 +153,16 @@ impl Registry {
                     "model '{label}' is disabled"
                 )));
             }
-            // Every model is an image classifier: images run directly; video runs
-            // as a per-frame scan, which requires a configured video_strategy.
-            match modality {
-                Modality::Image => {}
-                Modality::Video => match &model.video_strategy {
+            // Image models take images, and video as a per-frame scan (with a
+            // configured video_strategy); text models take text.
+            let takes = model.architecture.input();
+            let kind = match takes {
+                ModelInput::Image => "an image",
+                ModelInput::Text => "a text",
+            };
+            match (modality, takes) {
+                (Modality::Image, ModelInput::Image) | (Modality::Text, ModelInput::Text) => {}
+                (Modality::Video, ModelInput::Image) => match &model.video_strategy {
                     Some(s) if config.strategies.contains_key(s) => {}
                     Some(s) => {
                         return Err(EngineError::Config(format!(
@@ -170,9 +175,15 @@ impl Registry {
                         )));
                     }
                 },
-                Modality::Text | Modality::Audio => {
+                (Modality::Audio, _) => {
+                    return Err(EngineError::Incompatible(
+                        "audio input is not supported yet".into(),
+                    ));
+                }
+                (Modality::Image | Modality::Video | Modality::Text, _) => {
+                    let given = format!("{modality:?}").to_lowercase();
                     return Err(EngineError::Incompatible(format!(
-                        "{modality:?} input is not supported yet"
+                        "model '{label}' is {kind} model and does not take {given} input"
                     )));
                 }
             }

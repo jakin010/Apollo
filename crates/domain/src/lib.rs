@@ -9,7 +9,7 @@ pub mod result;
 pub mod task;
 
 pub use image::DecodedImage;
-pub use model::{Architecture, Modality};
+pub use model::{Architecture, Modality, ModelInput};
 pub use result::{
     Classification, Label, ModelOutput, Prediction, Sample, Scan, Segment, select_top,
 };

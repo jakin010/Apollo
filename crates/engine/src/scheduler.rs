@@ -41,6 +41,7 @@ enum Fetched {
         /// (and by retries), so each is done once.
         share: Arc<VideoShare>,
     },
+    Text(Arc<str>),
 }
 
 /// What every model of an item's parallel set shares.
@@ -863,6 +864,17 @@ impl Engine {
                 .await?;
                 Ok(ModelOutput::Classification(c))
             }
+            (Modality::Text, Fetched::Text(text)) => {
+                // One text, all its windows: bounded by `timeout`.
+                let on_timeout = format!("model '{label}' timed out classifying text");
+                let c = classify_with_timeout(
+                    timeout,
+                    handle.classify_text(Arc::clone(text)),
+                    &on_timeout,
+                )
+                .await?;
+                Ok(ModelOutput::Classification(c))
+            }
             (Modality::Video, Fetched::Video { info, share, .. }) => {
                 // Video: an image classifier over sampled frames, each frame bounded
                 // by `timeout` (applied inside run_frame_scan).
@@ -892,21 +904,32 @@ impl Engine {
         let (media, video) = match input {
             Input::Image(url) => (self.fetch_url(url).await?, false),
             Input::Video(url) => (self.fetch_url(url).await?, true),
+            Input::Text(text) => return self.text_input(text.as_str().into(), want_hash),
+            Input::Bytes {
+                path,
+                kind: MediaKind::Text,
+            } => {
+                let bytes = LocalMedia::adopt(path.clone()).read_bytes()?;
+                let text = String::from_utf8(bytes).map_err(|_| {
+                    EngineError::Media(MediaError::Decode("the uploaded text is not UTF-8".into()))
+                })?;
+                return self.text_input(text.into(), want_hash);
+            }
             Input::Bytes { path, kind } => (
                 LocalMedia::adopt(path.clone()),
                 match kind {
                     MediaKind::Image => false,
                     MediaKind::Video => true,
-                    MediaKind::Audio => {
+                    MediaKind::Audio | MediaKind::Text => {
                         return Err(EngineError::Incompatible(
                             "audio inputs are not supported yet".into(),
                         ));
                     }
                 },
             ),
-            Input::Text(_) | Input::Audio(_) => {
+            Input::Audio(_) => {
                 return Err(EngineError::Incompatible(
-                    "text/audio inputs are not supported yet".into(),
+                    "audio inputs are not supported yet".into(),
                 ));
             }
         };
@@ -920,6 +943,25 @@ impl Engine {
             fetched,
             content_hash,
             used_fallback,
+        })
+    }
+
+    /// A text input, checked against `[limits].max_text` and hashed for the
+    /// cache when `want_hash` is set.
+    fn text_input(&self, text: Arc<str>, want_hash: bool) -> Result<FetchedInput, EngineError> {
+        if let Some(max) = self.config().limits.max_text_bytes()
+            && text.len() as u64 > max
+        {
+            return Err(EngineError::Media(MediaError::Decode(format!(
+                "the text is {} bytes, over the {max}-byte limit ([limits].max_text)",
+                text.len()
+            ))));
+        }
+        let content_hash = want_hash.then(|| sha256_hex(text.as_bytes()));
+        Ok(FetchedInput {
+            fetched: Fetched::Text(text),
+            content_hash,
+            used_fallback: false,
         })
     }
 

@@ -1,11 +1,11 @@
-//! `apollo-inference` — load Hugging Face image-classification models with candle
-//! and run them on the best available device.
+//! `apollo-inference` — load Hugging Face image and text classifiers with
+//! candle and run them on the best available device.
 //!
 //! [`select_device`] picks CUDA → Metal → CPU (Metal is compiled in automatically
 //! on macOS; CUDA is opt-in via the `cuda` feature). [`load`] downloads a model
-//! from the Hub (cached) and returns a boxed [`ImageClassifier`]; the `arch`
-//! module is the seam where model families plug in. Image classifiers cover both
-//! image inputs and per-frame video scans.
+//! from the Hub (cached) and returns a [`LoadedModel`]: an [`ImageClassifier`]
+//! (images, and video frame by frame) or a [`TextClassifier`]. The `arch`
+//! module is the seam where model families plug in.
 //!
 //! Loading and inference are synchronous (candle + safetensors mmap + Hub I/O);
 //! the async engine runs them on blocking threads.
@@ -46,6 +46,30 @@ pub trait ImageClassifier: Send + Sync {
     fn input_size(&self) -> u32;
 }
 
+/// A text classifier: independent per-text classification, batched.
+pub trait TextClassifier: Send + Sync {
+    /// Classify a batch of texts, one [`Classification`] per input: the top 5
+    /// labels plus any above 0.90.
+    fn classify(&self, texts: &[&str]) -> Result<Vec<Classification>, InferenceError>;
+    /// The labels the model can predict (ids as in its predictions).
+    fn labels(&self) -> &[Label];
+}
+
+/// A loaded model, by the kind of input it classifies.
+pub enum LoadedModel {
+    Image(Box<dyn ImageClassifier>),
+    Text(Box<dyn TextClassifier>),
+}
+
+impl LoadedModel {
+    pub fn labels(&self) -> &[Label] {
+        match self {
+            LoadedModel::Image(m) => m.labels(),
+            LoadedModel::Text(m) => m.labels(),
+        }
+    }
+}
+
 /// The labels of the model `cfg` names, read without loading or downloading
 /// anything: from the config (siglip `labels` or `taxonomy_file`) or the
 /// repo's cached `config.json` (vit). `None` when they cannot be read that way
@@ -68,7 +92,12 @@ pub fn labels(cfg: &ModelConfig, cache_dir: Option<&Path>) -> Option<Vec<Label>>
             None => Some(Label::indexed(&cfg.labels)),
         },
         Architecture::Pdq => arch::pdq::category_labels(cfg).ok(),
-        Architecture::Vit => {
+        Architecture::Vit
+        | Architecture::Bert
+        | Architecture::Distilbert
+        | Architecture::XlmRoberta
+        | Architecture::Modernbert
+        | Architecture::DebertaV2 => {
             let path = loader::cached_file(cfg, cache_dir, "config.json")?;
             let bytes = std::fs::read(path).ok()?;
             let names = loader::labels_from_config(&bytes).ok()?;
@@ -111,17 +140,28 @@ pub fn load(
     files: &ModelFiles,
     device: &Device,
     cache_dir: Option<&Path>,
-) -> Result<Box<dyn ImageClassifier>, InferenceError> {
+) -> Result<LoadedModel, InferenceError> {
+    let image = |m: Box<dyn ImageClassifier>| Ok(LoadedModel::Image(m));
     match cfg.architecture {
         Architecture::Vit => {
             let hub = loader::Hub::open(cfg, cache_dir)?;
-            Ok(Box::new(arch::vit::load(&hub, device)?))
+            image(Box::new(arch::vit::load(&hub, device)?))
         }
         Architecture::Siglip => {
             let hub = loader::Hub::open(cfg, cache_dir)?;
-            Ok(Box::new(arch::siglip::load(&hub, cfg, files, device)?))
+            image(Box::new(arch::siglip::load(&hub, cfg, files, device)?))
         }
         // Runs on the CPU, with no weights to fetch.
-        Architecture::Pdq => Ok(Box::new(arch::pdq::load(cfg, files)?)),
+        Architecture::Pdq => image(Box::new(arch::pdq::load(cfg, files)?)),
+        Architecture::Bert
+        | Architecture::Distilbert
+        | Architecture::XlmRoberta
+        | Architecture::Modernbert
+        | Architecture::DebertaV2 => {
+            let hub = loader::Hub::open(cfg, cache_dir)?;
+            Ok(LoadedModel::Text(Box::new(arch::text::load(
+                &hub, cfg, device,
+            )?)))
+        }
     }
 }

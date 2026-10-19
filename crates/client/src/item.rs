@@ -1,7 +1,7 @@
 //! Ergonomic constructors for [`ClassifyRequest`](crate::ClassifyRequest).
 //!
-//! Each takes the content (a URL, or the bytes themselves) plus the models to
-//! run, or a pipeline name. Models accept anything `Into<String>`, so string
+//! Each takes the content (a URL, the bytes themselves, or text) plus the
+//! models to run, or a pipeline name. Models accept anything `Into<String>`, so string
 //! literals work: `item::image("cat.jpg", ["resnet", "vit"])`. Optional
 //! request fields are set with [`ClassifyRequestExt`]:
 //!
@@ -63,6 +63,27 @@ pub fn image_pipeline(url: impl Into<String>, pipeline: impl Into<String>) -> Cl
 /// A video fetched from `url`, run through the named `[pipelines.<name>]`.
 pub fn video_pipeline(url: impl Into<String>, pipeline: impl Into<String>) -> ClassifyRequest {
     self::url(MediaKind::Video, url, Some(Run::Pipeline(pipeline.into())))
+}
+
+/// Text classified by `models` (text models).
+pub fn text(
+    content: impl Into<String>,
+    models: impl IntoIterator<Item = impl Into<String>>,
+) -> ClassifyRequest {
+    ClassifyRequest {
+        input: Some(Input::Text(content.into())),
+        run: self::models(models),
+        ..Default::default()
+    }
+}
+
+/// Text run through the named `[pipelines.<name>]`.
+pub fn text_pipeline(content: impl Into<String>, pipeline: impl Into<String>) -> ClassifyRequest {
+    ClassifyRequest {
+        input: Some(Input::Text(content.into())),
+        run: Some(Run::Pipeline(pipeline.into())),
+        ..Default::default()
+    }
 }
 
 /// An image sent inline, classified by `models`. Bounded by the gRPC message
@@ -142,8 +163,18 @@ mod tests {
     fn media(req: &ClassifyRequest) -> &Media {
         match &req.input {
             Some(Input::Media(m)) => m,
-            None => panic!("no media"),
+            _ => panic!("no media"),
         }
+    }
+
+    #[test]
+    fn text_requests() {
+        let req = text("you are great", ["toxicity"]);
+        assert_eq!(req.input, Some(Input::Text("you are great".into())));
+        assert_eq!(
+            text_pipeline("x", "screen").run,
+            Some(Run::Pipeline("screen".into()))
+        );
     }
 
     #[test]

@@ -16,7 +16,8 @@ import "google/protobuf/timestamp.proto";
 
 // ---------------------------------- inputs -----------------------------------
 
-// A media input: what kind it is, and where its bytes come from.
+// A media input: what kind it is, and where its bytes come from. Text cannot
+// come from a `url`.
 message Media {
   MediaKind kind = 1;
   oneof source {
@@ -35,6 +36,9 @@ enum MediaKind {
   MEDIA_KIND_IMAGE = 1;
   MEDIA_KIND_VIDEO = 2;
   MEDIA_KIND_AUDIO = 3;
+  // UTF-8 text: as `data`, or streamed. (Inline text can also be sent as
+  // `ClassifyRequest.text`.)
+  MEDIA_KIND_TEXT = 4;
 }
 
 // Models to run on one input, concurrently.

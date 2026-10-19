@@ -27,7 +27,7 @@ pub enum MediaError {
     #[error("refused: {0}")]
     Refused(String),
 
-    #[error("image decode failed: {0}")]
+    #[error("could not decode the input: {0}")]
     Decode(String),
 
     #[error("{0}")]

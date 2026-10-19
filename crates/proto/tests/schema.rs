@@ -108,6 +108,7 @@ fn classify_requests() {
 
     let cr = fields_by_name(&msgs["ClassifyRequest"]);
     message(&cr["media"], 1, ".apollo.v1.Media", Optional);
+    scalar(&cr["text"], 8, Type::String, Optional);
     message(&cr["models"], 2, ".apollo.v1.ModelList", Optional);
     scalar(&cr["pipeline"], 3, Type::String, Optional);
     message(
@@ -119,7 +120,7 @@ fn classify_requests() {
     scalar(&cr["request_id"], 5, Type::String, Optional);
     scalar(&cr["wait_seconds"], 6, Type::Uint32, Optional);
     enumeration(&cr["view"], 7, ".apollo.v1.ResultView", Optional);
-    assert_eq!(cr.len(), 7);
+    assert_eq!(cr.len(), 8);
 
     // The stream's init mirrors ClassifyRequest, with `kind` for `media`.
     let si = fields_by_name(&msgs["ClassifyStreamInit"]);
@@ -370,6 +371,7 @@ fn enum_values() {
     assert_eq!(MediaKind::Image as i32, 1);
     assert_eq!(MediaKind::Video as i32, 2);
     assert_eq!(MediaKind::Audio as i32, 3);
+    assert_eq!(MediaKind::Text as i32, 4);
 
     assert_eq!(ResultView::Unspecified as i32, 0);
     assert_eq!(ResultView::Summary as i32, 1);

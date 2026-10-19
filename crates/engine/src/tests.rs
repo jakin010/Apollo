@@ -643,3 +643,54 @@ async fn a_model_loads_the_files_read_when_the_config_was_applied() {
     let err = f.engine.reload(again, None).await.unwrap_err();
     assert!(err.to_string().contains("blocklist.txt`: line 1"), "{err}");
 }
+
+#[tokio::test]
+async fn text_and_image_models_only_take_their_own_input() {
+    let f = fixture_with(
+        r#"
+        [limits]
+        max_text = "10b"
+        [models.toxicity]
+        architecture = "bert"
+        repo = "test/toxic-bert"
+        [models.nsfw]
+        architecture = "vit"
+        repo = "test/nsfw"
+        "#,
+    )
+    .await;
+    let text = Input::Text("hello".into());
+    let check = |input: &Input, model: &str| {
+        f.engine
+            .check_submission(input, &Run::Models(vec![model.into()]))
+    };
+    check(&text, "toxicity").unwrap();
+    for (input, model, needle) in [
+        (
+            &text,
+            "nsfw",
+            "is an image model and does not take text input",
+        ),
+        (
+            &image(),
+            "toxicity",
+            "is a text model and does not take image input",
+        ),
+        (
+            &Input::Text("a much longer text".into()),
+            "toxicity",
+            "over the 10-byte limit",
+        ),
+    ] {
+        let err = check(input, model).unwrap_err().to_string();
+        assert!(err.contains(needle), "{err}");
+    }
+
+    let catalog = f.engine.catalog().await.unwrap();
+    let toxicity = catalog
+        .models
+        .iter()
+        .find(|m| m.name == "toxicity")
+        .unwrap();
+    assert_eq!(toxicity.accepts, [MediaKind::Text]);
+}

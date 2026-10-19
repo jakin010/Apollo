@@ -258,6 +258,8 @@ pub struct LimitsConfig {
     /// Max decoded pixels (`width * height`) for an image, guarding against
     /// decompression bombs. `0` = unlimited.
     pub max_pixels: u64,
+    /// Max size of a text input (e.g. `100kb`; `0` = unlimited).
+    pub max_text: String,
 }
 
 impl Default for LimitsConfig {
@@ -270,6 +272,7 @@ impl Default for LimitsConfig {
             allow_local_files: defaults::allow_local_files(),
             local_roots: defaults::local_roots(),
             max_pixels: defaults::max_pixels(),
+            max_text: defaults::max_text(),
         }
     }
 }
@@ -278,6 +281,11 @@ impl LimitsConfig {
     /// `max_download` parsed to bytes; `None` means unlimited.
     pub fn max_download_bytes(&self) -> Option<u64> {
         crate::units::parse_size(&self.max_download)
+    }
+
+    /// `max_text` parsed to bytes; `None` means unlimited.
+    pub fn max_text_bytes(&self) -> Option<u64> {
+        crate::units::parse_size(&self.max_text)
     }
 }
 
@@ -545,6 +553,18 @@ pub struct ModelConfig {
     /// also makes matching independent of EXIF orientation.
     #[serde(default)]
     pub match_rotations: Option<bool>,
+    /// Text models: tokens per window. Longer text is classified in
+    /// overlapping windows, each label's score being its highest. Defaults to
+    /// 128; at most the model's own limit. Smaller windows find a short
+    /// passage in a long text better; larger ones give each window more
+    /// context.
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    /// Text models: score each label independently (sigmoid) instead of as
+    /// one choice among all labels (softmax). Defaults to what the model's
+    /// `config.json` says (`problem_type = "multi_label_classification"`).
+    #[serde(default)]
+    pub multi_label: Option<bool>,
 }
 
 /// `[models.<label>.early_exit]` — what counts as a trigger for this model.

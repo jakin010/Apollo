@@ -85,10 +85,7 @@ impl Inference for InferenceService {
         let owner = caller(&request).map(|c| c.subject);
         let req = request.into_inner();
         let invalid = Status::invalid_argument;
-        let media = req
-            .input
-            .map(|apollo_proto::classify_request::Input::Media(m)| m);
-        let source = convert::media_from_proto(media).map_err(invalid)?;
+        let source = convert::input_from_proto(req.input).map_err(invalid)?;
         let run = convert::classify_run(req.run).map_err(invalid)?;
         let accept = Accept::new(
             owner,
