@@ -142,6 +142,20 @@ step   = 3
 method = "fps"                 # densest — only reached if earlier steps didn't exit
 fps    = 5
 
+# --- Perceptual-hash block lists ---------------------------------------------
+# A `pdq` model matches images (and video frames) against a list of known
+# images by their PDQ hashes; no weights, CPU only. One `<hash> <category id>`
+# per line in `hash_list` (build it with `apollo hash --category 1 DIR`). A
+# match scores 1 - distance/256, so a threshold of 0.87 fires on any match
+# within the default max_distance of 31 bits. See docs/configuration.md.
+# [models.blocklist]
+# architecture   = "pdq"
+# hash_list      = "blocklist.txt"
+# categories     = { 1 = "known" }
+# video_strategy = "representative"
+# early_exit     = { labels = [1], threshold = 0.87 }
+# match_rotations = true          # default: rotated/mirrored copies match too
+
 # --- Metrics: a Prometheus scrape endpoint ------------------------------------
 # Off by default. `GET /metrics` on its own listener (not the gRPC port). It is
 # not authenticated, so keep it on loopback or behind a firewall. Read at

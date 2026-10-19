@@ -308,8 +308,8 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `architecture` | enum | *(required)* | `vit` (fixed‑head classifier) or `siglip` (open‑vocabulary). |
-| `repo` | string | *(required)* | Hugging Face repo. |
+| `architecture` | enum | *(required)* | `vit` (fixed‑head classifier), `siglip` (open‑vocabulary), or `pdq` (perceptual-hash block list; see [below](#perceptual-hash-block-lists-pdq)). |
+| `repo` | string | *(required for `vit`/`siglip`)* | Hugging Face repo. `pdq` has none. |
 | `revision` | string | `"main"` | Repo revision/branch/tag. |
 | `enabled` | bool | `true` | If `false`, the model is rejected at submit time. |
 | `keep_in_memory` | bool | `false` | Load the weights at startup and keep them resident (skip idle‑unload). |
@@ -323,6 +323,11 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 | `score_threshold` | f32 | `0.5` | Keep `siglip` labels scoring at/above this (sigmoid probability). For video frame scans, set this **low** so true peaks survive the temporal pool. |
 | `max_results` | usize | *(none)* | Cap on labels returned (highest first). Omit to return every label above the threshold. |
 | `taxonomy_file` | string | *(none)* | Path to a taxonomy TOML for a `siglip` model. Relative paths resolve from the config file's directory. Mutually exclusive with `labels`. |
+| `hash_list` | string | *(required for `pdq`)* | `pdq`: the block list file. Relative paths resolve from the config file's directory. |
+| `categories` | table | *(required for `pdq`)* | `pdq`: category names by id, e.g. `{ 1 = "known", 2 = "spam" }`. |
+| `max_distance` | u32 | `31` | `pdq`: most differing bits (of 256) that still count as a match. |
+| `min_quality` | u32 | `50` | `pdq`: images whose hash quality (0–100) is lower never match. |
+| `match_rotations` | bool | `true` | `pdq`: also match rotated (90°/180°/270°) and mirrored copies. |
 
 ### `[models.<label>.early_exit]`
 
@@ -330,7 +335,7 @@ What counts as a trigger during a **video** frame scan (has no effect without `v
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `labels` | list of u32 | *(required, non‑empty)* | Category ids that trigger early exit (a class index for `vit`; a label index or taxonomy child id for `siglip`). |
+| `labels` | list of u32 | *(required, non‑empty)* | Category ids that trigger early exit (a class index for `vit`; a label index or taxonomy child id for `siglip`; a category id for `pdq`). |
 | `threshold` | f32 | `0.85` | The score a listed label must reach on a frame to trigger. |
 
 Example:
@@ -395,6 +400,47 @@ Validation rejects a step with no models, an unknown model, a model that appears
 
 ---
 
+## Perceptual-hash block lists (`pdq`)
+
+A `pdq` model matches images against a list of known images, by their [PDQ](https://github.com/facebook/ThreatExchange/tree/main/pdq) hashes: 256-bit perceptual hashes that stay close when an image is re-encoded, resized, recoloured or lightly edited. It needs no weights and runs on the CPU. Like any image model it works on images, on video (frame by frame, through a `video_strategy`), in sets and in pipelines, and its `early_exit` gives video **segments**.
+
+```toml
+[models.blocklist]
+architecture   = "pdq"
+hash_list      = "blocklist.txt"
+categories     = { 1 = "known", 2 = "spam" }
+max_distance   = 31                    # default
+video_strategy = "every_second"
+early_exit     = { labels = [1, 2], threshold = 0.87 }
+```
+
+The list has one entry per line: a hash (64 hex digits, as other PDQ tools write them) and a category id. Blank lines and `#` comments are allowed:
+
+```text
+# known images
+b2876d28d15e8657b8a56928c7ceb6570db1317b026ed881ad0145bf366ee993 1  # kyoto_1.jpg
+339b33644e668c665b24233359b3c9b38d1918dbb0db661b66936ce1e3669a66 2
+```
+
+`apollo hash --category 1 DIR >> blocklist.txt` writes such lines for a folder of images. The list is read and checked at startup and on every reload: a malformed line or an unknown category rejects the config, and the running list stays. Editing the file has no effect until `apollo reload` (or a restart); a reload that finds it changed loads the model again.
+
+An image is hashed and compared with every entry. With `match_rotations` (the default), its 8 dihedral hashes are compared: the hashes of its rotations by 90°, 180° and 270° and of its mirror images. They are derived from the same transform, as in Meta's reference. Each category with an entry within `max_distance` bits of any of them is predicted, with `score = 1 − distance / 256` for its closest entry, so an identical image scores 1. Any match scores at least `1 − max_distance / 256` (0.879 by default), so an `early_exit` threshold of 0.87 fires on every match. Results report the category ids and names from `categories`.
+
+What matches, measured on photos:
+
+- **Matches:** JPEG re-encoding and colour or brightness changes move a hash by a few bits. Rotated and mirrored copies match through the dihedral hashes (about 8–16 bits); with `match_rotations = false` they don't.
+- **Usually matches:** downscaled copies stay close, but small thumbnails can drift past 31.
+- **Doesn't match:** crops of more than a few percent.
+- **Unrelated photos:** about 128 bits apart.
+
+Flat or nearly blank images (hash quality below `min_quality`) never match, since they all look alike to PDQ.
+
+**Compatibility with other PDQ tools.** Apollo's hashes match Meta's reference implementation ([ThreatExchange `pdq/cpp`](https://github.com/facebook/ThreatExchange/tree/main/pdq/cpp)) bit for bit: hash, quality and all 8 dihedral hashes. This was checked on photos and synthetic images of many sizes, against the reference built without fused multiply-add. Builds that fuse can differ in a bit or two on near-flat images. Like Meta's file hasher, Apollo first resizes images larger than 512 px on a side to 512×512 (nearest neighbour), so lists exchanged with other PDQ systems work.
+
+**Orientation.** `apollo hash` hashes images as stored, ignoring EXIF orientation, as Meta's tools do. The server decodes images upright (EXIF applied, as for every model). With `match_rotations`, the two still match.
+
+---
+
 ## Taxonomy files (`siglip`)
 
 A `taxonomy_file` defines grouped, prompt‑backed categories for a `siglip` model. It's a **two‑level tree**: top‑level tables are **parent** categories (each needs an integer `id`); nested tables are **child** categories (each needs an `id`, a list of `prompts`, an optional `aggregation`, and an optional `threshold`).
@@ -425,7 +471,7 @@ See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
 `apollo start` validates the config before serving and reports **all** problems at once. Enforced rules include:
 
 - **Strategies:** `confirm` at most 8 with `confirm_window` in (0.05, 5] s, and only for models that define `early_exit`; at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`, `refine`→`min_score` + `window` + `fps`); `min_gap` only on `scene` and ≥ 0; `refine` steps after all others, with `min_score` in 0..1, `window` in (0, 60] s and `fps` in (0, 60]. A model using a strategy with `refine` must define `early_exit`, with a `threshold` above the step's `min_score`.
-- **Models:** `video_strategy` must name a defined strategy; `early_exit` must list at least one label **and** requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
+- **Models:** `repo` is required for `vit`/`siglip`; a `pdq` model needs a `hash_list` whose lines parse and name its `categories`, and cannot set `labels`, `taxonomy_file`, `prompt_template`, `score_threshold` or `max_results` (while the `pdq` fields are rejected on other architectures); `video_strategy` must name a defined strategy; `early_exit` must list at least one label **and** requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
 - **Pipelines:** at least one step; no empty step; every `model` must be defined, and in at most one step; unique `order`s; a `stop_if` must list at least one label id, and name its step's model (`stop_if.model`) when the step runs several.
 - **Taxonomies:** a category `threshold` must be a number from 0 to 1.
 - **Database:** selecting `postgres`/`surrealdb` requires the matching `[database.<backend>]` section.
@@ -444,6 +490,7 @@ apollo calibrate --model NAME --data DIR|FILE.jsonl [--label L]... [--target-pre
 apollo config get    <key> [--config PATH]
 apollo config set    <key> <value> [--config PATH]
 apollo config remove <key> [--config PATH]
+apollo hash PATH... [--category ID] [--min-quality 50]   # PDQ hashes, for block lists
 apollo keygen                            # print a PASETO v4 keypair (PASERK)
 apollo token --subject NAME [--expires 30d] [--secret-key-file PATH]
 apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
@@ -463,6 +510,7 @@ apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
 - **`reload`** re-reads the config file and applies it to the running server, then reports which models were added, reloaded, kept or removed, and which changed settings need a restart. An invalid config is rejected and the running one stays. `SIGHUP` does the same. See [operations.md → Live config reload](./operations.md#live-config-reload).
 - **`calibrate`** measures a model's precision, recall and F1 on labelled examples over a range of thresholds (0.05–0.95, and down to 0.0001 for low-scoring labels), and recommends the lowest threshold reaching `--target-precision`. `--write` stores it in `early_exit.threshold`, or per category in the model's taxonomy file. See [operations.md → Threshold calibration](./operations.md#threshold-calibration).
 - **`config get|set|remove`** edit the file by **dotted key** (e.g. `models.nsfw.repo`), format‑preserving. `set` creates missing tables — and a default `[app]`‑only file — as needed.
+- **`hash`** prints the PDQ hash of each image given (directories are searched recursively), as stored (EXIF orientation not applied), so the hashes equal those of Meta's PDQ tools. With `--category`, each line is a block-list entry (`<hash> <category>  # file (quality N)`) ready to append to a `hash_list`. Images below `--min-quality` are skipped with a note on stderr.
 - **`keygen`** prints a fresh public/secret PASERK keypair.
 - **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` (a bare PASERK or `keygen` output), else the `APOLLO_SECRET_KEY` env var, else the server's local keypair file (`auth.key` in the state directory). `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key. The token goes to stdout (it goes in the client's `authorization` metadata) and its id to stderr.
 - **`revoke`** adds a token id or a subject to the revocation file (see [Authentication](#auth--authentication)); running servers apply it within ~10 s.

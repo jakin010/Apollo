@@ -2,6 +2,7 @@
 
 mod calibrate;
 mod config;
+mod hash;
 mod keys;
 mod reload;
 mod start;
@@ -36,6 +37,8 @@ enum Command {
     /// Measure a model's precision and recall on labelled examples over a range
     /// of thresholds, and optionally write the recommended threshold.
     Calibrate(calibrate::CalibrateArgs),
+    /// Print the PDQ hashes of images, to build block lists for `pdq` models.
+    Hash(hash::HashArgs),
     /// Generate a PASETO v4 signing keypair for authentication.
     Keygen(keys::KeygenArgs),
     /// Mint an API token signed with the secret key.
@@ -53,6 +56,7 @@ impl Cli {
             Command::Reload(args) => reload::run(args),
             Command::Config(cmd) => config::run(cmd),
             Command::Calibrate(args) => calibrate::run(args),
+            Command::Hash(args) => hash::run(args),
             Command::Keygen(args) => keys::run_keygen(args),
             Command::Token(args) => keys::run_token(args),
             Command::Revoke(args) => keys::run_revoke(args),

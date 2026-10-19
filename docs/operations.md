@@ -92,6 +92,8 @@ The new config is read the way `start` read it, with the same file and the same 
 
 **Models:** each model's worker is kept, loaded weights included, unless something its weights depend on changed: `architecture`, `repo`, `revision`, `labels`, `prompt_template`, `score_threshold`, `max_results`, `taxonomy_file` (or the taxonomy file's contents), `keep_in_memory` or `max_concurrent`. A model with such a change gets a new worker, which loads on first use (or at once with `keep_in_memory`). Added or newly enabled models get a worker. Removed or disabled models are rejected for new requests at once; their workers finish the work they have, then unload.
 
+**Files a model reads** — a SigLIP taxonomy, a PDQ hash list — are read when the config is applied, at startup or on a reload; the model loads from that copy (also after an idle unload), so editing a file takes effect on the next reload, and a broken file is rejected with the config.
+
 **Tasks already running** finish on the config they started with, so a scan is not switched to a different strategy halfway, and a pipeline keeps its steps. New submissions use the new config.
 
 **Restart-only:** `app.endpoint`, `app.port`, `app.device`, `app.cache_dir`, `app.max_concurrent`, `[tls]`, `[auth]`, `[database]` (except `retention`) and `[metrics]`. A reload reports these and keeps their running values until the next restart.

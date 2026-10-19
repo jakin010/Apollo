@@ -1,7 +1,7 @@
 //! Loaded-model registry and submission validation.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -24,13 +24,15 @@ struct Worker {
     key: LoadKey,
 }
 
-/// The parts of a model's config (and taxonomy file) its loaded weights depend
-/// on. Fields read per use — `timeout`, `priority`, `video_strategy`,
-/// `early_exit` — are left out, so changing them keeps the loaded model.
+/// The parts of a model's config (and the files it reads: a taxonomy, a hash
+/// list) its loaded state depends on. Fields read per use — `timeout`,
+/// `priority`, `video_strategy`, `early_exit` — are left out, so changing them
+/// keeps the loaded model.
 #[derive(PartialEq)]
 struct LoadKey {
     config: ModelConfig,
-    taxonomy: Option<Vec<u8>>,
+    /// The worker loads from these, so it uses what was validated.
+    files: apollo_inference::ModelFiles,
 }
 
 impl LoadKey {
@@ -40,12 +42,10 @@ impl LoadKey {
         config.priority = 0;
         config.video_strategy = None;
         config.early_exit = None;
-        // An unreadable taxonomy reads as "changed", so the next load reports it.
-        let taxonomy = model
-            .taxonomy_file
-            .as_deref()
-            .map(|p| std::fs::read(Path::new(p)).unwrap_or_default());
-        Self { config, taxonomy }
+        Self {
+            config,
+            files: apollo_inference::ModelFiles::read(model),
+        }
     }
 }
 
@@ -106,7 +106,7 @@ impl Registry {
                 Some(_) => changes.reloaded.push(label.clone()),
                 None => changes.added.push(label.clone()),
             }
-            let handle = spawn(label, model, env);
+            let handle = spawn(label, model, &key.files, env);
             workers.insert(
                 label.clone(),
                 Worker {
@@ -181,12 +181,18 @@ impl Registry {
     }
 }
 
-fn spawn(label: &str, model: &ModelConfig, env: &WorkerEnv<'_>) -> ModelHandle {
+fn spawn(
+    label: &str,
+    model: &ModelConfig,
+    files: &apollo_inference::ModelFiles,
+    env: &WorkerEnv<'_>,
+) -> ModelHandle {
     let cfg = model.clone();
+    let files = files.clone();
     let dev = apollo_inference::open_device(env.kind);
     let dir = env.cache_dir.cloned();
     let loader: Loader = Box::new(move || {
-        apollo_inference::load(&cfg, &dev, dir.as_deref()).map_err(|e| e.to_string())
+        apollo_inference::load(&cfg, &files, &dev, dir.as_deref()).map_err(|e| e.to_string())
     });
     let spec = WorkerSpec {
         name: label.to_string(),

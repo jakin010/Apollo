@@ -619,3 +619,27 @@ async fn metrics_render_in_the_prometheus_format() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_model_loads_the_files_read_when_the_config_was_applied() {
+    let files = tempfile::tempdir().unwrap();
+    let list = files.path().join("blocklist.txt");
+    std::fs::write(&list, format!("{} 1\n", "ab".repeat(32))).unwrap();
+    let toml = format!(
+        "[models.blocklist]\narchitecture = \"pdq\"\nhash_list = \"{}\"\ncategories = {{ 1 = \"known\" }}\n",
+        list.display()
+    );
+    let f = fixture_with(&toml).await;
+
+    // The file changes on disk, without a reload: the model still loads the
+    // list that was validated.
+    std::fs::write(&list, "not a hash list\n").unwrap();
+    f.engine.load_model("blocklist").await.unwrap();
+
+    // A reload reads the file again, and rejects it.
+    let mut again = apollo_config::load::from_str(&toml).unwrap();
+    again.database = f.engine.config().database.clone();
+    again.app.cache_dir = f.engine.config().app.cache_dir.clone();
+    let err = f.engine.reload(again, None).await.unwrap_err();
+    assert!(err.to_string().contains("blocklist.txt`: line 1"), "{err}");
+}

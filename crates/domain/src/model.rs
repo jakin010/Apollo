@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 pub enum Architecture {
     Vit,
     Siglip,
+    /// PDQ perceptual hashes matched against a block list.
+    Pdq,
 }
 
 impl Architecture {
@@ -20,6 +22,7 @@ impl Architecture {
         match self {
             Architecture::Vit => "vit",
             Architecture::Siglip => "siglip",
+            Architecture::Pdq => "pdq",
         }
     }
 }
