@@ -364,16 +364,14 @@ mod tests {
                 .iter()
                 .map(|img| {
                     assert!(img.width > 0, "boom");
+                    let score = if img.width == 13 { f32::NAN } else { 1.0 };
                     Classification {
-                        predictions: vec![Prediction {
-                            label: img.width,
-                            score: if img.width == 13 { f32::NAN } else { 1.0 },
-                        }],
+                        predictions: vec![Prediction::new(img.width, "w", score)],
                     }
                 })
                 .collect())
         }
-        fn labels(&self) -> &[String] {
+        fn labels(&self) -> &[apollo_domain::Label] {
             &[]
         }
         fn input_size(&self) -> u32 {

@@ -323,14 +323,17 @@ pub fn aggregate(per_frame: &[Classification], how: Aggregation) -> Classificati
 
     let denom = per_frame.len().max(1) as f32;
 
-    // Pool flat predictions by label id across all frames.
-    let mut flat: BTreeMap<u32, f32> = BTreeMap::new();
+    // Pool flat predictions by label id across all frames (keeping the name).
+    let mut flat: BTreeMap<u32, (&str, f32)> = BTreeMap::new();
     for frame in per_frame {
         for p in &frame.predictions {
-            let entry = flat.entry(p.label).or_insert(match how {
-                Aggregation::Max => f32::MIN,
-                Aggregation::Mean => 0.0,
-            });
+            let (_, entry) = flat.entry(p.label).or_insert((
+                &p.name,
+                match how {
+                    Aggregation::Max => f32::MIN,
+                    Aggregation::Mean => 0.0,
+                },
+            ));
             match how {
                 Aggregation::Max => *entry = entry.max(p.score),
                 Aggregation::Mean => *entry += p.score,
@@ -340,12 +343,12 @@ pub fn aggregate(per_frame: &[Classification], how: Aggregation) -> Classificati
 
     let predictions = flat
         .into_iter()
-        .map(|(label, value)| Prediction {
-            label,
-            score: match how {
+        .map(|(label, (name, value))| {
+            let score = match how {
                 Aggregation::Max => value,
                 Aggregation::Mean => value / denom,
-            },
+            };
+            Prediction::new(label, name, score)
         })
         .collect::<Vec<_>>();
 
@@ -423,10 +426,7 @@ mod tests {
         Classification {
             predictions: preds
                 .iter()
-                .map(|(l, s)| Prediction {
-                    label: *l,
-                    score: *s,
-                })
+                .map(|(l, s)| Prediction::new(*l, format!("l{l}"), *s))
                 .collect(),
         }
     }
@@ -613,6 +613,8 @@ mod tests {
         let max = aggregate(&frames, Aggregation::Max);
         let cat = max.predictions.iter().find(|p| p.label == 1).unwrap();
         assert!((cat.score - 0.9).abs() < 1e-6);
+        // Pooled predictions keep their label's name.
+        assert_eq!(cat.name, "l1");
     }
 
     #[test]

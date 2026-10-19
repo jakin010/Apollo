@@ -6,11 +6,15 @@ use std::time::Duration;
 use tonic::Request;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
+use std::collections::BTreeMap;
+
 use apollo_proto::classify_chunk::Payload;
+use apollo_proto::classify_stream_init::Run;
 use apollo_proto::inference_client::InferenceClient;
 use apollo_proto::{
-    CancelRequest, ClassifyChunk, ClassifyRequest, ClassifyStreamInit, GetTaskRequest, InputItem,
-    Task,
+    CancelTaskRequest, ClassifyChunk, ClassifyRequest, ClassifyStreamInit, GetTaskRequest,
+    ListModelsRequest, ListModelsResponse, ListTasksRequest, ListTasksResponse, MediaKind,
+    ModelList, ResultView, Task, WatchTaskRequest,
 };
 
 use pasetors::claims::Claims;
@@ -43,31 +47,66 @@ fn endpoint_with_tls(
     Ok(ep)
 }
 
-/// Opening parameters for a [`Client::classify_stream`] / [`Client::classify_stream_bytes`]
-/// call: which models (or a `pipeline`) to run, and whether the streamed bytes
-/// are a video. Set **either** `models` or `pipeline`, mirroring `Classify`.
+/// Opening parameters for a [`Client::classify_stream`] /
+/// [`Client::classify_stream_bytes`] call: what the bytes are, what to run on
+/// them, and the same optional fields as `Classify`.
 ///
 /// ```
-/// # use apollo_client::StreamInit;
-/// let init = StreamInit { models: vec!["nsfw".into()], video: true, ..Default::default() };
-/// let pipe = StreamInit { pipeline: Some("moderation".into()), ..Default::default() };
+/// # use apollo_client::{MediaKind, StreamInit};
+/// let init = StreamInit::models(MediaKind::Video, ["nsfw"]);
+/// let mut pipe = StreamInit::pipeline(MediaKind::Image, "moderation");
+/// pipe.wait_seconds = 30;
 /// ```
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct StreamInit {
-    /// Model labels to run as a parallel set. Set this or `pipeline`.
+    pub kind: MediaKind,
+    /// Models to run concurrently. Set this or `pipeline`.
     pub models: Vec<String>,
     /// A named pipeline to run instead of `models`.
     pub pipeline: Option<String>,
-    /// `true` if the streamed bytes are a video, `false` for a single image.
-    pub video: bool,
+    /// Echoed back on the task and in webhooks.
+    pub metadata: BTreeMap<String, String>,
+    /// Idempotency key: resubmitting with it returns the existing task.
+    pub request_id: Option<String>,
+    /// Wait up to this many seconds (at most 300) for the task to finish.
+    pub wait_seconds: u32,
+    pub view: ResultView,
 }
 
 impl StreamInit {
+    /// Run `models` on streamed content of `kind`.
+    pub fn models(kind: MediaKind, models: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            kind,
+            models: models.into_iter().map(Into::into).collect(),
+            pipeline: None,
+            metadata: BTreeMap::new(),
+            request_id: None,
+            wait_seconds: 0,
+            view: ResultView::Summary,
+        }
+    }
+
+    /// Run the named pipeline on streamed content of `kind`.
+    pub fn pipeline(kind: MediaKind, pipeline: impl Into<String>) -> Self {
+        Self {
+            pipeline: Some(pipeline.into()),
+            ..Self::models(kind, Vec::<String>::new())
+        }
+    }
+
     fn into_proto(self) -> ClassifyStreamInit {
+        let run = match self.pipeline {
+            Some(p) => Run::Pipeline(p),
+            None => Run::Models(ModelList { names: self.models }),
+        };
         ClassifyStreamInit {
-            models: self.models,
-            video: self.video,
-            pipeline: self.pipeline,
+            kind: self.kind as i32,
+            run: Some(run),
+            metadata: self.metadata,
+            request_id: self.request_id.unwrap_or_default(),
+            wait_seconds: self.wait_seconds,
+            view: self.view as i32,
         }
     }
 }
@@ -186,12 +225,13 @@ impl Client {
         Ok(req)
     }
 
-    /// Submit a single input. Returns the new task id. Build `item` with the
+    /// Submit a single input. Returns the task: queued, or finished if the
+    /// request's `wait_seconds` allowed for it. Build `request` with the
     /// [`crate::item`] helpers.
-    pub async fn classify(&self, item: InputItem) -> Result<String, ClientError> {
-        let req = self.request(ClassifyRequest { item: Some(item) })?;
+    pub async fn classify(&self, request: ClassifyRequest) -> Result<Task, ClientError> {
+        let req = self.request(request)?;
         let resp = self.inner.clone().classify(req).await?;
-        Ok(resp.into_inner().task_id)
+        Ok(resp.into_inner())
     }
 
     /// Stream the raw bytes of a single input and create a task for it, feeding a
@@ -201,7 +241,7 @@ impl Client {
     /// `tokio_util::io::ReaderStream`, drive a channel with
     /// `tokio_stream::wrappers::ReceiverStream`, or pass `futures::stream::iter`.
     /// Each yielded buffer is fragmented into ≤64 KiB content frames. Returns the
-    /// task id.
+    /// task, as [`classify`](Self::classify) does.
     ///
     /// The server stages the bytes to disk as they arrive and enforces the upload
     /// cap incrementally, so nothing has to be held in memory end to end.
@@ -209,7 +249,7 @@ impl Client {
         &self,
         init: StreamInit,
         chunks: impl futures::Stream<Item = Vec<u8>> + Send + 'static,
-    ) -> Result<String, ClientError> {
+    ) -> Result<Task, ClientError> {
         use futures::StreamExt;
         let init_frame = ClassifyChunk {
             payload: Some(Payload::Init(init.into_proto())),
@@ -228,7 +268,7 @@ impl Client {
         let stream = futures::stream::once(async move { init_frame }).chain(data_frames);
         let req = self.request(stream)?;
         let resp = self.inner.clone().classify_stream(req).await?;
-        Ok(resp.into_inner().task_id)
+        Ok(resp.into_inner())
     }
 
     /// Convenience over [`classify_stream`](Self::classify_stream) for content
@@ -237,28 +277,71 @@ impl Client {
         &self,
         init: StreamInit,
         data: Vec<u8>,
-    ) -> Result<String, ClientError> {
+    ) -> Result<Task, ClientError> {
         self.classify_stream(init, futures::stream::once(async move { data }))
             .await
     }
 
-    /// Poll a task's state and per-model results.
+    /// A task's state and per-model results (summary view: scans without
+    /// their per-sample results).
     pub async fn get_task(&self, task_id: impl Into<String>) -> Result<Task, ClientError> {
+        self.get_task_view(task_id, ResultView::Summary).await
+    }
+
+    /// [`get_task`](Self::get_task) with the given result detail.
+    pub async fn get_task_view(
+        &self,
+        task_id: impl Into<String>,
+        view: ResultView,
+    ) -> Result<Task, ClientError> {
         let req = self.request(GetTaskRequest {
             task_id: task_id.into(),
+            view: view as i32,
         })?;
         let resp = self.inner.clone().get_task(req).await?;
         Ok(resp.into_inner())
     }
 
+    /// Follow a task: the task now, then again each time it changes; the
+    /// stream ends once the task is completed, failed or cancelled.
+    pub async fn watch_task(
+        &self,
+        task_id: impl Into<String>,
+        view: ResultView,
+    ) -> Result<futures::stream::BoxStream<'static, Result<Task, ClientError>>, ClientError> {
+        use futures::StreamExt;
+        let req = self.request(WatchTaskRequest {
+            task_id: task_id.into(),
+            view: view as i32,
+        })?;
+        let stream = self.inner.clone().watch_task(req).await?.into_inner();
+        Ok(stream.map(|r| r.map_err(ClientError::from)).boxed())
+    }
+
+    /// Your tasks, newest first, a page at a time (pass the response's
+    /// `next_page_token` as the next request's `page_token`).
+    pub async fn list_tasks(
+        &self,
+        request: ListTasksRequest,
+    ) -> Result<ListTasksResponse, ClientError> {
+        let req = self.request(request)?;
+        Ok(self.inner.clone().list_tasks(req).await?.into_inner())
+    }
+
     /// Request cooperative cancellation of a task. Returns the task as it stands
     /// after the request: `CANCELLED`, unless it had already finished.
     pub async fn cancel_task(&self, task_id: impl Into<String>) -> Result<Task, ClientError> {
-        let req = self.request(CancelRequest {
+        let req = self.request(CancelTaskRequest {
             task_id: task_id.into(),
         })?;
         let resp = self.inner.clone().cancel_task(req).await?;
         Ok(resp.into_inner())
+    }
+
+    /// The server's models (with their labels) and pipelines.
+    pub async fn list_models(&self) -> Result<ListModelsResponse, ClientError> {
+        let req = self.request(ListModelsRequest {})?;
+        Ok(self.inner.clone().list_models(req).await?.into_inner())
     }
 }
 

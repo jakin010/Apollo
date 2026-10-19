@@ -30,13 +30,22 @@ pub enum Input {
     Text(String),
     /// (future)
     Audio(Url),
-    /// Raw content bytes streamed in via `ClassifyStream` and staged to a local
-    /// file. `video` selects the processing path (false = image, true = video).
-    /// The file is removed once the owning task reaches a terminal state.
+    /// Raw content bytes (inline in a request, or streamed via `ClassifyStream`)
+    /// staged to a local file. `kind` selects the processing path. The file is
+    /// removed once the owning task reaches a terminal state.
     Bytes {
         path: PathBuf,
-        video: bool,
+        kind: MediaKind,
     },
+}
+
+/// What kind of media a byte upload is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaKind {
+    Image,
+    Video,
+    Audio,
 }
 
 impl Input {
@@ -47,8 +56,11 @@ impl Input {
             Input::Video(_) => Modality::Video,
             Input::Text(_) => Modality::Text,
             Input::Audio(_) => Modality::Audio,
-            Input::Bytes { video: false, .. } => Modality::Image,
-            Input::Bytes { video: true, .. } => Modality::Video,
+            Input::Bytes { kind, .. } => match kind {
+                MediaKind::Image => Modality::Image,
+                MediaKind::Video => Modality::Video,
+                MediaKind::Audio => Modality::Audio,
+            },
         }
     }
 }
@@ -328,6 +340,21 @@ pub struct Item {
     pub retries: u32,
 }
 
+impl Item {
+    /// A queued item with no results yet.
+    pub fn new(input: Input, models: Vec<String>, pipeline: Option<String>) -> Self {
+        Self {
+            input,
+            models,
+            pipeline,
+            state: ItemState::Queued,
+            results: BTreeMap::new(),
+            error: None,
+            retries: 0,
+        }
+    }
+}
+
 /// A unit of work: one or more inputs submitted together under a single id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
@@ -340,4 +367,37 @@ pub struct Task {
     /// submitted with authentication disabled.
     #[serde(default)]
     pub owner: Option<String>,
+    /// The client's metadata, echoed back on the task and in webhooks.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+    /// The client's idempotency key: a resubmission with the same key (by the
+    /// same owner) returns this task.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Unix seconds. Set by storage when the task is created / last written /
+    /// reached a terminal state; ignored when creating a task.
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub finished_at: Option<i64>,
+}
+
+impl Task {
+    /// A freshly submitted task: queued, with no metadata or idempotency key
+    /// (set those fields directly if needed). Storage fills in the timestamps.
+    pub fn new(id: impl Into<String>, items: Vec<Item>, owner: Option<String>) -> Self {
+        Self {
+            id: id.into(),
+            state: TaskState::Queued,
+            items,
+            owner,
+            metadata: BTreeMap::new(),
+            request_id: None,
+            created_at: 0,
+            updated_at: 0,
+            finished_at: None,
+        }
+    }
 }

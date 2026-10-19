@@ -10,30 +10,44 @@ The contract is `apollo.v1.Webhook`, defined in `proto/webhook.proto` (sharing m
 
 ```protobuf
 service Webhook {
-  rpc TaskStatus (Task) returns (Ack);
+  rpc Notify (TaskEvent) returns (Ack);
+}
+
+message TaskEvent {
+  TaskEventType type = 1;                   // PROGRESS or FINISHED
+  Task task = 2;                            // the task as it is now (summary view)
+  uint32 attempt = 3;                       // delivery attempt, from 1
+  google.protobuf.Timestamp sent_at = 4;
+}
+
+enum TaskEventType {
+  TASK_EVENT_TYPE_UNSPECIFIED = 0;
+  TASK_EVENT_TYPE_PROGRESS    = 1;          // moved on but not finished (processing, retrying)
+  TASK_EVENT_TYPE_FINISHED    = 2;          // COMPLETED, FAILED or CANCELLED
 }
 
 message Ack {}   // empty acknowledgement
 ```
 
-`TaskStatus` takes a **bare `Task`** (the same `Task` message `GetTask` returns) and returns an empty `Ack`. Return a successful gRPC response (an `Ack`) to acknowledge; return an error status to signal a delivery failure (Apollo will retry — see below).
+`Notify` takes a `TaskEvent` and returns an empty `Ack`. Return a successful gRPC response (an `Ack`) to acknowledge; return an error status to signal a delivery failure (Apollo will retry; see below).
 
-| Method | Fired when |
-|--------|-----------|
-| `TaskStatus` | The task reaches a terminal state (finished with `models`, failed with `error`, or cancelled), and on intermediate transitions while it is processing. |
+| Event | Sent when |
+|-------|-----------|
+| `PROGRESS` | The task starts processing, or a retry begins after a transient failure. Best‑effort: not retried. |
+| `FINISHED` | The task is `COMPLETED`, `FAILED` or `CANCELLED`. Retried until delivered. |
 
-It carries the **full current `Task`**, so the receiver sees the task's `result` — its per‑model `models`, an `error`, or a live `state` — not just what changed.
+`task` is the same `Task` message `GetTask` returns, in its summary view (scans without per‑sample results): its `state`, per‑model `results`, `error`, and the client's `metadata` and `request_id` from the request, so you can match it to your own records without a lookup.
 
 ---
 
 ## Delivery semantics
 
-- **One delivery as the task finishes** (plus intermediate transitions). Every `Classify` submits a single input, so a task produces a `TaskStatus` delivery when it reaches a terminal state.
-- **At‑least‑once.** Apollo persists a "delivered" flag and only clears it after a successful call, but a crash between finishing and the flag being set will cause a redelivery. **Receivers must dedupe on `Task.id`.**
-- **Retries on failure.** If a delivery fails (the receiver is down or returns an error), it is retried by a background loop every `[webhook].redelivery_secs` seconds (default 60; `0` disables periodic retry). Undelivered webhooks are also retried on server **restart**, recovered from the persisted flag.
-- **Whether the task finished, failed, or is still processing** is read from the payload's `result` (`models` / `error` / `state`); the wire message is intentionally the whole `Task`.
+- **One `FINISHED` event per task**, plus progress events on the way. Every `Classify` submits a single input, so a task finishes once.
+- **At‑least‑once.** Apollo persists a "delivered" flag and only sets it after a successful call, but a crash between finishing and the flag being set causes a redelivery. **Receivers must dedupe on `task.id`.**
+- **Retries on failure.** A failed `FINISHED` delivery is retried right away (three attempts in a few seconds), then by a background loop every `[webhook].redelivery_secs` seconds (default 60; `0` disables periodic retry), and on server **restart**, recovered from the persisted flag. `attempt` counts the attempts of the current round, so it starts again at 1 for each redelivery pass.
+- **Progress events are best‑effort** and may arrive after the task has finished; a progress event is dropped when the task has already finished by the time it is sent. Go by `task.state` (or `type`), not by arrival order.
 
-Because delivery is at‑least‑once and unordered across retries, treat each webhook as "here is the current state of this task" rather than "here is a single event."
+Because delivery is at‑least‑once and unordered across retries, treat each event as "here is the current state of this task" rather than "here is a single change."
 
 ---
 
@@ -46,7 +60,7 @@ When `[webhook].secret` is set, every delivery is signed (scheme `v1`) with two 
 | `x-apollo-webhook-timestamp` | Unix seconds when the delivery was sent (fresh on every retry). |
 | `x-apollo-webhook-signature` | `v1=` + lowercase‑hex **HMAC‑SHA256**(secret, `"<timestamp>."` ‖ `payload`) |
 
-`payload` is the protobuf‑encoded `Task` **exactly as sent** — the gRPC message bytes, without gRPC's 5‑byte frame header. So the signature covers the whole delivery: a captured delivery cannot be altered (any change to the payload or timestamp breaks the signature), and an old one cannot be replayed later (the receiver rejects stale timestamps).
+`payload` is the protobuf‑encoded `TaskEvent` **exactly as sent** — the gRPC message bytes, without gRPC's 5‑byte frame header. So the signature covers the whole delivery: a captured delivery cannot be altered (any change to the payload or timestamp breaks the signature), and an old one cannot be replayed later (the receiver rejects stale timestamps).
 
 **To verify on the receiver:**
 
@@ -84,22 +98,27 @@ See [configuration.md → Webhook](./configuration.md#webhook--outbound-delivery
 
 ## Implementing a receiver
 
-Generate server stubs from `proto/webhook.proto` (which imports `common.proto`) in your language of choice, then implement `TaskStatus`. A minimal sketch:
+Generate server stubs from `proto/webhook.proto` (which imports `common.proto`) in your language of choice, then implement `Notify`. A minimal sketch:
 
 ```text
 service Webhook:
-  rpc TaskStatus(task):
+  rpc Notify(event):
       if a secret is set:                   # over the raw message bytes, see "Signing"
           ts  = header x-apollo-webhook-timestamp;  reject if |now - ts| > 300s
           sig = header x-apollo-webhook-signature
           reject unless sig == "v1=" + hex(HMAC_SHA256(secret, ts + "." + raw_payload))
+      task = event.task
+      if event.type != FINISHED:
+          return Ack()                      # optional: show progress
       if already_processed(task.id):        # idempotency / dedupe
           return Ack()
-      switch task.result:
-          case models:  record success (per‑model results in models.models)
-          case error:   record the task‑level failure
-          case state:   still processing / cancelled (optional to handle)
+      switch task.state:
+          case COMPLETED: record each of task.results (check every result's state)
+          case FAILED:    record task.error
+          case CANCELLED: record the cancellation
       return Ack()
 ```
 
-Return `Ack{}` (success) to acknowledge. Returning a gRPC error causes Apollo to keep the item marked undelivered and retry it later.
+Return `Ack{}` (success) to acknowledge. Returning a gRPC error causes Apollo to keep the task marked undelivered and retry it later.
+
+With the Rust SDK, implement `apollo_client::WebhookHandler::on_event` and serve it with `apollo_client::WebhookReceiver`.

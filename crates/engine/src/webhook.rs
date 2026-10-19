@@ -1,10 +1,11 @@
 //! Outbound webhook delivery.
 //!
-//! The engine decides *when* to fire — each time an item changes state (it starts
-//! processing, then reaches a terminal state) — and tracks a delivered flag for
-//! terminal notifications so they survive restarts; the *how* (converting to the
-//! wire format and making the gRPC call) is injected as a [`WebhookSink`] by the
-//! server/app layer, so this crate stays free of the protobuf types.
+//! The engine decides *when* to fire — a progress event each time the task moves
+//! on (processing, retrying), and a finished event once it is completed, failed
+//! or cancelled — and tracks a delivered flag for finished events so they
+//! survive restarts; the *how* (converting to the wire format and making the
+//! gRPC call) is injected as a [`WebhookSink`] by the server/app layer, so this
+//! crate stays free of the protobuf types.
 
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use async_trait::async_trait;
 use apollo_domain::Task;
 
 use crate::Engine;
+use crate::aggregate;
 
 /// An error from a webhook delivery attempt.
 #[derive(Debug, thiserror::Error)]
@@ -25,17 +27,33 @@ impl From<String> for WebhookError {
     }
 }
 
-/// Receives item state-change notifications. Terminal notifications are
-/// at-least-once (a failed delivery is retried on the next startup); intermediate
-/// notifications (e.g. an item entering `Processing`) are best-effort.
+/// What a [`TaskEvent`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// The task moved on but has not finished.
+    Progress,
+    /// The task is completed, failed or cancelled.
+    Finished,
+}
+
+/// One webhook notification: the task as it is now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskEvent {
+    pub kind: EventKind,
+    pub task: Task,
+    /// Delivery attempt for this event, from 1 (counted again after a restart).
+    pub attempt: u32,
+}
+
+/// Receives task events. Finished events are at-least-once (a failed delivery
+/// is retried periodically and on the next startup); progress events are
+/// best-effort.
 // `async_trait` marks the boxed-future methods `#[must_use]`; clippy >= 1.99
 // reports that as `double_must_use`.
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait WebhookSink: Send + Sync {
-    /// Deliver routine task status (the `TaskStatus` call): the current `task`,
-    /// identifying which item just changed state.
-    async fn deliver(&self, task: &Task, item_index: usize) -> Result<(), WebhookError>;
+    async fn deliver(&self, event: &TaskEvent) -> Result<(), WebhookError>;
 }
 
 impl Engine {
@@ -51,16 +69,36 @@ impl Engine {
         }
     }
 
-    /// Push routine task status (`TaskStatus`). No-op returning `false` if no sink
-    /// is configured or the task is missing. No bookkeeping.
-    async fn push_webhook(&self, task_id: &str, item_index: usize) -> bool {
+    /// Send the task's current state as a `kind` event. A progress event for a
+    /// task that has finished meanwhile is dropped (its finished event follows),
+    /// and a finished event for a task with items still running goes out as
+    /// progress. Returns `false` if no sink is configured, the task is missing,
+    /// or delivery failed. No bookkeeping.
+    async fn push_webhook(
+        &self,
+        task_id: &str,
+        item_index: usize,
+        kind: EventKind,
+        attempt: u32,
+    ) -> bool {
         let Some(sink) = self.inner.webhook.as_ref() else {
             return false;
         };
         let Some(task) = self.load_task_for_webhook(task_id).await else {
             return false;
         };
-        match sink.deliver(&task, item_index).await {
+        let finished = aggregate::task_terminal(task.state);
+        let kind = match kind {
+            EventKind::Progress if finished => return true,
+            EventKind::Finished if !finished => EventKind::Progress,
+            kind => kind,
+        };
+        let event = TaskEvent {
+            kind,
+            task,
+            attempt,
+        };
+        match sink.deliver(&event).await {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(task = %task_id, item = item_index, error = %e, "webhook delivery failed");
@@ -69,7 +107,7 @@ impl Engine {
         }
     }
 
-    /// Fire-and-forget notification that an item changed state (e.g. it started
+    /// Fire-and-forget progress event: an item changed state (e.g. it started
     /// processing). Spawned so a slow or unreachable receiver never blocks the
     /// scheduler; not tracked for redelivery (only terminal states are).
     pub(crate) async fn notify_item_change(&self, task_id: &str, item_index: usize) {
@@ -79,11 +117,13 @@ impl Engine {
         let engine = self.clone();
         let task_id = task_id.to_string();
         tokio::spawn(async move {
-            engine.push_webhook(&task_id, item_index).await;
+            engine
+                .push_webhook(&task_id, item_index, EventKind::Progress, 1)
+                .await;
         });
     }
 
-    /// Fire the webhook for a terminal item. Spawned so it never blocks the
+    /// Fire the finished event for a terminal item. Spawned so it never blocks the
     /// scheduler; retries a few times with backoff and marks the item delivered on
     /// success, otherwise leaving it pending for the periodic redelivery loop (and,
     /// ultimately, restart recovery).
@@ -94,11 +134,14 @@ impl Engine {
         let engine = self.clone();
         let task_id = task_id.to_string();
         tokio::spawn(async move {
-            for delay in [0u64, 1, 3] {
+            for (attempt, delay) in (1..).zip([0u64, 1, 3]) {
                 if delay > 0 {
                     tokio::time::sleep(Duration::from_secs(delay)).await;
                 }
-                if engine.push_webhook(&task_id, item_index).await {
+                if engine
+                    .push_webhook(&task_id, item_index, EventKind::Finished, attempt)
+                    .await
+                {
                     let _ = engine
                         .inner
                         .storage

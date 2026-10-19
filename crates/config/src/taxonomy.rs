@@ -26,6 +26,8 @@ pub struct Taxonomy {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaxonChild {
     pub id: u32,
+    /// `<parent>.<child>`, as written in the file (e.g. `food_and_drink.drinks`).
+    pub name: String,
     pub parent_id: u32,
     pub aggregation: Aggregation,
     pub prompt_start: usize,
@@ -112,6 +114,7 @@ impl Taxonomy {
 
                 children.push(TaxonChild {
                     id,
+                    name: qualified,
                     parent_id,
                     aggregation,
                     prompt_start: start,

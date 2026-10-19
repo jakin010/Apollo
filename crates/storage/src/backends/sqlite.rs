@@ -14,16 +14,22 @@ use sqlx::{Row, SqlitePool};
 
 use apollo_config::SqliteConfig;
 use apollo_domain::{
-    Classification, Frame, Item, ItemState, ModelOutput, ModelResult, ModelState, Task, TaskError,
+    Classification, Item, ItemState, ModelOutput, ModelResult, ModelState, Sample, Task, TaskError,
     TaskState,
 };
 
-use crate::Storage;
 use crate::error::StorageError;
 use crate::now;
 use crate::resume::PendingWebhook;
+use crate::{Storage, TaskCursor, TaskPage, TaskQuery};
 
 type Result<T> = std::result::Result<T, StorageError>;
+
+/// A value bound into a dynamically built query.
+enum Bind {
+    Text(Option<String>),
+    Int(i64),
+}
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS tasks (
@@ -129,15 +135,23 @@ impl SqliteStorage {
 
     /// Shared reconstruction used by `get_task` and `load_incomplete_tasks`.
     async fn load_task(&self, id: &str) -> Result<Option<Task>> {
-        let Some(trow) = sqlx::query("SELECT state, owner FROM tasks WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
+        let Some(trow) = sqlx::query(
+            "SELECT state, owner, metadata_json, request_id, created_at, updated_at, finished_at
+             FROM tasks WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
         else {
             return Ok(None);
         };
         let state = trow.try_get::<String, _>("state")?.parse::<TaskState>()?;
         let owner: Option<String> = trow.try_get("owner")?;
+        let metadata_json: Option<String> = trow.try_get("metadata_json")?;
+        let metadata = match metadata_json {
+            Some(j) => serde_json::from_str(&j)?,
+            None => Default::default(),
+        };
 
         let irows = sqlx::query(
             "SELECT idx, input_json, models_json, pipeline, state, error, retries
@@ -208,8 +222,38 @@ impl SqliteStorage {
             state,
             items,
             owner,
+            metadata,
+            request_id: trow.try_get("request_id")?,
+            created_at: trow.try_get("created_at")?,
+            updated_at: trow.try_get("updated_at")?,
+            finished_at: trow.try_get("finished_at")?,
         }))
     }
+}
+
+/// Add `column` (with SQL type `decl`) to `table` when an older database lacks
+/// it: `CREATE TABLE IF NOT EXISTS` does not extend an existing table.
+async fn add_column_if_missing(
+    tx: &mut sqlx::SqliteConnection,
+    table: &'static str,
+    column: &'static str,
+    decl: &'static str,
+) -> Result<()> {
+    let present: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?")
+            .bind(table)
+            .bind(column)
+            .fetch_one(&mut *tx)
+            .await?;
+    if present == 0 {
+        // Built only from the `'static` names passed above, never from input.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {decl}"
+        )))
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -219,17 +263,20 @@ impl Storage for SqliteStorage {
         for stmt in SCHEMA {
             sqlx::query(*stmt).execute(&mut *tx).await?;
         }
-        // Columns added after the first release: `CREATE TABLE IF NOT EXISTS`
-        // does not extend an existing table, so add them when missing.
-        let has_owner: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'owner'",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        if has_owner == 0 {
-            sqlx::query("ALTER TABLE tasks ADD COLUMN owner TEXT")
-                .execute(&mut *tx)
-                .await?;
+        // Columns added after the first release.
+        for (column, decl) in [
+            ("owner", "TEXT"),
+            ("metadata_json", "TEXT"),
+            ("request_id", "TEXT"),
+            ("finished_at", "INTEGER"),
+        ] {
+            add_column_if_missing(&mut tx, "tasks", column, decl).await?;
+        }
+        for stmt in [
+            "CREATE INDEX IF NOT EXISTS idx_tasks_request ON tasks(request_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at, id)",
+        ] {
+            sqlx::query(stmt).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -239,14 +286,17 @@ impl Storage for SqliteStorage {
         let mut tx = self.pool.begin().await?;
         let ts = now();
         sqlx::query(
-            "INSERT INTO tasks (id, state, attempts, created_at, updated_at, owner)
-             VALUES (?, ?, 0, ?, ?, ?)",
+            "INSERT INTO tasks
+                (id, state, attempts, created_at, updated_at, owner, metadata_json, request_id)
+             VALUES (?, ?, 0, ?, ?, ?, ?, ?)",
         )
         .bind(&task.id)
         .bind(task.state.as_str())
         .bind(ts)
         .bind(ts)
         .bind(task.owner.as_deref())
+        .bind(crate::metadata_to_json(&task.metadata)?)
+        .bind(task.request_id.as_deref())
         .execute(&mut *tx)
         .await?;
 
@@ -297,26 +347,116 @@ impl Storage for SqliteStorage {
     }
 
     async fn set_task_state(&self, id: &str, state: TaskState) -> Result<()> {
-        sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?")
-            .bind(state.as_str())
-            .bind(now())
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let ts = now();
+        let finished = crate::is_terminal(state).then_some(ts);
+        sqlx::query(
+            "UPDATE tasks SET state = ?, updated_at = ?,
+                finished_at = CASE WHEN ? IS NULL THEN NULL ELSE COALESCE(finished_at, ?) END
+             WHERE id = ?",
+        )
+        .bind(state.as_str())
+        .bind(ts)
+        .bind(finished)
+        .bind(finished)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool> {
+        let ts = now();
         let res = sqlx::query(
-            "UPDATE tasks SET state = ?, updated_at = ?
+            "UPDATE tasks SET state = ?, updated_at = ?, finished_at = ?
              WHERE id = ? AND state IN ('queued', 'processing')",
         )
         .bind(TaskState::Cancelled.as_str())
-        .bind(now())
+        .bind(ts)
+        .bind(ts)
         .bind(id)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn find_task_by_request(
+        &self,
+        owner: Option<&str>,
+        request_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM tasks WHERE request_id = ? AND owner IS ?
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(request_id)
+        .bind(owner)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn list_tasks(&self, query: &TaskQuery) -> Result<TaskPage> {
+        let mut sql = String::from("SELECT id, created_at FROM tasks WHERE 1 = 1");
+        let mut binds: Vec<Bind> = Vec::new();
+        if let Some(owner) = &query.owner {
+            sql.push_str(" AND owner IS ?");
+            binds.push(Bind::Text(owner.clone()));
+        }
+        if !query.states.is_empty() {
+            let marks = vec!["?"; query.states.len()].join(", ");
+            sql.push_str(&format!(" AND state IN ({marks})"));
+            binds.extend(
+                query
+                    .states
+                    .iter()
+                    .map(|s| Bind::Text(Some(s.as_str().into()))),
+            );
+        }
+        if let Some(t) = query.created_after {
+            sql.push_str(" AND created_at >= ?");
+            binds.push(Bind::Int(t));
+        }
+        if let Some(t) = query.created_before {
+            sql.push_str(" AND created_at < ?");
+            binds.push(Bind::Int(t));
+        }
+        if let Some(c) = &query.after {
+            sql.push_str(" AND (created_at < ? OR (created_at = ? AND id < ?))");
+            binds.push(Bind::Int(c.created_at));
+            binds.push(Bind::Int(c.created_at));
+            binds.push(Bind::Text(Some(c.id.clone())));
+        }
+        let limit = query.limit.max(1);
+        // One extra row tells whether another page follows.
+        sql.push_str(&format!(
+            " ORDER BY created_at DESC, id DESC LIMIT {}",
+            limit + 1
+        ));
+
+        // Assembled from fixed fragments and `?` placeholders only; every value
+        // is bound.
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for b in binds {
+            q = match b {
+                Bind::Text(v) => q.bind(v),
+                Bind::Int(v) => q.bind(v),
+            };
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        let more = rows.len() > limit;
+        let mut page = TaskPage::default();
+        for r in rows.into_iter().take(limit) {
+            let id: String = r.try_get("id")?;
+            if let Some(task) = self.load_task(&id).await? {
+                page.tasks.push(task);
+            }
+        }
+        if more && let Some(last) = page.tasks.last() {
+            page.next = Some(TaskCursor {
+                created_at: last.created_at,
+                id: last.id.clone(),
+            });
+        }
+        Ok(page)
     }
 
     async fn set_item_state(
@@ -366,42 +506,16 @@ impl Storage for SqliteStorage {
         self.touch(task_id).await
     }
 
-    async fn append_frame(
+    async fn append_samples(
         &self,
         task_id: &str,
         item: usize,
         label: &str,
-        frame: &Frame,
-    ) -> Result<()> {
-        let class_json = serde_json::to_string(&frame.classification)?;
-        sqlx::query(
-            "INSERT INTO frames (task_id, item_idx, label, frame_index, timestamp, class_json)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(task_id, item_idx, label, frame_index) DO UPDATE SET
-                timestamp = excluded.timestamp,
-                class_json = excluded.class_json",
-        )
-        .bind(task_id)
-        .bind(item as i64)
-        .bind(label)
-        .bind(frame.index as i64)
-        .bind(frame.timestamp)
-        .bind(class_json)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn append_frames(
-        &self,
-        task_id: &str,
-        item: usize,
-        label: &str,
-        frames: &[Frame],
+        samples: &[Sample],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        for frame in frames {
-            let class_json = serde_json::to_string(&frame.classification)?;
+        for sample in samples {
+            let class_json = serde_json::to_string(&sample.classification)?;
             sqlx::query(
                 "INSERT INTO frames (task_id, item_idx, label, frame_index, timestamp, class_json)
                  VALUES (?, ?, ?, ?, ?, ?)
@@ -412,8 +526,8 @@ impl Storage for SqliteStorage {
             .bind(task_id)
             .bind(item as i64)
             .bind(label)
-            .bind(frame.index as i64)
-            .bind(frame.timestamp)
+            .bind(sample.index as i64)
+            .bind(sample.start)
             .bind(class_json)
             .execute(&mut *tx)
             .await?;
@@ -422,7 +536,7 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn load_frames(&self, task_id: &str, item: usize, label: &str) -> Result<Vec<Frame>> {
+    async fn load_samples(&self, task_id: &str, item: usize, label: &str) -> Result<Vec<Sample>> {
         let rows = sqlx::query(
             "SELECT frame_index, timestamp, class_json
              FROM frames WHERE task_id = ? AND item_idx = ? AND label = ?
@@ -434,19 +548,15 @@ impl Storage for SqliteStorage {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut frames = Vec::with_capacity(rows.len());
+        let mut samples = Vec::with_capacity(rows.len());
         for r in rows {
             let index: i64 = r.try_get("frame_index")?;
             let timestamp: f64 = r.try_get("timestamp")?;
             let class_json: String = r.try_get("class_json")?;
             let classification: Classification = serde_json::from_str(&class_json)?;
-            frames.push(Frame {
-                timestamp,
-                index: index as u32,
-                classification,
-            });
+            samples.push(Sample::frame(index as u32, timestamp, classification));
         }
-        Ok(frames)
+        Ok(samples)
     }
 
     async fn set_steps_completed(
@@ -697,7 +807,7 @@ impl Storage for SqliteStorage {
 mod tests {
     use super::*;
     use apollo_config::SqliteConfig;
-    use apollo_domain::{Classification, Frame, Input, Item, Prediction, Url};
+    use apollo_domain::{Classification, Input, Item, Prediction, Sample, Url};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -738,12 +848,7 @@ mod tests {
             error: None,
             retries: 0,
         };
-        Task {
-            id: "task-1".into(),
-            state: TaskState::Queued,
-            items: vec![item],
-            owner: None,
-        }
+        Task::new("task-1", vec![item], None)
     }
 
     #[tokio::test]
@@ -768,10 +873,7 @@ mod tests {
 
         // A completed result with output.
         let out = ModelOutput::Classification(Classification {
-            predictions: vec![Prediction {
-                label: 7,
-                score: 0.99,
-            }],
+            predictions: vec![Prediction::new(7, "seven", 0.99)],
         });
         store
             .upsert_model_result("task-1", 0, "general", &ModelResult::done(out))
@@ -787,27 +889,23 @@ mod tests {
             .await
             .unwrap();
         store
-            .append_frame(
+            .append_samples(
                 "task-1",
                 0,
                 "nsfw",
-                &Frame {
-                    timestamp: 1.5,
-                    index: 0,
-                    classification: Classification {
-                        predictions: vec![Prediction {
-                            label: 0,
-                            score: 0.8,
-                        }],
+                &[Sample::frame(
+                    0,
+                    1.5,
+                    Classification {
+                        predictions: vec![Prediction::new(0, "normal", 0.8)],
                     },
-                },
+                )],
             )
             .await
             .unwrap();
-        assert_eq!(
-            store.load_frames("task-1", 0, "nsfw").await.unwrap().len(),
-            1
-        );
+        let samples = store.load_samples("task-1", 0, "nsfw").await.unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!((samples[0].start, samples[0].end()), (1.5, 1.5));
         assert_eq!(store.steps_completed("task-1", 0, "nsfw").await.unwrap(), 1);
 
         // Resume sees the in-flight task; attempts increment.
@@ -840,7 +938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_column_is_added_to_existing_databases() {
+    async fn new_columns_are_added_to_existing_databases() {
         let cfg = temp_cfg();
         // A database created before the `owner` column existed.
         {
@@ -863,6 +961,8 @@ mod tests {
         store.migrate().await.unwrap(); // still idempotent
         let old = store.get_task("old").await.unwrap().unwrap();
         assert_eq!(old.owner, None);
+        assert!(old.metadata.is_empty());
+        assert_eq!((old.request_id, old.finished_at), (None, None));
 
         let mut t = sample_task();
         t.owner = Some("alice".into());

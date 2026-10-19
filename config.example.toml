@@ -151,18 +151,19 @@ fps    = 5
 
 # --- Pipelines: ordered, gated model execution ---------------------------------
 # A pipeline runs its steps in ascending `order` for one input, rather than
-# running `models` as a parallel set. If a step's optional `stop_if` fires (any
-# listed category id at/above the threshold on that model's output), the pipeline
-# early-exits and later steps are marked skipped — the task completes and fires
-# the task webhook. A step *failure* (inference error) instead fails the whole
-# pipeline: it is retried up to [app].max_retries, then dead-lettered. A request
-# sets `pipeline = "moderation"` on its item instead of `models`.
-# [pipelines.moderation]
-# steps = [
-#   { model = "nsfw",    order = 1, stop_if = { labels = [1], threshold = 0.85 } },
-#   { model = "category", order = 2 },
-#   { model = "general", order = 3 },
-# ]
+# running `models` as one parallel set; a step's models (one name, or a list)
+# run concurrently. Once a step finishes, its optional `stop_if` is checked (any
+# listed category id at/above the threshold on the output of `stop_if.model`,
+# which may be left out for a one-model step): if it fires, every model of the
+# later steps is skipped and the task completes, firing the task webhook. A
+# model *failure* (inference error) instead fails the whole pipeline: it is
+# retried up to [app].max_retries, then dead-lettered. A request sets
+# `pipeline = "moderation"` instead of `models`.
+[pipelines.moderation]
+steps = [
+  { model = "nsfw", order = 1, stop_if = { labels = [1], threshold = 0.85 } },
+  { model = ["category", "general"], order = 2 },
+]
 
 [models.general]
 architecture   = "vit"
@@ -179,7 +180,8 @@ architecture   = "vit"
 repo           = "Falconsai/nsfw_image_detection"
 video_strategy = "coverage_scan"
 
-[models.nsfw.early_exit]        # model-side: what counts as a trigger. Absent -> no early exit.
+[models.nsfw.early_exit]        # model-side: what counts as a trigger. Absent -> no early exit
+                                # and no segments in video results.
 labels    = [1]
 threshold = 0.85
 

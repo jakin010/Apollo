@@ -8,6 +8,8 @@ build = "build.rs"
 tonic = { workspace = true }
 tonic-prost = "0.14"
 prost = "0.14"
+# google.protobuf.Timestamp in the schema.
+prost-types = "0.14"
 # Webhook delivery signing (see `webhook_signature`).
 hmac = "0.13.0"
 sha2 = "0.11.0"
@@ -17,5 +19,3 @@ thiserror = "2"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-# Provides FileDescriptorSet/DescriptorProto for the schema-stability tests.
-prost-types = "0.14"

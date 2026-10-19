@@ -3,52 +3,190 @@ syntax = "proto3";
 package apollo.v1;
 
 import "common.proto";
+import "google/protobuf/timestamp.proto";
 
 // =============================================================================
 // Inference service — implemented by the apollo server.
 //
-// Each input names its own models; the input's modality fixes which models are
-// valid for it:
-//   image -> any image-classifier
-//   video -> any image-classifier with a video_strategy (sampled-frame scan)
-//   text / audio -> models of that kind (future)
-// Invalid model/modality combinations are rejected synchronously by Classify
-// before anything is queued. Runtime failures (unfetchable URL, inference error,
-// timeout) are reported per item / per model instead.
+// A request names one input and the models to run on it, either as a set (run
+// concurrently) or as a named pipeline (run in steps). The input's kind fixes
+// which models are valid:
+//   image -> any image classifier
+//   video -> any image classifier with a video_strategy (sampled-frame scan)
+// Invalid combinations are rejected synchronously (INVALID_ARGUMENT) before
+// anything is queued. Runtime failures (unfetchable URL, inference error,
+// timeout) are reported on the task and its model results instead.
+//
+// With authentication enabled, a task belongs to the token subject that
+// submitted it; other callers (except admins) get NOT_FOUND for it, exactly as
+// for an unknown id.
 // =============================================================================
 
 service Inference {
-  // Submit a single input. Returns immediately with a task id.
-  rpc Classify (ClassifyRequest) returns (TaskCreated);
+  // Submit one input. Returns the queued task at once, or — with
+  // `wait_seconds` — the finished task if it finishes within that time.
+  rpc Classify (ClassifyRequest) returns (Task);
 
-  // Poll task state and results. Backed by the database, so it survives restarts.
+  // Submit one input as a stream of raw bytes (no URL fetch, no size limit
+  // beyond the server's upload cap). The first message MUST be `init`; every
+  // following one carries `data` in order. Returns like Classify.
+  rpc ClassifyStream (stream ClassifyChunk) returns (Task);
+
+  // A task's state and results. Backed by the database, so it survives
+  // restarts.
   rpc GetTask (GetTaskRequest) returns (Task);
 
-  // Request cooperative cancellation of a task. Returns the task's state after
-  // the request (CANCELLED unless it had already finished). In-flight items stop
-  // at the next checkpoint (between models / between sampled video frames).
-  rpc CancelTask (CancelRequest) returns (Task);
+  // The task now, then again each time it changes, ending once it is
+  // COMPLETED, FAILED or CANCELLED.
+  rpc WatchTask (WatchTaskRequest) returns (stream Task);
 
-  // Submit a single input as a stream of raw content bytes (no URL fetch). The
-  // first message MUST be the `init` frame (models + modality); every following
-  // message carries `data` bytes in order. The server stages the bytes locally
-  // and returns a task id, exactly like Classify.
-  rpc ClassifyStream (stream ClassifyChunk) returns (TaskCreated);
+  // Your tasks, newest first, a page at a time.
+  rpc ListTasks (ListTasksRequest) returns (ListTasksResponse);
+
+  // Request cooperative cancellation. Returns the task's state afterwards
+  // (CANCELLED unless it had already finished). Running work stops at the next
+  // checkpoint (between models, or between sampled video frames).
+  rpc CancelTask (CancelTaskRequest) returns (Task);
+
+  // The configured models (with their labels) and pipelines.
+  rpc ListModels (ListModelsRequest) returns (ListModelsResponse);
 }
 
-// Opening frame for ClassifyStream: the model labels to run and whether the
-// streamed bytes are a video (true) or a single image (false).
+// --------------------------------- requests ----------------------------------
+
+message ClassifyRequest {
+  // What to classify.
+  oneof input {
+    Media media = 1;
+  }
+  // What to run on it: a set of models (concurrently) or a named pipeline.
+  oneof run {
+    ModelList models = 2;
+    string pipeline = 3;
+  }
+  // Echoed back unchanged on the task and in webhooks, e.g. your own record id.
+  // At most 16 entries; keys up to 64 bytes, values up to 512.
+  map<string, string> metadata = 4;
+  // Idempotency key: submitting again with the same request_id (as the same
+  // caller) returns the existing task instead of creating a new one.
+  string request_id = 5;
+  // Wait up to this many seconds (at most 300) for the task to finish before
+  // returning. 0 returns the queued task immediately.
+  uint32 wait_seconds = 6;
+  // Result detail of the returned task (default SUMMARY).
+  ResultView view = 7;
+}
+
+// Opening message of ClassifyStream: everything a ClassifyRequest carries
+// except the content, which follows as `data` messages.
 message ClassifyStreamInit {
-  repeated string models = 1;
-  bool video = 2;
-  optional string pipeline = 3;   // run a named pipeline instead of `models` (as in InputItem)
+  MediaKind kind = 1;
+  oneof run {
+    ModelList models = 2;
+    string pipeline = 3;
+  }
+  map<string, string> metadata = 4;
+  string request_id = 5;
+  uint32 wait_seconds = 6;
+  ResultView view = 7;
 }
 
-// One message in a ClassifyStream. Exactly one of `init` (required, first) or
-// `data` (content bytes, in order) is set per message.
+// One message of a ClassifyStream: `init` first, then `data` chunks in order.
 message ClassifyChunk {
   oneof payload {
     ClassifyStreamInit init = 1;
     bytes data = 2;
   }
+}
+
+message GetTaskRequest {
+  string task_id = 1;
+  ResultView view = 2;
+}
+
+message WatchTaskRequest {
+  string task_id = 1;
+  ResultView view = 2;
+}
+
+message CancelTaskRequest {
+  string task_id = 1;
+}
+
+message ListTasksRequest {
+  // Only tasks in these states (all states when empty).
+  repeated TaskState states = 1;
+  // Only tasks created at or after / before these times.
+  google.protobuf.Timestamp created_after = 2;
+  google.protobuf.Timestamp created_before = 3;
+  // Tasks per page: default 50, at most 500.
+  uint32 page_size = 4;
+  // `next_page_token` from the previous page; empty for the first page.
+  string page_token = 5;
+}
+
+message ListTasksResponse {
+  // Newest first, with summary results.
+  repeated Task tasks = 1;
+  // Pass as `page_token` for the next page; empty on the last page.
+  string next_page_token = 2;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated ModelInfo models = 1;
+  repeated PipelineInfo pipelines = 2;
+}
+
+// ------------------------------ model discovery ------------------------------
+
+message ModelInfo {
+  string name = 1;
+  // e.g. "vit", "siglip".
+  string architecture = 2;
+  // Hugging Face repo the weights come from.
+  string repo = 3;
+  // Input kinds the model accepts (video only with a video strategy).
+  repeated MediaKind accepts = 4;
+  // Disabled models are rejected at submit time.
+  bool enabled = 5;
+  // Weights currently in memory.
+  bool loaded = 6;
+  // The model's labels; empty if they could not be read.
+  repeated Label labels = 7;
+  // What counts as a trigger for this model (stops video scans early when the
+  // strategy allows it; defines segments). Unset when it has none.
+  Trigger trigger = 8;
+  // Strategy used for video input; empty if the model takes no video.
+  string video_strategy = 9;
+}
+
+message Label {
+  uint32 id = 1;
+  string name = 2;
+}
+
+// Any of `labels` scoring at or above `threshold`.
+message Trigger {
+  repeated uint32 labels = 1;
+  float threshold = 2;
+}
+
+message PipelineInfo {
+  string name = 1;
+  // In run order; each step's models run concurrently.
+  repeated PipelineStepInfo steps = 2;
+}
+
+message PipelineStepInfo {
+  repeated string models = 1;
+  // When set and `stop_if.model`'s output triggers, later steps are skipped.
+  StopIf stop_if = 2;
+}
+
+message StopIf {
+  // Whose output is checked.
+  string model = 1;
+  Trigger trigger = 2;
 }

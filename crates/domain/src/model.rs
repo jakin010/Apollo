@@ -14,6 +14,16 @@ pub enum Architecture {
     Siglip,
 }
 
+impl Architecture {
+    /// The name used in the config (`architecture = "vit"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Architecture::Vit => "vit",
+            Architecture::Siglip => "siglip",
+        }
+    }
+}
+
 /// Modality of an input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

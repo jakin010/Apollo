@@ -26,15 +26,17 @@ use apollo_proto::webhook_server::{Webhook, WebhookServer};
 use apollo_proto::webhook_signature::{
     self, DEFAULT_TOLERANCE, SIGNATURE_HEADER, TIMESTAMP_HEADER,
 };
-use apollo_proto::{Ack, Task};
+use apollo_proto::{Ack, TaskEvent};
 
-/// Largest delivery accepted. A task carrying a long video frame scan can run to
-/// several MiB; tonic's 4 MiB default would reject it.
+/// Largest delivery accepted. Events carry the summary view (no per-sample
+/// results), but a task with many models and long scans still adds up; tonic's
+/// 4 MiB default is too tight to rely on.
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Handle task-status callbacks. Invoked as a task reaches a terminal state (and
-/// on intermediate transitions), carrying the full current [`Task`]. Delivery is
-/// at-least-once, so dedupe (e.g. by `Task.id`).
+/// Handle task events. A `FINISHED` [`TaskEvent`] arrives once a task is
+/// completed, failed or cancelled, and best-effort `PROGRESS` events on the way
+/// (processing, retrying); each carries the task as it is then. Finished events
+/// are delivered at least once, so dedupe (e.g. by `task.id`).
 ///
 /// Return `Ok(Response::new(Ack {}))` to acknowledge the delivery; returning an
 /// error `Status` tells the sender the delivery was not accepted, so it will be
@@ -47,7 +49,7 @@ const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 #[allow(clippy::double_must_use)]
 #[tonic::async_trait]
 pub trait WebhookHandler: Send + Sync + 'static {
-    async fn on_task_status(&self, task: Task) -> Result<Response<Ack>, Status>;
+    async fn on_event(&self, event: TaskEvent) -> Result<Response<Ack>, Status>;
 }
 
 /// A webhook receiver. Build it from a [`WebhookHandler`], optionally set a shared
@@ -55,11 +57,11 @@ pub trait WebhookHandler: Send + Sync + 'static {
 ///
 /// ```no_run
 /// # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
-/// # use apollo_client::{WebhookReceiver, WebhookHandler, Task, Ack};
+/// # use apollo_client::{WebhookReceiver, WebhookHandler, TaskEvent, Ack};
 /// # use tonic::{Response, Status};
 /// # struct Sink;
 /// # #[tonic::async_trait] impl WebhookHandler for Sink {
-/// #     async fn on_task_status(&self, _t: Task) -> Result<Response<Ack>, Status> { Ok(Response::new(Ack {})) }
+/// #     async fn on_event(&self, _e: TaskEvent) -> Result<Response<Ack>, Status> { Ok(Response::new(Ack {})) }
 /// # }
 /// WebhookReceiver::new(Sink)
 ///     .secret("shared-secret")          // must match the server's [webhook].secret
@@ -142,8 +144,8 @@ struct Handler<H> {
 
 #[tonic::async_trait]
 impl<H: WebhookHandler> Webhook for Handler<H> {
-    async fn task_status(&self, request: Request<Task>) -> Result<Response<Ack>, Status> {
-        self.handler.on_task_status(request.into_inner()).await
+    async fn notify(&self, request: Request<TaskEvent>) -> Result<Response<Ack>, Status> {
+        self.handler.on_event(request.into_inner()).await
     }
 }
 
@@ -294,20 +296,23 @@ mod tests {
 
     const SECRET: &str = "s3cret";
 
-    struct Recorder(mpsc::UnboundedSender<Task>);
+    struct Recorder(mpsc::UnboundedSender<String>);
 
     #[tonic::async_trait]
     impl WebhookHandler for Recorder {
-        async fn on_task_status(&self, task: Task) -> Result<Response<Ack>, Status> {
-            let _ = self.0.send(task);
+        async fn on_event(&self, event: TaskEvent) -> Result<Response<Ack>, Status> {
+            let _ = self.0.send(event.task.unwrap_or_default().id);
             Ok(Response::new(Ack {}))
         }
     }
 
-    fn task(id: &str) -> Task {
-        Task {
-            id: id.into(),
-            result: None,
+    fn task(id: &str) -> TaskEvent {
+        TaskEvent {
+            task: Some(apollo_proto::Task {
+                id: id.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
     }
 
@@ -317,7 +322,7 @@ mod tests {
         secret: Option<&str>,
     ) -> (
         WebhookClient<tonic::transport::Channel>,
-        mpsc::UnboundedReceiver<Task>,
+        mpsc::UnboundedReceiver<String>,
         oneshot::Sender<()>,
     ) {
         let port = TcpListener::bind("127.0.0.1:0")
@@ -347,7 +352,7 @@ mod tests {
 
     /// A request carrying `sent`, signed as if the payload were `signed_as` at
     /// `timestamp`.
-    fn request(sent: &Task, signed_as: &Task, timestamp: i64) -> Request<Task> {
+    fn request(sent: &TaskEvent, signed_as: &TaskEvent, timestamp: i64) -> Request<TaskEvent> {
         let sig = webhook_signature::sign(SECRET.as_bytes(), timestamp, &signed_as.encode_to_vec());
         let mut req = Request::new(sent.clone());
         let md = req.metadata_mut();
@@ -365,14 +370,14 @@ mod tests {
         let now = unix_now();
 
         client
-            .task_status(request(&task("ok"), &task("ok"), now))
+            .notify(request(&task("ok"), &task("ok"), now))
             .await
             .unwrap();
-        assert_eq!(seen.recv().await.unwrap().id, "ok");
+        assert_eq!(seen.recv().await.unwrap(), "ok");
 
         // A captured signature does not cover a different payload...
         let err = client
-            .task_status(request(&task("forged"), &task("ok"), now))
+            .notify(request(&task("forged"), &task("ok"), now))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -381,14 +386,14 @@ mod tests {
         // ...nor can an old delivery be replayed.
         let old = now - 3600;
         let err = client
-            .task_status(request(&task("ok"), &task("ok"), old))
+            .notify(request(&task("ok"), &task("ok"), old))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
         assert!(err.message().contains("window"), "{}", err.message());
 
         // Unsigned deliveries are refused.
-        let err = client.task_status(task("plain")).await.unwrap_err();
+        let err = client.notify(task("plain")).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
 
         assert!(
@@ -401,8 +406,8 @@ mod tests {
     #[tokio::test]
     async fn without_a_secret_everything_is_accepted() {
         let (mut client, mut seen, stop) = start(None).await;
-        client.task_status(task("plain")).await.unwrap();
-        assert_eq!(seen.recv().await.unwrap().id, "plain");
+        client.notify(task("plain")).await.unwrap();
+        assert_eq!(seen.recv().await.unwrap(), "plain");
         let _ = stop.send(());
     }
 

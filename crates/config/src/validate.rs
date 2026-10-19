@@ -212,12 +212,26 @@ impl Config {
                 errs.push(format!("pipeline '{name}': has no steps"));
             }
             let mut orders = BTreeSet::new();
+            let mut seen = BTreeSet::new();
             for step in &pipeline.steps {
-                if !self.models.contains_key(&step.model) {
+                let models = step.models();
+                if models.is_empty() {
                     errs.push(format!(
-                        "pipeline '{name}': step references unknown model '{}'",
-                        step.model
+                        "pipeline '{name}': step {} lists no models",
+                        step.order
                     ));
+                }
+                for model in models {
+                    if !self.models.contains_key(model) {
+                        errs.push(format!(
+                            "pipeline '{name}': step references unknown model '{model}'"
+                        ));
+                    }
+                    if !seen.insert(model.as_str()) {
+                        errs.push(format!(
+                            "pipeline '{name}': model '{model}' appears in more than one step"
+                        ));
+                    }
                 }
                 if !orders.insert(step.order) {
                     errs.push(format!(
@@ -225,13 +239,24 @@ impl Config {
                         step.order
                     ));
                 }
-                if let Some(stop) = &step.stop_if
-                    && stop.labels.is_empty()
-                {
-                    errs.push(format!(
-                        "pipeline '{name}': step '{}' stop_if needs at least one label id",
-                        step.model
-                    ));
+                if let Some(stop) = &step.stop_if {
+                    if stop.labels.is_empty() {
+                        errs.push(format!(
+                            "pipeline '{name}': step {} stop_if needs at least one label id",
+                            step.order
+                        ));
+                    }
+                    match &stop.model {
+                        Some(m) if !models.contains(m) => errs.push(format!(
+                            "pipeline '{name}': step {} stop_if.model '{m}' is not one of the step's models",
+                            step.order
+                        )),
+                        None if models.len() > 1 => errs.push(format!(
+                            "pipeline '{name}': step {} runs several models, so stop_if.model must name the one to check",
+                            step.order
+                        )),
+                        _ => {}
+                    }
                 }
             }
         }
