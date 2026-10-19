@@ -67,7 +67,7 @@ impl Engine {
     /// The configured models (with their labels, read without loading or
     /// downloading anything) and pipelines.
     pub async fn catalog(&self) -> Result<Catalog, EngineError> {
-        let config = self.inner.config.clone();
+        let config = self.config().clone();
         let cache_dir = config.app.cache_dir.clone().map(PathBuf::from);
         // Reading a taxonomy or a cached config.json is file I/O.
         let labels = tokio::task::spawn_blocking(move || {
@@ -83,7 +83,7 @@ impl Engine {
         .await
         .map_err(|e| EngineError::Join(e.to_string()))?;
 
-        let config = &self.inner.config;
+        let config = &self.config();
         let models = labels
             .into_iter()
             .filter_map(|(name, labels)| {
@@ -93,7 +93,7 @@ impl Engine {
                     accepts.push(MediaKind::Video);
                 }
                 let loaded = self
-                    .inner
+                    .live()
                     .registry
                     .get(&name)
                     .is_some_and(|h| h.snapshot().loaded);

@@ -32,19 +32,40 @@ pub struct StartArgs {
     pub daemon: bool,
 }
 
-pub fn run(args: StartArgs) -> anyhow::Result<()> {
-    let mut config = load::load(args.config.as_deref()).context("loading config")?;
-    config.apply_overrides(&Overrides {
-        endpoint: args.endpoint.clone(),
-        port: args.port,
-        webhook_url: args.webhook_url.clone(),
-    });
-    config.validate().context("config is invalid")?;
-    if !config.has_models() {
-        return Err(anyhow!(
-            "no models configured — nothing to serve; add a [models.<label>] section"
-        ));
+/// Where the config comes from, so a reload reads it the same way.
+#[derive(Clone)]
+struct ConfigSource {
+    /// `--config`, or `None` for the default location.
+    path: Option<PathBuf>,
+    /// The run-only command-line overrides, re-applied on every reload.
+    overrides: Overrides,
+}
+
+impl ConfigSource {
+    /// Load, apply the overrides, and validate.
+    fn load(&self) -> anyhow::Result<Config> {
+        let mut config = load::load(self.path.as_deref()).context("loading config")?;
+        config.apply_overrides(&self.overrides);
+        config.validate().context("config is invalid")?;
+        if !config.has_models() {
+            return Err(anyhow!(
+                "no models configured — nothing to serve; add a [models.<label>] section"
+            ));
+        }
+        Ok(config)
     }
+}
+
+pub fn run(args: StartArgs) -> anyhow::Result<()> {
+    let source = ConfigSource {
+        path: args.config.clone(),
+        overrides: Overrides {
+            endpoint: args.endpoint.clone(),
+            port: args.port,
+            webhook_url: args.webhook_url.clone(),
+        },
+    };
+    let config = source.load()?;
 
     if args.daemon {
         return spawn_detached(&args);
@@ -62,11 +83,15 @@ pub fn run(args: StartArgs) -> anyhow::Result<()> {
         .unwrap_or_else(load::default_path)
         .canonicalize()
         .ok();
-    runtime.block_on(serve(config, config_file))
+    runtime.block_on(serve(config, config_file, source))
 }
 
-async fn serve(config: Config, config_file: Option<PathBuf>) -> anyhow::Result<()> {
-    init_tracing(&config.app.log_level);
+async fn serve(
+    config: Config,
+    config_file: Option<PathBuf>,
+    source: ConfigSource,
+) -> anyhow::Result<()> {
+    let log_filter = init_tracing(&config.app.log_level);
 
     let addr = (config.app.endpoint.as_str(), config.app.port)
         .to_socket_addrs()
@@ -79,18 +104,18 @@ async fn serve(config: Config, config_file: Option<PathBuf>) -> anyhow::Result<(
         .await
         .context("opening storage")?;
 
-    let webhook = match &config.webhook {
-        Some(w) => {
-            let sink = apollo_server::GrpcWebhookSink::new(&w.url, w.secret.clone())
-                .context("configuring webhook client")?;
-            Some(Arc::new(sink) as Arc<dyn WebhookSink>)
-        }
-        None => None,
-    };
+    let webhook = webhook_sink(&config)?;
 
     // Engine::new spawns background tasks, so it must run inside the runtime.
     let config = Arc::new(config);
     let engine = Engine::new(config.clone(), storage, webhook);
+    let reloader = Reloader {
+        engine: engine.clone(),
+        source,
+        log_filter,
+    };
+    reload_on_hangup(reloader.clone());
+    let _metrics = start_metrics(&config.metrics, engine.clone()).await?;
 
     let resumed = engine.recover().await.context("recovering tasks")?;
     if resumed > 0 {
@@ -121,9 +146,8 @@ async fn serve(config: Config, config_file: Option<PathBuf>) -> anyhow::Result<(
         config_file: config_file.map(|p| p.display().to_string()),
         database: describe_database(&config.database),
         log_file: std::env::var(DAEMON_LOG_ENV).ok(),
-        webhook_url: config.webhook.as_ref().map(|w| w.url.clone()),
     };
-    let _status_socket = start_status_socket(engine.clone(), info);
+    let _status_socket = start_status_socket(engine.clone(), info, reloader);
 
     tracing::info!(%addr, models = config.model_count(), "apollo listening");
     apollo_server::serve_with_shutdown(
@@ -158,7 +182,131 @@ struct ServerInfo {
     config_file: Option<String>,
     database: String,
     log_file: Option<String>,
-    webhook_url: Option<String>,
+}
+
+/// The `[webhook]` sink for `config`, if it has one.
+fn webhook_sink(config: &Config) -> anyhow::Result<Option<Arc<dyn WebhookSink>>> {
+    match &config.webhook {
+        Some(w) => {
+            let sink = apollo_server::GrpcWebhookSink::new(&w.url, w.secret.clone())
+                .context("configuring webhook client")?;
+            Ok(Some(Arc::new(sink) as Arc<dyn WebhookSink>))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Re-reads the config and applies it to the running server (`apollo reload`,
+/// SIGHUP).
+#[derive(Clone)]
+struct Reloader {
+    engine: Engine,
+    source: ConfigSource,
+    log_filter: Option<LogFilter>,
+}
+
+impl Reloader {
+    /// Load, validate and apply the config. On any error the running config
+    /// stays as it was.
+    async fn reload(&self) -> anyhow::Result<crate::status::ReloadOutcome> {
+        let config = self.source.load()?;
+        let webhook = webhook_sink(&config)?;
+        let level = config.app.log_level.clone();
+        let report = self.engine.reload(config, webhook).await?;
+        if let Some(filter) = &self.log_filter {
+            set_log_level(filter, &level);
+        }
+        let m = report.models;
+        Ok(crate::status::ReloadOutcome {
+            generation: report.generation,
+            added: m.added,
+            reloaded: m.reloaded,
+            kept: m.kept,
+            removed: m.removed,
+            restart_required: report.restart_required,
+        })
+    }
+}
+
+/// Reload the config on SIGHUP.
+fn reload_on_hangup(reloader: Reloader) {
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut hangup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGHUP reload disabled");
+                return;
+            }
+        };
+        while hangup.recv().await.is_some() {
+            tracing::info!("SIGHUP received; reloading the config");
+            if let Err(e) = reloader.reload().await {
+                tracing::error!(error = %format!("{e:#}"), "config reload failed; the running config stays");
+            }
+        }
+    });
+    #[cfg(not(unix))]
+    let _ = reloader;
+}
+
+/// Serve `GET /metrics` when `[metrics]` is enabled. The listener runs until
+/// the process exits.
+async fn start_metrics(
+    config: &apollo_config::MetricsConfig,
+    engine: Engine,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let addr = (config.endpoint.as_str(), config.port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolving [metrics] {}:{}", config.endpoint, config.port))?
+        .next()
+        .ok_or_else(|| {
+            anyhow!(
+                "no address for [metrics] {}:{}",
+                config.endpoint,
+                config.port
+            )
+        })?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding the metrics listener on {addr}"))?;
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "serving unauthenticated metrics on a non-loopback address"
+        );
+    }
+    let app = axum::Router::new()
+        .route("/metrics", axum::routing::get(metrics_handler))
+        .with_state(engine);
+    tracing::info!(%addr, "serving Prometheus metrics on /metrics");
+    Ok(Some(tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!(error = %e, "metrics listener stopped");
+        }
+    })))
+}
+
+async fn metrics_handler(
+    axum::extract::State(engine): axum::extract::State<Engine>,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    match engine.metrics_text().await {
+        Ok(text) => (
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            text,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// The configured database, without credentials.
@@ -177,7 +325,11 @@ fn describe_database(db: &apollo_config::DatabaseConfig) -> String {
 /// Serve `apollo status` on the local status socket. Failure is logged, not
 /// fatal: the server works without it.
 #[cfg(unix)]
-fn start_status_socket(engine: Engine, info: ServerInfo) -> Option<crate::status::SocketGuard> {
+fn start_status_socket(
+    engine: Engine,
+    info: ServerInfo,
+    reloader: Reloader,
+) -> Option<crate::status::SocketGuard> {
     let path = match crate::status::socket_path() {
         Ok(p) => p,
         Err(e) => {
@@ -190,7 +342,11 @@ fn start_status_socket(engine: Engine, info: ServerInfo) -> Option<crate::status
         let info = info.clone();
         async move { build_report(&engine, &info).await }
     };
-    match crate::status::serve_socket(&path, report) {
+    let reload = move || {
+        let reloader = reloader.clone();
+        async move { reloader.reload().await }
+    };
+    match crate::status::serve_socket(&path, report, reload) {
         Ok(guard) => {
             tracing::info!(socket = %path.display(), "status socket ready (`apollo status`)");
             Some(guard)
@@ -203,7 +359,7 @@ fn start_status_socket(engine: Engine, info: ServerInfo) -> Option<crate::status
 }
 
 #[cfg(not(unix))]
-fn start_status_socket(_engine: Engine, _info: ServerInfo) -> Option<()> {
+fn start_status_socket(_engine: Engine, _info: ServerInfo, _reloader: Reloader) -> Option<()> {
     None
 }
 
@@ -215,6 +371,8 @@ async fn build_report(
 ) -> anyhow::Result<crate::status::StatusReport> {
     use crate::status::{self as st, unix_secs};
     let s = engine.status().await?;
+    let config = engine.config();
+    let (generation, loaded_at) = engine.config_generation();
     Ok(st::StatusReport {
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
@@ -224,6 +382,8 @@ async fn build_report(
         mutual_tls: info.mutual_tls,
         auth: info.auth,
         config_file: info.config_file.clone(),
+        config_generation: Some(generation),
+        config_loaded_at: Some(unix_secs(loaded_at)),
         database: info.database.clone(),
         log_file: info.log_file.clone(),
         device: s.device,
@@ -245,9 +405,9 @@ async fn build_report(
             failed: s.tasks.failed,
             cancelled: s.tasks.cancelled,
         },
-        webhook: match (&info.webhook_url, s.webhooks_pending) {
-            (Some(url), Some(pending)) => Some(st::Webhook {
-                url: url.clone(),
+        webhook: match (&config.webhook, s.webhooks_pending) {
+            (Some(w), Some(pending)) => Some(st::Webhook {
+                url: w.url.clone(),
                 pending,
             }),
             _ => None,
@@ -339,12 +499,38 @@ fn configure_auth(auth: &AuthConfig) -> anyhow::Result<apollo_server::AuthInterc
     Ok(interceptor)
 }
 
-fn init_tracing(level: &str) {
-    use tracing_subscriber::{EnvFilter, fmt};
-    // RUST_LOG wins; otherwise fall back to the configured level.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    // try_init is a no-op if a subscriber is already set (e.g. in tests).
-    let _ = fmt().with_env_filter(filter).try_init();
+/// Changes the log filter of the running subscriber.
+type LogFilter =
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
+/// Set up logging. Returns a handle to change the level on reload, or `None`
+/// when `RUST_LOG` is set (it wins over the config, then and on reload) or a
+/// subscriber already existed.
+fn init_tracing(level: &str) -> Option<LogFilter> {
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{EnvFilter, fmt, reload};
+    let from_env = EnvFilter::try_from_default_env().ok();
+    let pinned = from_env.is_some();
+    let filter = from_env.unwrap_or_else(|| EnvFilter::new(level));
+    let (filter, handle) = reload::Layer::new(filter);
+    // try_init fails if a subscriber is already set (e.g. in tests).
+    let installed = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer())
+        .try_init()
+        .is_ok();
+    (installed && !pinned).then_some(handle)
+}
+
+fn set_log_level(filter: &LogFilter, level: &str) {
+    match tracing_subscriber::EnvFilter::try_new(level) {
+        Ok(new) => {
+            if let Err(e) = filter.reload(new) {
+                tracing::warn!(error = %e, "could not change the log level");
+            }
+        }
+        Err(e) => tracing::warn!(level, error = %e, "invalid log level; unchanged"),
+    }
 }
 
 /// Re-exec this binary as a detached background `start` (without `--daemon`).

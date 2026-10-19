@@ -262,21 +262,23 @@ fn flat_classification(
 }
 
 /// Taxonomy mode: aggregate each child's prompt scores (mean/max) into one child
-/// score, keep the children scoring at/above `threshold`, and return them flat in
+/// score, keep the children scoring at/above their own `threshold` (or the
+/// model's `threshold` when they set none), and return them flat in
 /// `predictions` (highest first; `label` is the child id). The per-parent
 /// grouping is left to the caller, who can reconstruct it from the taxonomy.
 fn taxonomy_classification(row: &[f32], threshold: f32, children: &[TaxonChild]) -> Classification {
     let mut predictions = children
         .iter()
-        .map(|child| {
+        .filter_map(|child| {
             let slice = &row[child.prompt_start..child.prompt_start + child.prompt_len];
             let score = match child.aggregation {
                 Aggregation::Max => slice.iter().copied().fold(f32::MIN, f32::max),
                 Aggregation::Mean => slice.iter().sum::<f32>() / slice.len() as f32,
             };
-            Prediction::new(child.id, child.name.clone(), score)
+            // A child's own threshold replaces the model's.
+            (score >= child.threshold.unwrap_or(threshold))
+                .then(|| Prediction::new(child.id, child.name.clone(), score))
         })
-        .filter(|p| p.score >= threshold)
         .collect::<Vec<_>>();
     predictions.sort_by(|a, b| {
         b.score
@@ -451,4 +453,34 @@ impl EmbedCache {
 fn l2_normalize(t: &Tensor) -> Result<Tensor, InferenceError> {
     let norm = t.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
     Ok(t.broadcast_div(&norm)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn child(id: u32, start: usize, threshold: Option<f32>) -> TaxonChild {
+        TaxonChild {
+            id,
+            name: format!("p.c{id}"),
+            parent_id: 1,
+            aggregation: Aggregation::Max,
+            threshold,
+            prompt_start: start,
+            prompt_len: 1,
+        }
+    }
+
+    #[test]
+    fn a_childs_own_threshold_replaces_the_models() {
+        let children = [
+            child(1, 0, None),
+            child(2, 1, Some(0.5)),
+            child(3, 2, Some(0.05)),
+        ];
+        let c = taxonomy_classification(&[0.2, 0.3, 0.1], 0.15, &children);
+        let kept: Vec<u32> = c.predictions.iter().map(|p| p.label).collect();
+        // 1 passes the model's 0.15; 2 misses its own 0.5; 3 passes its 0.05.
+        assert_eq!(kept, [1, 3]);
+    }
 }

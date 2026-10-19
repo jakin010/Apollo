@@ -28,27 +28,7 @@ async fn fixture() -> Fixture {
 /// Models are never loaded, so their repos need not exist.
 async fn fixture_with(toml: &str) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let parsed = apollo_config::load::from_str(toml).unwrap();
-    parsed.validate().unwrap();
-    let mut config = Config {
-        app: Default::default(),
-        webhook: None,
-        auth: Default::default(),
-        tls: None,
-        limits: Default::default(),
-        database: DatabaseConfig {
-            sqlite: Some(SqliteConfig {
-                path: dir.path().join("apollo.db").to_string_lossy().into_owned(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        cache: None,
-        strategies: parsed.strategies,
-        pipelines: parsed.pipelines,
-        models: parsed.models,
-    };
-    config.app.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+    let config = config_in(&dir, toml);
     let storage = apollo_storage::open(&config.database).await.unwrap();
     let engine = Engine::new(Arc::new(config), storage.clone(), None);
     Fixture {
@@ -56,6 +36,21 @@ async fn fixture_with(toml: &str) -> Fixture {
         storage,
         _dir: dir,
     }
+}
+
+/// `toml` with the database and cache directory in `dir`.
+fn config_in(dir: &tempfile::TempDir, toml: &str) -> Config {
+    let mut config = apollo_config::load::from_str(toml).unwrap();
+    config.validate().unwrap();
+    config.database = DatabaseConfig {
+        sqlite: Some(SqliteConfig {
+            path: dir.path().join("apollo.db").to_string_lossy().into_owned(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    config.app.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+    config
 }
 
 fn task(id: &str, state: TaskState, item_state: ItemState, upload: Option<PathBuf>) -> Task {
@@ -464,4 +459,163 @@ async fn waiting_returns_the_finished_task_or_the_latest_state() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn a_reload_keeps_unchanged_models_and_replaces_changed_ones() {
+    let f = fixture_with(PIPELINE).await;
+    let before = f.engine.live();
+    let handle = |live: &crate::live::Live, m: &str| live.registry.get(m).unwrap();
+
+    // nsfw: only its timeout changes (read per use) -> kept.
+    // category: its labels change (baked into the loaded model) -> reloaded.
+    // general: enabled now -> added. A new strategy and pipeline, too.
+    let changed = PIPELINE
+        .replace(
+            "repo = \"test/nsfw\"",
+            "repo = \"test/nsfw\"\n    timeout = 99",
+        )
+        .replace(
+            "labels = [\"food\", \"sports\"]",
+            "labels = [\"food\", \"sports\", \"art\"]",
+        )
+        .replace("enabled = false", "enabled = true");
+    let report = f
+        .engine
+        .reload(config_in(&f._dir, &changed), None)
+        .await
+        .unwrap();
+    assert_eq!(report.generation, 2);
+    assert_eq!(report.models.kept, ["nsfw"]);
+    assert_eq!(report.models.reloaded, ["category"]);
+    assert_eq!(report.models.added, ["general"]);
+    assert!(report.models.removed.is_empty());
+    assert!(report.restart_required.is_empty());
+
+    let after = f.engine.live();
+    assert!(Arc::ptr_eq(
+        &handle(&before, "nsfw"),
+        &handle(&after, "nsfw")
+    ));
+    assert!(!Arc::ptr_eq(
+        &handle(&before, "category"),
+        &handle(&after, "category")
+    ));
+    assert_eq!(after.config.models["nsfw"].timeout, 99);
+    assert_eq!(f.engine.config_generation().0, 2);
+
+    // The new labels are listed at once.
+    let catalog = f.engine.catalog().await.unwrap();
+    let category = catalog
+        .models
+        .iter()
+        .find(|m| m.name == "category")
+        .unwrap();
+    assert_eq!(category.labels.len(), 3);
+
+    // Removing a model (and the pipeline that used it).
+    let removed = changed
+        .split("[models.general]")
+        .next()
+        .unwrap()
+        .to_string()
+        + "\n[strategies.s]\n[[strategies.s.sampling]]\nstep = 1\nmethod = \"uniform\"\ncount = 4\n";
+    let report = f
+        .engine
+        .reload(config_in(&f._dir, &removed), None)
+        .await
+        .unwrap();
+    assert_eq!(report.models.removed, ["general"]);
+    assert_eq!(report.models.kept, ["category", "nsfw"]);
+    assert!(f.engine.live().registry.get("general").is_none());
+    assert!(matches!(
+        f.engine
+            .check_submission(&image(), &Run::Pipeline("moderation".into())),
+        Err(EngineError::Config(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_task_keeps_the_config_it_started_with() {
+    let f = fixture_with(PIPELINE).await;
+    let pinned = f.engine.pinned();
+    let without_nsfw = PIPELINE
+        .replace(
+            "[models.nsfw]\n    architecture = \"vit\"\n    repo = \"test/nsfw\"\n",
+            "",
+        )
+        .replace(
+            "{ model = \"nsfw\", order = 1, stop_if = { labels = [1], threshold = 0.85 } },\n",
+            "",
+        )
+        .replace("order = 2", "order = 1");
+    f.engine
+        .reload(config_in(&f._dir, &without_nsfw), None)
+        .await
+        .unwrap();
+    // The current config lost nsfw; a handle pinned before still has it.
+    assert!(f.engine.live().registry.get("nsfw").is_none());
+    assert!(pinned.live().registry.get("nsfw").is_some());
+    assert_eq!(pinned.config_generation().0, 1);
+}
+
+#[tokio::test]
+async fn restart_only_changes_are_reported_and_invalid_configs_rejected() {
+    let f = fixture_with(PIPELINE).await;
+    let mut config = config_in(&f._dir, PIPELINE);
+    config.app.port += 1;
+    config.app.max_retries += 5;
+    let report = f.engine.reload(config, None).await.unwrap();
+    assert_eq!(report.restart_required, ["app.port"]);
+    let defaults = apollo_config::load::from_str("").unwrap().app;
+    let live = f.engine.config();
+    assert_eq!(live.app.port, defaults.port);
+    assert_eq!(live.app.max_retries, defaults.max_retries + 5);
+
+    // An invalid config (unknown strategy) changes nothing.
+    let bad = PIPELINE.replace("video_strategy = \"s\"", "video_strategy = \"nope\"");
+    let bad: Config = apollo_config::load::from_str(&bad).unwrap();
+    let err = f.engine.reload(bad, None).await.unwrap_err();
+    assert!(matches!(err, EngineError::Config(_)), "{err}");
+    assert_eq!(f.engine.config_generation().0, 2);
+    // So does one without models.
+    let empty: Config = apollo_config::load::from_str("").unwrap();
+    assert!(f.engine.reload(empty, None).await.is_err());
+    assert_eq!(f.engine.config_generation().0, 2);
+}
+
+#[tokio::test]
+async fn metrics_render_in_the_prometheus_format() {
+    let f = fixture_with(PIPELINE).await;
+    // A rejected submission is counted.
+    let bad = Submission {
+        input: image(),
+        run: Run::Models(vec!["nope".into()]),
+        metadata: Default::default(),
+        request_id: None,
+    };
+    assert!(f.engine.submit(bad, None).await.is_err());
+    let text = f.engine.metrics_text().await.unwrap();
+    for line in [
+        "# TYPE apollo_build_info gauge",
+        "apollo_submissions_total{outcome=\"invalid\"} 1",
+        "apollo_config_generation 1",
+        "apollo_model_loaded{model=\"nsfw\"} 0",
+        "apollo_tasks{state=\"queued\"} 0",
+        "# TYPE apollo_model_batch_seconds histogram",
+        "apollo_fetch_seconds_bucket{le=\"+Inf\"} 0",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
+        );
+    }
+    // Every sample line is `name{labels} value` with a numeric value.
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        let value = line.rsplit(' ').next().unwrap();
+        assert!(
+            value.parse::<f64>().is_ok() || value == "+Inf",
+            "bad sample {line:?}"
+        );
+    }
 }

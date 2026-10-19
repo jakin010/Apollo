@@ -103,3 +103,11 @@ pub(crate) fn redelivery_secs() -> u32 {
 pub(crate) fn max_retries() -> u32 {
     3
 }
+
+pub(crate) fn metrics_endpoint() -> String {
+    "127.0.0.1".to_string()
+}
+
+pub(crate) fn metrics_port() -> u16 {
+    9464
+}

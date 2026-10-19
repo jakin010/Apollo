@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use crate::error::ConfigError;
 
@@ -58,20 +58,39 @@ pub fn get(doc: &DocumentMut, key: &str) -> Option<String> {
 }
 
 /// Set the value at a dotted key, creating intermediate tables as needed.
+/// Keys may lead through inline tables (`early_exit = { threshold = 0.85 }`).
 pub fn set(doc: &mut DocumentMut, key: &str, value: &str) -> Result<(), ConfigError> {
+    set_value(doc, key, parse_value(value))
+}
+
+/// [`set`] with a value already typed (e.g. a float that must stay a float).
+pub fn set_value(doc: &mut DocumentMut, key: &str, value: Value) -> Result<(), ConfigError> {
     let segs: Vec<&str> = key.split('.').collect();
     let (last, parents) = segs
         .split_last()
         .ok_or_else(|| ConfigError::EditOp("empty key".into()))?;
 
-    let mut table: &mut Table = doc.as_table_mut();
+    let mut table: &mut dyn TableLike = doc.as_table_mut();
     for &seg in parents {
-        let entry = table.entry(seg).or_insert(Item::Table(Table::new()));
-        table = entry
-            .as_table_mut()
+        if table.get(seg).is_none() {
+            table.insert(seg, Item::Table(Table::new()));
+        }
+        table = table
+            .get_mut(seg)
+            .and_then(Item::as_table_like_mut)
             .ok_or_else(|| ConfigError::EditOp(format!("'{seg}' is not a table")))?;
     }
-    table.insert(last, Item::Value(parse_value(value)));
+    match table.get_mut(last) {
+        // Keep the existing value's comments and spacing.
+        Some(Item::Value(old)) => {
+            let decor = old.decor().clone();
+            *old = value;
+            *old.decor_mut() = decor;
+        }
+        _ => {
+            table.insert(last, Item::Value(value));
+        }
+    }
     Ok(())
 }
 

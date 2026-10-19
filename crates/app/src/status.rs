@@ -1,5 +1,8 @@
-//! `apollo status`: a running server answers on a Unix socket in its private
-//! per-user directory with a JSON [`StatusReport`]; the CLI reads and renders it.
+//! `apollo status` and `apollo reload`: a running server answers on a Unix
+//! socket in its private per-user directory. A client sends one request line —
+//! `status` or `reload` — and gets one JSON reply: a [`StatusReport`], or a
+//! [`ReloadOutcome`]. A client that sends nothing (older versions) gets a
+//! status report.
 //!
 //! A local socket (rather than an RPC on the public port) means no token, no TLS
 //! setup and no network exposure: only the OS user running the server can
@@ -22,6 +25,12 @@ pub struct StatusReport {
     pub mutual_tls: bool,
     pub auth: bool,
     pub config_file: Option<String>,
+    /// Configs applied since start (1 = the startup config) and when the
+    /// running one was applied (unix seconds). Unset from older servers.
+    #[serde(default)]
+    pub config_generation: Option<u64>,
+    #[serde(default)]
+    pub config_loaded_at: Option<u64>,
     pub database: String,
     /// Where a `--daemon` server logs (foreground servers log to their terminal).
     pub log_file: Option<String>,
@@ -85,12 +94,37 @@ pub struct Model {
     pub last_used: Option<u64>,
 }
 
-/// What the socket sends: a report, or why one could not be produced.
-#[derive(Debug, Serialize, Deserialize)]
+/// What a reload did (see `apollo_engine::ReloadReport`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadOutcome {
+    pub generation: u64,
+    pub added: Vec<String>,
+    pub reloaded: Vec<String>,
+    pub kept: Vec<String>,
+    pub removed: Vec<String>,
+    /// Changed settings that only take effect after a restart.
+    pub restart_required: Vec<String>,
+}
+
+/// What a client asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    Status,
+    Reload,
+}
+
+/// What the socket sends: a report or reload outcome, or why there is none.
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Reply {
     status: Option<StatusReport>,
+    #[serde(default)]
+    reload: Option<ReloadOutcome>,
     error: Option<String>,
 }
+
+/// How long the server waits for a request line before treating the client
+/// as an older one that only reads.
+const REQUEST_WAIT: Duration = Duration::from_millis(300);
 
 /// Where the status socket lives: the per-user runtime directory on Linux
 /// (`$XDG_RUNTIME_DIR`), else the state directory next to the PID file.
@@ -121,14 +155,20 @@ impl Drop for SocketGuard {
     }
 }
 
-/// Serve status reports on `path` until the returned guard drops. Each
-/// connection receives one JSON [`Reply`] built by `report`. Must be called
-/// within a Tokio runtime.
+/// Serve status reports and reloads on `path` until the returned guard drops.
+/// Each connection sends at most one request line and receives one JSON
+/// [`Reply`], from `report` or `reload`. Must be called within a Tokio runtime.
 #[cfg(unix)]
-pub fn serve_socket<F, Fut>(path: &Path, report: F) -> std::io::Result<SocketGuard>
+pub fn serve_socket<F, Fut, G, GFut>(
+    path: &Path,
+    report: F,
+    reload: G,
+) -> std::io::Result<SocketGuard>
 where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = anyhow::Result<StatusReport>> + Send + 'static,
+    G: Fn() -> GFut + Send + Sync + 'static,
+    GFut: std::future::Future<Output = anyhow::Result<ReloadOutcome>> + Send + 'static,
 {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
@@ -144,22 +184,34 @@ where
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let guard = SocketGuard(path.to_path_buf());
 
-    let report = std::sync::Arc::new(report);
+    let handlers = std::sync::Arc::new((report, reload));
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 continue;
             };
-            let report = std::sync::Arc::clone(&report);
+            let handlers = std::sync::Arc::clone(&handlers);
             tokio::spawn(async move {
-                let reply = match report().await {
-                    Ok(status) => Reply {
-                        status: Some(status),
-                        error: None,
+                let reply = match read_request(&mut stream).await {
+                    Request::Status => match (handlers.0)().await {
+                        Ok(status) => Reply {
+                            status: Some(status),
+                            ..Default::default()
+                        },
+                        Err(e) => Reply {
+                            error: Some(format!("{e:#}")),
+                            ..Default::default()
+                        },
                     },
-                    Err(e) => Reply {
-                        status: None,
-                        error: Some(format!("{e:#}")),
+                    Request::Reload => match (handlers.1)().await {
+                        Ok(outcome) => Reply {
+                            reload: Some(outcome),
+                            ..Default::default()
+                        },
+                        Err(e) => Reply {
+                            error: Some(format!("{e:#}")),
+                            ..Default::default()
+                        },
                     },
                 };
                 if let Ok(body) = serde_json::to_vec(&reply) {
@@ -172,24 +224,85 @@ where
     Ok(guard)
 }
 
-/// Ask the server listening on `path` for its status.
+/// The client's request line: `reload`, or anything else (including nothing
+/// within [`REQUEST_WAIT`]) for status.
 #[cfg(unix)]
-pub fn fetch(path: &Path) -> anyhow::Result<StatusReport> {
-    use anyhow::{Context, anyhow};
-    use std::io::Read;
+async fn read_request(stream: &mut tokio::net::UnixStream) -> Request {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 64];
+    let mut len = 0;
+    let read = async {
+        while len < buf.len() {
+            match stream.read(&mut buf[len..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    len += n;
+                    if buf[..len].contains(&b'\n') {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(REQUEST_WAIT, read).await;
+    match std::str::from_utf8(&buf[..len]).map(str::trim) {
+        Ok("reload") => Request::Reload,
+        _ => Request::Status,
+    }
+}
+
+/// Send `request` to the server listening on `path` and read its reply.
+#[cfg(unix)]
+fn exchange(path: &Path, request: Request, timeout: Duration) -> anyhow::Result<Reply> {
+    use anyhow::Context;
+    use std::io::{Read, Write};
 
     let mut stream = std::os::unix::net::UnixStream::connect(path)
         .with_context(|| format!("connecting to {}", path.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    let line: &[u8] = match request {
+        Request::Status => b"status\n",
+        Request::Reload => b"reload\n",
+    };
+    stream.write_all(line).context("sending the request")?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut body = Vec::new();
-    stream
-        .read_to_end(&mut body)
-        .context("reading the status reply")?;
-    let reply: Reply = serde_json::from_slice(&body).context("parsing the status reply")?;
+    stream.read_to_end(&mut body).context("reading the reply")?;
+    serde_json::from_slice(&body).context("parsing the reply")
+}
+
+/// Ask the server listening on `path` for its status.
+#[cfg(unix)]
+pub fn fetch(path: &Path) -> anyhow::Result<StatusReport> {
+    use anyhow::anyhow;
+    let reply = exchange(path, Request::Status, Duration::from_secs(10))?;
     match (reply.status, reply.error) {
         (Some(status), _) => Ok(status),
         (None, Some(error)) => Err(anyhow!("the server could not report its status: {error}")),
         (None, None) => Err(anyhow!("empty status reply")),
+    }
+}
+
+/// Ask the server listening on `path` to reload its config.
+#[cfg(unix)]
+pub fn reload(path: &Path) -> anyhow::Result<ReloadOutcome> {
+    use anyhow::anyhow;
+    // Loading a new model is lazy, so a reload is quick; allow for a slow disk.
+    let reply = exchange(path, Request::Reload, Duration::from_secs(60))?;
+    match reply {
+        Reply {
+            reload: Some(outcome),
+            ..
+        } => Ok(outcome),
+        Reply {
+            error: Some(error), ..
+        } => Err(anyhow!("the config was not reloaded: {error}")),
+        Reply {
+            status: Some(_), ..
+        } => Err(anyhow!(
+            "this server is too old to reload its config; restart it instead"
+        )),
+        _ => Err(anyhow!("empty reload reply")),
     }
 }
 
@@ -240,8 +353,17 @@ pub fn render(r: &StatusReport, now: SystemTime, rates: Option<&Rates>) -> Strin
         on(r.auth)
     ));
     line(format!("  device     {}", r.device));
+    let generation = match (r.config_generation, r.config_loaded_at) {
+        (Some(g), Some(at)) if g > 1 => format!(
+            " (generation {g}, reloaded {} ago)",
+            duration(now_secs.saturating_sub(at))
+        ),
+        _ => String::new(),
+    };
     if let Some(c) = &r.config_file {
-        line(format!("  config     {c}"));
+        line(format!("  config     {c}{generation}"));
+    } else if !generation.is_empty() {
+        line(format!("  config    {generation}"));
     }
     line(format!("  database   {}", r.database));
     if let Some(l) = &r.log_file {
@@ -430,6 +552,8 @@ mod tests {
             mutual_tls: false,
             auth: true,
             config_file: Some("/etc/apollo/config.toml".into()),
+            config_generation: Some(3),
+            config_loaded_at: Some(1_000_000 + 7_880),
             database: "sqlite /var/lib/apollo/apollo.db".into(),
             log_file: None,
             device: "metal".into(),
@@ -499,6 +623,10 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("TLS on, auth on"), "{text}");
+        assert!(
+            text.contains("/etc/apollo/config.toml (generation 3, reloaded 2m 0s ago)"),
+            "{text}"
+        );
         assert!(text.contains("1.5 GiB used (limit 4.0 GiB)"), "{text}");
         assert!(text.contains("3 items in flight (limit 1,024); 2 of 20 slots busy, 1 waiting"));
         assert!(text.contains("1,204 completed"));
@@ -545,10 +673,14 @@ mod tests {
         let path = dir.path().join("s.sock");
         let report = sample();
         let served = report.clone();
-        let guard = serve_socket(&path, move || {
-            let r = served.clone();
-            async move { Ok(r) }
-        })
+        let guard = serve_socket(
+            &path,
+            move || {
+                let r = served.clone();
+                async move { Ok(r) }
+            },
+            || async { Ok(outcome()) },
+        )
         .unwrap();
 
         use std::os::unix::fs::PermissionsExt;
@@ -562,6 +694,27 @@ mod tests {
             .unwrap();
         assert_eq!(got, report);
 
+        let p = path.clone();
+        let reloaded = tokio::task::spawn_blocking(move || reload(&p))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded, outcome());
+
+        // A client that sends nothing (an older `apollo status`) gets a report.
+        let p = path.clone();
+        let old = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut stream = std::os::unix::net::UnixStream::connect(&p).unwrap();
+            let mut body = String::new();
+            stream.read_to_string(&mut body).unwrap();
+            body
+        })
+        .await
+        .unwrap();
+        let reply: Reply = serde_json::from_str(&old).unwrap();
+        assert_eq!(reply.status, Some(report));
+
         drop(guard);
         assert!(!path.exists(), "socket removed on shutdown");
     }
@@ -571,9 +724,11 @@ mod tests {
     async fn server_errors_are_reported() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.sock");
-        let _guard = serve_socket(&path, || async {
-            Err(anyhow::anyhow!("database is locked"))
-        })
+        let _guard = serve_socket(
+            &path,
+            || async { Err(anyhow::anyhow!("database is locked")) },
+            || async { Err(anyhow::anyhow!("model 'x': unknown strategy")) },
+        )
         .unwrap();
         let p = path.clone();
         let err = tokio::task::spawn_blocking(move || fetch(&p))
@@ -582,5 +737,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("database is locked"), "{err}");
+        let p = path.clone();
+        let err = tokio::task::spawn_blocking(move || reload(&p))
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not reloaded: model 'x'"), "{err}");
+    }
+
+    fn outcome() -> ReloadOutcome {
+        ReloadOutcome {
+            generation: 2,
+            added: vec!["ocr".into()],
+            reloaded: vec![],
+            kept: vec!["general".into()],
+            removed: vec![],
+            restart_required: vec!["app.port".into()],
+        }
     }
 }

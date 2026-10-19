@@ -142,6 +142,15 @@ step   = 3
 method = "fps"                 # densest — only reached if earlier steps didn't exit
 fps    = 5
 
+# --- Metrics: a Prometheus scrape endpoint ------------------------------------
+# Off by default. `GET /metrics` on its own listener (not the gRPC port). It is
+# not authenticated, so keep it on loopback or behind a firewall. Read at
+# startup. See docs/operations.md for the metrics.
+# [metrics]
+# enabled  = true
+# endpoint = "127.0.0.1"
+# port     = 9464
+
 # ============================== models ==============================
 # Flat. `architecture` selects the candle builder. Almost everything else
 # is optional. An image-classifier with `video_strategy` set also accepts video.

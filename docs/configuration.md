@@ -21,6 +21,8 @@ The server **exits at startup if no `[models.<label>]` section is defined** — 
 
 Relative `taxonomy_file` paths inside a model are resolved against the **config file's directory**.
 
+A running server picks up an edited file with `apollo reload` (or `SIGHUP`), without a restart; a few settings (the listen address, TLS, auth, the database, the device, …) still need one. See [operations.md → Live config reload](./operations.md#live-config-reload).
+
 ### Units
 
 - **Sizes** accept a suffix: `512mb`, `4gb`, `1024kb`, or a bare byte count. `0` means "no limit / off".
@@ -157,6 +159,18 @@ Optional. A bare `[cache]` section turns it on (`enabled` defaults to `true`). W
 |-------|------|---------|---------|
 | `enabled` | bool | `true` | Master switch (so `[cache]` alone enables caching). |
 | `ttl_secs` | u64 | *(none)* | Freshness window in seconds; older entries are ignored and deleted by an hourly purge. Omit for entries that never expire. |
+
+---
+
+## `[metrics]` — Prometheus metrics
+
+Optional, off by default. When enabled, `GET /metrics` serves Prometheus metrics (queue, slots, memory, per-model inferences, batch sizes and latency, loads, scans, fetches, webhooks, …) on a separate listener. The endpoint is not authenticated, so it binds to loopback unless you change it. Read at startup. See [operations.md → Prometheus metrics](./operations.md#prometheus-metrics) for every metric.
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `enabled` | bool | `false` | Serve the endpoint. |
+| `endpoint` | string | `"127.0.0.1"` | Bind host/IP. A non-loopback address logs a warning. |
+| `port` | u16 | `9464` | Bind port. |
 
 ---
 
@@ -383,13 +397,13 @@ Validation rejects a step with no models, an unknown model, a model that appears
 
 ## Taxonomy files (`siglip`)
 
-A `taxonomy_file` defines grouped, prompt‑backed categories for a `siglip` model. It's a **two‑level tree**: top‑level tables are **parent** categories (each needs an integer `id`); nested tables are **child** categories (each needs an `id`, a list of `prompts`, and an optional `aggregation`).
+A `taxonomy_file` defines grouped, prompt‑backed categories for a `siglip` model. It's a **two‑level tree**: top‑level tables are **parent** categories (each needs an integer `id`); nested tables are **child** categories (each needs an `id`, a list of `prompts`, an optional `aggregation`, and an optional `threshold`).
 
 SigLIP scores each prompt independently against the image; a child's score is the **aggregation of its own prompts** — `mean` (default), `average` (alias for mean), or `max`. Use `max` when the prompts are alternatives (any one matching should light the category); use `mean` when they're corroborating evidence for the same concept.
 
 All prompts (taxonomy or `labels`) are encoded when the model loads. That's the slow part of loading — about 35 s for ~1,000 prompts on an 8‑core CPU — so the result is cached in an `apollo-prompt-embeds` folder inside the model's Hub cache directory and reused on later loads (well under a second). Changing a prompt, the model revision, or the tokenizer starts a new cache entry automatically; deleting the folder is always safe.
 
-At inference, each child that scores at/above the model's `score_threshold` is returned as a flat `Prediction` whose `label` is the **child id**. (Parent grouping is not carried on the wire — reconstruct parent→child from the taxonomy file if you need it.) Parent ids and child ids live in separate namespaces; ids are arbitrary unique `u32`s.
+At inference, each child that scores at/above its threshold is returned as a flat `Prediction` whose `label` is the **child id**. The threshold is the child's own `threshold` (a number from 0 to 1) when it sets one, else the model's `score_threshold`. Categories differ in how high SigLIP scores them, so a per-category threshold lets each be tuned on its own; `apollo calibrate --write` sets them from labelled examples (see [operations.md → Threshold calibration](./operations.md#threshold-calibration)). (Parent grouping is not carried on the wire — reconstruct parent→child from the taxonomy file if you need it.) Parent ids and child ids live in separate namespaces; ids are arbitrary unique `u32`s.
 
 ```toml
 [scene]
@@ -399,6 +413,7 @@ id = 2
 id = 2001
 prompts = ["a nature landscape", "a forest", "mountains or hills", "a beach"]
 aggregation = "max"      # alternatives, not a conjunction
+threshold = 0.12         # this category's own cut-off (else score_threshold)
 ```
 
 See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
@@ -411,7 +426,8 @@ See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
 
 - **Strategies:** `confirm` at most 8 with `confirm_window` in (0.05, 5] s, and only for models that define `early_exit`; at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`, `refine`→`min_score` + `window` + `fps`); `min_gap` only on `scene` and ≥ 0; `refine` steps after all others, with `min_score` in 0..1, `window` in (0, 60] s and `fps` in (0, 60]. A model using a strategy with `refine` must define `early_exit`, with a `threshold` above the step's `min_score`.
 - **Models:** `video_strategy` must name a defined strategy; `early_exit` must list at least one label **and** requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
-- **Pipelines:** at least one step; every `model` must be defined; unique `order`s; a `stop_if` must list at least one label id.
+- **Pipelines:** at least one step; no empty step; every `model` must be defined, and in at most one step; unique `order`s; a `stop_if` must list at least one label id, and name its step's model (`stop_if.model`) when the step runs several.
+- **Taxonomies:** a category `threshold` must be a number from 0 to 1.
 - **Database:** selecting `postgres`/`surrealdb` requires the matching `[database.<backend>]` section.
 
 ---
@@ -422,6 +438,9 @@ See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
 apollo start [--config PATH] [--endpoint HOST] [--port N] [--webhook-url URL] [--daemon]
 apollo stop  [...]                       # gracefully stop a running daemon
 apollo status [--json] [--watch [-n SECONDS]]   # is it running, and what is it doing
+apollo reload [--json]                   # apply the edited config without a restart
+apollo calibrate --model NAME --data DIR|FILE.jsonl [--label L]... [--target-precision 0.95]
+                 [--json] [--write] [--config PATH]
 apollo config get    <key> [--config PATH]
 apollo config set    <key> <value> [--config PATH]
 apollo config remove <key> [--config PATH]
@@ -432,7 +451,7 @@ apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
 
 - **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url`, or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
 - **`status`** reports whether the server is running and its live state:
-  - version, PID, uptime, listen address, TLS/auth, config file, database, and log file;
+  - version, PID, uptime, listen address, TLS/auth, config file (with its generation and when it was reloaded, after a reload), database, and log file;
   - memory in use against `max_memory` (measured as for `max_memory`: physical footprint on macOS, resident set size elsewhere);
   - the queue (items in flight, busy/waiting concurrency slots);
   - task counts by state, and pending webhook deliveries;
@@ -441,6 +460,8 @@ apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
   `--json` prints the same as JSON; memory in use is `memory.used_bytes` (earlier builds named it `memory.rss_bytes`). The exit status is `0` when running and `3` when not (like `systemctl status`).
 
   `--watch` (`-w`) keeps the view open and refreshes it in place every second (`-n 0.5` for twice a second; minimum 0.2) until Ctrl‑C, adding live throughput: images per second per model and in total. If the server stops or restarts, it shows that and waits for it. With `--json`, `--watch` prints one JSON object per line per refresh (`time`, `running`, `status`, `rates`, `error`); when the output is not a terminal, each refresh is printed in sequence instead of redrawn. The server answers on a Unix socket in its private per‑user directory (`$XDG_RUNTIME_DIR/apollo/` on Linux, otherwise the state directory), so only the same OS user can query it — run `apollo status` as that user.
+- **`reload`** re-reads the config file and applies it to the running server, then reports which models were added, reloaded, kept or removed, and which changed settings need a restart. An invalid config is rejected and the running one stays. `SIGHUP` does the same. See [operations.md → Live config reload](./operations.md#live-config-reload).
+- **`calibrate`** measures a model's precision, recall and F1 on labelled examples over a range of thresholds (0.05–0.95, and down to 0.0001 for low-scoring labels), and recommends the lowest threshold reaching `--target-precision`. `--write` stores it in `early_exit.threshold`, or per category in the model's taxonomy file. See [operations.md → Threshold calibration](./operations.md#threshold-calibration).
 - **`config get|set|remove`** edit the file by **dotted key** (e.g. `models.nsfw.repo`), format‑preserving. `set` creates missing tables — and a default `[app]`‑only file — as needed.
 - **`keygen`** prints a fresh public/secret PASERK keypair.
 - **`token`** signs an API token with the secret key. The key is read from `--secret-key-file` (a bare PASERK or `keygen` output), else the `APOLLO_SECRET_KEY` env var, else the server's local keypair file (`auth.key` in the state directory). `--expires` accepts `s`/`m`/`h`/`d` suffixes; omit it for a non‑expiring key. The token goes to stdout (it goes in the client's `authorization` metadata) and its id to stderr.

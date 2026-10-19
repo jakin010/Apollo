@@ -2,11 +2,13 @@
 //!
 //! A taxonomy is a two-level tree expressed in TOML: top-level tables are parent
 //! categories (each with an integer `id`), and their nested tables are child
-//! categories (each with an `id`, a list of `prompts`, and an optional
+//! categories (each with an `id`, a list of `prompts`, an optional
 //! `aggregation` — `mean`/`average`/`max`, default `mean` — controlling how the
-//! child's per-prompt scores combine into its score). It is flattened here for
-//! the inference arm: one ordered prompt list, plus per child its id, parent id,
-//! aggregation, and the slice of prompts it owns.
+//! child's per-prompt scores combine into its score, and an optional
+//! `threshold` that replaces the model's `score_threshold` for that child). It
+//! is flattened here for the inference arm: one ordered prompt list, plus per
+//! child its id, parent id, aggregation, threshold, and the slice of prompts it
+//! owns.
 
 use crate::error::ConfigError;
 use crate::schema::Aggregation;
@@ -30,6 +32,9 @@ pub struct TaxonChild {
     pub name: String,
     pub parent_id: u32,
     pub aggregation: Aggregation,
+    /// The child's own `threshold`, used instead of the model's
+    /// `score_threshold` (set by `apollo calibrate --write`, or by hand).
+    pub threshold: Option<f32>,
     pub prompt_start: usize,
     pub prompt_len: usize,
 }
@@ -112,11 +117,28 @@ impl Taxonomy {
                     }
                 };
 
+                let threshold = match child_tbl.get("threshold") {
+                    None => None,
+                    Some(v) => {
+                        let t = v
+                            .as_float()
+                            .or_else(|| v.as_integer().map(|i| i as f64))
+                            .filter(|t| (0.0..=1.0).contains(t))
+                            .ok_or_else(|| {
+                                ConfigError::Parse(format!(
+                                    "taxonomy: '{qualified}' threshold must be a number from 0 to 1"
+                                ))
+                            })?;
+                        Some(t as f32)
+                    }
+                };
+
                 children.push(TaxonChild {
                     id,
                     name: qualified,
                     parent_id,
                     aggregation,
+                    threshold,
                     prompt_start: start,
                     prompt_len: len,
                 });
@@ -187,6 +209,25 @@ aggregation = "max"
     fn aggregation_defaults_to_mean() {
         let t = Taxonomy::parse("[p]\nid = 1\n[p.c]\nid = 10\nprompts = [\"x\"]\n").unwrap();
         assert_eq!(t.children[0].aggregation, Aggregation::Mean);
+    }
+
+    #[test]
+    fn a_child_may_set_its_own_threshold() {
+        let t = Taxonomy::parse(&SAMPLE.replace(
+            "aggregation = \"max\"",
+            "aggregation = \"max\"\nthreshold = 0.25",
+        ))
+        .unwrap();
+        let drinks = t.children.iter().find(|c| c.id == 1002).unwrap();
+        assert_eq!(drinks.threshold, Some(0.25));
+        let meals = t.children.iter().find(|c| c.id == 1001).unwrap();
+        assert_eq!(meals.threshold, None);
+        assert!(
+            Taxonomy::parse(&SAMPLE.replace("id = 1002", "id = 1002\nthreshold = 2.0")).is_err()
+        );
+        assert!(
+            Taxonomy::parse(&SAMPLE.replace("id = 1002", "id = 1002\nthreshold = \"x\"")).is_err()
+        );
     }
 
     #[test]

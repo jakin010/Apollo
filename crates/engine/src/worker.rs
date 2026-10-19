@@ -30,6 +30,7 @@ use apollo_domain::{Classification, DecodedImage};
 use apollo_inference::ImageClassifier;
 
 use crate::error::EngineError;
+use crate::metrics::ModelMetrics;
 
 type ClassifyReply = oneshot::Sender<Result<Classification, EngineError>>;
 /// Answers a load request with the model's input size.
@@ -130,8 +131,17 @@ pub(crate) struct WorkerSpec {
     pub(crate) batch: usize,
     /// Pin the weights: load at startup and never idle-unload.
     pub(crate) keep_in_memory: bool,
-    /// Unload after this long without work (unless pinned).
-    pub(crate) idle: Duration,
+    /// Unload after this many milliseconds without work (unless pinned).
+    /// Shared by every worker, so a config reload changes it for all of them.
+    pub(crate) idle_ms: Arc<AtomicU64>,
+    /// Where the worker counts its loads and batches.
+    pub(crate) metrics: Arc<ModelMetrics>,
+}
+
+impl WorkerSpec {
+    fn idle(&self) -> Duration {
+        Duration::from_millis(self.idle_ms.load(Ordering::Relaxed).max(1))
+    }
 }
 
 /// Spawn the worker thread and return its handle.
@@ -176,7 +186,7 @@ impl Worker {
             tracing::warn!(model = %self.spec.name, error = %e, "preload failed; will retry on first use");
         }
         loop {
-            match rx.recv_timeout(self.spec.idle) {
+            match rx.recv_timeout(self.spec.idle()) {
                 Ok(Job::Load { reply }) => {
                     let _ = reply.send(self.ensure_loaded());
                 }
@@ -204,6 +214,7 @@ impl Worker {
         if let Some(model) = &self.model {
             return Ok(model.input_size());
         }
+        let load_started = std::time::Instant::now();
         match catch_unwind(AssertUnwindSafe(|| (self.loader)())) {
             Ok(Ok(m)) => {
                 // Warm up with a 1x1 image: the first forward pass compiles GPU
@@ -237,6 +248,11 @@ impl Worker {
                 self.stats.input_size.store(size, Ordering::Relaxed);
                 self.stats.loads.fetch_add(1, Ordering::Relaxed);
                 self.stats.loaded.store(true, Ordering::Relaxed);
+                let metrics = &self.spec.metrics;
+                metrics.loads.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .load_seconds
+                    .observe_duration(load_started.elapsed());
                 Ok(size)
             }
             Ok(Err(e)) => Err(EngineError::ModelUnavailable(format!(
@@ -286,7 +302,11 @@ impl Worker {
             return;
         };
         let views: Vec<&DecodedImage> = images.iter().map(|img| img.as_ref()).collect();
+        let metrics = Arc::clone(&self.spec.metrics);
+        metrics.batch_size.observe(views.len() as f64);
+        let started = std::time::Instant::now();
         let outcome = catch_unwind(AssertUnwindSafe(|| model.classify(&views)));
+        metrics.batch_seconds.observe_duration(started.elapsed());
         let err = match outcome {
             // A non-finite score means the forward pass went wrong (e.g. a GPU
             // fault); never hand such a result on — it would be stored and break
@@ -302,6 +322,9 @@ impl Worker {
                     .unwrap_or(0);
                 self.stats
                     .classified
+                    .fetch_add(results.len() as u64, Ordering::Relaxed);
+                metrics
+                    .inferences
                     .fetch_add(results.len() as u64, Ordering::Relaxed);
                 self.stats.last_used_ms.store(now_ms, Ordering::Relaxed);
                 for (reply, c) in replies.into_iter().zip(results) {
@@ -324,6 +347,9 @@ impl Worker {
                 format!("model panicked: {msg}")
             }
         };
+        metrics
+            .failures
+            .fetch_add(replies.len() as u64, Ordering::Relaxed);
         for reply in replies {
             let _ = reply.send(Err(EngineError::Inference(err.clone())));
         }
@@ -400,7 +426,8 @@ mod tests {
                 name: "test".into(),
                 batch: 4,
                 keep_in_memory: keep,
-                idle: Duration::from_secs(60),
+                idle_ms: Arc::new(AtomicU64::new(60_000)),
+                metrics: crate::metrics::Metrics::new().model("test"),
             },
             loader,
         )
