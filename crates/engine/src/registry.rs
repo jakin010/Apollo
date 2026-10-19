@@ -1,57 +1,134 @@
 //! Loaded-model registry and submission validation.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::AtomicU64;
 
-use apollo_config::Config;
+use apollo_config::{Config, ModelConfig};
 use apollo_domain::{Input, Modality};
 
 use crate::error::EngineError;
+use crate::metrics::Metrics;
 use crate::worker::{Loader, ModelHandle, WorkerSpec, spawn_worker};
 
 /// Holds one worker per enabled model, keyed by label.
 pub(crate) struct Registry {
-    workers: HashMap<String, Arc<ModelHandle>>,
+    workers: HashMap<String, Worker>,
+}
+
+struct Worker {
+    handle: Arc<ModelHandle>,
+    /// What the worker was built from; a reload keeps the worker while this
+    /// is unchanged.
+    key: LoadKey,
+}
+
+/// The parts of a model's config (and taxonomy file) its loaded weights depend
+/// on. Fields read per use — `timeout`, `priority`, `video_strategy`,
+/// `early_exit` — are left out, so changing them keeps the loaded model.
+#[derive(PartialEq)]
+struct LoadKey {
+    config: ModelConfig,
+    taxonomy: Option<Vec<u8>>,
+}
+
+impl LoadKey {
+    fn of(model: &ModelConfig) -> Self {
+        let mut config = model.clone();
+        config.timeout = 0;
+        config.priority = 0;
+        config.video_strategy = None;
+        config.early_exit = None;
+        // An unreadable taxonomy reads as "changed", so the next load reports it.
+        let taxonomy = model
+            .taxonomy_file
+            .as_deref()
+            .map(|p| std::fs::read(Path::new(p)).unwrap_or_default());
+        Self { config, taxonomy }
+    }
+}
+
+/// How a rebuild treated each model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistryChanges {
+    /// New (or newly enabled) models: a new worker.
+    pub added: Vec<String>,
+    /// Models whose weights depend on something that changed: a new worker,
+    /// which loads on first use.
+    pub reloaded: Vec<String>,
+    /// Models kept as they were, loaded weights included.
+    pub kept: Vec<String>,
+    /// Removed (or disabled) models. Their workers finish the work they have,
+    /// then exit.
+    pub removed: Vec<String>,
+}
+
+/// What a worker is built with besides the model's config.
+pub(crate) struct WorkerEnv<'a> {
+    pub(crate) kind: apollo_inference::DeviceKind,
+    pub(crate) cache_dir: Option<&'a PathBuf>,
+    /// Idle-unload timeout in milliseconds, shared so a reload changes it for
+    /// every worker.
+    pub(crate) idle_ms: &'a Arc<AtomicU64>,
+    pub(crate) metrics: &'a Metrics,
 }
 
 impl Registry {
-    /// Spawn a worker for every enabled model. `device` is cloned per worker.
-    /// Spawn a worker per enabled model, each with its own `kind` device (never
-    /// a shared one — see [`apollo_inference::open_device`]).
+    /// A worker per enabled model, each with its own `kind` device (never a
+    /// shared one — see [`apollo_inference::open_device`]). With `previous`,
+    /// workers whose [`LoadKey`] is unchanged are carried over.
     pub(crate) fn build(
         config: &Config,
-        kind: apollo_inference::DeviceKind,
-        cache_dir: Option<PathBuf>,
-        idle: Duration,
-    ) -> Self {
+        env: &WorkerEnv<'_>,
+        previous: Option<&Registry>,
+    ) -> (Self, RegistryChanges) {
+        let mut changes = RegistryChanges::default();
         let mut workers = HashMap::new();
         for (label, model) in &config.models {
             if !model.enabled {
                 continue;
             }
-            let cfg = model.clone();
-            let dev = apollo_inference::open_device(kind);
-            let dir = cache_dir.clone();
-            let loader: Loader = Box::new(move || {
-                apollo_inference::load(&cfg, &dev, dir.as_deref()).map_err(|e| e.to_string())
-            });
-            let spec = WorkerSpec {
-                name: label.clone(),
-                batch: model.max_concurrent.max(1) as usize,
-                keep_in_memory: model.keep_in_memory,
-                idle,
-            };
-            let handle = spawn_worker(spec, loader);
-            workers.insert(label.clone(), Arc::new(handle));
-            tracing::info!(model = %label, repo = %model.repo, "model worker started");
+            let key = LoadKey::of(model);
+            let old = previous.and_then(|p| p.workers.get(label));
+            match old {
+                Some(w) if w.key == key => {
+                    changes.kept.push(label.clone());
+                    workers.insert(
+                        label.clone(),
+                        Worker {
+                            handle: Arc::clone(&w.handle),
+                            key,
+                        },
+                    );
+                    continue;
+                }
+                Some(_) => changes.reloaded.push(label.clone()),
+                None => changes.added.push(label.clone()),
+            }
+            let handle = spawn(label, model, env);
+            workers.insert(
+                label.clone(),
+                Worker {
+                    handle: Arc::new(handle),
+                    key,
+                },
+            );
         }
-        Self { workers }
+        if let Some(previous) = previous {
+            changes.removed = previous
+                .workers
+                .keys()
+                .filter(|label| !workers.contains_key(*label))
+                .cloned()
+                .collect();
+            changes.removed.sort();
+        }
+        (Self { workers }, changes)
     }
 
     pub(crate) fn get(&self, label: &str) -> Option<Arc<ModelHandle>> {
-        self.workers.get(label).cloned()
+        self.workers.get(label).map(|w| Arc::clone(&w.handle))
     }
 
     /// Validate one item's input against its requested models. Rejects unknown or
@@ -102,4 +179,23 @@ impl Registry {
         }
         Ok(())
     }
+}
+
+fn spawn(label: &str, model: &ModelConfig, env: &WorkerEnv<'_>) -> ModelHandle {
+    let cfg = model.clone();
+    let dev = apollo_inference::open_device(env.kind);
+    let dir = env.cache_dir.cloned();
+    let loader: Loader = Box::new(move || {
+        apollo_inference::load(&cfg, &dev, dir.as_deref()).map_err(|e| e.to_string())
+    });
+    let spec = WorkerSpec {
+        name: label.to_string(),
+        batch: model.max_concurrent.max(1) as usize,
+        keep_in_memory: model.keep_in_memory,
+        idle_ms: Arc::clone(env.idle_ms),
+        metrics: env.metrics.model(label),
+    };
+    let handle = spawn_worker(spec, loader);
+    tracing::info!(model = %label, repo = %model.repo, "model worker started");
+    handle
 }

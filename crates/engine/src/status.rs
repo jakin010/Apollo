@@ -71,6 +71,7 @@ impl Engine {
     /// Collect the engine's current state.
     pub async fn status(&self) -> Result<EngineStatus, EngineError> {
         let inner = &self.inner;
+        let live = self.live();
         let (slots_total, slots_busy, slots_waiting) = inner.gate.snapshot();
 
         let mut tasks = TaskCounts::default();
@@ -84,17 +85,17 @@ impl Engine {
             }
         }
 
-        let webhooks_pending = match inner.webhook {
+        let webhooks_pending = match live.webhook {
             Some(_) => Some(inner.storage.items_pending_webhook().await?.len()),
             None => None,
         };
 
-        let models = inner
+        let models = live
             .config
             .models
             .iter()
             .map(|(label, cfg)| {
-                let worker = inner.registry.get(label).map(|h| h.snapshot());
+                let worker = live.registry.get(label).map(|h| h.snapshot());
                 ModelStatus {
                     label: label.clone(),
                     repo: cfg.repo.clone(),
@@ -115,12 +116,12 @@ impl Engine {
         Ok(EngineStatus {
             device: inner.device.to_string(),
             items_in_flight: inner.in_flight.load(std::sync::atomic::Ordering::SeqCst),
-            max_pending: inner.max_pending,
+            max_pending: live.max_pending,
             slots_total,
             slots_busy,
             slots_waiting,
             memory_bytes: memory::current_memory_bytes(),
-            max_memory_bytes: inner.max_memory_bytes,
+            max_memory_bytes: live.max_memory_bytes,
             models,
             tasks,
             webhooks_pending,

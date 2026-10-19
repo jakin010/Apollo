@@ -81,7 +81,7 @@ impl Engine {
         kind: EventKind,
         attempt: u32,
     ) -> bool {
-        let Some(sink) = self.inner.webhook.as_ref() else {
+        let Some(sink) = self.live().webhook.clone() else {
             return false;
         };
         let Some(task) = self.load_task_for_webhook(task_id).await else {
@@ -98,7 +98,13 @@ impl Engine {
             task,
             attempt,
         };
-        match sink.deliver(&event).await {
+        let name = match kind {
+            EventKind::Progress => "progress",
+            EventKind::Finished => "finished",
+        };
+        let delivered = sink.deliver(&event).await;
+        self.inner.metrics.webhook(name, delivered.is_ok());
+        match delivered {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(task = %task_id, item = item_index, error = %e, "webhook delivery failed");
@@ -111,10 +117,11 @@ impl Engine {
     /// processing). Spawned so a slow or unreachable receiver never blocks the
     /// scheduler; not tracked for redelivery (only terminal states are).
     pub(crate) async fn notify_item_change(&self, task_id: &str, item_index: usize) {
-        if self.inner.webhook.is_none() {
+        if self.live().webhook.is_none() {
             return;
         }
-        let engine = self.clone();
+        // The current webhook, also for a task pinned to an older config.
+        let engine = self.current();
         let task_id = task_id.to_string();
         tokio::spawn(async move {
             engine
@@ -128,10 +135,11 @@ impl Engine {
     /// success, otherwise leaving it pending for the periodic redelivery loop (and,
     /// ultimately, restart recovery).
     pub(crate) async fn deliver_webhook(&self, task_id: &str, item_index: usize) {
-        if self.inner.webhook.is_none() {
+        if self.live().webhook.is_none() {
             return;
         }
-        let engine = self.clone();
+        // The current webhook, also for a task pinned to an older config.
+        let engine = self.current();
         let task_id = task_id.to_string();
         tokio::spawn(async move {
             for (attempt, delay) in (1..).zip([0u64, 1, 3]) {
@@ -158,28 +166,27 @@ impl Engine {
     }
 
     /// Start the periodic redelivery loop: every `[webhook].redelivery_secs`,
-    /// re-attempt every terminal item whose task-status or dead-letter webhook is
-    /// still undelivered. No-op when no sink is configured or the interval is zero.
+    /// re-attempt every finished item whose webhook event is still
+    /// undelivered. The interval is read from the current config each time, so
+    /// a reload that adds, removes or retimes the webhook applies; while there
+    /// is no webhook (or the interval is zero) the loop only checks back.
     pub(crate) fn spawn_redelivery(&self) {
-        if self.inner.webhook.is_none() {
-            return;
-        }
-        let secs = self
-            .inner
-            .config
-            .webhook
-            .as_ref()
-            .map(|w| w.redelivery_secs)
-            .unwrap_or(0);
-        if secs == 0 {
-            return;
-        }
+        /// How often to look again while redelivery is off.
+        const IDLE_CHECK: Duration = Duration::from_secs(30);
         let engine = self.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(secs as u64));
-            tick.tick().await; // consume the immediate first tick
             loop {
-                tick.tick().await;
+                let live = engine.live();
+                let secs = match (&live.webhook, &live.config.webhook) {
+                    (Some(_), Some(w)) => w.redelivery_secs,
+                    _ => 0,
+                };
+                drop(live);
+                if secs == 0 {
+                    tokio::time::sleep(IDLE_CHECK).await;
+                    continue;
+                }
+                tokio::time::sleep(Duration::from_secs(secs.into())).await;
                 match engine.inner.storage.items_pending_webhook().await {
                     Ok(pending) if !pending.is_empty() => {
                         tracing::debug!(count = pending.len(), "redelivering pending webhooks");

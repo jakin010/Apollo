@@ -29,6 +29,8 @@ pub struct Config {
     #[serde(default)]
     pub cache: Option<CacheConfig>,
     #[serde(default)]
+    pub metrics: MetricsConfig,
+    #[serde(default)]
     pub strategies: BTreeMap<String, StrategyConfig>,
     #[serde(default)]
     pub pipelines: BTreeMap<String, PipelineConfig>,
@@ -106,6 +108,30 @@ pub struct CacheConfig {
     /// eligible for purge). Omit for entries that never expire.
     #[serde(default)]
     pub ttl_secs: Option<u64>,
+}
+
+/// `[metrics]` — a Prometheus scrape endpoint (`GET /metrics`) on its own
+/// listener, separate from the gRPC port. Off by default; read at startup.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind host/IP. Loopback by default: the metrics are not authenticated.
+    #[serde(default = "crate::defaults::metrics_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "crate::defaults::metrics_port")]
+    pub port: u16,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: defaults::metrics_endpoint(),
+            port: defaults::metrics_port(),
+        }
+    }
 }
 
 /// `[app]` — application-wide settings.

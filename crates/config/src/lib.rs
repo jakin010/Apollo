@@ -23,8 +23,8 @@ pub use error::ConfigError;
 pub use load::Overrides;
 pub use schema::{
     Aggregation, AppConfig, AuthConfig, Backend, CacheConfig, Config, DatabaseConfig,
-    DevicePreference, EarlyExit, LimitsConfig, ModelConfig, PipelineConfig, PipelineStep,
-    PostgresConfig, SamplingKind, SamplingStep, SqliteConfig, StepModels, StopIf, StrategyConfig,
-    SurrealdbConfig, TlsConfig, WebhookConfig,
+    DevicePreference, EarlyExit, LimitsConfig, MetricsConfig, ModelConfig, PipelineConfig,
+    PipelineStep, PostgresConfig, SamplingKind, SamplingStep, SqliteConfig, StepModels, StopIf,
+    StrategyConfig, SurrealdbConfig, TlsConfig, WebhookConfig,
 };
 pub use taxonomy::{TaxonChild, Taxonomy};

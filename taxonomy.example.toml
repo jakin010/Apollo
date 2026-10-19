@@ -2,14 +2,16 @@
 #
 # A two-level tree. Top-level tables are PARENT categories — each needs an
 # integer `id`. Their nested tables are CHILD categories — each needs an `id`, a
-# list of `prompts`, and an optional `aggregation`: "mean" (the default),
-# "average" (an alias for mean), or "max", controlling how that child's per-prompt
-# scores combine into a single child score.
+# list of `prompts`, an optional `aggregation`: "mean" (the default), "average"
+# (an alias for mean), or "max", controlling how that child's per-prompt scores
+# combine into a single child score, and an optional `threshold` (0 to 1) that
+# replaces the model's `score_threshold` for that child (`apollo calibrate
+# --write` sets these from labelled examples).
 #
 # SigLIP scores every prompt independently; a child's score is the aggregation of
 # its own prompts. Results come back as flat predictions whose label is the child
-# id, keeping children at/above the model's `score_threshold` (every child when it
-# is unset). Reference it from a model with
+# id, keeping children at/above their own `threshold`, else the model's
+# `score_threshold` (every child when neither is set). Reference it from a model with
 #   taxonomy_file = "taxonomy.toml"
 # (a relative path resolves from the config file's directory).
 #

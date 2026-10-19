@@ -1,7 +1,9 @@
-//! clap command tree: `start` / `stop` / `config`.
+//! clap command tree: `start` / `stop` / `status` / `reload` / `config` / keys.
 
+mod calibrate;
 mod config;
 mod keys;
+mod reload;
 mod start;
 mod status;
 mod stop;
@@ -25,9 +27,15 @@ enum Command {
     /// Show whether the server is running, and its live state (queue, tasks,
     /// models, memory).
     Status(status::StatusArgs),
+    /// Apply the edited config file to the running server without restarting
+    /// it (also done on SIGHUP).
+    Reload(reload::ReloadArgs),
     /// Read or edit the config file.
     #[command(subcommand)]
     Config(config::ConfigCmd),
+    /// Measure a model's precision and recall on labelled examples over a range
+    /// of thresholds, and optionally write the recommended threshold.
+    Calibrate(calibrate::CalibrateArgs),
     /// Generate a PASETO v4 signing keypair for authentication.
     Keygen(keys::KeygenArgs),
     /// Mint an API token signed with the secret key.
@@ -42,7 +50,9 @@ impl Cli {
             Command::Start(args) => start::run(args),
             Command::Stop(args) => stop::run(args),
             Command::Status(args) => status::run(args),
+            Command::Reload(args) => reload::run(args),
             Command::Config(cmd) => config::run(cmd),
+            Command::Calibrate(args) => calibrate::run(args),
             Command::Keygen(args) => keys::run_keygen(args),
             Command::Token(args) => keys::run_token(args),
             Command::Revoke(args) => keys::run_revoke(args),

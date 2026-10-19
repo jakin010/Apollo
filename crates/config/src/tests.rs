@@ -418,3 +418,25 @@ fn a_multi_model_gate_names_its_model() {
         assert!(err.contains(needle), "{steps}: {err}");
     }
 }
+
+#[test]
+fn set_reaches_into_inline_tables_and_keeps_comments() {
+    let text = r#"
+[models.nsfw]
+repo = "a/b"
+early_exit = { labels = [1], threshold = 0.85 }
+
+[models.general.early_exit]
+labels    = [3]
+threshold = 0.5   # tuned by hand
+"#;
+    let mut doc: DocumentMut = text.parse().unwrap();
+    edit::set_value(&mut doc, "models.nsfw.early_exit.threshold", 0.7.into()).unwrap();
+    edit::set_value(&mut doc, "models.general.early_exit.threshold", 0.65.into()).unwrap();
+    let out = doc.to_string();
+    assert!(
+        out.contains("early_exit = { labels = [1], threshold = 0.7 }"),
+        "{out}"
+    );
+    assert!(out.contains("threshold = 0.65   # tuned by hand"), "{out}");
+}

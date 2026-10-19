@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 apollo-config  = { path = "../config" }
+apollo-domain  = { path = "../domain" }
 apollo-engine  = { path = "../engine" }
 apollo-server  = { path = "../server" }
 apollo-storage = { path = "../storage" }
@@ -23,6 +24,8 @@ dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The Prometheus `/metrics` listener. Already in the tree (tonic routes with it).
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 
 [dev-dependencies]
 tempfile = "3"

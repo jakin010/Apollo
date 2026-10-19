@@ -9,19 +9,22 @@
 //! - `webhook`   — task-event delivery via an injected sink
 //! - `watch`     — task change notifications (`WatchTask`, `wait_seconds`)
 //! - `catalog`   — the configured models and pipelines (`ListModels`)
+//! - `live`      — the reloadable part of the engine, and config reload
+//! - `metrics`   — Prometheus counters, histograms and the text format
 //!
 //! [`Engine`] is a cheap clonable handle around a shared `Inner`; cloning it does
-//! not duplicate any models or state.
+//! not duplicate any models or state. What a config reload can change (the
+//! config itself, the model workers, the webhook sink, the limits) lives in a
+//! [`live::Live`] snapshot that a reload swaps out; each task runs on the
+//! snapshot it started with.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use apollo_config::Config;
 use apollo_domain::{Input, Item, Task};
-use apollo_media::FetchLimits;
 use apollo_storage::Storage;
 use tokio::sync::broadcast;
 
@@ -29,7 +32,9 @@ mod aggregate;
 mod catalog;
 mod error;
 mod gate;
+mod live;
 mod memory;
+mod metrics;
 mod queue;
 mod registry;
 mod scheduler;
@@ -45,12 +50,15 @@ pub use aggregate::task_error;
 pub use apollo_storage::{TaskCursor, TaskPage, TaskQuery};
 pub use catalog::{Catalog, Gate, ModelInfo, PipelineInfo, PipelineStepInfo, Trigger};
 pub use error::EngineError;
+pub use live::ReloadReport;
+pub use registry::RegistryChanges;
 pub use status::{EngineStatus, ModelStatus, TaskCounts};
 pub use watch::TaskWatch;
 pub use webhook::{EventKind, TaskEvent, WebhookError, WebhookSink};
 
 use crate::gate::PriorityGate;
-use registry::Registry;
+use live::Live;
+use registry::{Registry, WorkerEnv};
 
 /// What to run on an input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,25 +95,27 @@ pub struct Submitted {
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<Inner>,
+    /// A snapshot this handle is pinned to (see [`Engine::pinned`]); `None`
+    /// reads the current one.
+    pinned: Option<Arc<Live>>,
 }
 
 struct Inner {
     storage: Arc<dyn Storage>,
     /// Compute backend the workers run on.
     device: apollo_inference::DeviceKind,
-    config: Arc<Config>,
-    registry: Registry,
-    /// Priority-ordered global ceiling on concurrently processing items.
+    /// Where model weights are cached (`[app].cache_dir`; restart-only).
+    cache_dir: Option<PathBuf>,
+    /// Idle-unload timeout in milliseconds, shared with every worker.
+    idle_ms: Arc<AtomicU64>,
+    /// The reloadable part: config, workers, webhook sink, limits.
+    live: RwLock<Arc<Live>>,
+    /// Serializes reloads.
+    reloading: tokio::sync::Mutex<()>,
+    metrics: metrics::Metrics,
+    /// Priority-ordered global ceiling on concurrently processing items
+    /// (`[app].max_concurrent`; restart-only).
     gate: Arc<PriorityGate>,
-    webhook: Option<Arc<dyn WebhookSink>>,
-    /// SSRF / resource limits applied to remote input fetches.
-    fetch_limits: FetchLimits,
-    /// Max decoded pixels (`width * height`) per image; `None` disables the cap.
-    max_pixels: Option<u64>,
-    /// Soft memory cap in bytes (see [`memory`]); `None` disables the check.
-    max_memory_bytes: Option<u64>,
-    /// Max items queued or in-flight before submissions are rejected; `0` = off.
-    max_pending: usize,
     /// Items currently queued or processing (admission backpressure counter).
     in_flight: AtomicUsize,
     /// Per-task cooperative cancellation signals, keyed by task id.
@@ -143,26 +153,16 @@ impl Engine {
         tracing::info!(device = %kind, "selected compute device");
 
         let cache_dir = config.app.cache_dir.clone().map(PathBuf::from);
-        let idle = Duration::from_secs(config.app.idle_timeout as u64);
-        let registry = Registry::build(&config, kind, cache_dir, idle);
-        let gate = Arc::new(PriorityGate::new(config.app.max_concurrent.max(1) as usize));
-
-        let fetch_limits = FetchLimits {
-            allowed_schemes: config.limits.allowed_schemes.clone(),
-            block_private_ips: config.limits.block_private_ips,
-            max_download_bytes: config.limits.max_download_bytes(),
-            allow_local_files: config.limits.allow_local_files,
-            local_roots: config
-                .limits
-                .local_roots
-                .iter()
-                .cloned()
-                .map(PathBuf::from)
-                .collect(),
+        let idle_ms = Arc::new(AtomicU64::new(live::idle_ms(&config)));
+        let metrics = metrics::Metrics::new();
+        let env = WorkerEnv {
+            kind,
+            cache_dir: cache_dir.as_ref(),
+            idle_ms: &idle_ms,
+            metrics: &metrics,
         };
-        let max_pixels = (config.limits.max_pixels != 0).then_some(config.limits.max_pixels);
-        let max_memory_bytes = config.app.max_memory_bytes();
-        let max_pending = config.app.max_pending as usize;
+        let (registry, _) = Registry::build(&config, &env, None);
+        let gate = Arc::new(PriorityGate::new(config.app.max_concurrent.max(1) as usize));
         let (changes, _) = broadcast::channel(watch::CHANGE_BUFFER);
         let storage: Arc<dyn Storage> = Arc::new(watch::Notifying {
             inner: storage,
@@ -173,23 +173,53 @@ impl Engine {
             inner: Arc::new(Inner {
                 storage,
                 device: kind,
-                config,
-                registry,
+                cache_dir,
+                idle_ms,
+                live: RwLock::new(Arc::new(Live::new(config, registry, webhook, 1))),
+                reloading: tokio::sync::Mutex::new(()),
+                metrics,
                 gate,
-                webhook,
-                fetch_limits,
-                max_pixels,
-                max_memory_bytes,
-                max_pending,
                 in_flight: AtomicUsize::new(0),
                 cancels: Mutex::new(HashMap::new()),
                 changes,
                 idempotency: tokio::sync::Mutex::new(()),
             }),
+            pinned: None,
         };
         engine.spawn_maintenance();
         engine.spawn_redelivery();
         engine
+    }
+
+    /// The live snapshot: the pinned one, or the current one.
+    pub(crate) fn live(&self) -> Arc<Live> {
+        match &self.pinned {
+            Some(live) => Arc::clone(live),
+            None => Arc::clone(&self.inner.live.read().unwrap()),
+        }
+    }
+
+    /// The config in effect (for this handle).
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.live().config)
+    }
+
+    /// A handle that reads the current snapshot, even from a pinned one.
+    pub(crate) fn current(&self) -> Engine {
+        Engine {
+            inner: Arc::clone(&self.inner),
+            pinned: None,
+        }
+    }
+
+    /// A handle that keeps using the current snapshot even if the config is
+    /// reloaded meanwhile, so a task runs start to finish on one config (and
+    /// a removed model's worker lives until the tasks using it are done).
+    pub(crate) fn pinned(&self) -> Engine {
+        Engine {
+            inner: Arc::clone(&self.inner),
+            pinned: Some(self.live()),
+        }
     }
 
     /// Directory under which `ClassifyStream` uploads are staged:
@@ -199,8 +229,8 @@ impl Engine {
     /// pre-create the directory and read or plant uploads. Not created here; see
     /// [`Engine::ensure_upload_dir`].
     pub fn upload_dir(&self) -> PathBuf {
-        let base = match &self.inner.config.app.cache_dir {
-            Some(dir) => PathBuf::from(dir),
+        let base = match &self.inner.cache_dir {
+            Some(dir) => dir.clone(),
             None => dirs::cache_dir()
                 .unwrap_or_else(std::env::temp_dir)
                 .join("apollo"),
@@ -226,7 +256,7 @@ impl Engine {
     /// Hard cap on accepted upload bytes, mirroring the remote-download cap
     /// (`[limits].max_download`). `None` means unlimited.
     pub fn max_upload_bytes(&self) -> Option<u64> {
-        self.inner.fetch_limits.max_download_bytes
+        self.live().fetch_limits.max_download_bytes
     }
 
     /// Validate, persist, and start a task owned by `owner` (the submitting
@@ -239,6 +269,26 @@ impl Engine {
     /// caller then owns an `Input::Bytes` file it staged, as it does when
     /// `submit` fails.
     pub async fn submit(
+        &self,
+        submission: Submission,
+        owner: Option<String>,
+    ) -> Result<Submitted, EngineError> {
+        let result = self.submit_once(submission, owner).await;
+        self.inner.metrics.submission(match &result {
+            Ok(Submitted { existing: true, .. }) => "existing",
+            Ok(_) => "accepted",
+            Err(EngineError::Overloaded(_)) => "overloaded",
+            Err(
+                EngineError::UnknownModel(_)
+                | EngineError::Incompatible(_)
+                | EngineError::Config(_),
+            ) => "invalid",
+            Err(_) => "error",
+        });
+        result
+    }
+
+    async fn submit_once(
         &self,
         submission: Submission,
         owner: Option<String>,
@@ -257,12 +307,12 @@ impl Engine {
 
         // Backpressure: shed load instead of growing memory without bound.
         self.check_memory()?;
+        let max_pending = self.live().max_pending;
         let prev = self.inner.in_flight.fetch_add(1, Ordering::SeqCst);
-        if self.inner.max_pending > 0 && prev + 1 > self.inner.max_pending {
+        if max_pending > 0 && prev + 1 > max_pending {
             self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
             return Err(EngineError::Overloaded(format!(
-                "queue full ({prev} items in flight, limit {})",
-                self.inner.max_pending
+                "queue full ({prev} items in flight, limit {max_pending})"
             )));
         }
 
@@ -308,11 +358,11 @@ impl Engine {
     pub fn check_submission(&self, input: &Input, run: &Run) -> Result<(), EngineError> {
         self.resolve(input, run)?;
         self.check_memory()?;
+        let max_pending = self.live().max_pending;
         let pending = self.inner.in_flight.load(Ordering::SeqCst);
-        if self.inner.max_pending > 0 && pending >= self.inner.max_pending {
+        if max_pending > 0 && pending >= max_pending {
             return Err(EngineError::Overloaded(format!(
-                "queue full ({pending} items in flight, limit {})",
-                self.inner.max_pending
+                "queue full ({pending} items in flight, limit {max_pending})"
             )));
         }
         Ok(())
@@ -326,29 +376,39 @@ impl Engine {
         input: &Input,
         run: &Run,
     ) -> Result<(Vec<String>, Option<String>), EngineError> {
-        let (models, pipeline) =
-            match run {
-                Run::Pipeline(name) => {
-                    let p =
-                        self.inner.config.pipelines.get(name).ok_or_else(|| {
-                            EngineError::Config(format!("unknown pipeline '{name}'"))
-                        })?;
-                    (p.models(), Some(name.clone()))
+        let live = self.live();
+        let (models, pipeline) = match run {
+            Run::Pipeline(name) => {
+                let p = live
+                    .config
+                    .pipelines
+                    .get(name)
+                    .ok_or_else(|| EngineError::Config(format!("unknown pipeline '{name}'")))?;
+                (p.models(), Some(name.clone()))
+            }
+            Run::Models(models) => {
+                let mut seen = std::collections::HashSet::new();
+                if let Some(dup) = models.iter().find(|m| !seen.insert(*m)) {
+                    return Err(EngineError::Incompatible(format!(
+                        "model '{dup}' is listed twice"
+                    )));
                 }
-                Run::Models(models) => {
-                    let mut seen = std::collections::HashSet::new();
-                    if let Some(dup) = models.iter().find(|m| !seen.insert(*m)) {
-                        return Err(EngineError::Incompatible(format!(
-                            "model '{dup}' is listed twice"
-                        )));
-                    }
-                    (models.clone(), None)
-                }
-            };
-        self.inner
-            .registry
-            .validate_item(&self.inner.config, input, &models)?;
+                (models.clone(), None)
+            }
+        };
+        live.registry.validate_item(&live.config, input, &models)?;
         Ok((models, pipeline))
+    }
+
+    /// Load `model`'s weights now (downloading them if needed) instead of on
+    /// first use.
+    pub async fn load_model(&self, model: &str) -> Result<(), EngineError> {
+        let handle = self
+            .live()
+            .registry
+            .get(model)
+            .ok_or_else(|| EngineError::UnknownModel(model.to_string()))?;
+        handle.ensure_loaded().await.map(|_| ())
     }
 
     /// A page of tasks (backs `ListTasks`).
@@ -408,7 +468,7 @@ impl Engine {
 
     /// Reject new work while process memory is over the configured soft cap.
     fn check_memory(&self) -> Result<(), EngineError> {
-        let Some(limit) = self.inner.max_memory_bytes else {
+        let Some(limit) = self.live().max_memory_bytes else {
             return Ok(());
         };
         let Some(used) = memory::current_memory_bytes() else {

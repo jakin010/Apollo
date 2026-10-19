@@ -147,9 +147,12 @@ impl Engine {
             return;
         }
 
+        // The items run on the config in effect now, even if it is reloaded
+        // while they run.
+        let pinned = self.pinned();
         let mut handles = Vec::with_capacity(n_items);
         for (idx, item) in task.items.into_iter().enumerate() {
-            let engine = self.clone();
+            let engine = pinned.clone();
             let tid = task_id.clone();
             let token = cancel.clone();
             handles.push(tokio::spawn(async move {
@@ -177,35 +180,29 @@ impl Engine {
 
     /// Start the hourly maintenance loop: purge finished tasks older than
     /// `database.retention` (when set) and result-cache entries older than
-    /// `cache.ttl_secs` (when the cache is enabled with a TTL). No-op when neither
-    /// is configured.
+    /// `cache.ttl_secs` (when the cache is enabled with a TTL). Both are read
+    /// from the current config on every pass, so a reload applies to the next
+    /// one.
     pub(crate) fn spawn_maintenance(&self) {
-        let retention = match self.inner.config.database.retention.as_deref() {
-            Some(spec) => match apollo_storage::retention::parse(spec) {
-                Some(window) => Some(window.as_secs() as i64),
-                None => {
-                    tracing::warn!(retention = %spec, "could not parse retention window; disabled");
-                    None
-                }
-            },
-            None => None,
-        };
-        let cache_ttl = self
-            .inner
-            .config
-            .cache
-            .as_ref()
-            .filter(|c| c.enabled)
-            .and_then(|c| c.ttl_secs)
-            .map(|t| t as i64);
-        if retention.is_none() && cache_ttl.is_none() {
-            return;
-        }
         let engine = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 tick.tick().await;
+                let config = engine.config();
+                let retention = config.database.retention.as_deref().and_then(|spec| {
+                    let window = apollo_storage::retention::parse(spec);
+                    if window.is_none() {
+                        tracing::warn!(retention = %spec, "could not parse retention window; skipped");
+                    }
+                    window.map(|w| w.as_secs() as i64)
+                });
+                let cache_ttl = config
+                    .cache
+                    .as_ref()
+                    .filter(|c| c.enabled)
+                    .and_then(|c| c.ttl_secs)
+                    .map(|t| t as i64);
                 let now = now_unix();
                 if let Some(secs) = retention {
                     match engine.inner.storage.purge_finished_before(now - secs).await {

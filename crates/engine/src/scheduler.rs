@@ -183,13 +183,17 @@ impl Engine {
         // Fetch with retries: a transient failure (e.g. an unreachable host) puts
         // the item into `Retrying` and tries again, up to `[app].max_retries`. A
         // permanent one (refused URL, undecodable content) fails at once.
-        let max_retries = self.inner.config.app.max_retries;
+        let max_retries = self.config().app.max_retries;
         let FetchedInput {
             fetched,
             content_hash,
             used_fallback,
         } = loop {
-            match self.fetch_item(&item.input).await {
+            let fetched = self.fetch_item(&item.input).await;
+            if let Err(e) = &fetched {
+                self.inner.metrics.fetch_failed(e.is_transient());
+            }
+            match fetched {
                 Ok(f) => break f,
                 Err(e) if e.is_transient() && item.retries < max_retries => {
                     let err = e.to_fetch_error();
@@ -342,7 +346,7 @@ impl Engine {
         priority: i32,
         cancel: &AtomicBool,
     ) -> bool {
-        let max = self.inner.config.app.max_retries;
+        let max = self.config().app.max_retries;
         item.retries += 1;
         let _ = self
             .inner
@@ -410,6 +414,10 @@ impl Engine {
                             .await;
                     }
                     tracing::debug!(task = %task_id, item = idx, model = %label, "cache hit");
+                    self.inner
+                        .metrics
+                        .cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
                     return SetOutcome::Finished(done);
                 }
                 Ok(None) => {}
@@ -509,7 +517,8 @@ impl Engine {
         permit: &mut Option<GatePermit>,
         priority: i32,
     ) {
-        let Some(config) = self.inner.config.pipelines.get(pipeline) else {
+        let live_config = self.config();
+        let Some(config) = live_config.pipelines.get(pipeline) else {
             self.fail_item(
                 task_id,
                 idx,
@@ -520,7 +529,7 @@ impl Engine {
             return;
         };
         let steps = config.ordered_steps();
-        let max_retries = self.inner.config.app.max_retries;
+        let max_retries = self.config().app.max_retries;
 
         let stopped_at = 'attempt: loop {
             for (i, step) in steps.iter().enumerate() {
@@ -623,13 +632,13 @@ impl Engine {
 
     /// Whether the result cache is configured and enabled.
     fn cache_enabled(&self) -> bool {
-        self.inner.config.cache.as_ref().is_some_and(|c| c.enabled)
+        self.config().cache.as_ref().is_some_and(|c| c.enabled)
     }
 
     /// Lower bound (unix secs) on a cache entry's `created_at` for it to count as
     /// fresh: `now - ttl`, or `0` (no cutoff) when no TTL is configured.
     fn cache_fresh_after(&self) -> i64 {
-        match self.inner.config.cache.as_ref().and_then(|c| c.ttl_secs) {
+        match self.config().cache.as_ref().and_then(|c| c.ttl_secs) {
             Some(ttl) => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -644,8 +653,7 @@ impl Engine {
     /// The configured revision for a model label (part of the cache key, so a
     /// revision bump invalidates prior cache entries). Empty if unknown.
     fn model_revision(&self, label: &str) -> String {
-        self.inner
-            .config
+        self.config()
             .models
             .get(label)
             .map(|m| m.revision.clone())
@@ -663,6 +671,7 @@ impl Engine {
         {
             tracing::error!(task = %task_id, item = idx, error = %e, "set item completed");
         }
+        self.inner.metrics.item_finished(ItemState::Completed);
         self.rollup_task_state(task_id).await;
         self.deliver_webhook(task_id, idx).await;
     }
@@ -700,6 +709,10 @@ impl Engine {
             }
         }
         for (label, output) in resolved {
+            self.inner
+                .metrics
+                .cache_hits
+                .fetch_add(1, Ordering::Relaxed);
             let _ = self
                 .inner
                 .storage
@@ -722,6 +735,7 @@ impl Engine {
                 Some(&TaskError::cancelled("cancelled")),
             )
             .await;
+        self.inner.metrics.item_finished(ItemState::Cancelled);
         self.rollup_task_state(task_id).await;
         self.deliver_webhook(task_id, idx).await;
     }
@@ -749,6 +763,7 @@ impl Engine {
             .storage
             .set_item_state(task_id, idx, ItemState::Failed, Some(&err))
             .await;
+        self.inner.metrics.item_finished(ItemState::Failed);
         self.rollup_task_state(task_id).await;
         self.deliver_webhook(task_id, idx).await;
     }
@@ -817,7 +832,7 @@ impl Engine {
         cancel: &AtomicBool,
     ) -> Result<ModelOutput, EngineError> {
         let handle = self
-            .inner
+            .live()
             .registry
             .get(label)
             .ok_or_else(|| EngineError::UnknownModel(label.to_string()))?;
@@ -875,14 +890,8 @@ impl Engine {
     async fn fetch_item(&self, input: &Input) -> Result<FetchedInput, EngineError> {
         let want_hash = self.cache_enabled();
         let (media, video) = match input {
-            Input::Image(url) => (
-                apollo_media::fetch(url, &self.inner.fetch_limits).await?,
-                false,
-            ),
-            Input::Video(url) => (
-                apollo_media::fetch(url, &self.inner.fetch_limits).await?,
-                true,
-            ),
+            Input::Image(url) => (self.fetch_url(url).await?, false),
+            Input::Video(url) => (self.fetch_url(url).await?, true),
             Input::Bytes { path, kind } => (
                 LocalMedia::adopt(path.clone()),
                 match kind {
@@ -914,6 +923,19 @@ impl Engine {
         })
     }
 
+    /// Fetch a URL input (with its fallback), recording the time and size.
+    async fn fetch_url(&self, url: &Url) -> Result<LocalMedia, EngineError> {
+        let started = std::time::Instant::now();
+        let limits = self.live().fetch_limits.clone();
+        let media = apollo_media::fetch(url, &limits).await?;
+        let metrics = &self.inner.metrics;
+        metrics.fetch_seconds.observe_duration(started.elapsed());
+        if let Ok(meta) = std::fs::metadata(media.path()) {
+            metrics.fetch_bytes.fetch_add(meta.len(), Ordering::Relaxed);
+        }
+        Ok(media)
+    }
+
     /// Decode `media` as an image, hashing the raw bytes for the cache key when
     /// `want_hash` is set.
     async fn image_from_media(
@@ -927,7 +949,7 @@ impl Engine {
         } else {
             None
         };
-        let max_pixels = self.inner.max_pixels;
+        let max_pixels = self.live().max_pixels;
         let img =
             tokio::task::spawn_blocking(move || apollo_media::decode_image(&bytes, max_pixels))
                 .await
@@ -943,7 +965,7 @@ impl Engine {
         want_hash: bool,
     ) -> Result<(Fetched, Option<String>), EngineError> {
         let info = apollo_media::probe(media.path()).await?;
-        let max = self.inner.config.limits.max_video_seconds;
+        let max = self.config().limits.max_video_seconds;
         if max > 0 && info.duration > max as f64 {
             return Err(EngineError::Incompatible(format!(
                 "video is {:.0}s, over the {max}s limit",
@@ -952,7 +974,7 @@ impl Engine {
         }
         // Reject oversized frames up front, before ffmpeg decodes (and PNG-encodes)
         // any of them at full resolution.
-        if let Some(max_px) = self.inner.max_pixels {
+        if let Some(max_px) = self.live().max_pixels {
             let px = u64::from(info.width) * u64::from(info.height);
             if px > max_px {
                 return Err(EngineError::Media(MediaError::Decode(format!(
@@ -1002,7 +1024,14 @@ impl Engine {
         let model = self.model_cfg(label)?;
         let strategy = self.strategy_for(&model)?;
         let trigger = Trigger::for_scan(&strategy, &model);
-        let result = |frames: Vec<Sample>| {
+        let scan_metrics = self.inner.metrics.model(label);
+        let result = |frames: Vec<Sample>, stopped_early: bool| {
+            scan_metrics.scans.fetch_add(1, Ordering::Relaxed);
+            if stopped_early {
+                scan_metrics
+                    .scan_early_exits
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             Ok(ModelOutput::Scan(aggregate::scan(
                 frames,
                 strategy.aggregation,
@@ -1039,7 +1068,7 @@ impl Engine {
                 }
             };
             if t.stop && fired {
-                return result(frames);
+                return result(frames, true);
             }
         }
 
@@ -1136,7 +1165,7 @@ impl Engine {
             frames_shared = shared.frames_shared,
             "frame scan done (video totals so far)"
         );
-        result(frames)
+        result(frames, stopped)
     }
 
     /// Classify `pending` frames in order, appending results to `frames`.
@@ -1334,6 +1363,12 @@ impl Engine {
             )
         });
         let results = futures::future::join_all(calls).await;
+        let classified = results.iter().filter(|r| r.is_ok()).count() as u64;
+        self.inner
+            .metrics
+            .model(scan.label)
+            .scan_frames
+            .fetch_add(classified, Ordering::Relaxed);
         let mut out = Vec::with_capacity(refs.len());
         for (fref, res) in refs.iter().zip(results) {
             match res {
@@ -1362,8 +1397,7 @@ impl Engine {
     // ------------------------- small config lookups -------------------------
 
     fn model_cfg(&self, label: &str) -> Result<ModelConfig, EngineError> {
-        self.inner
-            .config
+        self.config()
             .models
             .get(label)
             .cloned()
@@ -1372,8 +1406,7 @@ impl Engine {
 
     fn model_timeout(&self, label: &str) -> Duration {
         let secs = self
-            .inner
-            .config
+            .config()
             .models
             .get(label)
             .map(|m| m.timeout)
@@ -1384,9 +1417,10 @@ impl Engine {
     /// An item's scheduling priority: the maximum `priority` among the models it
     /// targets (default 0 when none are known).
     fn item_priority(&self, item: &Item) -> i32 {
+        let config = self.config();
         item.models
             .iter()
-            .filter_map(|m| self.inner.config.models.get(m))
+            .filter_map(|m| config.models.get(m))
             .map(|m| m.priority)
             .max()
             .unwrap_or(0)
@@ -1396,8 +1430,7 @@ impl Engine {
         let name = model.video_strategy.as_deref().ok_or_else(|| {
             EngineError::Config("video input requires the model to set video_strategy".into())
         })?;
-        self.inner
-            .config
+        self.config()
             .strategies
             .get(name)
             .cloned()
