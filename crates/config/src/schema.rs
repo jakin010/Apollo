@@ -474,7 +474,8 @@ pub enum SamplingKind {
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub architecture: Architecture,
-    /// Hugging Face repo (the only required field).
+    /// Hugging Face repo. Required for `vit` and `siglip`; `pdq` has none.
+    #[serde(default)]
     pub repo: String,
     #[serde(default = "crate::defaults::revision")]
     pub revision: String,
@@ -522,6 +523,28 @@ pub struct ModelConfig {
     /// directory. Mutually exclusive with `labels`.
     #[serde(default)]
     pub taxonomy_file: Option<String>,
+    /// `pdq`: the block list, one `<hash> <category id>` per line (`#`
+    /// comments allowed). Relative paths resolve from the config file's
+    /// directory. Re-read when the model reloads.
+    #[serde(default)]
+    pub hash_list: Option<String>,
+    /// `pdq`: category names by id, e.g. `categories = { 1 = "csam" }`. The
+    /// ids are what the list's entries carry and predictions report.
+    #[serde(default)]
+    pub categories: BTreeMap<String, String>,
+    /// `pdq`: the most bits (of 256) an image's hash may differ from a listed
+    /// one and still match. Defaults to 31.
+    #[serde(default)]
+    pub max_distance: Option<u32>,
+    /// `pdq`: images whose hash quality (0–100) is below this never match;
+    /// flat or nearly blank images hash unreliably. Defaults to 50.
+    #[serde(default)]
+    pub min_quality: Option<u32>,
+    /// `pdq`: also match rotated (90°, 180°, 270°) and mirrored copies, by
+    /// comparing all 8 of an image's dihedral hashes. Defaults to true; it
+    /// also makes matching independent of EXIF orientation.
+    #[serde(default)]
+    pub match_rotations: Option<bool>,
 }
 
 /// `[models.<label>.early_exit]` — what counts as a trigger for this model.

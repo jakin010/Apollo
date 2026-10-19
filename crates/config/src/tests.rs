@@ -440,3 +440,100 @@ threshold = 0.5   # tuned by hand
     );
     assert!(out.contains("threshold = 0.65   # tuned by hand"), "{out}");
 }
+
+#[test]
+fn pdq_models_need_a_list_and_categories() {
+    let dir = tempfile::tempdir().unwrap();
+    let list = dir.path().join("blocklist.txt");
+    std::fs::write(&list, "").unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        r#"
+        [models.known]
+        architecture = "pdq"
+        hash_list    = "blocklist.txt"
+        categories   = { 1 = "known", 7 = "spam" }
+        max_distance = 40
+        "#,
+    )
+    .unwrap();
+    let cfg = load::load_from(&config).unwrap();
+    cfg.validate().expect("valid");
+    let m = &cfg.models["known"];
+    // Resolved from the config file's directory.
+    assert_eq!(
+        m.hash_list.as_deref(),
+        Some(list.to_string_lossy().as_ref())
+    );
+    assert_eq!(m.categories.len(), 2);
+    assert!(m.repo.is_empty());
+
+    for (toml, needle) in [
+        (
+            "[models.k]\narchitecture = \"pdq\"\ncategories = { 1 = \"a\" }\n",
+            "need a `hash_list`",
+        ),
+        (
+            "[models.k]\narchitecture = \"pdq\"\nhash_list = \"/no/such/list\"\ncategories = { 1 = \"a\" }\n",
+            "does not exist",
+        ),
+        (
+            &format!(
+                "[models.k]\narchitecture = \"pdq\"\nhash_list = \"{}\"\n",
+                list.display()
+            ),
+            "need `categories`",
+        ),
+        (
+            &format!(
+                "[models.k]\narchitecture = \"pdq\"\nhash_list = \"{}\"\ncategories = {{ x = \"a\" }}\nmax_distance = 300\n",
+                list.display()
+            ),
+            "max_distance is at most 256",
+        ),
+        (
+            &format!(
+                "[models.k]\narchitecture = \"pdq\"\nhash_list = \"{}\"\ncategories = {{ 1 = \"a\" }}\nlabels = [\"x\"]\n",
+                list.display()
+            ),
+            "`labels` does not apply",
+        ),
+        (
+            "[models.k]\narchitecture = \"vit\"\nrepo = \"a/b\"\nmax_distance = 3\n",
+            "only applies to architecture \"pdq\"",
+        ),
+        ("[models.k]\narchitecture = \"vit\"\n", "`repo` is required"),
+    ] {
+        let err = load::from_str(toml)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(needle), "{toml}: {err}");
+    }
+
+    // The list's lines are checked too.
+    let good = format!("{} 7  # spam\n", "ab".repeat(32));
+    for (content, needle) in [
+        (format!("{good}zzz 1\n"), "line 2: 'zzz' is not a PDQ hash"),
+        (
+            format!("{} 9\n", "ab".repeat(32)),
+            "category '9' is not one of",
+        ),
+        (
+            format!("{}\n", "ab".repeat(32)),
+            "expected `<hash> <category id>`",
+        ),
+    ] {
+        std::fs::write(&list, content).unwrap();
+        let err = load::load_from(&config)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(needle), "{err}");
+    }
+    std::fs::write(&list, good).unwrap();
+    load::load_from(&config).unwrap().validate().unwrap();
+}

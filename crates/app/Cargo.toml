@@ -11,6 +11,8 @@ path = "src/main.rs"
 apollo-config  = { path = "../config" }
 apollo-domain  = { path = "../domain" }
 apollo-engine  = { path = "../engine" }
+apollo-inference = { path = "../inference" }
+apollo-media   = { path = "../media" }
 apollo-server  = { path = "../server" }
 apollo-storage = { path = "../storage" }
 clap = { version = "4", features = ["derive"] }

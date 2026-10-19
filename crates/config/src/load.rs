@@ -56,7 +56,7 @@ pub struct Overrides {
 }
 
 impl Config {
-    /// Resolve relative file paths (model `taxonomy_file`, the `[tls]` files, and
+    /// Resolve relative file paths (model `taxonomy_file` and `hash_list`, the `[tls]` files, and
     /// `[auth].revocation_file`) against `base` (the directory of the config
     /// file), so downstream consumers can open them directly.
     fn resolve_paths(&mut self, base: &Path) {
@@ -68,6 +68,9 @@ impl Config {
         for model in self.models.values_mut() {
             if let Some(tf) = model.taxonomy_file.as_mut() {
                 resolve(tf);
+            }
+            if let Some(list) = model.hash_list.as_mut() {
+                resolve(list);
             }
         }
         if let Some(tls) = self.tls.as_mut() {

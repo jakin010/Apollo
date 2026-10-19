@@ -22,7 +22,7 @@ pub mod share;
 pub mod strategy;
 
 pub use confirm::Confirm;
-pub use decode::decode_image;
+pub use decode::{decode_image, decode_image_as_stored};
 pub use error::MediaError;
 pub use extract::{FrameRequest, extract_frames_scaled};
 pub use fetch::{FetchLimits, LocalMedia, fetch};

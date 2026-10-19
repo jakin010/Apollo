@@ -5,7 +5,8 @@
 //! [`Config::has_models`].
 
 use crate::error::ConfigError;
-use crate::schema::{Backend, Config, SamplingKind};
+use crate::schema::{Backend, Config, ModelConfig, SamplingKind};
+use apollo_domain::Architecture;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -205,6 +206,7 @@ impl Config {
                     tf
                 ));
             }
+            validate_architecture(label, model, &mut errs);
         }
 
         for (name, pipeline) in &self.pipelines {
@@ -301,4 +303,112 @@ impl Config {
     pub fn has_models(&self) -> bool {
         !self.models.is_empty()
     }
+}
+
+/// The fields each architecture needs, and those it cannot use.
+fn validate_architecture(label: &str, model: &ModelConfig, errs: &mut Vec<String>) {
+    let pdq_fields = [
+        ("hash_list", model.hash_list.is_some()),
+        ("categories", !model.categories.is_empty()),
+        ("max_distance", model.max_distance.is_some()),
+        ("min_quality", model.min_quality.is_some()),
+        ("match_rotations", model.match_rotations.is_some()),
+    ];
+    match model.architecture {
+        Architecture::Vit | Architecture::Siglip => {
+            if model.repo.is_empty() {
+                errs.push(format!("model '{label}': `repo` is required"));
+            }
+            for (field, set) in pdq_fields {
+                if set {
+                    errs.push(format!(
+                        "model '{label}': `{field}` only applies to architecture \"pdq\""
+                    ));
+                }
+            }
+        }
+        Architecture::Pdq => {
+            match &model.hash_list {
+                None => errs.push(format!("model '{label}': pdq models need a `hash_list`")),
+                Some(list) if !Path::new(list).is_file() => errs.push(format!(
+                    "model '{label}': hash list `{list}` does not exist"
+                )),
+                Some(list) => {
+                    if let Err(e) = check_hash_list(Path::new(list), &model.categories) {
+                        errs.push(format!("model '{label}': hash list `{list}`: {e}"));
+                    }
+                }
+            }
+            if model.categories.is_empty() {
+                errs.push(format!(
+                    "model '{label}': pdq models need `categories`, e.g. categories = {{ 1 = \"known\" }}"
+                ));
+            }
+            for id in model.categories.keys() {
+                if id.parse::<u32>().is_err() {
+                    errs.push(format!(
+                        "model '{label}': category id '{id}' is not a number"
+                    ));
+                }
+            }
+            if model.max_distance.is_some_and(|d| d > 256) {
+                errs.push(format!(
+                    "model '{label}': max_distance is at most 256 (the hash's bits)"
+                ));
+            }
+            if model.min_quality.is_some_and(|q| q > 100) {
+                errs.push(format!("model '{label}': min_quality is at most 100"));
+            }
+            for (field, set) in [
+                ("labels", !model.labels.is_empty()),
+                ("taxonomy_file", model.taxonomy_file.is_some()),
+                ("prompt_template", model.prompt_template.is_some()),
+                ("score_threshold", model.score_threshold.is_some()),
+                ("max_results", model.max_results.is_some()),
+            ] {
+                if set {
+                    errs.push(format!(
+                        "model '{label}': `{field}` does not apply to architecture \"pdq\""
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Check a pdq hash list's lines: `<64 hex digits> <category id>`, the id one
+/// of `categories`; blank lines and `#` comments allowed. Mirrors the parser
+/// in `apollo-inference`, so a broken list is rejected before it is used.
+fn check_hash_list(
+    path: &Path,
+    categories: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    for (n, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [hash, category] = fields[..] else {
+            return Err(format!("line {}: expected `<hash> <category id>`", n + 1));
+        };
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "line {}: '{hash}' is not a PDQ hash (64 hex digits)",
+                n + 1
+            ));
+        }
+        let known = category
+            .parse::<u32>()
+            .ok()
+            .is_some_and(|id| categories.keys().any(|k| k.parse::<u32>() == Ok(id)));
+        if !known {
+            return Err(format!(
+                "line {}: category '{category}' is not one of the model's `categories`",
+                n + 1
+            ));
+        }
+    }
+    Ok(())
 }

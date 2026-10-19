@@ -11,6 +11,7 @@
 //! the async engine runs them on blocking threads.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use candle_core::Device;
 
@@ -23,6 +24,11 @@ mod error;
 mod loader;
 mod preprocess;
 
+pub use arch::pdq::{
+    DEFAULT_MAX_DISTANCE as PDQ_DEFAULT_MAX_DISTANCE,
+    DEFAULT_MIN_QUALITY as PDQ_DEFAULT_MIN_QUALITY, ListEntry as PdqListEntry, PdqHash,
+    parse_hash_list as parse_pdq_hash_list, pdq_dihedral_hashes, pdq_hash,
+};
 pub use device::{DeviceKind, open_device, select_device};
 pub use error::InferenceError;
 pub use preprocess::Normalization;
@@ -61,6 +67,7 @@ pub fn labels(cfg: &ModelConfig, cache_dir: Option<&Path>) -> Option<Vec<Label>>
             }
             None => Some(Label::indexed(&cfg.labels)),
         },
+        Architecture::Pdq => arch::pdq::category_labels(cfg).ok(),
         Architecture::Vit => {
             let path = loader::cached_file(cfg, cache_dir, "config.json")?;
             let bytes = std::fs::read(path).ok()?;
@@ -70,16 +77,51 @@ pub fn labels(cfg: &ModelConfig, cache_dir: Option<&Path>) -> Option<Vec<Label>>
     }
 }
 
-/// Download (if not cached) and load the model named by `cfg` onto `device`.
-/// `cache_dir` overrides the Hugging Face cache location when set.
+/// The contents of the files a model reads besides its weights (a taxonomy,
+/// a hash list), read when the config is applied. A model loads from these,
+/// not from disk, so it always loads what was validated, also after an idle
+/// unload, until a reload reads the files again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelFiles {
+    pub taxonomy: Option<Arc<str>>,
+    pub hash_list: Option<Arc<str>>,
+}
+
+impl ModelFiles {
+    /// Read `cfg`'s files now. One that cannot be read is left out, and
+    /// loading the model then fails with the reason.
+    pub fn read(cfg: &ModelConfig) -> Self {
+        let read = |path: &Option<String>| {
+            path.as_deref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(Arc::from)
+        };
+        Self {
+            taxonomy: read(&cfg.taxonomy_file),
+            hash_list: read(&cfg.hash_list),
+        }
+    }
+}
+
+/// Download (if not cached) and load the model named by `cfg` onto `device`,
+/// with its `files` as read by [`ModelFiles::read`]. `cache_dir` overrides the
+/// Hugging Face cache location when set.
 pub fn load(
     cfg: &ModelConfig,
+    files: &ModelFiles,
     device: &Device,
     cache_dir: Option<&Path>,
 ) -> Result<Box<dyn ImageClassifier>, InferenceError> {
-    let hub = loader::Hub::open(cfg, cache_dir)?;
     match cfg.architecture {
-        Architecture::Vit => Ok(Box::new(arch::vit::load(&hub, device)?)),
-        Architecture::Siglip => Ok(Box::new(arch::siglip::load(&hub, cfg, device)?)),
+        Architecture::Vit => {
+            let hub = loader::Hub::open(cfg, cache_dir)?;
+            Ok(Box::new(arch::vit::load(&hub, device)?))
+        }
+        Architecture::Siglip => {
+            let hub = loader::Hub::open(cfg, cache_dir)?;
+            Ok(Box::new(arch::siglip::load(&hub, cfg, files, device)?))
+        }
+        // Runs on the CPU, with no weights to fetch.
+        Architecture::Pdq => Ok(Box::new(arch::pdq::load(cfg, files)?)),
     }
 }

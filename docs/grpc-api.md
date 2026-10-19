@@ -70,7 +70,7 @@ Requests cooperative cancellation and returns the task **after** the request: `C
 
 ### `ListModels(ListModelsRequest) → ListModelsResponse`
 
-The configured models and pipelines, so clients need not hard-code them. Each model lists the input kinds it accepts, whether it is enabled and currently loaded, its labels (id and name, as in predictions), its trigger (`[models.<name>.early_exit]`) and its video strategy. Labels are read without loading or downloading the model: from the config for `siglip`, from the cached `config.json` for `vit`. A `vit` model that was never downloaded has no labels listed until its first use.
+The configured models and pipelines, so clients need not hard-code them. Each model lists the input kinds it accepts, whether it is enabled and currently loaded, its labels (id and name, as in predictions), its trigger (`[models.<name>.early_exit]`) and its video strategy. Labels are read without loading or downloading the model: from the config for `siglip` and `pdq` (its `categories`), from the cached `config.json` for `vit`. A `vit` model that was never downloaded has no labels listed until its first use.
 
 ---
 
@@ -197,7 +197,7 @@ message Segment {
 - A task whose input is being **retried** after a transient failure stays `PROCESSING`, with `retries` counting the attempts; `error` is only set once it has failed for good.
 - `results` has one entry per model **in run order**: the pipeline's step order, or the order you listed `models`. Results of models that have not started are `QUEUED`.
 - A `Classification` returns the **top 5 predictions unioned with any label scoring above 0.90**, so a confident sixth label is never dropped (models with a `score_threshold` return the labels at or above it instead).
-- Each prediction has the label's `id` (a class index for `vit`, a label‑list index for `siglip` with `labels`, a taxonomy child id for `siglip` with a taxonomy) and its `name` (e.g. `nsfw`, or `food_and_drink.drinks` for a taxonomy child). `ListModels` lists every label a model can predict.
+- Each prediction has the label's `id` (a class index for `vit`, a label‑list index for `siglip` with `labels`, a taxonomy child id for `siglip` with a taxonomy, a category id for `pdq`) and its `name` (e.g. `nsfw`, or `food_and_drink.drinks` for a taxonomy child). `ListModels` lists every label a model can predict.
 - For `siglip`, `score` is an independent **sigmoid probability**.
 - Video results come back as a `Scan`: `aggregated` is the roll-up across the classified frames (the strategy's `max` or `mean`), `segments` the stretches where a trigger label fired, and `samples` the individual frames (`FULL` view only). A scan that stopped early (`early_exit`) has only the frames classified up to then.
 
@@ -296,7 +296,7 @@ The input's kind fixes which models are valid for it. Invalid combinations are r
 
 | Input | Valid models |
 |-------|--------------|
-| image | any image classifier (`vit`, `siglip`) |
+| image | any image model (`vit`, `siglip`, `pdq`) |
 | video | any image classifier that has a `video_strategy` configured (it is run over sampled frames) |
 | audio | none yet |
 

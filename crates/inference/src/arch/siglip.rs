@@ -85,6 +85,7 @@ pub(crate) struct SiglipClassifier {
 pub(crate) fn load(
     hub: &Hub,
     cfg: &ModelConfig,
+    files: &crate::ModelFiles,
     device: &Device,
 ) -> Result<SiglipClassifier, InferenceError> {
     let config_bytes = std::fs::read(hub.file("config.json")?)?;
@@ -110,7 +111,10 @@ pub(crate) fn load(
     // set; here we just dispatch on whichever is present.)
     let (text_inputs, mode, labels) = match cfg.taxonomy_file.as_deref() {
         Some(path) => {
-            let tax = Taxonomy::load(Path::new(path))
+            let text = files.taxonomy.as_deref().ok_or_else(|| {
+                InferenceError::Config(format!("taxonomy file {path} could not be read"))
+            })?;
+            let tax = Taxonomy::parse(text)
                 .map_err(|e| InferenceError::Config(format!("taxonomy: {e}")))?;
             // Taxonomy prompts are complete phrases — used verbatim, no template.
             (
