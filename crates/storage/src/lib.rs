@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 
 use apollo_config::{Backend, DatabaseConfig};
-use apollo_domain::{Frame, ItemState, ModelOutput, ModelResult, Task, TaskError, TaskState};
+use apollo_domain::{ItemState, ModelOutput, ModelResult, Sample, Task, TaskError, TaskState};
 
 pub mod backends;
 pub mod error;
@@ -43,6 +43,57 @@ pub(crate) fn now() -> i64 {
         .unwrap_or(0)
 }
 pub use resume::PendingWebhook;
+
+/// Which tasks [`Storage::list_tasks`] returns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskQuery {
+    /// `Some(owner)`: only that owner's tasks (`Some(None)` = tasks submitted
+    /// without authentication). `None`: everyone's.
+    pub owner: Option<Option<String>>,
+    /// Only these states; all when empty.
+    pub states: Vec<TaskState>,
+    /// Created at or after / before these unix seconds.
+    pub created_after: Option<i64>,
+    pub created_before: Option<i64>,
+    /// Page size (at least 1).
+    pub limit: usize,
+    /// Continue after this task (the last one of the previous page).
+    pub after: Option<TaskCursor>,
+}
+
+/// A position in the newest-first task order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCursor {
+    pub created_at: i64,
+    pub id: String,
+}
+
+/// One page of [`Storage::list_tasks`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TaskPage {
+    pub tasks: Vec<Task>,
+    /// Where the next page starts; `None` on the last page.
+    pub next: Option<TaskCursor>,
+}
+
+/// Whether a task in `state` is finished (it gets a `finished_at`).
+pub(crate) fn is_terminal(state: TaskState) -> bool {
+    matches!(
+        state,
+        TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+    )
+}
+
+/// The stored form of a task's metadata (`None` when empty).
+pub(crate) fn metadata_to_json(
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<String>, StorageError> {
+    if metadata.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::to_string(metadata)?))
+    }
+}
 
 /// Persistence operations the rest of the app depends on. Task lifecycle is fully
 /// persisted (it survives restarts), tracked at per-(item, model) granularity so
@@ -78,6 +129,18 @@ pub trait Storage: Send + Sync {
         error: Option<&TaskError>,
     ) -> Result<(), StorageError>;
 
+    /// The id of the task `owner` created with idempotency key `request_id`, if
+    /// any (`owner` is `None` for tasks submitted without authentication).
+    async fn find_task_by_request(
+        &self,
+        owner: Option<&str>,
+        request_id: &str,
+    ) -> Result<Option<String>, StorageError>;
+
+    /// A page of tasks matching `query`, newest first (by creation time, then
+    /// id). Backs `ListTasks`.
+    async fn list_tasks(&self, query: &TaskQuery) -> Result<TaskPage, StorageError>;
+
     /// Insert or update the result for one (item, model). Leaves frame progress
     /// and the steps-completed marker untouched.
     async fn upsert_model_result(
@@ -88,36 +151,27 @@ pub trait Storage: Send + Sync {
         result: &ModelResult,
     ) -> Result<(), StorageError>;
 
-    // ------------------------ video scan checkpoint ----------------------
+    // ------------------------- scan checkpoint --------------------------
 
-    /// Append (or replace) one classified frame. Written incrementally, the frame
-    /// rows are the resume checkpoint for an interrupted scan.
-    async fn append_frame(
+    /// Append (or replace) a batch of classified samples atomically. Written
+    /// incrementally, the sample rows are the resume checkpoint for an
+    /// interrupted scan.
+    async fn append_samples(
         &self,
         task_id: &str,
         item: usize,
         label: &str,
-        frame: &Frame,
+        samples: &[Sample],
     ) -> Result<(), StorageError>;
 
-    /// Append (or replace) a batch of classified frames atomically: one
-    /// transaction instead of one write per frame.
-    async fn append_frames(
+    /// Samples already classified for a (item, model), ordered by index. Seeds
+    /// the dedupe set on resume.
+    async fn load_samples(
         &self,
         task_id: &str,
         item: usize,
         label: &str,
-        frames: &[Frame],
-    ) -> Result<(), StorageError>;
-
-    /// Frames already classified for a (item, model), ordered by index. Seeds the
-    /// dedupe set on resume.
-    async fn load_frames(
-        &self,
-        task_id: &str,
-        item: usize,
-        label: &str,
-    ) -> Result<Vec<Frame>, StorageError>;
+    ) -> Result<Vec<Sample>, StorageError>;
 
     /// Record how many sampling steps have fully completed. Reserved for skipping
     /// finished steps on resume; the engine does not use it yet (resume relies on

@@ -1,6 +1,6 @@
 # Apollo
 
-Apollo is a gRPC service that runs machine‑learning **classification models over images and video**. You submit an input (an image or video URL, or a stream of raw bytes) together with the names of the models to run on it; Apollo returns a **task id** immediately and does the work asynchronously. You then poll for the result or receive it over a webhook.
+Apollo is a gRPC service that runs machine‑learning **classification models over images and video**. You submit an input (an image or video URL, its bytes inline, or a stream of raw bytes) together with the names of the models to run on it; Apollo returns the **task** immediately and does the work asynchronously. You then wait for it in the same call, watch it, poll it, or receive it over a webhook.
 
 Models are loaded from [Hugging Face](https://huggingface.co/) and executed with the [candle](https://github.com/huggingface/candle) inference framework. The service is built to be operated as a long‑running daemon: task state is fully persisted, so work survives restarts, and interrupted video scans resume from where they stopped.
 
@@ -9,22 +9,23 @@ Models are loaded from [Hugging Face](https://huggingface.co/) and executed with
 ## What it does, concretely
 
 - **Classify an image.** Run one or more image classifiers on a picture and get back scored labels.
-- **Classify a video.** Any image classifier can be pointed at a video; Apollo samples frames according to a named **strategy**, classifies each frame, and rolls the per‑frame scores up into one result. Scans can **early‑exit** as soon as a trigger label fires.
-- **Run ordered pipelines.** Instead of running models as a parallel set, an input can be sent through a named **pipeline** whose steps run in order and can **gate** (stop early) based on a previous step's output — e.g. "run the NSFW model first; only run the expensive category model if it's clean."
-- **Skip repeated work.** An optional result **cache** keys model outputs by content hash, so identical inputs don't get re‑inferred.
-- **Notify on completion.** An optional **webhook** fires as a task reaches a terminal state (and on intermediate transitions), carrying the full current `Task`.
+- **Classify a video.** Any image classifier can be pointed at a video; Apollo samples frames according to a named **strategy**, classifies each frame, and rolls the per‑frame scores up into one result, with the **segments** where a trigger label fired. Scans can **early‑exit** as soon as a trigger label fires.
+- **Run ordered pipelines.** Instead of running models as a parallel set, an input can be sent through a named **pipeline** whose steps run in order (each step's models concurrently) and can **gate** (stop early) based on a previous step's output — e.g. "run the NSFW model first; only run the category and general models if it's clean."
+- **Skip repeated work.** An optional result **cache** keys model outputs by content hash, so identical inputs don't get re‑inferred, and a `request_id` makes a retried submission return the existing task.
+- **Follow a task.** `Classify` can wait for the result (`wait_seconds`), `WatchTask` streams each change, and an optional **webhook** sends a `TaskEvent` as the task moves on and once it finishes.
+- **Discover what to run.** `ListModels` lists the configured models with their labels, and the pipelines; `ListTasks` lists your tasks.
 
 ## Core concepts
 
 | Term | Meaning |
 |------|---------|
-| **Task** | One submission. A `Classify`/`ClassifyStream` call creates a task with exactly one **item**. |
-| **Item** | One input within a task, plus the set of models (or the pipeline) to run on it. |
+| **Task** | One submission: one input, the models (or the pipeline) to run on it, and their results. Created by `Classify`/`ClassifyStream`. (Internally a task holds one **item**, the input and its per‑model results.) |
 | **Model** | A registered `[models.<label>]` entry: an architecture + a Hugging Face repo + options. Referenced by its **label**, not its repo. |
 | **Architecture** | The model family. Two are supported: **`vit`** (a fixed‑head image classifier whose labels come from the weights) and **`siglip`** (an open‑vocabulary classifier scored against a caller‑supplied label list or a **taxonomy**). |
 | **Strategy** | A reusable `[strategies.<name>]` recipe describing how an image classifier is applied to a video: which frames to sample, how to aggregate per‑frame scores (`max`/`mean`), and whether to early‑exit. |
-| **Pipeline** | A reusable `[pipelines.<name>]` sequence of models run in order, with optional per‑step gates. |
-| **Prediction** | A `(label, score)` pair. `label` is an integer id (a class index for `vit`, a label‑list index or taxonomy child id for `siglip`). |
+| **Pipeline** | A reusable `[pipelines.<name>]` sequence of steps run in order (a step's models concurrently), with optional per‑step gates. |
+| **Prediction** | A `(label, name, score)` triple. `label` is an integer id (a class index for `vit`, a label‑list index or taxonomy child id for `siglip`), `name` its readable name. |
+| **Segment** | A stretch of a video where one of a model's trigger labels scored at or above its threshold on consecutive sampled frames. |
 
 There is **no separate video architecture** — video is always "an image classifier run over sampled frames."
 
@@ -33,9 +34,9 @@ There is **no separate video architecture** — video is always "an image classi
 ```
                          ┌──────────────────────────────────────────────┐
    gRPC client ─────────▶│  apollo-server   (Inference service)         │
-   (Classify /           │   • auth interceptor (PASETO, optional)      │
-    GetTask / Cancel /   │   • proto ⇄ domain conversion                │
-    ClassifyStream)      └───────────────────────┬──────────────────────┘
+   (Classify, GetTask,   │   • auth interceptor (PASETO, optional)      │
+    WatchTask, List…,    │   • proto ⇄ domain conversion                │
+    CancelTask)          └───────────────────────┬──────────────────────┘
                                                  │ submit / query
                                                  ▼
    ┌──────────────────────────────────────────────────────────────────────┐
@@ -45,8 +46,9 @@ There is **no separate video architecture** — video is always "an image classi
    │   worker     – one dedicated OS thread per model: batching + idle‑     │
    │                unload of weights                                       │
    │   registry   – loaded‑model registry + submit‑time validation         │
-   │   aggregate  – assembles results and lifecycle state                  │
-   │   webhook    – fires terminal‑item deliveries via an injected sink     │
+   │   aggregate  – assembles results, segments and lifecycle state        │
+   │   watch      – announces task changes (WatchTask, wait_seconds)       │
+   │   webhook    – sends task events via an injected sink                 │
    └───────┬───────────────────────────┬───────────────────────┬───────────┘
            ▼                           ▼                       ▼
    ┌───────────────┐          ┌────────────────┐      ┌──────────────────┐
@@ -60,11 +62,11 @@ There is **no separate video architecture** — video is always "an image classi
 
 **Request lifecycle:**
 
-1. A `Classify` call is validated **synchronously** — unknown/disabled models and input/model modality mismatches are rejected before anything is queued (mapped to gRPC `InvalidArgument`). The task is persisted and a task id is returned.
-2. The scheduler fetches the input **once**, then fans it out to each model's worker — an item's models run **concurrently**. A global concurrency cap (a priority‑ordered gate) bounds how many inferences run at once (your VRAM budget).
+1. A `Classify` call is validated **synchronously** — unknown/disabled models and input/model modality mismatches are rejected before anything is queued (mapped to gRPC `InvalidArgument`). The task is persisted and returned (after up to `wait_seconds`, if the caller asked to wait).
+2. The scheduler fetches the input **once**, then fans it out to each model's worker — a task's models (or a pipeline step's) run **concurrently**. A global concurrency cap (a priority‑ordered gate) bounds how many inputs are processed at once (your VRAM budget).
 3. Each model runs on its own dedicated worker thread that **lazily loads** weights on first use, **batches** concurrent requests into one forward pass, and **unloads** after an idle timeout (unless the model is pinned with `keep_in_memory`).
-4. Results are written per `(item, model)` as they complete. For video, frames are extracted in batches by a single ffmpeg pass (scaled to the model's input size, the next batch extracted while the current one is classified), and each classified batch is checkpointed so an interrupted scan resumes without re‑doing frames.
-5. When every model for an item is done, the item reaches a terminal state, the webhook (if configured) fires, and `GetTask` reflects the final result. Transient failures (network errors, model timeouts) are **retried** up to `[app].max_retries`; permanent ones (a refused URL, undecodable input) fail immediately.
+4. Results are written per model as they complete. For video, frames are extracted in batches by a single ffmpeg pass (scaled to the model's input size, the next batch extracted while the current one is classified), and each classified batch is checkpointed so an interrupted scan resumes without re‑doing frames.
+5. When every model is done, the task reaches a terminal state, the webhook (if configured) fires, watchers get the final task, and `GetTask` reflects the final result. Transient failures (network errors, model timeouts) are **retried** up to `[app].max_retries`; permanent ones (a refused URL, undecodable input) fail immediately.
 
 On startup the engine **recovers** any tasks left non‑terminal by a previous run and re‑queues them; a poison task that keeps crashing is failed once its resume‑attempt count exceeds the cap.
 
@@ -103,13 +105,16 @@ TOKEN=$(apollo token --subject my-client --expires 30d)
 # 4. Check it is up (models, queue, tasks, memory).
 apollo status
 
-# 5. Submit an image (reflection is enabled, so grpcurl needs no .proto files).
+# 5. Submit an image and wait for the result (reflection is enabled, so
+#    grpcurl needs no .proto files).
 grpcurl -plaintext \
   -H "authorization: $TOKEN" \
-  -d '{"item": {"models": ["general"], "image_url": {"main": "https://example.com/cat.jpg"}}}' \
+  -d '{"media": {"kind": "MEDIA_KIND_IMAGE", "url": "https://example.com/cat.jpg"},
+       "models": {"names": ["general"]}, "wait_seconds": 30}' \
   localhost:8080 apollo.v1.Inference/Classify
-# → {"taskId": "…"}
+# → {"id": "…", "state": "TASK_STATE_COMPLETED", "results": [{"model": "general", …}], …}
 
+# Or submit without waiting and poll.
 grpcurl -plaintext -H "authorization: $TOKEN" -d '{"task_id": "…"}' localhost:8080 apollo.v1.Inference/GetTask
 ```
 
@@ -119,7 +124,7 @@ The server exits at startup if **no models are configured** — there would be n
 
 | Document | Covers |
 |----------|--------|
-| [grpc-api.md](./grpc-api.md) | The `Inference` service: methods, messages, enums, error codes, auth, and examples. |
-| [webhooks.md](./webhooks.md) | The `Webhook` service you implement to receive results, delivery semantics, and payload signing. |
+| [grpc-api.md](./grpc-api.md) | The `Inference` service: methods, messages, states, segments, error codes, auth, and examples. |
+| [webhooks.md](./webhooks.md) | The `Webhook` service you implement to receive task events, delivery semantics, and payload signing. |
 | [configuration.md](./configuration.md) | Every config section and field, defaults, units, validation, and the CLI. |
 | [database.md](./database.md) | Persistence: backends, schema, migrations, retention, and the result cache. |

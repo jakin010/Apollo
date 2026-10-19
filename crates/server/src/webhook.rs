@@ -1,6 +1,6 @@
 //! Outbound webhook client: the concrete [`WebhookSink`] injected into the engine.
 //!
-//! Delivers `TaskStatus` to the receiver configured by `[webhook].url` over a
+//! Delivers `TaskEvent`s to the receiver configured by `[webhook].url` over a
 //! lazily-connected, auto-reconnecting channel. When `[webhook].secret` is set,
 //! each delivery is signed with scheme `v1` (see
 //! [`apollo_proto::webhook_signature`]): an HMAC-SHA256 over the delivery
@@ -16,12 +16,11 @@ use prost::Message;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
-use apollo_domain::Task;
-use apollo_engine::{WebhookError, WebhookSink};
+use apollo_engine::{EventKind, TaskEvent, WebhookError, WebhookSink};
 use apollo_proto::webhook_client::WebhookClient;
 use apollo_proto::webhook_signature::{self, SIGNATURE_HEADER, TIMESTAMP_HEADER};
 
-use crate::convert::task_to_proto;
+use crate::convert::{View, task_to_proto};
 
 /// Deadline for establishing a connection to the receiver.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,7 +28,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// forever (the redelivery loop would otherwise keep stacking them up).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A [`WebhookSink`] that delivers task status to a gRPC `Webhook` receiver.
+/// A [`WebhookSink`] that delivers task events to a gRPC `Webhook` receiver.
 pub struct GrpcWebhookSink {
     channel: Channel,
     secret: Option<String>,
@@ -53,18 +52,31 @@ impl GrpcWebhookSink {
         })
     }
 
-    /// Build the bare-Task request, signed when a secret is set.
+    /// Build the `TaskEvent` request (the task in its summary view), signed
+    /// when a secret is set.
     fn build_request(
         &self,
-        task: &Task,
-    ) -> Result<tonic::Request<apollo_proto::Task>, WebhookError> {
-        let mut request = tonic::Request::new(task_to_proto(task.clone()));
+        event: &TaskEvent,
+    ) -> Result<tonic::Request<apollo_proto::TaskEvent>, WebhookError> {
+        let timestamp = unix_now();
+        let kind = match event.kind {
+            EventKind::Progress => apollo_proto::TaskEventType::Progress,
+            EventKind::Finished => apollo_proto::TaskEventType::Finished,
+        };
+        let mut request = tonic::Request::new(apollo_proto::TaskEvent {
+            r#type: kind as i32,
+            task: Some(task_to_proto(event.task.clone(), View::Summary)),
+            attempt: event.attempt,
+            sent_at: Some(apollo_proto::Timestamp {
+                seconds: timestamp,
+                nanos: 0,
+            }),
+        });
         if let Some(secret) = &self.secret {
             // Sign the exact bytes tonic will send: encoding is deterministic
             // (map entries sorted by key), so encoding this message again on the
             // wire reproduces `payload` byte for byte.
             let payload = request.get_ref().encode_to_vec();
-            let timestamp = unix_now();
             let signature = webhook_signature::sign(secret.as_bytes(), timestamp, &payload);
             let header = |v: &str| {
                 MetadataValue::try_from(v)
@@ -80,14 +92,12 @@ impl GrpcWebhookSink {
 
 #[async_trait]
 impl WebhookSink for GrpcWebhookSink {
-    async fn deliver(&self, task: &Task, _item_index: usize) -> Result<(), WebhookError> {
-        // The wire message is the full Task (bare, per the proto); the receiver
-        // dedupes by id. Built per attempt, so each retry carries a fresh
-        // timestamp.
-        let request = self.build_request(task)?;
+    async fn deliver(&self, event: &TaskEvent) -> Result<(), WebhookError> {
+        // Built per attempt, so each retry carries a fresh timestamp.
+        let request = self.build_request(event)?;
         let mut client = WebhookClient::new(self.channel.clone());
         client
-            .task_status(request)
+            .notify(request)
             .await
             .map_err(|status| WebhookError(status.to_string()))?;
         Ok(())
@@ -107,16 +117,18 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
 
     use apollo_client::{Ack, WebhookHandler, WebhookReceiver};
-    use apollo_domain::TaskState;
+    use apollo_domain::{Task, TaskState};
     use tokio::sync::{mpsc, oneshot};
     use tonic::{Response, Status};
 
-    fn task(id: &str) -> Task {
-        Task {
-            id: id.into(),
-            state: TaskState::Completed,
-            items: vec![],
-            owner: None,
+    fn task(id: &str) -> TaskEvent {
+        let mut task = Task::new(id, vec![], None);
+        task.state = TaskState::Completed;
+        task.metadata = [("ref".to_string(), "42".to_string())].into();
+        TaskEvent {
+            kind: EventKind::Finished,
+            task,
+            attempt: 2,
         }
     }
 
@@ -126,7 +138,7 @@ mod tests {
         // not with tonic's "HTTPS without TLS enabled" (which meant TLS was never
         // compiled in and every https:// webhook silently failed).
         let sink = GrpcWebhookSink::new("https://127.0.0.1:1", None).unwrap();
-        let err = sink.deliver(&task("t"), 0).await.unwrap_err().to_string();
+        let err = sink.deliver(&task("t")).await.unwrap_err().to_string();
         assert!(!err.contains("without TLS"), "{err}");
     }
 
@@ -150,21 +162,20 @@ mod tests {
         assert_eq!(check(b"s3cret", &payload), Ok(()));
         // A different payload for the same task id does not verify.
         let mut other = request.get_ref().clone();
-        other.result = Some(apollo_proto::task::Result::State(
-            apollo_proto::TaskState::Cancelled as i32,
-        ));
-        assert_eq!(other.id, "t1");
+        let t = other.task.as_mut().unwrap();
+        t.state = apollo_proto::TaskState::Cancelled as i32;
+        assert_eq!(t.id, "t1");
         assert!(check(b"s3cret", &other.encode_to_vec()).is_err());
         assert!(check(b"wrong", &payload).is_err());
     }
 
     /// Records every delivery it accepts.
-    struct Recorder(mpsc::UnboundedSender<apollo_proto::Task>);
+    struct Recorder(mpsc::UnboundedSender<apollo_proto::TaskEvent>);
 
     #[tonic::async_trait]
     impl WebhookHandler for Recorder {
-        async fn on_task_status(&self, task: apollo_proto::Task) -> Result<Response<Ack>, Status> {
-            let _ = self.0.send(task);
+        async fn on_event(&self, event: apollo_proto::TaskEvent) -> Result<Response<Ack>, Status> {
+            let _ = self.0.send(event);
             Ok(Response::new(Ack {}))
         }
     }
@@ -174,7 +185,7 @@ mod tests {
         secret: &str,
     ) -> (
         String,
-        mpsc::UnboundedReceiver<apollo_proto::Task>,
+        mpsc::UnboundedReceiver<apollo_proto::TaskEvent>,
         oneshot::Sender<()>,
     ) {
         let port = TcpListener::bind("127.0.0.1:0")
@@ -204,20 +215,22 @@ mod tests {
         let (url, mut seen, stop) = receiver("s3cret").await;
 
         let sink = GrpcWebhookSink::new(&url, Some("s3cret".into())).unwrap();
-        sink.deliver(&task("ok"), 0).await.unwrap();
-        assert_eq!(seen.recv().await.unwrap().id, "ok");
+        sink.deliver(&task("ok")).await.unwrap();
+        let event = seen.recv().await.unwrap();
+        assert_eq!(event.r#type(), apollo_proto::TaskEventType::Finished);
+        assert_eq!(event.attempt, 2);
+        assert!(event.sent_at.is_some());
+        let delivered = event.task.unwrap();
+        assert_eq!(delivered.id, "ok");
+        assert_eq!(delivered.metadata["ref"], "42");
 
         let wrong = GrpcWebhookSink::new(&url, Some("wrong".into())).unwrap();
-        let err = wrong
-            .deliver(&task("bad"), 0)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = wrong.deliver(&task("bad")).await.unwrap_err().to_string();
         assert!(err.contains("invalid webhook signature"), "{err}");
 
         let unsigned = GrpcWebhookSink::new(&url, None).unwrap();
         let err = unsigned
-            .deliver(&task("none"), 0)
+            .deliver(&task("none"))
             .await
             .unwrap_err()
             .to_string();

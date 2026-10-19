@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use apollo_config::{Aggregation, ModelConfig, TaxonChild, Taxonomy};
-use apollo_domain::{Classification, DecodedImage, Prediction};
+use apollo_domain::{Classification, DecodedImage, Label, Prediction};
 
 use crate::ImageClassifier;
 use crate::error::InferenceError;
@@ -71,8 +71,8 @@ pub(crate) struct SiglipClassifier {
     text_embeds: Tensor,
     logit_scale: Tensor,
     logit_bias: Tensor,
-    /// For the `labels()` accessor: the flat labels, or the taxonomy's prompts.
-    labels: Vec<String>,
+    /// The flat labels by index, or the taxonomy's children by id.
+    labels: Vec<Label>,
     norm: Normalization,
     mode: Mode,
     device: Device,
@@ -120,9 +120,15 @@ pub(crate) fn load(
                     // mechanism), taxonomy historically returned every child; an
                     // unset threshold preserves that (0.0 keeps everything).
                     threshold: cfg.score_threshold.unwrap_or(0.0),
-                    children: tax.children,
+                    children: tax.children.clone(),
                 },
-                tax.prompts,
+                tax.children
+                    .iter()
+                    .map(|c| Label {
+                        id: c.id,
+                        name: c.name.clone(),
+                    })
+                    .collect(),
             )
         }
         None => {
@@ -137,7 +143,7 @@ pub(crate) fn load(
                     threshold: cfg.score_threshold.unwrap_or(DEFAULT_THRESHOLD),
                     max_results: cfg.max_results,
                 },
-                cfg.labels.clone(),
+                Label::indexed(&cfg.labels),
             )
         }
     };
@@ -211,7 +217,7 @@ impl ImageClassifier for SiglipClassifier {
                 Mode::Flat {
                     threshold,
                     max_results,
-                } => flat_classification(&row, *threshold, *max_results),
+                } => flat_classification(&row, &self.labels, *threshold, *max_results),
                 Mode::Taxonomy {
                     threshold,
                     children,
@@ -221,7 +227,7 @@ impl ImageClassifier for SiglipClassifier {
         Ok(out)
     }
 
-    fn labels(&self) -> &[String] {
+    fn labels(&self) -> &[Label] {
         &self.labels
     }
 
@@ -232,14 +238,16 @@ impl ImageClassifier for SiglipClassifier {
 
 /// Flat mode: every label scoring at/above `threshold`, highest first, capped by
 /// `max_results`. `label` is the label's index in the configured list.
-fn flat_classification(row: &[f32], threshold: f32, max_results: Option<usize>) -> Classification {
-    let mut preds = row
+fn flat_classification(
+    row: &[f32],
+    labels: &[Label],
+    threshold: f32,
+    max_results: Option<usize>,
+) -> Classification {
+    let mut preds = labels
         .iter()
-        .enumerate()
-        .map(|(i, &score)| Prediction {
-            label: i as u32,
-            score,
-        })
+        .zip(row)
+        .map(|(label, &score)| label.predict(score))
         .filter(|p| p.score >= threshold)
         .collect::<Vec<_>>();
     preds.sort_by(|a, b| {
@@ -266,10 +274,7 @@ fn taxonomy_classification(row: &[f32], threshold: f32, children: &[TaxonChild])
                 Aggregation::Max => slice.iter().copied().fold(f32::MIN, f32::max),
                 Aggregation::Mean => slice.iter().sum::<f32>() / slice.len() as f32,
             };
-            Prediction {
-                label: child.id,
-                score,
-            }
+            Prediction::new(child.id, child.name.clone(), score)
         })
         .filter(|p| p.score >= threshold)
         .collect::<Vec<_>>();

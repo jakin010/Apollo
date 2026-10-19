@@ -2,15 +2,17 @@
 //! cover lifecycle paths (recovery, cancellation, cleanup) that run without
 //! inference.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use apollo_config::{Config, DatabaseConfig, SqliteConfig};
-use apollo_domain::{ErrorKind, Input, Item, ItemState, ModelState, Task, TaskState};
+use apollo_domain::{
+    ErrorKind, Input, Item, ItemState, MediaKind, ModelResult, ModelState, Task, TaskState,
+};
 use apollo_storage::Storage;
 
-use crate::{Engine, EngineError};
+use crate::{Engine, EngineError, Run, Submission};
 
 struct Fixture {
     engine: Engine,
@@ -19,7 +21,15 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with("").await
+}
+
+/// A fixture whose config also has the `models` / `pipelines` TOML given.
+/// Models are never loaded, so their repos need not exist.
+async fn fixture_with(toml: &str) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
+    let parsed = apollo_config::load::from_str(toml).unwrap();
+    parsed.validate().unwrap();
     let mut config = Config {
         app: Default::default(),
         webhook: None,
@@ -34,9 +44,9 @@ async fn fixture() -> Fixture {
             ..Default::default()
         },
         cache: None,
-        strategies: Default::default(),
-        pipelines: Default::default(),
-        models: Default::default(),
+        strategies: parsed.strategies,
+        pipelines: parsed.pipelines,
+        models: parsed.models,
     };
     config.app.cache_dir = Some(dir.path().to_string_lossy().into_owned());
     let storage = apollo_storage::open(&config.database).await.unwrap();
@@ -50,26 +60,24 @@ async fn fixture() -> Fixture {
 
 fn task(id: &str, state: TaskState, item_state: ItemState, upload: Option<PathBuf>) -> Task {
     let input = match upload {
-        Some(path) => Input::Bytes { path, video: false },
-        None => Input::Image(apollo_domain::Url {
-            main: "https://example.com/a.png".into(),
-            fallback: None,
-        }),
+        Some(path) => Input::Bytes {
+            path,
+            kind: MediaKind::Image,
+        },
+        None => image(),
     };
-    Task {
-        id: id.into(),
-        state,
-        items: vec![Item {
-            input,
-            models: vec!["m".into()],
-            pipeline: None,
-            state: item_state,
-            results: BTreeMap::new(),
-            error: None,
-            retries: 0,
-        }],
-        owner: None,
-    }
+    let mut item = Item::new(input, vec!["m".into()], None);
+    item.state = item_state;
+    let mut task = Task::new(id, vec![item], None);
+    task.state = state;
+    task
+}
+
+fn image() -> Input {
+    Input::Image(apollo_domain::Url {
+        main: "https://example.com/a.png".into(),
+        fallback: None,
+    })
 }
 
 fn staged_upload(engine: &Engine, name: &str) -> PathBuf {
@@ -235,4 +243,225 @@ async fn status_reports_tasks_queue_and_models() {
     assert!(s.slots_total >= 1);
     assert_eq!(s.webhooks_pending, None, "no webhook configured");
     assert!(s.models.is_empty(), "fixture configures no models");
+}
+
+#[tokio::test]
+async fn a_repeated_request_id_returns_the_existing_task() {
+    let f = fixture().await;
+    let mut earlier = task("earlier", TaskState::Completed, ItemState::Completed, None);
+    earlier.request_id = Some("order-7".into());
+    earlier.owner = Some("alice".into());
+    f.storage.create_task(&earlier).await.unwrap();
+
+    // The lookup comes first, so even a submission that would not validate
+    // (no such model) gets the earlier task back.
+    let submission = |rid: &str| Submission {
+        input: image(),
+        run: Run::Models(vec!["nope".into()]),
+        metadata: Default::default(),
+        request_id: Some(rid.into()),
+    };
+    let same = f
+        .engine
+        .submit(submission("order-7"), Some("alice".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        same,
+        crate::Submitted {
+            id: "earlier".into(),
+            existing: true
+        }
+    );
+    // Another caller's key, or a new key, is a new submission.
+    for (rid, owner) in [("order-7", Some("bob")), ("order-8", Some("alice"))] {
+        let err = f
+            .engine
+            .submit(submission(rid), owner.map(str::to_string))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::UnknownModel(_)), "{err}");
+    }
+}
+
+const PIPELINE: &str = r#"
+    [models.nsfw]
+    architecture = "vit"
+    repo = "test/nsfw"
+    [models.category]
+    architecture = "siglip"
+    repo = "test/siglip"
+    labels = ["food", "sports"]
+    early_exit = { labels = [1], threshold = 0.7 }
+    video_strategy = "s"
+    [models.general]
+    architecture = "vit"
+    repo = "test/general"
+    enabled = false
+
+    [strategies.s]
+    [[strategies.s.sampling]]
+    step = 1
+    method = "uniform"
+    count = 4
+
+    [pipelines.moderation]
+    steps = [
+        { model = "nsfw", order = 1, stop_if = { labels = [1], threshold = 0.85 } },
+        { model = ["category"], order = 2 },
+    ]
+"#;
+
+#[tokio::test]
+async fn submissions_are_checked_against_models_and_pipelines() {
+    let f = fixture_with(PIPELINE).await;
+    let check = |run: Run| f.engine.check_submission(&image(), &run);
+
+    check(Run::Pipeline("moderation".into())).unwrap();
+    check(Run::Models(vec!["nsfw".into(), "category".into()])).unwrap();
+    assert!(matches!(
+        check(Run::Pipeline("nope".into())),
+        Err(EngineError::Config(_))
+    ));
+    assert!(matches!(
+        check(Run::Models(vec!["nsfw".into(), "nsfw".into()])),
+        Err(EngineError::Incompatible(_))
+    ));
+    assert!(matches!(
+        check(Run::Models(vec!["general".into()])),
+        Err(EngineError::Incompatible(_))
+    ));
+}
+
+#[tokio::test]
+async fn the_catalog_lists_models_labels_and_pipelines() {
+    let f = fixture_with(PIPELINE).await;
+    let catalog = f.engine.catalog().await.unwrap();
+
+    let names: Vec<&str> = catalog.models.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["category", "general", "nsfw"]);
+    let category = &catalog.models[0];
+    assert_eq!(category.accepts, [MediaKind::Image, MediaKind::Video]);
+    let labels: Vec<(u32, &str)> = category
+        .labels
+        .iter()
+        .map(|l| (l.id, l.name.as_str()))
+        .collect();
+    assert_eq!(labels, [(0, "food"), (1, "sports")]);
+    assert_eq!(category.trigger.as_ref().unwrap().labels, [1]);
+    assert!(!category.loaded);
+    // A vit model that was never downloaded: no labels, and nothing fetched.
+    let nsfw = &catalog.models[2];
+    assert!(nsfw.labels.is_empty());
+    assert_eq!(nsfw.accepts, [MediaKind::Image]);
+    assert!(!catalog.models[1].enabled);
+
+    let p = &catalog.pipelines[0];
+    assert_eq!(p.name, "moderation");
+    assert_eq!(p.steps[0].models, ["nsfw"]);
+    let gate = p.steps[0].stop_if.as_ref().unwrap();
+    assert_eq!(gate.model, "nsfw");
+    assert_eq!(gate.trigger.labels, [1]);
+    assert_eq!(p.steps[1].models, ["category"]);
+    assert!(p.steps[1].stop_if.is_none());
+}
+
+#[tokio::test]
+async fn a_watch_follows_a_task_until_it_finishes() {
+    let f = fixture().await;
+    // Writes through the engine's storage are announced.
+    let storage = f.engine.inner.storage.clone();
+    storage
+        .create_task(&task("w", TaskState::Queued, ItemState::Queued, None))
+        .await
+        .unwrap();
+
+    let mut watch = f.engine.watch("w");
+    assert_eq!(
+        watch.next().await.unwrap().unwrap().state,
+        TaskState::Queued
+    );
+
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        storage
+            .set_item_state("w", 0, ItemState::Processing, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let done = ModelResult::skipped();
+        storage
+            .upsert_model_result("w", 0, "m", &done)
+            .await
+            .unwrap();
+        storage
+            .set_item_state("w", 0, ItemState::Completed, None)
+            .await
+            .unwrap();
+        storage
+            .set_task_state("w", TaskState::Completed)
+            .await
+            .unwrap();
+    });
+
+    let mut states = Vec::new();
+    while let Some(t) = watch.next().await.unwrap() {
+        states.push(t.state);
+    }
+    writer.await.unwrap();
+    assert_eq!(states.last(), Some(&TaskState::Completed));
+    assert!(states.len() >= 2, "{states:?}");
+    assert!(watch.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn waiting_returns_the_finished_task_or_the_latest_state() {
+    let f = fixture().await;
+    let storage = f.engine.inner.storage.clone();
+    for id in ["slow", "fast"] {
+        storage
+            .create_task(&task(
+                id,
+                TaskState::Processing,
+                ItemState::Processing,
+                None,
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Nothing happens to "slow": the wait ends with its current state.
+    let started = std::time::Instant::now();
+    let slow = f
+        .engine
+        .wait_for("slow", Duration::from_millis(100))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(slow.state, TaskState::Processing);
+    assert!(started.elapsed() >= Duration::from_millis(100));
+
+    // "fast" finishes well within its wait, which returns at once.
+    let s = storage.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        s.set_task_state("fast", TaskState::Failed).await.unwrap();
+    });
+    let started = std::time::Instant::now();
+    let fast = f
+        .engine
+        .wait_for("fast", Duration::from_secs(10))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fast.state, TaskState::Failed);
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    assert!(
+        f.engine
+            .wait_for("missing", Duration::from_millis(10))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

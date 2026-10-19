@@ -29,6 +29,9 @@ fn parses_and_validates_example() {
     let scan = cfg.strategies.get("progressive_scan").expect("strategy");
     assert_eq!(scan.sampling[0].method, SamplingKind::Iframes);
     assert!(scan.early_exit);
+
+    let moderation = cfg.pipelines.get("moderation").expect("pipeline");
+    assert_eq!(moderation.models(), ["nsfw", "category", "general"]);
 }
 
 #[test]
@@ -344,4 +347,74 @@ fn max_frames_parses_and_rejects_zero() {
     assert_eq!(c.strategies["s"].max_frames, Some(40));
     let err = cfg("max_frames = 0").validate().unwrap_err().to_string();
     assert!(err.contains("max_frames must be at least 1"), "{err}");
+}
+
+fn pipeline(steps: &str) -> String {
+    format!(
+        r#"
+        [models.nsfw]
+        architecture = "vit"
+        repo = "a/b"
+        [models.category]
+        architecture = "vit"
+        repo = "a/c"
+        [models.general]
+        architecture = "vit"
+        repo = "a/d"
+
+        [pipelines.moderation]
+        steps = [{steps}]
+        "#
+    )
+}
+
+#[test]
+fn a_pipeline_step_takes_one_model_or_a_list() {
+    let cfg = load::from_str(&pipeline(
+        r#"
+        { model = ["category", "general"], order = 2 },
+        { model = "nsfw", order = 1, stop_if = { labels = [1], threshold = 0.85 } },
+        "#,
+    ))
+    .unwrap();
+    cfg.validate().expect("valid");
+    let p = cfg.pipelines.get("moderation").unwrap();
+    assert_eq!(p.models(), ["nsfw", "category", "general"]);
+    let steps = p.ordered_steps();
+    assert_eq!(steps[0].gate_model(), Some("nsfw"));
+    assert_eq!(steps[1].models(), ["category", "general"]);
+    assert_eq!(steps[1].gate_model(), None);
+}
+
+#[test]
+fn a_multi_model_gate_names_its_model() {
+    let ok = load::from_str(&pipeline(
+        r#"{ model = ["nsfw", "category"], order = 1, stop_if = { model = "nsfw", labels = [1] } },
+           { model = "general", order = 2 }"#,
+    ))
+    .unwrap();
+    ok.validate().expect("valid");
+    let step = ok.pipelines["moderation"].ordered_steps()[0].clone();
+    assert_eq!(step.gate_model(), Some("nsfw"));
+
+    for (steps, needle) in [
+        (
+            r#"{ model = ["nsfw", "category"], order = 1, stop_if = { labels = [1] } }"#,
+            "stop_if.model must name",
+        ),
+        (
+            r#"{ model = ["nsfw", "category"], order = 1, stop_if = { model = "general", labels = [1] } }"#,
+            "is not one of the step's models",
+        ),
+        (
+            r#"{ model = "nsfw", order = 1 }, { model = ["nsfw", "general"], order = 2 }"#,
+            "appears in more than one step",
+        ),
+        (r#"{ model = [], order = 1 }"#, "lists no models"),
+        (r#"{ model = ["nope"], order = 1 }"#, "unknown model 'nope'"),
+    ] {
+        let cfg = load::from_str(&pipeline(steps)).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains(needle), "{steps}: {err}");
+    }
 }

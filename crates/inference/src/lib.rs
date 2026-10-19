@@ -15,7 +15,7 @@ use std::path::Path;
 use candle_core::Device;
 
 use apollo_config::ModelConfig;
-use apollo_domain::{Architecture, Classification, DecodedImage};
+use apollo_domain::{Architecture, Classification, DecodedImage, Label};
 
 mod arch;
 mod device;
@@ -33,11 +33,41 @@ pub trait ImageClassifier: Send + Sync {
     /// selection is architecture-specific (vit: top-5 ∪ >0.90; siglip: a sigmoid
     /// threshold).
     fn classify(&self, images: &[&DecodedImage]) -> Result<Vec<Classification>, InferenceError>;
-    /// The model's label set, ordered by class index.
-    fn labels(&self) -> &[String];
+    /// The labels the model can predict (ids as in its predictions).
+    fn labels(&self) -> &[Label];
     /// Side of the square input the model is fed; images of exactly this size
     /// skip resizing (video frames are extracted at this size).
     fn input_size(&self) -> u32;
+}
+
+/// The labels of the model `cfg` names, read without loading or downloading
+/// anything: from the config (siglip `labels` or `taxonomy_file`) or the
+/// repo's cached `config.json` (vit). `None` when they cannot be read that way
+/// (e.g. a vit model that was never downloaded).
+pub fn labels(cfg: &ModelConfig, cache_dir: Option<&Path>) -> Option<Vec<Label>> {
+    match cfg.architecture {
+        Architecture::Siglip => match cfg.taxonomy_file.as_deref() {
+            Some(path) => {
+                let tax = apollo_config::Taxonomy::load(Path::new(path)).ok()?;
+                Some(
+                    tax.children
+                        .into_iter()
+                        .map(|c| Label {
+                            id: c.id,
+                            name: c.name,
+                        })
+                        .collect(),
+                )
+            }
+            None => Some(Label::indexed(&cfg.labels)),
+        },
+        Architecture::Vit => {
+            let path = loader::cached_file(cfg, cache_dir, "config.json")?;
+            let bytes = std::fs::read(path).ok()?;
+            let names = loader::labels_from_config(&bytes).ok()?;
+            Some(Label::indexed(&names))
+        }
+    }
 }
 
 /// Download (if not cached) and load the model named by `cfg` onto `device`.

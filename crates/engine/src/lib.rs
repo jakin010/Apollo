@@ -5,24 +5,28 @@
 //! - `scheduler` — per-task dispatch: fetch-once, fan-out, global concurrency cap
 //! - `worker`    — per-model dedicated-thread batching worker (idle-unload)
 //! - `registry`  — loaded-model registry + submission validation
-//! - `aggregate` — result / lifecycle-state assembly
-//! - `webhook`   — terminal-item delivery via an injected sink
+//! - `aggregate` — result / lifecycle-state assembly, scan segments
+//! - `webhook`   — task-event delivery via an injected sink
+//! - `watch`     — task change notifications (`WatchTask`, `wait_seconds`)
+//! - `catalog`   — the configured models and pipelines (`ListModels`)
 //!
 //! [`Engine`] is a cheap clonable handle around a shared `Inner`; cloning it does
 //! not duplicate any models or state.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use apollo_config::Config;
-use apollo_domain::{Input, Item, ItemState, Task, TaskState};
+use apollo_domain::{Input, Item, Task};
 use apollo_media::FetchLimits;
 use apollo_storage::Storage;
+use tokio::sync::broadcast;
 
 mod aggregate;
+mod catalog;
 mod error;
 mod gate;
 mod memory;
@@ -30,26 +34,53 @@ mod queue;
 mod registry;
 mod scheduler;
 mod status;
+mod watch;
 mod webhook;
 mod worker;
 
 #[cfg(test)]
 mod tests;
 
+pub use aggregate::task_error;
+pub use apollo_storage::{TaskCursor, TaskPage, TaskQuery};
+pub use catalog::{Catalog, Gate, ModelInfo, PipelineInfo, PipelineStepInfo, Trigger};
 pub use error::EngineError;
 pub use status::{EngineStatus, ModelStatus, TaskCounts};
-pub use webhook::{WebhookError, WebhookSink};
+pub use watch::TaskWatch;
+pub use webhook::{EventKind, TaskEvent, WebhookError, WebhookSink};
 
 use crate::gate::PriorityGate;
 use registry::Registry;
 
-/// One input plus the model labels to run on it.
+/// What to run on an input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Run {
+    /// These models, concurrently.
+    Models(Vec<String>),
+    /// A named `[pipelines.<name>]`: its steps in order, each step's models
+    /// concurrently, gated by `stop_if`.
+    Pipeline(String),
+}
+
+/// One input, what to run on it, and the client's task fields.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Submission {
     pub input: Input,
-    pub models: Vec<String>,
-    /// Optional named pipeline. When set, the engine resolves it to an ordered
-    /// model list and runs the item as a gated sequence instead of a parallel set.
-    pub pipeline: Option<String>,
+    pub run: Run,
+    /// Echoed back on the task and in webhooks.
+    pub metadata: BTreeMap<String, String>,
+    /// Idempotency key: the same owner submitting it again gets the existing
+    /// task back.
+    pub request_id: Option<String>,
+}
+
+/// The task a submission resulted in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submitted {
+    pub id: String,
+    /// The submission's `request_id` matched an earlier task, which is
+    /// returned instead of creating one (the submission's input is unused).
+    pub existing: bool,
 }
 
 /// The orchestration engine. Clone freely — all clones share one core.
@@ -79,6 +110,11 @@ struct Inner {
     in_flight: AtomicUsize,
     /// Per-task cooperative cancellation signals, keyed by task id.
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Ids of changed tasks, announced by the storage wrapper.
+    changes: broadcast::Sender<Arc<str>>,
+    /// Serializes submissions that carry a `request_id`, so two concurrent
+    /// ones cannot both create a task.
+    idempotency: tokio::sync::Mutex<()>,
 }
 
 /// Decrements the in-flight item counter on drop. One guard is created at the
@@ -127,6 +163,11 @@ impl Engine {
         let max_pixels = (config.limits.max_pixels != 0).then_some(config.limits.max_pixels);
         let max_memory_bytes = config.app.max_memory_bytes();
         let max_pending = config.app.max_pending as usize;
+        let (changes, _) = broadcast::channel(watch::CHANGE_BUFFER);
+        let storage: Arc<dyn Storage> = Arc::new(watch::Notifying {
+            inner: storage,
+            changes: changes.clone(),
+        });
 
         let engine = Engine {
             inner: Arc::new(Inner {
@@ -142,6 +183,8 @@ impl Engine {
                 max_pending,
                 in_flight: AtomicUsize::new(0),
                 cancels: Mutex::new(HashMap::new()),
+                changes,
+                idempotency: tokio::sync::Mutex::new(()),
             }),
         };
         engine.spawn_maintenance();
@@ -190,25 +233,33 @@ impl Engine {
     /// token's subject; `None` when authentication is disabled). Returns its id
     /// immediately; processing continues in the background. Validation is
     /// synchronous, so a bad request is rejected before anything is written.
+    ///
+    /// With a `request_id` that `owner` already used, the earlier task is
+    /// returned instead (`existing`), whatever this submission contains. The
+    /// caller then owns an `Input::Bytes` file it staged, as it does when
+    /// `submit` fails.
     pub async fn submit(
         &self,
-        submissions: Vec<Submission>,
+        submission: Submission,
         owner: Option<String>,
-    ) -> Result<String, EngineError> {
-        if submissions.is_empty() {
-            return Err(EngineError::Incompatible("no items submitted".into()));
+    ) -> Result<Submitted, EngineError> {
+        let _serialized = match &submission.request_id {
+            Some(_) => Some(self.inner.idempotency.lock().await),
+            None => None,
+        };
+        if let Some(rid) = &submission.request_id
+            && let Some(id) = self.find_request(owner.as_deref(), rid).await?
+        {
+            return Ok(Submitted { id, existing: true });
         }
-        let mut resolved = Vec::with_capacity(submissions.len());
-        for s in submissions {
-            resolved.push(self.resolve_submission(s)?);
-        }
+
+        let (models, pipeline) = self.resolve(&submission.input, &submission.run)?;
 
         // Backpressure: shed load instead of growing memory without bound.
         self.check_memory()?;
-        let n = resolved.len();
-        let prev = self.inner.in_flight.fetch_add(n, Ordering::SeqCst);
-        if self.inner.max_pending > 0 && prev + n > self.inner.max_pending {
-            self.inner.in_flight.fetch_sub(n, Ordering::SeqCst);
+        let prev = self.inner.in_flight.fetch_add(1, Ordering::SeqCst);
+        if self.inner.max_pending > 0 && prev + 1 > self.inner.max_pending {
+            self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
             return Err(EngineError::Overloaded(format!(
                 "queue full ({prev} items in flight, limit {})",
                 self.inner.max_pending
@@ -216,41 +267,46 @@ impl Engine {
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let items = resolved
-            .into_iter()
-            .map(|(input, models, pipeline)| Item {
-                input,
-                models,
-                pipeline,
-                state: ItemState::Queued,
-                results: Default::default(),
-                error: None,
-                retries: 0,
-            })
-            .collect();
-        let task = Task {
-            id: id.clone(),
-            state: TaskState::Queued,
-            items,
+        let mut task = Task::new(
+            id.clone(),
+            vec![Item::new(submission.input, models, pipeline)],
             owner,
-        };
+        );
+        task.metadata = submission.metadata;
+        task.request_id = submission.request_id;
         if let Err(e) = self.inner.storage.create_task(&task).await {
             // Release the reservation: no run_items will be spawned to do it.
-            self.inner.in_flight.fetch_sub(n, Ordering::SeqCst);
+            self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
             return Err(e.into());
         }
-        tracing::info!(task = %task.id, items = task.items.len(), "task submitted");
+        tracing::info!(task = %task.id, "task submitted");
 
         let engine = self.clone();
         tokio::spawn(async move { engine.run_task(task).await });
-        Ok(id)
+        Ok(Submitted {
+            id,
+            existing: false,
+        })
+    }
+
+    /// The task `owner` submitted with `request_id`, if any.
+    pub async fn find_request(
+        &self,
+        owner: Option<&str>,
+        request_id: &str,
+    ) -> Result<Option<String>, EngineError> {
+        Ok(self
+            .inner
+            .storage
+            .find_task_by_request(owner, request_id)
+            .await?)
     }
 
     /// Check a submission without queueing it: model / pipeline / modality
     /// validation plus a capacity check. Lets `ClassifyStream` reject a request
     /// before accepting any upload bytes. `submit` repeats every check.
-    pub fn check_submission(&self, submission: Submission) -> Result<(), EngineError> {
-        self.resolve_submission(submission)?;
+    pub fn check_submission(&self, input: &Input, run: &Run) -> Result<(), EngineError> {
+        self.resolve(input, run)?;
         self.check_memory()?;
         let pending = self.inner.in_flight.load(Ordering::SeqCst);
         if self.inner.max_pending > 0 && pending >= self.inner.max_pending {
@@ -262,38 +318,42 @@ impl Engine {
         Ok(())
     }
 
-    /// Resolve a named pipeline to its ordered model list (so the models get the
-    /// same compatibility checks as a direct `models` list) and validate the
-    /// models against the input's modality.
-    fn resolve_submission(
+    /// Resolve what to run to the item's model list (a pipeline's models in
+    /// step order, so they get the same compatibility checks as a direct list)
+    /// and pipeline name, and validate the models against the input's modality.
+    fn resolve(
         &self,
-        submission: Submission,
-    ) -> Result<(Input, Vec<String>, Option<String>), EngineError> {
-        let Submission {
-            input,
-            models,
-            pipeline,
-        } = submission;
+        input: &Input,
+        run: &Run,
+    ) -> Result<(Vec<String>, Option<String>), EngineError> {
         let (models, pipeline) =
-            match pipeline {
-                Some(name) => {
+            match run {
+                Run::Pipeline(name) => {
                     let p =
-                        self.inner.config.pipelines.get(&name).ok_or_else(|| {
+                        self.inner.config.pipelines.get(name).ok_or_else(|| {
                             EngineError::Config(format!("unknown pipeline '{name}'"))
                         })?;
-                    let mut steps = p.steps.clone();
-                    steps.sort_by_key(|x| x.order);
-                    (
-                        steps.into_iter().map(|x| x.model).collect::<Vec<_>>(),
-                        Some(name),
-                    )
+                    (p.models(), Some(name.clone()))
                 }
-                None => (models, None),
+                Run::Models(models) => {
+                    let mut seen = std::collections::HashSet::new();
+                    if let Some(dup) = models.iter().find(|m| !seen.insert(*m)) {
+                        return Err(EngineError::Incompatible(format!(
+                            "model '{dup}' is listed twice"
+                        )));
+                    }
+                    (models.clone(), None)
+                }
             };
         self.inner
             .registry
-            .validate_item(&self.inner.config, &input, &models)?;
-        Ok((input, models, pipeline))
+            .validate_item(&self.inner.config, input, &models)?;
+        Ok((models, pipeline))
+    }
+
+    /// A page of tasks (backs `ListTasks`).
+    pub async fn list_tasks(&self, query: &TaskQuery) -> Result<TaskPage, EngineError> {
+        Ok(self.inner.storage.list_tasks(query).await?)
     }
 
     /// Graceful-shutdown hook, called once the server has stopped accepting

@@ -10,8 +10,10 @@ pub mod task;
 
 pub use image::DecodedImage;
 pub use model::{Architecture, Modality};
-pub use result::{Classification, Frame, FrameScan, ModelOutput, Prediction, select_top};
+pub use result::{
+    Classification, Label, ModelOutput, Prediction, Sample, Scan, Segment, select_top,
+};
 pub use task::{
-    ErrorKind, Input, Item, ItemState, ModelResult, ModelState, ParseStateError, Task, TaskError,
-    TaskState, Url,
+    ErrorKind, Input, Item, ItemState, MediaKind, ModelResult, ModelState, ParseStateError, Task,
+    TaskError, TaskState, Url,
 };

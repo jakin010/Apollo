@@ -312,7 +312,7 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 
 ### `[models.<label>.early_exit]`
 
-What counts as a trigger during a **video** frame scan (has no effect without `video_strategy`).
+What counts as a trigger during a **video** frame scan (has no effect without `video_strategy`). A trigger stops the scan early when the strategy's `early_exit` is on, steers its `confirm` and `refine` steps, and defines the scan's **segments**: the stretches of the video where a trigger label reached the threshold (see [gRPC API → Segments](./grpc-api.md#segments)). A model without `early_exit` gets no segments.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -350,26 +350,34 @@ score_threshold = 0.1        # low, so frame‑scan peaks survive aggregation
 
 ## `[pipelines.<name>]` — ordered, gated model execution
 
-A pipeline runs its steps in ascending `order` for one input, instead of running `models` as a parallel set. If a step's optional `stop_if` gate fires (any listed category id at/above the threshold on that model's output), the pipeline **early‑exits** and later steps are marked `SKIPPED` — the task completes normally and fires the task webhook. A step **failure** instead fails the whole pipeline: a transient one is retried up to `[app].max_retries` (finished steps are kept), then the item is marked failed.
+A pipeline runs its steps in ascending `order` for one input, instead of running `models` as one parallel set. A step runs one model or several **concurrently**. When the whole step has finished and its optional `stop_if` gate fires (any listed category id at/above the threshold on the gating model's output), the pipeline **early‑exits**: every model of the later steps is marked `SKIPPED` and the task completes normally (firing the task webhook). A model **failure** instead fails the whole pipeline: a transient one is retried up to `[app].max_retries` (models that finished are kept), then the task is marked failed.
 
-A request opts in by setting `pipeline = "<name>"` on its item (instead of `models`).
+A request opts in by setting `pipeline = "<name>"` instead of `models`. Results come back in step order.
 
 ```toml
 [pipelines.moderation]
 steps = [
-  { model = "nsfw",     order = 1, stop_if = { labels = [1], threshold = 0.85 } },
-  { model = "category", order = 2 },
-  { model = "general",  order = 3 },
+  { model = "nsfw", order = 1, stop_if = { labels = [1], threshold = 0.85 } },
+  # Runs only if nsfw did not fire; both models at once.
+  { model = ["category", "general"], order = 2 },
 ]
 ```
 
-**`stop_if`** reuses the `early_exit` shape (`labels` + `threshold`, default `0.85`) but is **independent** of a model's own `[models.<l>.early_exit]` (which governs video frame scans, not pipeline gating).
+A multi‑model step can gate too; `stop_if.model` then names whose output is checked:
+
+```toml
+{ model = ["nsfw", "violence"], order = 1, stop_if = { model = "nsfw", labels = [1] } }
+```
+
+**`stop_if`** uses the `early_exit` shape (`labels` + `threshold`, default `0.85`) but is **independent** of a model's own `[models.<l>.early_exit]` (which governs video frame scans, not pipeline gating). For a video, it is checked on the scan's aggregated result.
 
 | Step field | Type | Meaning |
 |------------|------|---------|
-| `model` | string | The model label to run (must exist under `[models.*]`). |
+| `model` | string or list | The model to run, or models to run concurrently (each must exist under `[models.*]`). |
 | `order` | u32 | Execution position; unique within the pipeline. |
-| `stop_if` | table | Optional gate: `{ labels = [...], threshold = ... }`. |
+| `stop_if` | table | Optional gate: `{ model = "...", labels = [...], threshold = ... }`. `model` may be left out when the step runs one model. |
+
+Validation rejects a step with no models, an unknown model, a model that appears in more than one step, a `stop_if.model` that is not one of its step's models, and a multi‑model step whose `stop_if` names no model.
 
 ---
 

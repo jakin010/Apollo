@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use apollo_config::{EarlyExit, ModelConfig, PipelineStep, SamplingKind, StrategyConfig};
+use apollo_config::{EarlyExit, ModelConfig, SamplingKind, StrategyConfig};
 use apollo_domain::{
-    Classification, DecodedImage, Frame, Input, Item, ItemState, Modality, ModelOutput,
-    ModelResult, ModelState, TaskError, Url,
+    Classification, DecodedImage, Input, Item, ItemState, MediaKind, Modality, ModelOutput,
+    ModelResult, ModelState, Sample, TaskError, Url,
 };
 use apollo_media::{
     Confirm, FrameRef, FrameRequest, LocalMedia, MediaError, VideoInfo, VideoShare,
@@ -379,9 +379,9 @@ impl Engine {
         true
     }
 
-    /// Run one model of a parallel set: content-cache fast path, else run it,
-    /// cache its output, and persist the result. Runs concurrently with the
-    /// item's other models.
+    /// Run one model of a parallel set or pipeline step: content-cache fast
+    /// path, else run it, cache its output, and persist the result. Runs
+    /// concurrently with the set's (or step's) other models.
     async fn run_set_model(&self, ctx: &ModelRun<'_>, label: &str) -> SetOutcome {
         let (task_id, idx) = (ctx.task_id, ctx.idx);
 
@@ -487,12 +487,13 @@ impl Engine {
         }
     }
 
-    /// Run an item through a named pipeline: its steps in `order`, each optionally
-    /// gated by `stop_if`. A gate firing skips the remaining steps and completes
-    /// the task normally (task webhook). A step *failure* fails the whole pipeline:
-    /// a transient one is retried up to `[app].max_retries` (completed steps
-    /// resume), then the item is dead-lettered. The input was fetched once by the
-    /// caller and is reused.
+    /// Run an item through a named pipeline: its steps in `order`, each step's
+    /// models concurrently (as in a parallel set), each step optionally gated by
+    /// `stop_if`, checked once the whole step has finished. A gate firing skips
+    /// every model of the remaining steps and completes the task normally. A
+    /// model *failure* fails the whole pipeline: a transient one is retried up to
+    /// `[app].max_retries` (finished models are kept), then the item is
+    /// dead-lettered. The input was fetched once by the caller and is reused.
     #[allow(clippy::too_many_arguments)]
     async fn run_pipeline(
         &self,
@@ -508,125 +509,76 @@ impl Engine {
         permit: &mut Option<GatePermit>,
         priority: i32,
     ) {
-        let steps = match self.pipeline_steps(pipeline) {
-            Some(s) => s,
-            None => {
-                self.fail_item(
-                    task_id,
-                    idx,
-                    &item,
-                    TaskError::internal(format!("unknown pipeline '{pipeline}'")),
-                )
-                .await;
-                return;
-            }
+        let Some(config) = self.inner.config.pipelines.get(pipeline) else {
+            self.fail_item(
+                task_id,
+                idx,
+                &item,
+                TaskError::internal(format!("unknown pipeline '{pipeline}'")),
+            )
+            .await;
+            return;
         };
+        let steps = config.ordered_steps();
         let max_retries = self.inner.config.app.max_retries;
 
         let stopped_at = 'attempt: loop {
-            let mut stop_idx: Option<usize> = None;
             for (i, step) in steps.iter().enumerate() {
                 if cancel.load(Ordering::SeqCst) {
                     self.cancel_item(task_id, idx).await;
                     return;
                 }
 
-                // Already terminal (resume or a prior attempt): don't re-run, but
-                // still honour a completed step's gate so later steps stay skipped.
-                if let Some(r) = item.results.get(&step.model) {
-                    match r.state {
-                        ModelState::Done => {
-                            if let (Some(cond), Some(out)) = (&step.stop_if, &r.output)
-                                && output_triggers(out, cond)
-                            {
-                                stop_idx = Some(i);
-                                break;
-                            }
-                            continue;
-                        }
-                        ModelState::Skipped => continue,
-                        _ => {}
-                    }
-                }
-
-                // Content-cache fast path, mirroring the parallel loop.
-                if let Some(ch) = content_hash {
-                    let rev = self.model_revision(&step.model);
-                    if let Ok(Some(output)) = self
-                        .inner
-                        .storage
-                        .cache_lookup(ch, &step.model, &rev, fresh_after)
-                        .await
-                    {
-                        let done = ModelResult::done(output.clone());
-                        let _ = self
-                            .inner
-                            .storage
-                            .upsert_model_result(task_id, idx, &step.model, &done)
-                            .await;
-                        item.results.insert(step.model.clone(), done);
-                        if let Some(uh) = url_hash {
-                            let _ = self
-                                .inner
-                                .storage
-                                .url_cache_store(uh, &step.model, &rev, ch)
-                                .await;
-                        }
-                        if let Some(cond) = &step.stop_if
-                            && output_triggers(&output, cond)
-                        {
-                            stop_idx = Some(i);
-                            break;
-                        }
-                        continue;
-                    }
-                }
-
-                let _ = self
-                    .inner
-                    .storage
-                    .upsert_model_result(task_id, idx, &step.model, &ModelResult::processing())
+                // Models already finished (resume, or a prior attempt) are not
+                // re-run; the step's gate is still checked below.
+                let todo: Vec<String> = step
+                    .models()
+                    .iter()
+                    .filter(|m| !model_done(&item, m))
+                    .cloned()
+                    .collect();
+                if !todo.is_empty() {
+                    let ctx = ModelRun {
+                        task_id,
+                        idx,
+                        item: &item,
+                        fetched,
+                        content_hash,
+                        url_hash,
+                        fresh_after,
+                        cancel,
+                    };
+                    let outcomes = futures::future::join_all(
+                        todo.iter().map(|model| self.run_set_model(&ctx, model)),
+                    )
                     .await;
 
-                match self
-                    .run_model(task_id, idx, &step.model, &item, fetched, cancel)
-                    .await
-                {
-                    Ok(output) => {
-                        self.store_in_cache(task_id, &step.model, content_hash, url_hash, &output)
-                            .await;
-                        let done = ModelResult::done(output.clone());
-                        let _ = self
-                            .inner
-                            .storage
-                            .upsert_model_result(task_id, idx, &step.model, &done)
-                            .await;
-                        item.results.insert(step.model.clone(), done);
-                        if let Some(cond) = &step.stop_if
-                            && output_triggers(&output, cond)
-                        {
-                            stop_idx = Some(i);
-                            break;
+                    // A permanent failure outranks a transient one.
+                    let mut failure: Option<(TaskError, bool)> = None;
+                    let mut cancelled = false;
+                    for (model, outcome) in todo.into_iter().zip(outcomes) {
+                        match outcome {
+                            SetOutcome::Finished(result) => {
+                                item.results.insert(model, result);
+                            }
+                            SetOutcome::Failed { result, transient } => {
+                                if !matches!(failure, Some((_, false))) {
+                                    let err = result.error.clone().unwrap_or_else(|| {
+                                        TaskError::internal(format!("model '{model}' failed"))
+                                    });
+                                    failure = Some((err, transient));
+                                }
+                                item.results.insert(model, result);
+                            }
+                            SetOutcome::Cancelled => cancelled = true,
                         }
                     }
-                    Err(EngineError::Cancelled) => {
+                    if cancelled {
                         self.cancel_item(task_id, idx).await;
                         return;
                     }
-                    Err(e) => {
-                        // Strict: a step failure fails the whole pipeline.
-                        let err = e.to_model_error();
-                        let _ = self
-                            .inner
-                            .storage
-                            .upsert_model_result(
-                                task_id,
-                                idx,
-                                &step.model,
-                                &ModelResult::failed(err.clone()),
-                            )
-                            .await;
-                        if e.is_transient() && item.retries < max_retries {
+                    if let Some((err, transient)) = failure {
+                        if transient && item.retries < max_retries {
                             if !self
                                 .retry_after_failure(
                                     task_id, idx, &mut item, err, permit, priority, cancel,
@@ -637,40 +589,36 @@ impl Engine {
                             }
                             continue 'attempt;
                         }
+                        // Strict: a step failure fails the whole pipeline.
                         self.fail_item(task_id, idx, &item, err).await;
                         return;
                     }
                 }
+
+                if let (Some(stop), Some(gate)) = (&step.stop_if, step.gate_model())
+                    && let Some(out) = item.results.get(gate).and_then(|r| r.output.as_ref())
+                    && output_triggers(out, &stop.labels, stop.threshold)
+                {
+                    break 'attempt Some(i);
+                }
             }
-            break 'attempt stop_idx;
+            break 'attempt None;
         };
 
-        // A gate fired: mark every later step Skipped.
+        // A gate fired: mark every model of the later steps Skipped.
         if let Some(i) = stopped_at {
-            for step in steps.iter().skip(i + 1) {
-                let already_done = matches!(
-                    item.results.get(&step.model).map(|r| &r.state),
-                    Some(ModelState::Done)
-                );
-                if !already_done {
+            for model in steps.iter().skip(i + 1).flat_map(|s| s.models()) {
+                if !model_done(&item, model) {
                     let _ = self
                         .inner
                         .storage
-                        .upsert_model_result(task_id, idx, &step.model, &ModelResult::skipped())
+                        .upsert_model_result(task_id, idx, model, &ModelResult::skipped())
                         .await;
                 }
             }
         }
 
         self.complete_item(task_id, idx).await;
-    }
-
-    /// The steps of a named pipeline, sorted by `order`. `None` if undefined.
-    fn pipeline_steps(&self, name: &str) -> Option<Vec<PipelineStep>> {
-        let p = self.inner.config.pipelines.get(name)?;
-        let mut steps = p.steps.clone();
-        steps.sort_by_key(|s| s.order);
-        Some(steps)
     }
 
     /// Whether the result cache is configured and enabled.
@@ -779,10 +727,15 @@ impl Engine {
     }
 
     /// Mark the item (and its not-yet-done models) failed, then fire the webhook.
-    /// Preserves results from models that already finished on a prior run.
+    /// Preserves results from models that already finished on a prior run, and
+    /// the errors of models that already failed.
     pub(crate) async fn fail_item(&self, task_id: &str, idx: usize, item: &Item, err: TaskError) {
         for label in &item.models {
-            if model_done(item, label) {
+            let failed = item
+                .results
+                .get(label)
+                .is_some_and(|r| r.state == ModelState::Failed);
+            if model_done(item, label) || failed {
                 continue;
             }
             let _ = self
@@ -930,7 +883,18 @@ impl Engine {
                 apollo_media::fetch(url, &self.inner.fetch_limits).await?,
                 true,
             ),
-            Input::Bytes { path, video } => (LocalMedia::adopt(path.clone()), *video),
+            Input::Bytes { path, kind } => (
+                LocalMedia::adopt(path.clone()),
+                match kind {
+                    MediaKind::Image => false,
+                    MediaKind::Video => true,
+                    MediaKind::Audio => {
+                        return Err(EngineError::Incompatible(
+                            "audio inputs are not supported yet".into(),
+                        ));
+                    }
+                },
+            ),
             Input::Text(_) | Input::Audio(_) => {
                 return Err(EngineError::Incompatible(
                     "text/audio inputs are not supported yet".into(),
@@ -1025,7 +989,7 @@ impl Engine {
     /// sampled there when the plan has none). If nothing triggers and the
     /// strategy has `refine` steps, frames around the ambiguous scores are
     /// planned from the results and classified the same way. Rolls up into a
-    /// `FrameScan`.
+    /// `Scan`, with the segments where the trigger fired.
     async fn run_frame_scan(&self, scan: &FrameScanRun<'_>) -> Result<ModelOutput, EngineError> {
         let FrameScanRun {
             task_id,
@@ -1038,12 +1002,12 @@ impl Engine {
         let model = self.model_cfg(label)?;
         let strategy = self.strategy_for(&model)?;
         let trigger = Trigger::for_scan(&strategy, &model);
-        let result = |frames: Vec<Frame>| {
-            let confirming = trigger.as_ref().and_then(Trigger::confirming);
-            Ok(ModelOutput::FrameScan(aggregate::frame_scan(
+        let result = |frames: Vec<Sample>| {
+            Ok(ModelOutput::Scan(aggregate::scan(
                 frames,
                 strategy.aggregation,
-                confirming,
+                trigger.as_ref().map(Trigger::flagging),
+                info.duration,
             )))
         };
 
@@ -1053,7 +1017,7 @@ impl Engine {
         let mut frames = self
             .inner
             .storage
-            .load_frames(task_id, idx, label)
+            .load_samples(task_id, idx, label)
             .await
             .unwrap_or_default();
         let done_idx: HashSet<u32> = frames.iter().map(|f| f.index).collect();
@@ -1132,7 +1096,7 @@ impl Engine {
             && has_refine
             && let Some(t) = trigger.as_ref()
         {
-            let all: Vec<(f64, f32)> = frames.iter().map(|f| (f.timestamp, t.score(f))).collect();
+            let all: Vec<(f64, f32)> = frames.iter().map(|f| (f.start, t.score(f))).collect();
             let effective = match t.rule {
                 Some(rule) => apollo_media::confirm::confirmed_scores(&all, t.threshold, rule),
                 None => all.iter().map(|&(_, s)| s).collect(),
@@ -1186,7 +1150,7 @@ impl Engine {
         model: &ModelConfig,
         trigger: Option<&Trigger>,
         pending: &[FrameRef],
-        frames: &mut Vec<Frame>,
+        frames: &mut Vec<Sample>,
     ) -> Result<bool, EngineError> {
         let FrameScanRun {
             share,
@@ -1276,17 +1240,15 @@ impl Engine {
         model: &ModelConfig,
         trigger: &Trigger,
         candidates: &[FrameRef],
-        frames: &mut Vec<Frame>,
+        frames: &mut Vec<Sample>,
     ) -> Result<bool, EngineError> {
         let Some(rule) = trigger.rule else {
             return Ok(false);
         };
         // Which candidates the frames so far already confirm.
-        let confirmed = |frames: &[Frame]| -> Vec<bool> {
-            let scored: Vec<(f64, f32)> = frames
-                .iter()
-                .map(|f| (f.timestamp, trigger.score(f)))
-                .collect();
+        let confirmed = |frames: &[Sample]| -> Vec<bool> {
+            let scored: Vec<(f64, f32)> =
+                frames.iter().map(|f| (f.start, trigger.score(f))).collect();
             candidates
                 .iter()
                 .map(|c| {
@@ -1309,9 +1271,7 @@ impl Engine {
         for (c, _) in candidates.iter().zip(&before).filter(|(_, done)| !**done) {
             for t in apollo_media::confirm::targets(scan.info, c, rule) {
                 let near = |u: f64| (u - t.timestamp).abs() <= apollo_media::DEDUPE_TOLERANCE;
-                let have = frames
-                    .iter()
-                    .any(|f| f.index == t.index || near(f.timestamp))
+                let have = frames.iter().any(|f| f.index == t.index || near(f.start))
                     || targets.iter().any(|x| near(x.timestamp));
                 if !have {
                     targets.push(t);
@@ -1332,7 +1292,7 @@ impl Engine {
         scan: &FrameScanRun<'_>,
         model: &ModelConfig,
         refs: &[FrameRef],
-        frames: &mut Vec<Frame>,
+        frames: &mut Vec<Sample>,
     ) -> Result<(), EngineError> {
         let batch = model.max_concurrent.max(1) as usize;
         for chunk in refs.chunks(EXTRACT_CHUNK.max(batch)) {
@@ -1364,7 +1324,7 @@ impl Engine {
         scan: &FrameScanRun<'_>,
         refs: &[FrameRef],
         imgs: &[Arc<DecodedImage>],
-    ) -> (Vec<Frame>, Option<EngineError>) {
+    ) -> (Vec<Sample>, Option<EngineError>) {
         let timeout_msg = format!("model '{}' timed out classifying a video frame", scan.label);
         let calls = imgs.iter().map(|img| {
             classify_with_timeout(
@@ -1377,11 +1337,9 @@ impl Engine {
         let mut out = Vec::with_capacity(refs.len());
         for (fref, res) in refs.iter().zip(results) {
             match res {
-                Ok(classification) => out.push(Frame {
-                    timestamp: fref.timestamp,
-                    index: fref.index,
-                    classification,
-                }),
+                Ok(classification) => {
+                    out.push(Sample::frame(fref.index, fref.timestamp, classification))
+                }
                 Err(e) => return (out, Some(e)),
             }
         }
@@ -1390,11 +1348,11 @@ impl Engine {
 
     /// Persist classified frames as one checkpoint; a failure is logged, not
     /// fatal (the frames are only re-done on resume).
-    async fn save_checkpoint(&self, scan: &FrameScanRun<'_>, frames: &[Frame]) {
+    async fn save_checkpoint(&self, scan: &FrameScanRun<'_>, frames: &[Sample]) {
         if let Err(e) = self
             .inner
             .storage
-            .append_frames(scan.task_id, scan.idx, scan.label, frames)
+            .append_samples(scan.task_id, scan.idx, scan.label, frames)
             .await
         {
             tracing::warn!(task = %scan.task_id, model = %scan.label, error = %e, "frame checkpoint failed");
@@ -1455,17 +1413,14 @@ fn model_done(item: &Item, label: &str) -> bool {
     )
 }
 
-/// Whether a model output trips a stop condition: any listed id scoring at or
-/// above the threshold (checked on the aggregated result for a video frame scan).
-fn output_triggers(out: &ModelOutput, cond: &EarlyExit) -> bool {
+/// Whether a model output trips a stop condition: any of `labels` scoring at or
+/// above `threshold` (checked on the aggregated result for a video scan).
+fn output_triggers(out: &ModelOutput, labels: &[u32], threshold: f32) -> bool {
     let class = match out {
         ModelOutput::Classification(c) => c,
-        ModelOutput::FrameScan(fs) => &fs.aggregated,
+        ModelOutput::Scan(scan) => &scan.aggregated,
     };
-    class
-        .predictions
-        .iter()
-        .any(|p| p.score >= cond.threshold && cond.labels.contains(&p.label))
+    apollo_media::triggered(class, labels, threshold)
 }
 
 /// Backoff before the Nth retry: 1s, 2s, 4s, 8s, … capped at 30s.
@@ -1547,34 +1502,34 @@ impl Trigger {
     }
 
     /// The frame's highest trigger-label score.
-    fn score(&self, frame: &Frame) -> f32 {
+    fn score(&self, frame: &Sample) -> f32 {
         apollo_media::trigger_score(&frame.classification, &self.labels)
     }
 
     /// Whether the frame reaches the threshold on its own.
-    fn reached(&self, frame: &Frame) -> bool {
+    fn reached(&self, frame: &Sample) -> bool {
         apollo_media::triggered(&frame.classification, &self.labels, self.threshold)
     }
 
     /// Whether the frame needs confirming: it reaches the threshold and was not
     /// itself sampled to confirm another frame.
-    fn candidate(&self, frame: &Frame) -> bool {
+    fn candidate(&self, frame: &Sample) -> bool {
         self.reached(frame) && !apollo_media::confirm::is_confirmation_frame(frame.index)
     }
 
-    fn confirming(&self) -> Option<aggregate::Confirming<'_>> {
-        self.rule.map(|rule| aggregate::Confirming {
+    fn flagging(&self) -> aggregate::Flagging<'_> {
+        aggregate::Flagging {
             labels: &self.labels,
             threshold: self.threshold,
-            rule,
-        })
+            rule: self.rule,
+        }
     }
 }
 
-fn frame_ref(frame: &Frame) -> FrameRef {
+fn frame_ref(frame: &Sample) -> FrameRef {
     FrameRef {
         index: frame.index,
-        timestamp: frame.timestamp,
+        timestamp: frame.start,
         keyframe: false,
     }
 }

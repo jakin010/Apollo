@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
-use hf_hub::{Repo, RepoType};
+use hf_hub::{Cache, Repo, RepoType};
 
 use apollo_config::ModelConfig;
 
@@ -41,6 +41,27 @@ impl Hub {
             .get(name)
             .map_err(|e| InferenceError::Hub(format!("{name}: {e}")))
     }
+}
+
+/// A file of the repo `cfg` names, if it is already in the local cache (never
+/// downloads).
+pub(crate) fn cached_file(
+    cfg: &ModelConfig,
+    cache_dir: Option<&Path>,
+    name: &str,
+) -> Option<PathBuf> {
+    let cache = match cache_dir {
+        Some(dir) => Cache::new(dir.to_path_buf()),
+        // Where `Api::new()` (used by `Hub::open`) caches.
+        None => Cache::default(),
+    };
+    cache
+        .repo(Repo::with_revision(
+            cfg.repo.clone(),
+            RepoType::Model,
+            cfg.revision.clone(),
+        ))
+        .get(name)
 }
 
 /// Read `id2label` from a model `config.json`, returning labels ordered by index.

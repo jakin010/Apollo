@@ -43,7 +43,7 @@ Migrations are **idempotent** and run automatically inside `open()` at startup, 
 Values are stored in backend‑native columns where it helps queries (ids, states, timestamps, flags) and as **JSON** where the shape is rich:
 
 - **Lifecycle states** (`TaskState`, `ItemState`, `ModelState`) are stored as their lowercase string tokens (`queued`, `processing`, `completed`, `retrying`, `done`, `skipped`, `failed`, `cancelled`).
-- **Model outputs** (`Classification` / `FrameScan`) and **cache entries** are stored as serialized JSON.
+- **Model outputs** (`Classification` / `Scan`) and **cache entries** are stored as serialized JSON. Outputs stored before the API redesign (`FrameScan` with `frames`) still read back.
 - **Errors** (the typed `TaskError`: a category + message) are stored as JSON; a value that doesn't parse is read back as an uncategorized error carrying the raw text.
 - **Timestamps** (`created_at` / `updated_at`) are UNIX seconds.
 
@@ -61,11 +61,14 @@ One row per submission.
 |--------|------|-------|
 | `id` | TEXT | Primary key (the task id). |
 | `state` | TEXT | `TaskState` token. |
-| `owner` | TEXT | Subject of the token that submitted the task (`NULL` when auth was disabled). Only that subject or an admin can read / cancel it. Added to existing databases automatically. |
+| `owner` | TEXT | Subject of the token that submitted the task (`NULL` when auth was disabled). Only that subject or an admin can read / cancel / list it. |
 | `attempts` | INTEGER | Crash‑interrupted resume count; a task is failed once this exceeds the cap (poison‑task guard). A graceful shutdown gives the attempt back, so restarts and deploys never count. |
+| `metadata_json` | TEXT | The client's `metadata` as a JSON object (`NULL` when empty). |
+| `request_id` | TEXT | The client's idempotency key, if any. |
 | `created_at` / `updated_at` | INTEGER | UNIX seconds. |
+| `finished_at` | INTEGER | UNIX seconds when the task first reached a terminal state; `NULL` until then. |
 
-Indexed on `state` (`idx_tasks_state`) for fast recovery scans.
+Indexed on `state` (`idx_tasks_state`) for fast recovery scans, on `request_id` (`idx_tasks_request`) for idempotent resubmission, and on `(created_at, id)` (`idx_tasks_created`) for `ListTasks`. The `owner`, `metadata_json`, `request_id` and `finished_at` columns are added to existing databases automatically.
 
 ### `items`
 
@@ -80,7 +83,7 @@ One row per input within a task. `PRIMARY KEY (task_id, idx)`.
 | `pipeline` | TEXT | Pipeline name, if the item runs a pipeline. |
 | `state` | TEXT | `ItemState` token. |
 | `error` | TEXT | Item‑level error as JSON, if failed. |
-| `webhook_delivered` | INTEGER | 0/1 — the `TaskStatus` delivery flag. |
+| `webhook_delivered` | INTEGER | 0/1 — whether the `FINISHED` webhook event was delivered. |
 | `retries` | INTEGER | Retry count, compared against `[app].max_retries`. |
 
 ### `model_results`
@@ -92,7 +95,7 @@ One row per `(item, model)`. `PRIMARY KEY (task_id, item_idx, label)`, cascading
 | `task_id`, `item_idx` | TEXT/INTEGER | → `items(task_id, idx)`. |
 | `label` | TEXT | Model label. |
 | `state` | TEXT | `ModelState` token. |
-| `output_json` | TEXT | Serialized `ModelOutput` (`Classification`/`FrameScan`), when done. |
+| `output_json` | TEXT | Serialized `ModelOutput` (`Classification`/`Scan`), when done. |
 | `error` | TEXT | Model‑level error as JSON, if failed. |
 | `steps_completed` | INTEGER | Reserved for skipping finished sampling steps on resume; not used yet (resume relies on the `frames` rows). |
 
@@ -128,7 +131,7 @@ The optional result cache (see below).
 The SurrealDB backend models the same data with `SCHEMALESS` tables and explicit indexes:
 
 - **Tables:** `task`, `item`, `model_result`, `frame`, `cache`, `url_cache`.
-- **Indexes:** `task(state)`, `task(created_at)`, `item(task_id)`, `item(webhook_delivered, state)`, `model_result(task_id, item_idx)`, `frame(task_id, item_idx, label)`.
+- **Indexes:** `task(state)`, `task(created_at)`, `task(request_id)`, `item(task_id)`, `item(webhook_delivered, state)`, `model_result(task_id, item_idx)`, `frame(task_id, item_idx, label)`.
 
 Records use composite record ids (e.g. `item:[task_id, idx]`, `model_result:[task_id, item_idx, label]`) mirroring the SQLite primary keys, so the same lifecycle, checkpointing, and cache semantics apply.
 
@@ -141,7 +144,7 @@ On startup the engine loads every task still in a non‑terminal state, fully re
 - `tasks.state` (indexed) to find incomplete work,
 - `model_results.state` + `frames` to skip already‑finished models and frames,
 - `tasks.attempts` (bumped per resume, given back on graceful shutdown) to **fail a poison task** once it exceeds its cap instead of crash‑looping — its items are marked failed, its webhook fires, and its staged upload is removed,
-- `items.webhook_delivered` to redeliver any `TaskStatus` webhook that a crash left un‑acknowledged.
+- `items.webhook_delivered` to redeliver any `FINISHED` webhook event that a crash left un‑acknowledged.
 
 ---
 

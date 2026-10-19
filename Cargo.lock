@@ -207,6 +207,7 @@ name = "apollo-domain"
 version = "1.0.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -289,6 +290,7 @@ dependencies = [
  "apollo-proto",
  "apollo-storage",
  "async-trait",
+ "futures",
  "pasetors",
  "prost",
  "rcgen",

@@ -10,6 +10,9 @@ tonic::include_proto!("apollo.v1");
 
 pub mod webhook_signature;
 
+/// The well-known timestamp type the messages use.
+pub use prost_types::Timestamp;
+
 /// Self-contained `FileDescriptorSet` covering the shared messages and the
 /// `Inference` service only. Register this with `tonic_reflection` on the apollo
 /// server so tools like `grpcurl` discover `Inference` — and not `Webhook`.

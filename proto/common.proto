@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package apollo.v1;
 
+import "google/protobuf/timestamp.proto";
+
 // =============================================================================
 // Shared messages and enums for the apollo.v1 services.
 //
@@ -12,91 +14,121 @@ package apollo.v1;
 // two services leaking into each other's schema.
 // =============================================================================
 
-// --------------------------------- requests ----------------------------------
+// ---------------------------------- inputs -----------------------------------
 
-message ClassifyRequest      { InputItem item = 1; }
-message GetTaskRequest       { string task_id = 1; }
-message CancelRequest        { string task_id = 1; }
-message TaskCreated          { string task_id = 1; }
-message Ack                  {}
-
-// A content reference: a primary URL plus an optional fallback that is tried
-// only if `main` cannot be fetched or decoded. Not a oneof — main and fallback
-// coexist (a primary with a backup), rather than being mutually exclusive.
-message Url {
-  string main = 1;              // local path, file://, or http(s)://
-  optional string fallback = 2; // tried only if `main` fails
+// A media input: what kind it is, and where its bytes come from.
+message Media {
+  MediaKind kind = 1;
+  oneof source {
+    // Local path, `file://`, or `http(s)://`.
+    string url = 2;
+    // The content itself. Bounded by the gRPC message size (4 MiB by default);
+    // stream larger files with `ClassifyStream`.
+    bytes data = 3;
+  }
+  // Tried only if `url` cannot be fetched or decoded.
+  string fallback_url = 4;
 }
 
-// An input plus the models to run on it. Every label must be compatible with
-// the chosen input modality.
-message InputItem {
-  repeated string models = 1;
+enum MediaKind {
+  MEDIA_KIND_UNSPECIFIED = 0;
+  MEDIA_KIND_IMAGE = 1;
+  MEDIA_KIND_VIDEO = 2;
+  MEDIA_KIND_AUDIO = 3;
+}
 
-  oneof input {
-    Url    image_url = 2;   // fetched; supports a fallback
-    Url    video_url = 3;   // fetched; supports a fallback
-    string text      = 4;   // inline content (future); no URL, no fallback
-    Url    audio_url = 5;   // fetched; supports a fallback (future)
-  }
+// Models to run on one input, concurrently.
+message ModelList {
+  repeated string names = 1;
+}
 
-  // Run this input through a named [pipelines.<name>] instead of `models` as a
-  // parallel set: the pipeline's steps run in order and may early-exit. At least
-  // one of `models` or `pipeline` must be set.
-  optional string pipeline = 6;
+// How much of a scan result to return.
+enum ResultView {
+  // Same as SUMMARY.
+  RESULT_VIEW_UNSPECIFIED = 0;
+  // The aggregated result and segments; per-sample results are left out.
+  RESULT_VIEW_SUMMARY = 1;
+  // Everything, including every classified sample.
+  RESULT_VIEW_FULL = 2;
 }
 
 // ---------------------------------- results ----------------------------------
 
-// A task carries a single input. Its `result` is exactly one of:
-//   * error  — the task failed as a whole (e.g. the input could not be fetched);
-//   * state  — a non-terminal (queued/processing) or cancelled task;
-//   * models — the task finished and per-model results are available.
-// The presence of `models` is itself the "completed" signal and the presence of
-// `error` the "failed" signal, so those two states are implicit rather than enum
-// values. Fields 2..99 are reserved — the previous layout put `state`/`items`
-// there — so the result payload starts at 100, leaving room for future
-// top-level fields.
+// One submitted input and everything known about it.
 message Task {
   string id = 1;
+  TaskState state = 2;
+  // Why the task failed, when `state` is FAILED (e.g. the input could not be
+  // fetched). Individual model failures are reported on their result instead.
+  Error error = 3;
+  // One entry per model, in run order (pipeline order, or as requested), each
+  // with its own state; outputs appear as models complete.
+  repeated ModelResult results = 4;
+  // The pipeline the input runs through; empty for a plain set of models.
+  string pipeline = 5;
+  // The client's metadata from the request, unchanged.
+  map<string, string> metadata = 6;
+  // The client's idempotency key from the request, if any.
+  string request_id = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  // Unset until the task is COMPLETED, FAILED or CANCELLED.
+  google.protobuf.Timestamp finished_at = 10;
+  Progress progress = 11;
+  // Times the task was retried after a transient failure.
+  uint32 retries = 12;
+}
 
-  reserved 2 to 99;
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_QUEUED = 1;
+  // Running, or waiting to retry after a transient failure.
+  TASK_STATE_PROCESSING = 2;
+  // Every model finished; check each result's state (one may have failed).
+  TASK_STATE_COMPLETED = 3;
+  // The task as a whole failed; see `Task.error`.
+  TASK_STATE_FAILED = 4;
+  // Cancelled by a client.
+  TASK_STATE_CANCELLED = 5;
+}
 
-  oneof result {
-    Error     error  = 100;  // task-level failure (implicit "failed")
-    TaskState state  = 101;  // non-terminal or cancelled
-    Models    models = 102;  // per-model results (implicit "completed")
+// How many of the task's models have finished (completed, failed or skipped).
+message Progress {
+  uint32 models_total = 1;
+  uint32 models_finished = 2;
+}
+
+// The outcome of one model on the task's input.
+message ModelResult {
+  // The model's name, as configured.
+  string model = 1;
+  ModelState state = 2;
+  // Why the model failed, when `state` is FAILED.
+  Error error = 3;
+  // Set when `state` is COMPLETED.
+  oneof output {
+    // An image (or other single input) classified once.
+    Classification classification = 4;
+    // An image classifier run over a video's sampled frames.
+    Scan scan = 5;
   }
 }
 
-// Per-model results for a finished task, keyed by model label. One model failing
-// does not sink the others — each carries its own `result`.
-message Models {
-  // The pipeline the input ran through, if any (else `models` was a flat set).
-  optional string pipeline = 1;
-  map<string, Model> models = 2;
-}
-
-// The outcome of running one model. Exactly one of:
-//   * error          — the model failed (inference error, timeout, ...);
-//   * state          — the model is still queued/processing, or was skipped;
-//   * classification — image input result;
-//   * frame_scan     — an image-classifier applied to a video (sampled frames).
-// A set `classification`/`frame_scan` is the implicit "done" signal and a set
-// `error` the implicit "failed" signal.
-message Model {
-  oneof result {
-    Error          error          = 1;  // implicit "failed"
-    ModelState     state          = 2;  // queued / processing / skipped
-    Classification classification = 3;  // implicit "done" (image)
-    FrameScan      frame_scan     = 4;  // implicit "done" (video scan)
-  }
+enum ModelState {
+  MODEL_STATE_UNSPECIFIED = 0;
+  MODEL_STATE_QUEUED = 1;
+  MODEL_STATE_PROCESSING = 2;
+  MODEL_STATE_COMPLETED = 3;
+  MODEL_STATE_FAILED = 4;
+  // Not run because an earlier pipeline step's gate fired.
+  MODEL_STATE_SKIPPED = 5;
+  // Not finished because the task was cancelled.
+  MODEL_STATE_CANCELLED = 6;
 }
 
 // A structured error. `kind` categorizes it for programmatic handling; `message`
-// carries human-readable detail (and is always allowed). A purely ad-hoc error
-// uses ERROR_TYPE_UNSPECIFIED with the text in `message`. (`kind`, not `type`, to
-// avoid the Rust keyword.)
+// carries human-readable detail. A purely ad-hoc error uses
+// ERROR_TYPE_UNSPECIFIED with the text in `message`.
 message Error {
   ErrorType kind = 1;
   string message = 2;
@@ -113,55 +145,60 @@ enum ErrorType {
   ERROR_TYPE_INTERNAL = 7;           // an unexpected server error
 }
 
-// A label set. Returned predictions are the top 5 unioned with any label
-// scoring above 0.90.
+// Predictions for one input. The top 5 by score are returned, plus any other
+// label scoring above 0.90 (models with a `score_threshold` return the labels
+// above it instead).
 message Classification {
-  // Flat predictions. The `label` is a class index (vit) or a label-list index
-  // (siglip flat); for a siglip taxonomy model it is the child-category id. The
-  // per-parent grouping was dropped — reconstruct it from the taxonomy if needed.
   repeated Prediction predictions = 1;
 }
 
-// An image-classifier run frame-by-frame over a video.
-message FrameScan {
-  // Rolled up across classified frames via the strategy aggregation (max/mean).
-  Classification aggregated = 1;
-  // Only the frames actually classified (early exit truncates this list).
-  repeated Frame frames = 2;
-}
-
-message Frame {
-  double timestamp = 1;             // seconds into the video
-  uint32 index     = 2;             // ordinal among sampled frames
-  Classification classification = 3;
-}
-
 message Prediction {
+  // The label's id: a class index (vit), a label-list index (siglip), or a
+  // taxonomy category id.
   uint32 label = 1;
-  float  score = 2;
+  // The label's name, e.g. "nsfw" or "food_and_drink.drinks".
+  string name = 2;
+  float score = 3;
 }
 
-// ----------------------------------- enums -----------------------------------
-// proto3 enum values share the package namespace, so each set is prefixed.
-
-// Non-terminal (and cancelled) task states. "Completed" and "failed" are not
-// listed here: they are conveyed by Task.result being `models` or `error`.
-enum TaskState {
-  TASK_STATE_UNSPECIFIED = 0;
-  TASK_STATE_QUEUED      = 1;
-  TASK_STATE_PROCESSING  = 2;
-  reserved 3, 4;  // was COMPLETED / FAILED — now implicit (see Task.result)
-  reserved "TASK_STATE_COMPLETED", "TASK_STATE_FAILED";
-  TASK_STATE_CANCELLED   = 5;   // cancelled by a client request
+// An image classifier run over a video's sampled frames.
+message Scan {
+  // Rolled up across samples by the strategy's aggregation (max or mean).
+  Classification aggregated = 1;
+  // Stretches where the model's trigger labels reached their threshold.
+  repeated Segment segments = 2;
+  // Every classified sample, in time order. Only with RESULT_VIEW_FULL.
+  repeated Sample samples = 3;
+  // How many samples were classified (also when `samples` is left out).
+  uint32 sample_count = 4;
 }
 
-// Non-terminal (and skipped) model states. "Done" and "failed" are not listed:
-// they are conveyed by Model.result being a result payload or `error`.
-enum ModelState {
-  MODEL_STATE_UNSPECIFIED = 0;
-  MODEL_STATE_QUEUED      = 1;
-  MODEL_STATE_PROCESSING  = 2;
-  reserved 3, 4;  // was DONE / FAILED — now implicit (see Model.result)
-  reserved "MODEL_STATE_DONE", "MODEL_STATE_FAILED";
-  MODEL_STATE_SKIPPED     = 5;   // skipped by an earlier pipeline gate
+// One classified sample: a video frame (`start` == `end`).
+message Sample {
+  // Position in processing order.
+  uint32 index = 1;
+  // Seconds into the media.
+  double start = 2;
+  double end = 3;
+  Classification classification = 4;
+}
+
+// A stretch of the media where a trigger label (the model's `early_exit`
+// labels) reached its threshold on consecutive samples.
+message Segment {
+  uint32 label = 1;
+  string name = 2;
+  // First and last flagged sample, in seconds.
+  double start = 3;
+  double end = 4;
+  // Highest score in the segment, and where it was.
+  float peak = 5;
+  double peak_at = 6;
+  // Flagged samples in the segment.
+  uint32 samples = 7;
+  // The nearest sample below the threshold on either side (or the media's
+  // start/end): the segment may extend that far, since nothing between was
+  // sampled.
+  double bound_start = 8;
+  double bound_end = 9;
 }

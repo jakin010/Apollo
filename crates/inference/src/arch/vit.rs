@@ -4,7 +4,7 @@ use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use candle_transformers::models::vit;
 
-use apollo_domain::{Classification, DecodedImage, Prediction, select_top};
+use apollo_domain::{Classification, DecodedImage, Label, select_top};
 
 use crate::ImageClassifier;
 use crate::error::InferenceError;
@@ -14,7 +14,7 @@ use crate::preprocess::{self, Normalization};
 /// A loaded ViT image classifier: weights, labels, and the input normalization.
 pub(crate) struct VitClassifier {
     model: vit::Model,
-    labels: Vec<String>,
+    labels: Vec<Label>,
     norm: Normalization,
     device: Device,
 }
@@ -37,6 +37,7 @@ pub(crate) fn load(hub: &Hub, device: &Device) -> Result<VitClassifier, Inferenc
     // SAFETY: mmap of a trusted, locally-cached safetensors file.
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, device)? };
     let model = vit::Model::new(&config, labels.len(), vb)?;
+    let labels = Label::indexed(&labels);
 
     let norm = preprocess::normalization_for(hub, config.image_size);
     Ok(VitClassifier {
@@ -59,13 +60,11 @@ impl ImageClassifier for VitClassifier {
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let preds = row
+            let preds = self
+                .labels
                 .iter()
-                .enumerate()
-                .map(|(i, &score)| Prediction {
-                    label: i as u32,
-                    score,
-                })
+                .zip(row)
+                .map(|(label, score)| label.predict(score))
                 .collect::<Vec<_>>();
             out.push(Classification {
                 predictions: select_top(preds),
@@ -74,7 +73,7 @@ impl ImageClassifier for VitClassifier {
         Ok(out)
     }
 
-    fn labels(&self) -> &[String] {
+    fn labels(&self) -> &[Label] {
         &self.labels
     }
 

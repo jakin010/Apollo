@@ -28,14 +28,14 @@ use surrealdb::types::SurrealValue;
 
 use apollo_config::SurrealdbConfig;
 use apollo_domain::{
-    Classification, Frame, Input, Item, ItemState, ModelOutput, ModelResult, ModelState, Task,
+    Classification, Input, Item, ItemState, ModelOutput, ModelResult, ModelState, Sample, Task,
     TaskError, TaskState,
 };
 
-use crate::Storage;
 use crate::error::StorageError;
 use crate::now;
 use crate::resume::PendingWebhook;
+use crate::{Storage, TaskCursor, TaskPage, TaskQuery};
 
 type Result<T> = std::result::Result<T, StorageError>;
 
@@ -58,6 +58,7 @@ const SCHEMA: &str = "
     DEFINE TABLE IF NOT EXISTS url_cache SCHEMALESS;
     DEFINE INDEX IF NOT EXISTS task_state ON TABLE task FIELDS state;
     DEFINE INDEX IF NOT EXISTS task_created ON TABLE task FIELDS created_at;
+    DEFINE INDEX IF NOT EXISTS task_request ON TABLE task FIELDS request_id;
     DEFINE INDEX IF NOT EXISTS item_task ON TABLE item FIELDS task_id;
     DEFINE INDEX IF NOT EXISTS item_webhook ON TABLE item FIELDS webhook_delivered, state;
     DEFINE INDEX IF NOT EXISTS mr_item ON TABLE model_result FIELDS task_id, item_idx;
@@ -71,7 +72,7 @@ const CREATE_TASK: &str = "
     BEGIN TRANSACTION;
     CREATE type::record('task', $tid) SET
         key = $tid, state = $tstate, attempts = 0, created_at = $ts, updated_at = $ts,
-        owner = $owner;
+        owner = $owner, metadata_json = $metadata, request_id = $rid;
     FOR $it IN $items {
         CREATE type::record('item', [$tid, $it.idx]) SET
             task_id = $tid, idx = $it.idx, input_json = $it.input_json,
@@ -95,6 +96,17 @@ const CREATE_TASK: &str = "
 struct TaskStateRow {
     state: String,
     owner: Option<String>,
+    metadata_json: Option<String>,
+    request_id: Option<String>,
+    created_at: Option<i64>,
+    updated_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+#[derive(SurrealValue)]
+struct TaskKeyRow {
+    key: String,
+    created_at: i64,
 }
 
 #[derive(SurrealValue)]
@@ -151,7 +163,7 @@ struct StateCountRow {
 }
 
 #[derive(SurrealValue)]
-struct FrameInsert {
+struct SampleInsert {
     frame_index: i64,
     timestamp: f64,
     class_json: String,
@@ -208,7 +220,10 @@ impl SurrealStorage {
     async fn load_task(&self, id: &str) -> Result<Option<Task>> {
         let mut resp = self
             .db
-            .query("SELECT state, owner FROM type::record('task', $tid)")
+            .query(
+                "SELECT state, owner, metadata_json, request_id, created_at, updated_at, finished_at
+                 FROM type::record('task', $tid)",
+            )
             .bind(("tid", id.to_string()))
             .await?;
         let trows: Vec<TaskStateRow> = resp.take(0)?;
@@ -217,6 +232,10 @@ impl SurrealStorage {
         };
         let state = trow.state.parse::<TaskState>()?;
         let owner = trow.owner;
+        let metadata = match trow.metadata_json {
+            Some(j) => serde_json::from_str(&j)?,
+            None => Default::default(),
+        };
 
         let mut resp = self
             .db
@@ -279,6 +298,11 @@ impl SurrealStorage {
             state,
             items,
             owner,
+            metadata,
+            request_id: trow.request_id,
+            created_at: trow.created_at.unwrap_or(0),
+            updated_at: trow.updated_at.unwrap_or(0),
+            finished_at: trow.finished_at,
         }))
     }
 }
@@ -322,6 +346,8 @@ impl Storage for SurrealStorage {
             .bind(("tid", task.id.clone()))
             .bind(("tstate", task.state.as_str().to_string()))
             .bind(("owner", task.owner.clone()))
+            .bind(("metadata", crate::metadata_to_json(&task.metadata)?))
+            .bind(("rid", task.request_id.clone()))
             .bind(("ts", ts))
             .bind(("items", items))
             .bind(("mrs", mrs))
@@ -335,8 +361,16 @@ impl Storage for SurrealStorage {
     }
 
     async fn set_task_state(&self, id: &str, state: TaskState) -> Result<()> {
+        // A finished task keeps its first finish time.
+        let query = if crate::is_terminal(state) {
+            "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts,
+                finished_at = IF finished_at THEN finished_at ELSE $ts END"
+        } else {
+            "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts,
+                finished_at = NONE"
+        };
         self.db
-            .query("UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts")
+            .query(query)
             .bind(("tid", id.to_string()))
             .bind(("state", state.as_str().to_string()))
             .bind(("ts", now()))
@@ -351,7 +385,8 @@ impl Storage for SurrealStorage {
         let mut resp = self
             .db
             .query(
-                "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts
+                "UPDATE type::record('task', $tid)
+                 SET state = $state, updated_at = $ts, finished_at = $ts
                  WHERE state IN ['queued', 'processing']
                  RETURN VALUE state",
             )
@@ -411,47 +446,22 @@ impl Storage for SurrealStorage {
         self.touch(task_id).await
     }
 
-    async fn append_frame(
+    async fn append_samples(
         &self,
         task_id: &str,
         item: usize,
         label: &str,
-        frame: &Frame,
+        samples: &[Sample],
     ) -> Result<()> {
-        let class_json = serde_json::to_string(&frame.classification)?;
-        self.db
-            .query(
-                "UPSERT type::record('frame', [$tid, $idx, $label, $fidx]) SET
-                    task_id = $tid, item_idx = $idx, label = $label,
-                    frame_index = $fidx, timestamp = $ts, class_json = $cj",
-            )
-            .bind(("tid", task_id.to_string()))
-            .bind(("idx", item as i64))
-            .bind(("label", label.to_string()))
-            .bind(("fidx", frame.index as i64))
-            .bind(("ts", frame.timestamp))
-            .bind(("cj", class_json))
-            .await?
-            .check()?;
-        Ok(())
-    }
-
-    async fn append_frames(
-        &self,
-        task_id: &str,
-        item: usize,
-        label: &str,
-        frames: &[Frame],
-    ) -> Result<()> {
-        if frames.is_empty() {
+        if samples.is_empty() {
             return Ok(());
         }
-        let mut rows = Vec::with_capacity(frames.len());
-        for frame in frames {
-            rows.push(FrameInsert {
-                frame_index: frame.index as i64,
-                timestamp: frame.timestamp,
-                class_json: serde_json::to_string(&frame.classification)?,
+        let mut rows = Vec::with_capacity(samples.len());
+        for sample in samples {
+            rows.push(SampleInsert {
+                frame_index: sample.index as i64,
+                timestamp: sample.start,
+                class_json: serde_json::to_string(&sample.classification)?,
             });
         }
         // One round trip and one transaction for the whole batch.
@@ -475,7 +485,7 @@ impl Storage for SurrealStorage {
         Ok(())
     }
 
-    async fn load_frames(&self, task_id: &str, item: usize, label: &str) -> Result<Vec<Frame>> {
+    async fn load_samples(&self, task_id: &str, item: usize, label: &str) -> Result<Vec<Sample>> {
         let mut resp = self
             .db
             .query(
@@ -489,16 +499,101 @@ impl Storage for SurrealStorage {
             .await?;
         let rows: Vec<FrameRow> = resp.take(0)?;
 
-        let mut frames = Vec::with_capacity(rows.len());
+        let mut samples = Vec::with_capacity(rows.len());
         for r in rows {
             let classification: Classification = serde_json::from_str(&r.class_json)?;
-            frames.push(Frame {
-                timestamp: r.timestamp,
-                index: r.frame_index as u32,
+            samples.push(Sample::frame(
+                r.frame_index as u32,
+                r.timestamp,
                 classification,
+            ));
+        }
+        Ok(samples)
+    }
+
+    async fn find_task_by_request(
+        &self,
+        owner: Option<&str>,
+        request_id: &str,
+    ) -> Result<Option<String>> {
+        let mut resp = self
+            .db
+            .query(
+                "SELECT VALUE key FROM task WHERE request_id = $rid AND owner = $owner
+                 ORDER BY created_at LIMIT 1",
+            )
+            .bind(("rid", request_id.to_string()))
+            .bind(("owner", owner.map(str::to_string)))
+            .await?;
+        let ids: Vec<String> = resp.take(0)?;
+        Ok(ids.into_iter().next())
+    }
+
+    async fn list_tasks(&self, query: &TaskQuery) -> Result<TaskPage> {
+        let mut conditions = Vec::new();
+        if query.owner.is_some() {
+            conditions.push("owner = $owner");
+        }
+        if !query.states.is_empty() {
+            conditions.push("state IN $states");
+        }
+        if query.created_after.is_some() {
+            conditions.push("created_at >= $after_ts");
+        }
+        if query.created_before.is_some() {
+            conditions.push("created_at < $before_ts");
+        }
+        if query.after.is_some() {
+            conditions.push("(created_at < $cur_ts OR (created_at = $cur_ts AND key < $cur_id))");
+        }
+        let filter = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+        let limit = query.limit.max(1);
+        // One extra row tells whether another page follows.
+        let sql = format!(
+            "SELECT key, created_at FROM task{filter}
+             ORDER BY created_at DESC, key DESC LIMIT {}",
+            limit + 1
+        );
+        let states: Vec<String> = query
+            .states
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        let (cur_ts, cur_id) = query
+            .after
+            .as_ref()
+            .map_or((0, String::new()), |c| (c.created_at, c.id.clone()));
+        let mut resp = self
+            .db
+            .query(sql)
+            .bind(("owner", query.owner.clone().flatten()))
+            .bind(("states", states))
+            .bind(("after_ts", query.created_after.unwrap_or(0)))
+            .bind(("before_ts", query.created_before.unwrap_or(0)))
+            .bind(("cur_ts", cur_ts))
+            .bind(("cur_id", cur_id))
+            .await?;
+        let rows: Vec<TaskKeyRow> = resp.take(0)?;
+        let more = rows.len() > limit;
+        let mut page = TaskPage::default();
+        let mut last = None;
+        for row in rows.into_iter().take(limit) {
+            if let Some(task) = self.load_task(&row.key).await? {
+                page.tasks.push(task);
+            }
+            last = Some(TaskCursor {
+                created_at: row.created_at,
+                id: row.key,
             });
         }
-        Ok(frames)
+        if more {
+            page.next = last;
+        }
+        Ok(page)
     }
 
     async fn set_steps_completed(

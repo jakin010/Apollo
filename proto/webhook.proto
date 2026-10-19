@@ -3,22 +3,40 @@ syntax = "proto3";
 package apollo.v1;
 
 import "common.proto";
+import "google/protobuf/timestamp.proto";
 
 // =============================================================================
 // Webhook service — implemented by the RECEIVER, called by the apollo server.
 //
 // The apollo server is the client here, calling the receiver configured by
-// [webhook].url. TaskStatus fires when the task's input reaches a terminal state
-// (Task.result is `models`, `error`, or `state: CANCELLED`) and, best-effort, on
-// intermediate transitions (processing, retrying — reported as PROCESSING). The
-// message always carries the full current Task. Delivery of the terminal update
-// is at-least-once, so receivers should dedupe by Task.id. When the server is
-// configured with a secret, each call is signed: `x-apollo-webhook-timestamp`
-// (unix seconds) and `x-apollo-webhook-signature` = "v1=" + lowercase-hex
-// HMAC-SHA256(secret, "<timestamp>." + the encoded Task bytes as sent). See
-// docs/webhooks.md for verification.
+// [webhook].url. It sends a FINISHED event when a task is COMPLETED, FAILED or
+// CANCELLED and, best-effort, PROGRESS events on intermediate transitions
+// (processing, retrying). Each event carries the full current Task (summary
+// view). Delivery of FINISHED is at-least-once, so receivers should dedupe by
+// Task.id. When the server is configured with a secret, each call is signed:
+// `x-apollo-webhook-timestamp` (unix seconds) and `x-apollo-webhook-signature`
+// = "v1=" + lowercase-hex HMAC-SHA256(secret, "<timestamp>." + the encoded
+// TaskEvent bytes as sent). See docs/webhooks.md for verification.
 // =============================================================================
 
 service Webhook {
-  rpc TaskStatus (Task) returns (Ack);
+  rpc Notify (TaskEvent) returns (Ack);
 }
+
+message TaskEvent {
+  TaskEventType type = 1;
+  Task task = 2;
+  // Delivery attempt for this event, starting at 1.
+  uint32 attempt = 3;
+  google.protobuf.Timestamp sent_at = 4;
+}
+
+enum TaskEventType {
+  TASK_EVENT_TYPE_UNSPECIFIED = 0;
+  // The task moved on but has not finished (processing, retrying).
+  TASK_EVENT_TYPE_PROGRESS = 1;
+  // The task is COMPLETED, FAILED or CANCELLED.
+  TASK_EVENT_TYPE_FINISHED = 2;
+}
+
+message Ack {}

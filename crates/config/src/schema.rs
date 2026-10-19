@@ -511,30 +511,97 @@ pub struct EarlyExit {
 }
 
 /// `[pipelines.<name>]` — an ordered, gated sequence of models for one input.
-/// Steps run in ascending `order`; if a step's optional `stop_if` trigger fires
-/// on that model's output, the remaining steps are skipped and the task
-/// completes normally (firing the task webhook). A step *failure* (inference
-/// error) instead fails the whole pipeline, routing the item through the normal
-/// retry + dead-letter path.
+/// Steps run in ascending `order`, each step's models concurrently; if a step's
+/// optional `stop_if` trigger fires on its gating model's output, the remaining
+/// steps are skipped and the task completes normally (firing the task webhook).
+/// A step *failure* (inference error) instead fails the whole pipeline, routing
+/// the item through the normal retry + dead-letter path.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub steps: Vec<PipelineStep>,
 }
 
-/// One step of a pipeline: a model, its position in the order, and an optional
-/// gate condition evaluated on that model's output.
+impl PipelineConfig {
+    /// The steps in run order (ascending `order`).
+    pub fn ordered_steps(&self) -> Vec<&PipelineStep> {
+        let mut steps: Vec<&PipelineStep> = self.steps.iter().collect();
+        steps.sort_by_key(|s| s.order);
+        steps
+    }
+
+    /// Every model of the pipeline, in run order.
+    pub fn models(&self) -> Vec<String> {
+        self.ordered_steps()
+            .into_iter()
+            .flat_map(|s| s.models().iter().cloned())
+            .collect()
+    }
+}
+
+/// One step of a pipeline: its model(s), its position in the order, and an
+/// optional gate evaluated once the step finishes.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineStep {
-    /// The model label to run (must be defined under `[models.*]`).
-    pub model: String,
+    /// The model label to run, or a list of them to run concurrently (each
+    /// must be defined under `[models.*]`).
+    pub model: StepModels,
     /// Execution position; steps run in ascending `order`, unique per pipeline.
     pub order: u32,
-    /// If set and this model's output triggers it (any listed id at or above the
-    /// threshold), the pipeline early-exits and later steps are skipped. Reuses
-    /// the `EarlyExit` shape (`labels` + `threshold`) but is independent of a
-    /// model's own `[models.<l>.early_exit]` (which governs video frame scans).
+    /// If set and the gating model's output triggers it (any listed id at or
+    /// above the threshold), the pipeline early-exits and later steps are
+    /// skipped. Independent of a model's own `[models.<l>.early_exit]` (which
+    /// governs video frame scans).
     #[serde(default)]
-    pub stop_if: Option<EarlyExit>,
+    pub stop_if: Option<StopIf>,
+}
+
+impl PipelineStep {
+    /// The step's models, in the order written.
+    pub fn models(&self) -> &[String] {
+        self.model.names()
+    }
+
+    /// The model whose output `stop_if` checks: `stop_if.model`, or the step's
+    /// only model. `None` without a gate, or when a multi-model step's gate
+    /// names none (rejected by validation).
+    pub fn gate_model(&self) -> Option<&str> {
+        let stop = self.stop_if.as_ref()?;
+        match (&stop.model, self.models()) {
+            (Some(m), _) => Some(m),
+            (None, [only]) => Some(only),
+            (None, _) => None,
+        }
+    }
+}
+
+/// A step's `model`: one name or a list.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum StepModels {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StepModels {
+    pub fn names(&self) -> &[String] {
+        match self {
+            StepModels::One(name) => std::slice::from_ref(name),
+            StepModels::Many(names) => names,
+        }
+    }
+}
+
+/// A pipeline step's gate: stop when `model`'s output has any of `labels` at or
+/// above `threshold` (on the aggregated result for a video scan).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StopIf {
+    /// Whose output is checked; required when the step runs several models.
+    #[serde(default)]
+    pub model: Option<String>,
+    pub labels: Vec<u32>,
+    #[serde(default = "crate::defaults::early_exit_threshold")]
+    pub threshold: f32,
 }
