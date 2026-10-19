@@ -15,7 +15,7 @@
 //!
 //! Video inputs are handled one frame at a time through this same image path
 //! (the scheduler samples frames and submits them as ordinary image jobs); there
-//! is no separate whole-clip path.
+//! is no separate whole-clip path. Text models take text jobs the same way.
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -27,7 +27,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tokio::sync::oneshot;
 
 use apollo_domain::{Classification, DecodedImage};
-use apollo_inference::ImageClassifier;
+use apollo_inference::LoadedModel;
 
 use crate::error::EngineError;
 use crate::metrics::ModelMetrics;
@@ -37,16 +37,22 @@ type ClassifyReply = oneshot::Sender<Result<Classification, EngineError>>;
 type LoadReply = oneshot::Sender<Result<u32, EngineError>>;
 
 /// Builds a model on the worker thread. Errors are reported as text.
-pub(crate) type Loader = Box<dyn Fn() -> Result<Box<dyn ImageClassifier>, String> + Send>;
+pub(crate) type Loader = Box<dyn Fn() -> Result<LoadedModel, String> + Send>;
+
+/// What a job classifies.
+pub(crate) enum Payload {
+    /// Shared, so several models can classify one decoded image without
+    /// copying it.
+    Image(Arc<DecodedImage>),
+    Text(Arc<str>),
+}
 
 /// A unit of work for a model worker.
 pub(crate) enum Job {
-    /// Classify one image, merged with other pending images into a single
+    /// Classify one input, merged with other pending inputs into a single
     /// batched forward pass.
     Classify {
-        /// Shared, so several models can classify one decoded image without
-        /// copying it.
-        image: Arc<DecodedImage>,
+        input: Payload,
         reply: ClassifyReply,
     },
     /// Make sure the weights are resident; replies with the model's input size
@@ -115,9 +121,20 @@ impl ModelHandle {
         &self,
         image: Arc<DecodedImage>,
     ) -> Result<Classification, EngineError> {
+        self.classify(Payload::Image(image)).await
+    }
+
+    pub(crate) async fn classify_text(
+        &self,
+        text: Arc<str>,
+    ) -> Result<Classification, EngineError> {
+        self.classify(Payload::Text(text)).await
+    }
+
+    async fn classify(&self, input: Payload) -> Result<Classification, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Job::Classify { image, reply })
+            .send(Job::Classify { input, reply })
             .map_err(|_| EngineError::WorkerGone)?;
         rx.await.map_err(|_| EngineError::WorkerGone)?
     }
@@ -159,7 +176,7 @@ pub(crate) fn spawn_worker(spec: WorkerSpec, loader: Loader) -> ModelHandle {
 struct Worker {
     spec: WorkerSpec,
     loader: Loader,
-    model: Option<Box<dyn ImageClassifier>>,
+    model: Option<LoadedModel>,
     stats: Arc<WorkerStats>,
 }
 
@@ -190,8 +207,8 @@ impl Worker {
                 Ok(Job::Load { reply }) => {
                     let _ = reply.send(self.ensure_loaded());
                 }
-                Ok(Job::Classify { image, reply }) => match self.ensure_loaded() {
-                    Ok(_) => self.run_batch(image, reply, &rx),
+                Ok(Job::Classify { input, reply }) => match self.ensure_loaded() {
+                    Ok(_) => self.run_batch(input, reply, &rx),
                     Err(e) => {
                         let _ = reply.send(Err(e));
                     }
@@ -208,16 +225,17 @@ impl Worker {
         }
     }
 
-    /// Load the model if it is not resident and return its input size. A failure
-    /// (or panic) leaves it unloaded, so the next job tries again.
+    /// Load the model if it is not resident and return its input size (0 for
+    /// a text model). A failure (or panic) leaves it unloaded, so the next job
+    /// tries again.
     fn ensure_loaded(&mut self) -> Result<u32, EngineError> {
         if let Some(model) = &self.model {
-            return Ok(model.input_size());
+            return Ok(input_size(model));
         }
         let load_started = std::time::Instant::now();
         match catch_unwind(AssertUnwindSafe(|| (self.loader)())) {
             Ok(Ok(m)) => {
-                // Warm up with a 1x1 image: the first forward pass compiles GPU
+                // Warm up with a tiny input: the first forward pass compiles GPU
                 // kernels / allocates buffers and can take seconds, which would
                 // otherwise eat into the first real request's timeout.
                 let started = std::time::Instant::now();
@@ -226,8 +244,12 @@ impl Worker {
                     height: 1,
                     data: vec![0; 3],
                 };
-                match catch_unwind(AssertUnwindSafe(|| m.classify(&[&warm]))) {
-                    Ok(Ok(_)) => {}
+                let warm_up = || match &m {
+                    LoadedModel::Image(m) => m.classify(&[&warm]).map(drop),
+                    LoadedModel::Text(m) => m.classify(&["warm up"]).map(drop),
+                };
+                match catch_unwind(AssertUnwindSafe(warm_up)) {
+                    Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         tracing::warn!(model = %self.spec.name, error = %e, "warm-up inference failed")
                     }
@@ -243,7 +265,7 @@ impl Worker {
                     warmup_ms = started.elapsed().as_millis() as u64,
                     "model loaded"
                 );
-                let size = m.input_size();
+                let size = input_size(&m);
                 self.model = Some(m);
                 self.stats.input_size.store(size, Ordering::Relaxed);
                 self.stats.loads.fetch_add(1, Ordering::Relaxed);
@@ -266,26 +288,17 @@ impl Worker {
     }
 
     /// Merge `first` plus whatever else is queued (up to the batch size) into one
-    /// forward pass, then fan the per-image results back to each caller. Load
+    /// forward pass, then fan the per-input results back to each caller. Load
     /// requests found while draining are answered immediately (the model is
-    /// resident).
-    fn run_batch(
-        &mut self,
-        first: Arc<DecodedImage>,
-        first_reply: ClassifyReply,
-        rx: &Receiver<Job>,
-    ) {
+    /// resident). An input of the wrong kind for the model (text for an image
+    /// model, or the reverse) fails on its own.
+    fn run_batch(&mut self, first: Payload, first_reply: ClassifyReply, rx: &Receiver<Job>) {
         let batch = self.spec.batch.max(1);
-        let mut images = Vec::with_capacity(batch);
-        let mut replies = Vec::with_capacity(batch);
-        images.push(first);
-        replies.push(first_reply);
-        while images.len() < batch {
+        let mut jobs = Vec::with_capacity(batch);
+        jobs.push((first, first_reply));
+        while jobs.len() < batch {
             match rx.try_recv() {
-                Ok(Job::Classify { image, reply }) => {
-                    images.push(image);
-                    replies.push(reply);
-                }
+                Ok(Job::Classify { input, reply }) => jobs.push((input, reply)),
                 Ok(Job::Load { reply }) => {
                     let _ = reply.send(self.ensure_loaded());
                 }
@@ -293,20 +306,81 @@ impl Worker {
             }
         }
 
-        let Some(model) = self.model.as_deref() else {
-            for reply in replies {
+        let Some(model) = self.model.as_ref() else {
+            for (_, reply) in jobs {
                 let _ = reply.send(Err(EngineError::ModelUnavailable(
                     "model is not loaded".into(),
                 )));
             }
             return;
         };
-        let views: Vec<&DecodedImage> = images.iter().map(|img| img.as_ref()).collect();
-        let metrics = Arc::clone(&self.spec.metrics);
-        metrics.batch_size.observe(views.len() as f64);
+        let wrong_kind = |reply: ClassifyReply, what: &str| {
+            let _ = reply.send(Err(EngineError::Incompatible(format!(
+                "model '{}' does not take {what}",
+                self.spec.name
+            ))));
+        };
+        let mut replies = Vec::with_capacity(jobs.len());
+        let outcome = match model {
+            LoadedModel::Image(m) => {
+                let mut images = Vec::with_capacity(jobs.len());
+                for (input, reply) in jobs {
+                    match input {
+                        Payload::Image(img) => {
+                            images.push(img);
+                            replies.push(reply);
+                        }
+                        Payload::Text(_) => wrong_kind(reply, "text"),
+                    }
+                }
+                if images.is_empty() {
+                    return;
+                }
+                let views: Vec<&DecodedImage> = images.iter().map(|img| img.as_ref()).collect();
+                self.timed(views.len(), || m.classify(&views))
+            }
+            LoadedModel::Text(m) => {
+                let mut texts = Vec::with_capacity(jobs.len());
+                for (input, reply) in jobs {
+                    match input {
+                        Payload::Text(t) => {
+                            texts.push(t);
+                            replies.push(reply);
+                        }
+                        Payload::Image(_) => wrong_kind(reply, "images"),
+                    }
+                }
+                if texts.is_empty() {
+                    return;
+                }
+                let views: Vec<&str> = texts.iter().map(|t| t.as_ref()).collect();
+                self.timed(views.len(), || m.classify(&views))
+            }
+        };
+        self.deliver(outcome, replies);
+    }
+
+    /// Run one forward pass of `n` inputs, timed and with panics caught.
+    fn timed(
+        &self,
+        n: usize,
+        f: impl FnOnce() -> Result<Vec<Classification>, apollo_inference::InferenceError>,
+    ) -> std::thread::Result<Result<Vec<Classification>, apollo_inference::InferenceError>> {
+        let metrics = &self.spec.metrics;
+        metrics.batch_size.observe(n as f64);
         let started = std::time::Instant::now();
-        let outcome = catch_unwind(AssertUnwindSafe(|| model.classify(&views)));
+        let outcome = catch_unwind(AssertUnwindSafe(f));
         metrics.batch_seconds.observe_duration(started.elapsed());
+        outcome
+    }
+
+    /// Hand each caller its result, or the batch's error.
+    fn deliver(
+        &mut self,
+        outcome: std::thread::Result<Result<Vec<Classification>, apollo_inference::InferenceError>>,
+        replies: Vec<ClassifyReply>,
+    ) {
+        let metrics = Arc::clone(&self.spec.metrics);
         let err = match outcome {
             // A non-finite score means the forward pass went wrong (e.g. a GPU
             // fault); never hand such a result on — it would be stored and break
@@ -333,7 +407,7 @@ impl Worker {
                 return;
             }
             Ok(Ok(results)) => format!(
-                "model returned {} results for {} images",
+                "model returned {} results for {} inputs",
                 results.len(),
                 replies.len()
             ),
@@ -356,6 +430,15 @@ impl Worker {
     }
 }
 
+/// The square input side of an image model (video frames are extracted at
+/// it); 0 for a text model.
+fn input_size(model: &LoadedModel) -> u32 {
+    match model {
+        LoadedModel::Image(m) => m.input_size(),
+        LoadedModel::Text(_) => 0,
+    }
+}
+
 fn has_non_finite(c: &Classification) -> bool {
     c.predictions.iter().any(|p| !p.score.is_finite())
 }
@@ -375,7 +458,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use apollo_domain::Prediction;
-    use apollo_inference::InferenceError;
+    use apollo_inference::{ImageClassifier, InferenceError, TextClassifier};
 
     /// Classifies every image as label = its width; panics on width 0 and scores
     /// NaN on width 13.
@@ -413,13 +496,63 @@ mod tests {
         })
     }
 
+    /// Classifies every text as label = its length in bytes.
+    struct FakeText;
+
+    impl TextClassifier for FakeText {
+        fn classify(&self, texts: &[&str]) -> Result<Vec<Classification>, InferenceError> {
+            Ok(texts
+                .iter()
+                .map(|t| Classification {
+                    predictions: vec![Prediction::new(t.len() as u32, "len", 0.9)],
+                })
+                .collect())
+        }
+        fn labels(&self) -> &[apollo_domain::Label] {
+            &[]
+        }
+    }
+
+    fn spawn_with(model: fn() -> LoadedModel) -> ModelHandle {
+        spawn_worker(
+            WorkerSpec {
+                name: "test".into(),
+                batch: 4,
+                keep_in_memory: false,
+                idle_ms: Arc::new(AtomicU64::new(60_000)),
+                metrics: crate::metrics::Metrics::new().model("test"),
+            },
+            Box::new(move || Ok(model())),
+        )
+    }
+
+    #[tokio::test]
+    async fn text_models_take_text_and_refuse_images() {
+        let text = spawn_with(|| LoadedModel::Text(Box::new(FakeText)));
+        // Text models report no input size.
+        assert_eq!(text.ensure_loaded().await.unwrap(), 0);
+        let c = text.classify_text(Arc::from("hello")).await.unwrap();
+        assert_eq!(c.predictions[0].label, 5);
+        let err = text.classify_image(img(3)).await.unwrap_err();
+        assert!(err.to_string().contains("does not take images"), "{err}");
+
+        let image = spawn_with(|| LoadedModel::Image(Box::new(Fake)));
+        let err = image.classify_text(Arc::from("hi")).await.unwrap_err();
+        assert!(err.to_string().contains("does not take text"), "{err}");
+        // The image model still serves images afterwards.
+        assert_eq!(
+            image.classify_image(img(3)).await.unwrap().predictions[0].label,
+            3
+        );
+    }
+
     fn spawn(loads: Arc<AtomicUsize>, fail_first: bool, keep: bool) -> ModelHandle {
         let loader: Loader = Box::new(move || {
             let n = loads.fetch_add(1, Ordering::SeqCst);
             if fail_first && n == 0 {
                 return Err("hub unreachable".into());
             }
-            Ok(Box::new(Fake) as Box<dyn ImageClassifier>)
+            Ok(LoadedModel::Image(Box::new(Fake)))
         });
         spawn_worker(
             WorkerSpec {

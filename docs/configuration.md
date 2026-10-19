@@ -142,6 +142,7 @@ Guards applied to inputs: SSRF protection when fetching remote URLs, a gate on l
 | `allow_local_files` | bool | `false` | Allow `file://` and bare local‑path inputs. Off by default; even when on, a path must resolve inside one of `local_roots`. |
 | `local_roots` | list | `[]` | Directories a local‑file input may resolve inside (checked after canonicalization, so `..`/symlinks can't escape). Empty means no local path is permitted, even with `allow_local_files = true`. |
 | `max_pixels` | u64 | `50000000` | Max decoded image pixels (width × height), rejecting decompression bombs before the pixel buffer is allocated. `0` = unlimited. Applies to still images and to sampled video frames. |
+| `max_text` | size | `"100kb"` | Max size of a text input. Inline text over it is rejected at submit; uploaded text fails the task. `0` = unlimited. |
 
 > Video inputs are probed and decoded by ffmpeg restricted to the local `file` protocol, so a crafted container or playlist cannot make ffmpeg open network URLs. Downloads are stored under a fixed name (keeping only a known media extension), and frame dimensions are checked against `max_pixels` before any frame is decoded.
 >
@@ -308,8 +309,8 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `architecture` | enum | *(required)* | `vit` (fixed‑head classifier), `siglip` (open‑vocabulary), or `pdq` (perceptual-hash block list; see [below](#perceptual-hash-block-lists-pdq)). |
-| `repo` | string | *(required for `vit`/`siglip`)* | Hugging Face repo. `pdq` has none. |
+| `architecture` | enum | *(required)* | Image models: `vit` (fixed‑head classifier), `siglip` (open‑vocabulary), or `pdq` (perceptual-hash block list; see [below](#perceptual-hash-block-lists-pdq)). Text models: `bert`, `distilbert`, `xlm_roberta` (also RoBERTa checkpoints; `roberta` is an alias), `modernbert`, `deberta_v2` (also DeBERTa-v3); see [text models](#text-models). |
+| `repo` | string | *(required, except for `pdq`)* | Hugging Face repo. `pdq` has none. |
 | `revision` | string | `"main"` | Repo revision/branch/tag. |
 | `enabled` | bool | `true` | If `false`, the model is rejected at submit time. |
 | `keep_in_memory` | bool | `false` | Load the weights at startup and keep them resident (skip idle‑unload). |
@@ -328,6 +329,8 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 | `max_distance` | u32 | `31` | `pdq`: most differing bits (of 256) that still count as a match. |
 | `min_quality` | u32 | `50` | `pdq`: images whose hash quality (0–100) is lower never match. |
 | `match_rotations` | bool | `true` | `pdq`: also match rotated (90°/180°/270°) and mirrored copies. |
+| `max_tokens` | usize | `128` | Text models: tokens per window (at most the model's limit). |
+| `multi_label` | bool | *(from `config.json`)* | Text models: score each label on its own (sigmoid) instead of as one choice among them (softmax). |
 
 ### `[models.<label>.early_exit]`
 
@@ -441,6 +444,42 @@ Flat or nearly blank images (hash quality below `min_quality`) never match, sinc
 
 ---
 
+## Text models
+
+A text model classifies UTF-8 text sent in a request's `text` (or as `TEXT` media). Five families of Hugging Face sequence-classification checkpoints load, by `architecture`:
+
+| `architecture` | Loads | Example |
+|----------------|-------|---------|
+| `bert` | `BertForSequenceClassification` | `unitary/toxic-bert` (toxicity, multi-label) |
+| `distilbert` | `DistilBertForSequenceClassification` | `distilbert/distilbert-base-uncased-finetuned-sst-2-english` (sentiment) |
+| `xlm_roberta` | `XLMRobertaForSequenceClassification`, `RobertaForSequenceClassification` | `papluca/xlm-roberta-base-language-detection` (20 languages) |
+| `modernbert` | `ModernBertForSequenceClassification` | `cirimus/modernbert-base-go-emotions` (28 emotions, multi-label) |
+| `deberta_v2` | `DebertaV2ForSequenceClassification` (v2 and v3) | `protectai/deberta-v3-base-prompt-injection-v2` (prompt injection) |
+
+```toml
+[models.toxicity]
+architecture = "bert"
+repo         = "unitary/toxic-bert"
+```
+
+The repo needs a `config.json` (with `id2label`, which gives the labels), `model.safetensors`, and a `tokenizer.json`, or a `vocab.txt` for BERT-style models that ship only that (the standard WordPiece tokenizer is built from it, lower-casing as `tokenizer_config.json` says).
+
+**Scores.** A multi-label model (`problem_type = "multi_label_classification"` in its `config.json`, or `multi_label = true`) scores every label on its own with a sigmoid; otherwise the labels' scores are a softmax and sum to 1. Like image models, a result has the top 5 labels plus any above 0.90.
+
+**Long text.** Text is split into overlapping windows of `max_tokens` tokens (128 by default, a quarter of it shared with the next window), each classified on its own; a label's score is its highest in any window, so a passage anywhere in the text counts. A window's score is about the whole window, so smaller windows find a short passage in a long text better, while larger ones give each window more context. Measured with `unitary/toxic-bert`, one toxic sentence in 3,000 words of neutral text scored:
+
+| `max_tokens` | Sentence at the start | In the middle | At the end |
+|---|---|---|---|
+| 512 | 0.66 | 0.03 | 0.09 |
+| 128 (default) | 0.89 | 0.46 | 0.88 |
+| 64 | 0.95 | 0.80 | 0.96 |
+
+The same text without it scored 0.001. Text shorter than a window is classified in one piece, so short texts are unaffected.
+
+Text models take neither `video_strategy` nor `early_exit` (they run no video scans), nor the `siglip` or `pdq` fields. They work in sets and pipelines like any model; a pipeline's models all need to accept the input.
+
+---
+
 ## Taxonomy files (`siglip`)
 
 A `taxonomy_file` defines grouped, prompt‑backed categories for a `siglip` model. It's a **two‑level tree**: top‑level tables are **parent** categories (each needs an integer `id`); nested tables are **child** categories (each needs an `id`, a list of `prompts`, an optional `aggregation`, and an optional `threshold`).
@@ -471,7 +510,7 @@ See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
 `apollo start` validates the config before serving and reports **all** problems at once. Enforced rules include:
 
 - **Strategies:** `confirm` at most 8 with `confirm_window` in (0.05, 5] s, and only for models that define `early_exit`; at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`, `refine`→`min_score` + `window` + `fps`); `min_gap` only on `scene` and ≥ 0; `refine` steps after all others, with `min_score` in 0..1, `window` in (0, 60] s and `fps` in (0, 60]. A model using a strategy with `refine` must define `early_exit`, with a `threshold` above the step's `min_score`.
-- **Models:** `repo` is required for `vit`/`siglip`; a `pdq` model needs a `hash_list` whose lines parse and name its `categories`, and cannot set `labels`, `taxonomy_file`, `prompt_template`, `score_threshold` or `max_results` (while the `pdq` fields are rejected on other architectures); `video_strategy` must name a defined strategy; `early_exit` must list at least one label **and** requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
+- **Models:** `repo` is required, except for `pdq`; text models cannot set `video_strategy` or `early_exit`, `max_tokens` is at least 16, and `max_tokens`/`multi_label` only apply to text models; a `pdq` model needs a `hash_list` whose lines parse and name its `categories`, and cannot set `labels`, `taxonomy_file`, `prompt_template`, `score_threshold` or `max_results` (while the `pdq` fields are rejected on other architectures); `video_strategy` must name a defined strategy; `early_exit` must list at least one label **and** requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
 - **Pipelines:** at least one step; no empty step; every `model` must be defined, and in at most one step; unique `order`s; a `stop_if` must list at least one label id, and name its step's model (`stop_if.model`) when the step runs several.
 - **Taxonomies:** a category `threshold` must be a number from 0 to 1.
 - **Database:** selecting `postgres`/`surrealdb` requires the matching `[database.<backend>]` section.

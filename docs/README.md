@@ -1,6 +1,6 @@
 # Apollo
 
-Apollo is a gRPC service that runs machine‑learning **classification models over images and video**. You submit an input (an image or video URL, its bytes inline, or a stream of raw bytes) together with the names of the models to run on it; Apollo returns the **task** immediately and does the work asynchronously. You then wait for it in the same call, watch it, poll it, or receive it over a webhook.
+Apollo is a gRPC service that runs machine‑learning **classification models over images, video and text**. You submit an input (an image or video URL, its bytes inline, or a stream of raw bytes) together with the names of the models to run on it; Apollo returns the **task** immediately and does the work asynchronously. You then wait for it in the same call, watch it, poll it, or receive it over a webhook.
 
 Models are loaded from [Hugging Face](https://huggingface.co/) and executed with the [candle](https://github.com/huggingface/candle) inference framework. The service is built to be operated as a long‑running daemon: task state is fully persisted, so work survives restarts, and interrupted video scans resume from where they stopped.
 
@@ -9,6 +9,7 @@ Models are loaded from [Hugging Face](https://huggingface.co/) and executed with
 ## What it does, concretely
 
 - **Classify an image.** Run one or more image classifiers on a picture and get back scored labels.
+- **Classify text.** Text classifiers (BERT, DistilBERT, XLM-RoBERTa, ModernBERT, DeBERTa) score toxicity, sentiment, language, prompt injection, emotions — whatever a Hugging Face checkpoint was fine-tuned for. Long text is split into overlapping windows.
 - **Match known images.** A `pdq` model compares perceptual hashes against a block list, so re-encoded or resized copies of listed images are caught, in images and in video frames.
 - **Classify a video.** Any image classifier can be pointed at a video; Apollo samples frames according to a named **strategy**, classifies each frame, and rolls the per‑frame scores up into one result, with the **segments** where a trigger label fired. Scans can **early‑exit** as soon as a trigger label fires.
 - **Run ordered pipelines.** Instead of running models as a parallel set, an input can be sent through a named **pipeline** whose steps run in order (each step's models concurrently) and can **gate** (stop early) based on a previous step's output — e.g. "run the NSFW model first; only run the category and general models if it's clean."
@@ -23,10 +24,10 @@ Models are loaded from [Hugging Face](https://huggingface.co/) and executed with
 |------|---------|
 | **Task** | One submission: one input, the models (or the pipeline) to run on it, and their results. Created by `Classify`/`ClassifyStream`. (Internally a task holds one **item**, the input and its per‑model results.) |
 | **Model** | A registered `[models.<label>]` entry: an architecture + a Hugging Face repo + options. Referenced by its **label**, not its repo. |
-| **Architecture** | The model family: **`vit`** (a fixed‑head image classifier whose labels come from the weights), **`siglip`** (an open‑vocabulary classifier scored against a caller‑supplied label list or a **taxonomy**), or **`pdq`** (perceptual hashes matched against a **block list** of known images). |
+| **Architecture** | The model family. Image models: **`vit`** (a fixed‑head image classifier whose labels come from the weights), **`siglip`** (an open‑vocabulary classifier scored against a caller‑supplied label list or a **taxonomy**), and **`pdq`** (perceptual hashes matched against a **block list** of known images). Text models: **`bert`**, **`distilbert`**, **`xlm_roberta`**, **`modernbert`**, **`deberta_v2`**. |
 | **Strategy** | A reusable `[strategies.<name>]` recipe describing how an image classifier is applied to a video: which frames to sample, how to aggregate per‑frame scores (`max`/`mean`), and whether to early‑exit. |
 | **Pipeline** | A reusable `[pipelines.<name>]` sequence of steps run in order (a step's models concurrently), with optional per‑step gates. |
-| **Prediction** | A `(label, name, score)` triple. `label` is an integer id (a class index for `vit`, a label‑list index or taxonomy child id for `siglip`, a category id for `pdq`), `name` its readable name. |
+| **Prediction** | A `(label, name, score)` triple. `label` is an integer id (a class index for `vit` and text models, a label‑list index or taxonomy child id for `siglip`, a category id for `pdq`), `name` its readable name. |
 | **Segment** | A stretch of a video where one of a model's trigger labels scored at or above its threshold on consecutive sampled frames. |
 
 There is **no separate video architecture** — video is always "an image classifier run over sampled frames."
@@ -84,7 +85,7 @@ Apollo is a Cargo workspace of small crates:
 | `apollo-config` | TOML config schema, defaults, validation, and format‑preserving edits. |
 | `apollo-proto` | Generated protobuf/gRPC types + reflection descriptor. |
 | `apollo-storage` | The `Storage` trait and its SQLite / SurrealDB backends. |
-| `apollo-inference` | candle model loading + inference (`vit`, `siglip`), and PDQ hashing (`pdq`). |
+| `apollo-inference` | candle model loading + inference (`vit`, `siglip`, and the text models), and PDQ hashing (`pdq`). |
 | `apollo-media` | Fetching, decoding, probing, and frame sampling/extraction. |
 | `apollo-engine` | Async orchestration (queue, scheduler, workers, webhook). |
 | `apollo-server` | The gRPC surface: `Inference` service, auth, proto conversion, webhook client. |

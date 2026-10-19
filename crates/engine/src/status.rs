@@ -99,7 +99,7 @@ impl Engine {
                 ModelStatus {
                     label: label.clone(),
                     repo: cfg.repo.clone(),
-                    architecture: format!("{:?}", cfg.architecture).to_lowercase(),
+                    architecture: cfg.architecture.as_str().to_string(),
                     enabled: cfg.enabled,
                     loaded: worker.as_ref().is_some_and(|w| w.loaded),
                     keep_in_memory: cfg.keep_in_memory,

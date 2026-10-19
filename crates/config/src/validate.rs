@@ -307,6 +307,18 @@ impl Config {
 
 /// The fields each architecture needs, and those it cannot use.
 fn validate_architecture(label: &str, model: &ModelConfig, errs: &mut Vec<String>) {
+    use apollo_domain::ModelInput;
+    let arch = model.architecture.as_str();
+    // Fields set where they have no meaning, collected apart from `errs` so
+    // the arms below can add to it too.
+    let mut misplaced = Vec::new();
+    let mut not_for = |field: &str, set: bool, why: &str| {
+        if set {
+            misplaced.push(format!(
+                "model '{label}': `{field}` {why} (architecture \"{arch}\")"
+            ));
+        }
+    };
     let pdq_fields = [
         ("hash_list", model.hash_list.is_some()),
         ("categories", !model.categories.is_empty()),
@@ -314,17 +326,31 @@ fn validate_architecture(label: &str, model: &ModelConfig, errs: &mut Vec<String
         ("min_quality", model.min_quality.is_some()),
         ("match_rotations", model.match_rotations.is_some()),
     ];
+    let siglip_fields = [
+        ("labels", !model.labels.is_empty()),
+        ("taxonomy_file", model.taxonomy_file.is_some()),
+        ("prompt_template", model.prompt_template.is_some()),
+        ("score_threshold", model.score_threshold.is_some()),
+        ("max_results", model.max_results.is_some()),
+    ];
+    let text_fields = [
+        ("max_tokens", model.max_tokens.is_some()),
+        ("multi_label", model.multi_label.is_some()),
+    ];
+    if model.architecture != Architecture::Pdq {
+        for (field, set) in pdq_fields {
+            not_for(field, set, "only applies to architecture \"pdq\"");
+        }
+    }
+    if model.architecture.input() != ModelInput::Text {
+        for (field, set) in text_fields {
+            not_for(field, set, "only applies to text models");
+        }
+    }
     match model.architecture {
         Architecture::Vit | Architecture::Siglip => {
             if model.repo.is_empty() {
                 errs.push(format!("model '{label}': `repo` is required"));
-            }
-            for (field, set) in pdq_fields {
-                if set {
-                    errs.push(format!(
-                        "model '{label}': `{field}` only applies to architecture \"pdq\""
-                    ));
-                }
             }
         }
         Architecture::Pdq => {
@@ -359,21 +385,37 @@ fn validate_architecture(label: &str, model: &ModelConfig, errs: &mut Vec<String
             if model.min_quality.is_some_and(|q| q > 100) {
                 errs.push(format!("model '{label}': min_quality is at most 100"));
             }
-            for (field, set) in [
-                ("labels", !model.labels.is_empty()),
-                ("taxonomy_file", model.taxonomy_file.is_some()),
-                ("prompt_template", model.prompt_template.is_some()),
-                ("score_threshold", model.score_threshold.is_some()),
-                ("max_results", model.max_results.is_some()),
-            ] {
-                if set {
-                    errs.push(format!(
-                        "model '{label}': `{field}` does not apply to architecture \"pdq\""
-                    ));
-                }
+            for (field, set) in siglip_fields {
+                not_for(field, set, "does not apply");
             }
         }
+        Architecture::Bert
+        | Architecture::Distilbert
+        | Architecture::XlmRoberta
+        | Architecture::Modernbert
+        | Architecture::DebertaV2 => {
+            if model.repo.is_empty() {
+                errs.push(format!("model '{label}': `repo` is required"));
+            }
+            if model.max_tokens.is_some_and(|t| t < 16) {
+                errs.push(format!("model '{label}': max_tokens must be at least 16"));
+            }
+            for (field, set) in siglip_fields {
+                not_for(field, set, "does not apply");
+            }
+            not_for(
+                "video_strategy",
+                model.video_strategy.is_some(),
+                "does not apply to a text model",
+            );
+            not_for(
+                "early_exit",
+                model.early_exit.is_some(),
+                "only applies to video scans, which text models do not run",
+            );
+        }
     }
+    errs.extend(misplaced);
 }
 
 /// Check a pdq hash list's lines: `<64 hex digits> <category id>`, the id one

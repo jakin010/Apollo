@@ -2,7 +2,8 @@
 //! over a range of thresholds, recommend one, and optionally write it back.
 //!
 //! The examples run through an in-process engine with a throwaway database,
-//! so images and videos are classified exactly as the server would (a video
+//! so images, videos and texts (`.txt` files) are classified exactly as the
+//! server would (a video
 //! through the model's strategy, its score the scan's aggregated result). A
 //! few settings change for the run so every score is seen:
 //! - the strategy's `early_exit` is off, so a scan does not stop at the
@@ -89,6 +90,7 @@ fn init_logging() {
 enum Kind {
     Image,
     Video,
+    Text,
 }
 
 /// One labelled example: a file and the labels (as written) it shows.
@@ -104,6 +106,7 @@ fn kind_of(path: &Path) -> Option<Kind> {
     match ext.as_str() {
         "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tif" | "tiff" => Some(Kind::Image),
         "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" => Some(Kind::Video),
+        "txt" => Some(Kind::Text),
         _ => None,
     }
 }
@@ -333,6 +336,10 @@ async fn score_all(
         let input = match ex.kind {
             Kind::Image => Input::Image(url),
             Kind::Video => Input::Video(url),
+            Kind::Text => Input::Text(
+                std::fs::read_to_string(&ex.path)
+                    .with_context(|| format!("reading {}", ex.path.display()))?,
+            ),
         };
         let submitted = engine
             .submit(
@@ -878,7 +885,8 @@ mod tests {
             ("nsfw", "a.jpg"),
             ("nsfw/more", "b.MP4"),
             ("negative", "c.png"),
-            ("negative", "notes.txt"),
+            ("negative", "notes.md"),
+            ("negative", "d.txt"),
         ] {
             std::fs::create_dir_all(root.join(sub)).unwrap();
             std::fs::write(root.join(sub).join(file), b"x").unwrap();
@@ -896,6 +904,7 @@ mod tests {
             got,
             [
                 ("c.png".to_string(), Kind::Image, vec![]),
+                ("d.txt".to_string(), Kind::Text, vec![]),
                 ("a.jpg".to_string(), Kind::Image, vec!["nsfw".to_string()]),
                 ("b.MP4".to_string(), Kind::Video, vec!["nsfw".to_string()]),
             ]

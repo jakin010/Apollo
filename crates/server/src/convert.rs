@@ -38,10 +38,27 @@ pub(crate) enum Source {
 }
 
 /// A request's `Media`.
+/// A `ClassifyRequest`'s input: `media`, or inline `text`.
+pub(crate) fn input_from_proto(
+    input: Option<pb::classify_request::Input>,
+) -> Result<Source, String> {
+    use pb::classify_request::Input;
+    match input {
+        Some(Input::Media(m)) => media_from_proto(Some(m)),
+        Some(Input::Text(t)) if t.is_empty() => Err("`text` is empty".into()),
+        Some(Input::Text(t)) => Ok(Source::Input(dom::Input::Text(t))),
+        None => Err("request has no `media` or `text`".into()),
+    }
+}
+
 pub(crate) fn media_from_proto(media: Option<pb::Media>) -> Result<Source, String> {
     let media = media.ok_or("request has no `media`")?;
     let kind = media_kind_from_proto(media.kind)?;
     match media.source {
+        Some(pb::media::Source::Url(_)) if kind == dom::MediaKind::Text => Err(
+            "text cannot come from a `url`; send it as `text`, as `media.data`, or with ClassifyStream"
+                .into(),
+        ),
         Some(pb::media::Source::Url(url)) if !url.is_empty() => {
             let url = dom::Url {
                 main: url,
@@ -51,6 +68,7 @@ pub(crate) fn media_from_proto(media: Option<pb::Media>) -> Result<Source, Strin
                 dom::MediaKind::Image => dom::Input::Image(url),
                 dom::MediaKind::Video => dom::Input::Video(url),
                 dom::MediaKind::Audio => dom::Input::Audio(url),
+                dom::MediaKind::Text => unreachable!("rejected above"),
             }))
         }
         Some(pb::media::Source::Data(bytes)) if !bytes.is_empty() => {
@@ -68,7 +86,8 @@ pub(crate) fn media_kind_from_proto(kind: i32) -> Result<dom::MediaKind, String>
         Ok(pb::MediaKind::Image) => Ok(dom::MediaKind::Image),
         Ok(pb::MediaKind::Video) => Ok(dom::MediaKind::Video),
         Ok(pb::MediaKind::Audio) => Ok(dom::MediaKind::Audio),
-        Ok(pb::MediaKind::Unspecified) => Err("`kind` must be IMAGE, VIDEO or AUDIO".into()),
+        Ok(pb::MediaKind::Text) => Ok(dom::MediaKind::Text),
+        Ok(pb::MediaKind::Unspecified) => Err("`kind` must be IMAGE, VIDEO, AUDIO or TEXT".into()),
         Err(_) => Err(format!("unknown media kind {kind}")),
     }
 }
@@ -463,6 +482,7 @@ fn media_kind_to_proto(k: dom::MediaKind) -> pb::MediaKind {
         dom::MediaKind::Image => pb::MediaKind::Image,
         dom::MediaKind::Video => pb::MediaKind::Video,
         dom::MediaKind::Audio => pb::MediaKind::Audio,
+        dom::MediaKind::Text => pb::MediaKind::Text,
     }
 }
 
@@ -507,6 +527,34 @@ mod tests {
                 bytes: vec![1, 2]
             }
         );
+    }
+
+    #[test]
+    fn text_comes_inline_or_as_data_but_not_from_a_url() {
+        use pb::classify_request::Input;
+        use pb::media::Source as S;
+        assert_eq!(
+            input_from_proto(Some(Input::Text("hello".into()))),
+            Ok(Source::Input(dom::Input::Text("hello".into())))
+        );
+        assert!(input_from_proto(Some(Input::Text(String::new()))).is_err());
+        assert!(input_from_proto(None).is_err());
+        let data =
+            media_from_proto(media(pb::MediaKind::Text, S::Data(b"hi".to_vec()), "")).unwrap();
+        assert_eq!(
+            data,
+            Source::Data {
+                kind: dom::MediaKind::Text,
+                bytes: b"hi".to_vec()
+            }
+        );
+        let err = media_from_proto(media(
+            pb::MediaKind::Text,
+            S::Url("https://x/a.txt".into()),
+            "",
+        ))
+        .unwrap_err();
+        assert!(err.contains("cannot come from a `url`"), "{err}");
     }
 
     #[test]

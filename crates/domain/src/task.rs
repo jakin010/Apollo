@@ -46,6 +46,8 @@ pub enum MediaKind {
     Image,
     Video,
     Audio,
+    /// UTF-8 text.
+    Text,
 }
 
 impl Input {
@@ -60,6 +62,7 @@ impl Input {
                 MediaKind::Image => Modality::Image,
                 MediaKind::Video => Modality::Video,
                 MediaKind::Audio => Modality::Audio,
+                MediaKind::Text => Modality::Text,
             },
         }
     }

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use apollo_config::EarlyExit;
-use apollo_domain::{Architecture, Label, MediaKind};
+use apollo_domain::{Architecture, Label, MediaKind, ModelInput};
 
 use crate::Engine;
 use crate::error::EngineError;
@@ -23,7 +23,8 @@ pub struct ModelInfo {
     pub name: String,
     pub architecture: Architecture,
     pub repo: String,
-    /// Input kinds it accepts: images, and video with a video strategy.
+    /// Input kinds it accepts: images (and video, with a video strategy), or
+    /// text.
     pub accepts: Vec<MediaKind>,
     pub enabled: bool,
     /// Weights currently in memory.
@@ -88,10 +89,13 @@ impl Engine {
             .into_iter()
             .filter_map(|(name, labels)| {
                 let cfg = config.models.get(&name)?;
-                let mut accepts = vec![MediaKind::Image];
-                if cfg.video_strategy.is_some() {
-                    accepts.push(MediaKind::Video);
-                }
+                let accepts = match cfg.architecture.input() {
+                    ModelInput::Text => vec![MediaKind::Text],
+                    ModelInput::Image if cfg.video_strategy.is_some() => {
+                        vec![MediaKind::Image, MediaKind::Video]
+                    }
+                    ModelInput::Image => vec![MediaKind::Image],
+                };
                 let loaded = self
                     .live()
                     .registry

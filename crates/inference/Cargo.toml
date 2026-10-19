@@ -29,3 +29,6 @@ candle-transformers = { version = "0.11", features = ["metal"] }
 # CUDA is opt-in: it needs the NVIDIA toolkit and only builds on Linux/Windows.
 # Do NOT enable it on macOS. Without it, non-macOS builds are CPU-only.
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+
+[dev-dependencies]
+tempfile = "3"

@@ -156,6 +156,16 @@ fps    = 5
 # early_exit     = { labels = [1], threshold = 0.87 }
 # match_rotations = true          # default: rotated/mirrored copies match too
 
+# --- Text models -----------------------------------------------------------------
+# A Hugging Face sequence-classification checkpoint: architecture "bert",
+# "distilbert", "xlm_roberta", "modernbert" or "deberta_v2". It takes text (a
+# request's `text`); long text runs in overlapping windows of `max_tokens`
+# (default 128). Multi-label models score each label with a sigmoid.
+# [models.toxicity]
+# architecture = "bert"
+# repo         = "unitary/toxic-bert"
+# max_tokens   = 128
+
 # --- Metrics: a Prometheus scrape endpoint ------------------------------------
 # Off by default. `GET /metrics` on its own listener (not the gRPC port). It is
 # not authenticated, so keep it on loopback or behind a firewall. Read at

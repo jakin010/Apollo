@@ -111,3 +111,7 @@ pub(crate) fn metrics_endpoint() -> String {
 pub(crate) fn metrics_port() -> u16 {
     9464
 }
+
+pub(crate) fn max_text() -> String {
+    "100kb".to_string()
+}
