@@ -49,6 +49,17 @@ pub(crate) fn preprocess(
     Ok(Tensor::stack(&tensors, 0)?)
 }
 
+/// `img` at `size`×`size`, resized as [`preprocess`] resizes it, so a model
+/// classifying the result scores it exactly as it would score `img`. Lets the
+/// engine resize on its blocking pool instead of on the model's thread.
+pub fn resize_to_input(img: &DecodedImage, size: u32) -> Result<DecodedImage, InferenceError> {
+    Ok(DecodedImage {
+        width: size,
+        height: size,
+        data: resize_rgb(img, size)?,
+    })
+}
+
 /// The pixels at `size`×`size`: copied as-is when the image already has that
 /// size (e.g. video frames extracted at the model size), else resized from a
 /// borrowed view of the buffer (no copy of the full-resolution image).
@@ -133,5 +144,27 @@ mod tests {
         let norm = Normalization::centered(4);
         let batch = preprocess(&[&img, &img], &norm, &Device::Cpu).unwrap();
         assert_eq!(batch.dims(), &[2, 3, 4, 4]);
+    }
+
+    #[test]
+    fn resizing_ahead_gives_the_same_tensor() {
+        let (width, height) = (61, 37);
+        let data = (0..width * height * 3)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect::<Vec<_>>();
+        let img = DecodedImage {
+            width,
+            height,
+            data,
+        };
+        let norm = Normalization::centered(16);
+        let resized = resize_to_input(&img, 16).unwrap();
+        assert_eq!((resized.width, resized.height), (16, 16));
+        let direct = preprocess(&[&img], &norm, &Device::Cpu).unwrap();
+        let ahead = preprocess(&[&resized], &norm, &Device::Cpu).unwrap();
+        assert_eq!(
+            direct.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            ahead.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
     }
 }
