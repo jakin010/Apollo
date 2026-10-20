@@ -238,6 +238,10 @@ impl ImageClassifier for SiglipClassifier {
     fn input_size(&self) -> u32 {
         self.norm.size as u32
     }
+
+    fn resizes_to_input(&self) -> bool {
+        true
+    }
 }
 
 /// Flat mode: every label scoring at/above `threshold`, highest first, capped by

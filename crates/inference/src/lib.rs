@@ -31,7 +31,7 @@ pub use arch::pdq::{
 };
 pub use device::{DeviceKind, open_device, select_device};
 pub use error::InferenceError;
-pub use preprocess::Normalization;
+pub use preprocess::{Normalization, resize_to_input};
 
 /// An image classifier: independent per-image classification, batched.
 pub trait ImageClassifier: Send + Sync {
@@ -44,6 +44,13 @@ pub trait ImageClassifier: Send + Sync {
     /// Side of the square input the model is fed; images of exactly this size
     /// skip resizing (video frames are extracted at this size).
     fn input_size(&self) -> u32;
+    /// Whether `classify` only uses an image after resizing it to
+    /// `input_size` with [`resize_to_input`], so a caller may resize ahead of
+    /// time, off the model's thread, and get the same result. `false` for a
+    /// model that reads the full image (`pdq`).
+    fn resizes_to_input(&self) -> bool {
+        false
+    }
 }
 
 /// A text classifier: independent per-text classification, batched.

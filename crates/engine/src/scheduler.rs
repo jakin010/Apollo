@@ -5,8 +5,8 @@
 //! and an interrupted video scan continues from its persisted frame checkpoint.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use apollo_config::{EarlyExit, ModelConfig, SamplingKind, StrategyConfig};
@@ -22,7 +22,7 @@ use crate::Engine;
 use crate::aggregate;
 use crate::error::EngineError;
 use crate::gate::GatePermit;
-use crate::worker::ModelHandle;
+use crate::worker::{InputShape, ModelHandle};
 
 /// How long to wait for a cold model to download and load. Separate from (and
 /// much longer than) the per-classification `timeout`, which only starts once
@@ -31,8 +31,7 @@ const MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// A fetched, decoded/probed input ready for inference.
 enum Fetched {
-    /// Shared so each model of the item classifies the same buffer, uncopied.
-    Image(Arc<DecodedImage>),
+    Image(StillImage),
     Video {
         /// Owns the file `share` reads: a download is deleted when dropped.
         _media: LocalMedia,
@@ -42,6 +41,49 @@ enum Fetched {
         share: Arc<VideoShare>,
     },
     Text(Arc<str>),
+}
+
+/// A decoded still image, and copies of it resized to the models' input
+/// sizes. Each size is resized once, on the blocking pool, and shared by every
+/// model of the item that takes it (and by later pipeline steps), so a model's
+/// worker thread gets its input ready to batch instead of resizing a
+/// full-resolution photo while the GPU waits.
+struct StillImage {
+    /// Shared so each model that needs the full image classifies the same
+    /// buffer, uncopied.
+    full: Arc<DecodedImage>,
+    resized: Mutex<HashMap<u32, Arc<tokio::sync::OnceCell<Arc<DecodedImage>>>>>,
+}
+
+impl StillImage {
+    fn new(full: DecodedImage) -> Self {
+        Self {
+            full: Arc::new(full),
+            resized: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The image as a model with `shape` takes it.
+    async fn input_for(&self, shape: InputShape) -> Result<Arc<DecodedImage>, EngineError> {
+        let size = shape.size;
+        if !shape.resize_ahead || (self.full.width == size && self.full.height == size) {
+            return Ok(Arc::clone(&self.full));
+        }
+        let cell = Arc::clone(self.resized.lock().unwrap().entry(size).or_default());
+        let resized = cell
+            .get_or_try_init(|| async {
+                let full = Arc::clone(&self.full);
+                let img = tokio::task::spawn_blocking(move || {
+                    apollo_inference::resize_to_input(&full, size)
+                })
+                .await
+                .map_err(|e| EngineError::Join(e.to_string()))?
+                .map_err(|e| EngineError::Inference(e.to_string()))?;
+                Ok::<_, EngineError>(Arc::new(img))
+            })
+            .await?;
+        Ok(Arc::clone(resized))
+    }
 }
 
 /// What every model of an item's parallel set shares.
@@ -840,28 +882,25 @@ impl Engine {
 
         // Wait for a cold model to download/load before starting the per-
         // classification clock, so first use is not reported as a timeout.
-        let input_size =
-            match tokio::time::timeout(MODEL_LOAD_TIMEOUT, handle.ensure_loaded()).await {
-                Ok(loaded) => loaded?,
-                Err(_) => {
-                    return Err(EngineError::ModelUnavailable(format!(
-                        "model '{label}' did not load within {}s",
-                        MODEL_LOAD_TIMEOUT.as_secs()
-                    )));
-                }
-            };
+        let shape = match tokio::time::timeout(MODEL_LOAD_TIMEOUT, handle.ensure_loaded()).await {
+            Ok(loaded) => loaded?,
+            Err(_) => {
+                return Err(EngineError::ModelUnavailable(format!(
+                    "model '{label}' did not load within {}s",
+                    MODEL_LOAD_TIMEOUT.as_secs()
+                )));
+            }
+        };
 
         let timeout = self.model_timeout(label);
         match (item.input.modality(), fetched) {
-            (Modality::Image, Fetched::Image(img)) => {
-                // One image: the whole classification is bounded by `timeout`.
+            (Modality::Image, Fetched::Image(still)) => {
+                // One image: the whole classification is bounded by `timeout`,
+                // which starts once the image is resized for the model.
+                let img = still.input_for(shape).await?;
                 let on_timeout = format!("model '{label}' timed out classifying image");
-                let c = classify_with_timeout(
-                    timeout,
-                    handle.classify_image(Arc::clone(img)),
-                    &on_timeout,
-                )
-                .await?;
+                let c =
+                    classify_with_timeout(timeout, handle.classify_image(img), &on_timeout).await?;
                 Ok(ModelOutput::Classification(c))
             }
             (Modality::Text, Fetched::Text(text)) => {
@@ -885,7 +924,7 @@ impl Engine {
                     handle: &handle,
                     share,
                     info,
-                    input_size,
+                    input_size: shape.size,
                     timeout,
                     cancel,
                 };
@@ -996,7 +1035,7 @@ impl Engine {
             tokio::task::spawn_blocking(move || apollo_media::decode_image(&bytes, max_pixels))
                 .await
                 .map_err(|e| EngineError::Join(e.to_string()))??;
-        Ok((Fetched::Image(Arc::new(img)), hash))
+        Ok((Fetched::Image(StillImage::new(img)), hash))
     }
 
     /// Probe `media` as a video, hashing the file for the cache key when
@@ -1628,5 +1667,54 @@ async fn classify_with_timeout(
     match tokio::time::timeout(timeout, fut).await {
         Ok(result) => result,
         Err(_) => Err(EngineError::Timeout(on_timeout.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn photo(width: u32, height: u32) -> DecodedImage {
+        DecodedImage {
+            width,
+            height,
+            data: (0..width * height * 3).map(|i| (i % 251) as u8).collect(),
+        }
+    }
+
+    fn shape(size: u32, resize_ahead: bool) -> InputShape {
+        InputShape { size, resize_ahead }
+    }
+
+    #[tokio::test]
+    async fn models_that_resize_get_one_shared_copy_per_size() {
+        let still = StillImage::new(photo(90, 60));
+        let (a, b) = tokio::join!(
+            still.input_for(shape(16, true)),
+            still.input_for(shape(16, true))
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(Arc::ptr_eq(&a, &b), "concurrent models share one resize");
+        assert_eq!((a.width, a.height), (16, 16));
+        let expected = apollo_inference::resize_to_input(&still.full, 16).unwrap();
+        assert_eq!(a.data, expected.data);
+
+        let again = still.input_for(shape(16, true)).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &again), "later steps reuse it");
+        let other = still.input_for(shape(8, true)).await.unwrap();
+        assert_eq!((other.width, other.height), (8, 8));
+    }
+
+    #[tokio::test]
+    async fn the_full_image_when_resizing_is_not_wanted_or_needed() {
+        let still = StillImage::new(photo(90, 60));
+        // A model that reads the full image (pdq).
+        let full = still.input_for(shape(512, false)).await.unwrap();
+        assert!(Arc::ptr_eq(&full, &still.full));
+
+        // Already the model's size: nothing to resize.
+        let square = StillImage::new(photo(16, 16));
+        let same = square.input_for(shape(16, true)).await.unwrap();
+        assert!(Arc::ptr_eq(&same, &square.full));
     }
 }

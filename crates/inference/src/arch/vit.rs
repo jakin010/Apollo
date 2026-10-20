@@ -80,4 +80,8 @@ impl ImageClassifier for VitClassifier {
     fn input_size(&self) -> u32 {
         self.norm.size as u32
     }
+
+    fn resizes_to_input(&self) -> bool {
+        true
+    }
 }

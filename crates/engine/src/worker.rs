@@ -33,8 +33,21 @@ use crate::error::EngineError;
 use crate::metrics::ModelMetrics;
 
 type ClassifyReply = oneshot::Sender<Result<Classification, EngineError>>;
-/// Answers a load request with the model's input size.
-type LoadReply = oneshot::Sender<Result<u32, EngineError>>;
+/// Answers a load request with the model's input shape.
+type LoadReply = oneshot::Sender<Result<InputShape, EngineError>>;
+
+/// What a loaded model takes as input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InputShape {
+    /// Side of the square input of an image model (video frames are extracted
+    /// at it); 0 for a text model.
+    pub(crate) size: u32,
+    /// Still images may be resized to `size` before they are sent, with
+    /// `apollo_inference::resize_to_input`, so the worker thread doesn't spend
+    /// its time resizing while the GPU waits. False when the model needs the
+    /// full image (`pdq`).
+    pub(crate) resize_ahead: bool,
+}
 
 /// Builds a model on the worker thread. Errors are reported as text.
 pub(crate) type Loader = Box<dyn Fn() -> Result<LoadedModel, String> + Send>;
@@ -55,7 +68,7 @@ pub(crate) enum Job {
         input: Payload,
         reply: ClassifyReply,
     },
-    /// Make sure the weights are resident; replies with the model's input size
+    /// Make sure the weights are resident; replies with the model's input shape
     /// once they are (or the load error).
     Load { reply: LoadReply },
 }
@@ -107,9 +120,9 @@ impl ModelHandle {
         }
     }
 
-    /// Wait until the model's weights are loaded and return its input size
-    /// (square side in pixels). Cheap when already resident.
-    pub(crate) async fn ensure_loaded(&self) -> Result<u32, EngineError> {
+    /// Wait until the model's weights are loaded and return its input shape.
+    /// Cheap when already resident.
+    pub(crate) async fn ensure_loaded(&self) -> Result<InputShape, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Job::Load { reply })
@@ -225,12 +238,11 @@ impl Worker {
         }
     }
 
-    /// Load the model if it is not resident and return its input size (0 for
-    /// a text model). A failure (or panic) leaves it unloaded, so the next job
-    /// tries again.
-    fn ensure_loaded(&mut self) -> Result<u32, EngineError> {
+    /// Load the model if it is not resident and return its input shape. A
+    /// failure (or panic) leaves it unloaded, so the next job tries again.
+    fn ensure_loaded(&mut self) -> Result<InputShape, EngineError> {
         if let Some(model) = &self.model {
-            return Ok(input_size(model));
+            return Ok(input_shape(model));
         }
         let load_started = std::time::Instant::now();
         match catch_unwind(AssertUnwindSafe(|| (self.loader)())) {
@@ -265,9 +277,9 @@ impl Worker {
                     warmup_ms = started.elapsed().as_millis() as u64,
                     "model loaded"
                 );
-                let size = input_size(&m);
+                let shape = input_shape(&m);
                 self.model = Some(m);
-                self.stats.input_size.store(size, Ordering::Relaxed);
+                self.stats.input_size.store(shape.size, Ordering::Relaxed);
                 self.stats.loads.fetch_add(1, Ordering::Relaxed);
                 self.stats.loaded.store(true, Ordering::Relaxed);
                 let metrics = &self.spec.metrics;
@@ -275,7 +287,7 @@ impl Worker {
                 metrics
                     .load_seconds
                     .observe_duration(load_started.elapsed());
-                Ok(size)
+                Ok(shape)
             }
             Ok(Err(e)) => Err(EngineError::ModelUnavailable(format!(
                 "model load failed: {e}"
@@ -430,12 +442,16 @@ impl Worker {
     }
 }
 
-/// The square input side of an image model (video frames are extracted at
-/// it); 0 for a text model.
-fn input_size(model: &LoadedModel) -> u32 {
+fn input_shape(model: &LoadedModel) -> InputShape {
     match model {
-        LoadedModel::Image(m) => m.input_size(),
-        LoadedModel::Text(_) => 0,
+        LoadedModel::Image(m) => InputShape {
+            size: m.input_size(),
+            resize_ahead: m.resizes_to_input(),
+        },
+        LoadedModel::Text(_) => InputShape {
+            size: 0,
+            resize_ahead: false,
+        },
     }
 }
 
@@ -530,7 +546,7 @@ mod tests {
     async fn text_models_take_text_and_refuse_images() {
         let text = spawn_with(|| LoadedModel::Text(Box::new(FakeText)));
         // Text models report no input size.
-        assert_eq!(text.ensure_loaded().await.unwrap(), 0);
+        assert_eq!(text.ensure_loaded().await.unwrap().size, 0);
         let c = text.classify_text(Arc::from("hello")).await.unwrap();
         assert_eq!(c.predictions[0].label, 5);
         let err = text.classify_image(img(3)).await.unwrap_err();
@@ -570,7 +586,8 @@ mod tests {
     async fn loads_once_and_classifies() {
         let loads = Arc::new(AtomicUsize::new(0));
         let h = spawn(loads.clone(), false, false);
-        assert_eq!(h.ensure_loaded().await.unwrap(), 224);
+        let shape = h.ensure_loaded().await.unwrap();
+        assert_eq!((shape.size, shape.resize_ahead), (224, false));
         h.ensure_loaded().await.unwrap();
         let c = h.classify_image(img(7)).await.unwrap();
         assert_eq!(c.predictions[0].label, 7);
