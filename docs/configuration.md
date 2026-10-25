@@ -332,8 +332,8 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 | `early_exit` | table | *(none)* | Video‑scan trigger for this model (see below). |
 | `labels` | list | *(empty)* | Candidate labels for open‑vocabulary models (`siglip`). Ignored by `vit` (which gets labels from the weights). Mutually exclusive with `taxonomy_file`. |
 | `prompt_template` | string | *(none)* | Wraps each `siglip` label before encoding, e.g. `"a photo of a {}"` (a `{}` is substituted; otherwise it's a prefix). The bare label is what's returned. |
-| `score_threshold` | f32 | `0.5` | Keep `siglip` labels scoring at/above this (sigmoid probability). For video frame scans, set this **low** so true peaks survive the temporal pool. |
-| `max_results` | usize | *(none)* | Cap on labels returned (highest first). Omit to return every label above the threshold. |
+| `score_threshold` | f32 | `0.5` (taxonomy: none) | Keep `siglip` labels scoring at/above this: a number from 0 to 1 with at most 2 decimals. SigLIP scores are calibrated: a clear match scores about 0.5–0.9, noise below about 0.1 (see [Scores](#siglip-scores)). For video frame scans with `mean` aggregation, set it lower so labels seen in part of the video survive the average. A taxonomy with no threshold keeps every category. |
+| `max_results` | usize | *(none)* | Cap on `siglip` labels or taxonomy categories returned (highest first). Omit to return every one above the threshold. |
 | `taxonomy_file` | string | *(none)* | Path to a taxonomy TOML for a `siglip` model. Relative paths resolve from the config file's directory. Mutually exclusive with `labels`. |
 | `hash_list` | string | *(required for `pdq`)* | `pdq`: the block list file. Relative paths resolve from the config file's directory. |
 | `categories` | table | *(required for `pdq`)* | `pdq`: category names by id, e.g. `{ 1 = "known", 2 = "spam" }`. |
@@ -495,11 +495,11 @@ Text models take neither `video_strategy` nor `early_exit` (they run no video sc
 
 A `taxonomy_file` defines grouped, prompt‑backed categories for a `siglip` model. It's a **two‑level tree**: top‑level tables are **parent** categories (each needs an integer `id`); nested tables are **child** categories (each needs an `id`, a list of `prompts`, an optional `aggregation`, and an optional `threshold`).
 
-SigLIP scores each prompt independently against the image; a child's score is the **aggregation of its own prompts** — `mean` (default), `average` (alias for mean), or `max`. Use `max` when the prompts are alternatives (any one matching should light the category); use `mean` when they're corroborating evidence for the same concept.
+SigLIP scores each prompt independently against the image; a child's score is the **aggregation of its own prompts** — `mean` (default), `average` (alias for mean), or `max` — then calibrated (see [Scores](#siglip-scores)). Use `max` when the prompts are alternatives (any one matching should light the category); use `mean` when they're corroborating evidence for the same concept.
 
 All prompts (taxonomy or `labels`) are encoded when the model loads. That's the slow part of loading — about 35 s for ~1,000 prompts on an 8‑core CPU — so the result is cached in an `apollo-prompt-embeds` folder inside the model's Hub cache directory and reused on later loads (well under a second). Changing a prompt, the model revision, or the tokenizer starts a new cache entry automatically; deleting the folder is always safe.
 
-At inference, each child that scores at/above its threshold is returned as a flat `Prediction` whose `label` is the **child id**. The threshold is the child's own `threshold` (a number from 0 to 1) when it sets one, else the model's `score_threshold`. Categories differ in how high SigLIP scores them, so a per-category threshold lets each be tuned on its own; `apollo calibrate --write` sets them from labelled examples (see [operations.md → Threshold calibration](./operations.md#threshold-calibration)). (Parent grouping is not carried on the wire — reconstruct parent→child from the taxonomy file if you need it.) Parent ids and child ids live in separate namespaces; ids are arbitrary unique `u32`s.
+At inference, each child that scores at/above its threshold is returned as a flat `Prediction` whose `label` is the **child id**, highest first and capped by `max_results`. The threshold is the child's own `threshold` (a number from 0 to 1 with at most 2 decimals) when it sets one, else the model's `score_threshold`. Categories differ in how high SigLIP scores them, so a per-category threshold lets each be tuned on its own; `apollo calibrate --write` sets them from labelled examples (see [operations.md → Threshold calibration](./operations.md#threshold-calibration)). (Parent grouping is not carried on the wire — reconstruct parent→child from the taxonomy file if you need it.) Parent ids and child ids live in separate namespaces; ids are arbitrary unique `u32`s.
 
 ```toml
 [scene]
@@ -509,10 +509,14 @@ id = 2
 id = 2001
 prompts = ["a nature landscape", "a forest", "mountains or hills", "a beach"]
 aggregation = "max"      # alternatives, not a conjunction
-threshold = 0.12         # this category's own cut-off (else score_threshold)
+threshold = 0.35         # this category's own cut-off (else score_threshold)
 ```
 
 See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
+
+### SigLIP scores
+
+SigLIP's own sigmoid probabilities against short prompts are tiny: a clear match such as a dog photo against "dogs" scores about 0.006, and unrelated categories about 0.00001. Apollo therefore reports every SigLIP score (a label's, or a category's after aggregation) shifted by 7 on the logit scale: `sigmoid(logit(p) + 7)`. A clear match then scores about 0.5–0.9 and noise about 0.00–0.10, so thresholds of two decimals are enough. The shift is monotonic: the order of the labels is exactly SigLIP's. An old threshold maps to `sigmoid(logit(t) + 7)` on the new scale, rounded to two decimals: `0.00001` becomes about `0.01`. It was tuned on `google/siglip-base-patch16-224` with a 117-category taxonomy; on that set a `score_threshold` of 0.20 kept every clear and every weaker-but-correct top category (0.24 and up) and dropped nearly all noise.
 
 ---
 
@@ -523,7 +527,7 @@ See [`taxonomy.example.toml`](../taxonomy.example.toml) for a full example.
 - **Strategies:** `confirm` at most 8 with `confirm_window` in (0.05, 5] s, and only for models that define `early_exit`; at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`, `refine`→`min_score` + `window` + `fps`); `min_gap` only on `scene` and ≥ 0; `refine` steps after all others, with `min_score` in 0..1, `window` in (0, 60] s and `fps` in (0, 60]. A model using a strategy with `refine` must define `early_exit`, with a `threshold` above the step's `min_score`.
 - **Models:** `repo` is required, except for `pdq`; text models cannot set `video_strategy` or `early_exit`, `max_tokens` is at least 16, and `max_tokens`/`multi_label` only apply to text models; a `pdq` model needs a `hash_list` whose lines parse and name its `categories`, and cannot set `labels`, `taxonomy_file`, `prompt_template`, `score_threshold` or `max_results` (while the `pdq` fields are rejected on other architectures); `video_strategy` must name a defined strategy; `early_exit` must list at least one label **and** requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
 - **Pipelines:** at least one step; no empty step; every `model` must be defined, and in at most one step; unique `order`s; a `stop_if` must list at least one label id, and name its step's model (`stop_if.model`) when the step runs several.
-- **Taxonomies:** a category `threshold` must be a number from 0 to 1.
+- **Taxonomies:** a category `threshold` must be a number from 0 to 1 with at most 2 decimals, as must a `siglip` model's `score_threshold`.
 - **Database:** selecting `postgres`/`surrealdb` requires the matching `[database.<backend>]` section.
 
 ---

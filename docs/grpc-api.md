@@ -202,7 +202,7 @@ message Segment {
 - `results` has one entry per model **in run order**: the pipeline's step order, or the order you listed `models`. Results of models that have not started are `QUEUED`.
 - A `Classification` returns the **top 5 predictions unioned with any label scoring above 0.90**, so a confident sixth label is never dropped (models with a `score_threshold` return the labels at or above it instead).
 - Each prediction has the label's `id` (a class index for `vit` and the text models, a label‑list index for `siglip` with `labels`, a taxonomy child id for `siglip` with a taxonomy, a category id for `pdq`) and its `name` (e.g. `nsfw`, or `food_and_drink.drinks` for a taxonomy child). `ListModels` lists every label a model can predict.
-- For `siglip`, `score` is an independent **sigmoid probability**.
+- For `siglip`, `score` is an independent, calibrated score from 0 to 1: SigLIP's sigmoid shifted so that a clear match scores about 0.5–0.9 (see [configuration → SigLIP scores](./configuration.md#siglip-scores)).
 - Video results come back as a `Scan`: `aggregated` is the roll-up across the classified frames (the strategy's `max` or `mean`), `segments` the stretches where a trigger label fired, and `samples` the individual frames (`FULL` view only). A scan that stopped early (`early_exit`) has only the frames classified up to then.
 
 ### Segments

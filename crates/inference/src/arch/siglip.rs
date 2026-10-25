@@ -6,7 +6,8 @@
 //! disk next to the model so later loads skip the text tower); classification then
 //! encodes the image, takes its cosine similarity to each prompt embedding,
 //! applies SigLIP's learned scale + bias and a sigmoid — yielding an INDEPENDENT
-//! probability per prompt.
+//! probability per prompt. Those raw probabilities are tiny for short prompts,
+//! so every score is calibrated ([`calibrated`]) onto a usable 0–1 scale.
 //!
 //! Two shapes of configuration are supported:
 //!   * **flat** — a `labels` list. Each label is a candidate; results are the
@@ -19,7 +20,7 @@
 //!     flat in `predictions` (each `Prediction.label` is the child id), highest
 //!     first. The parent grouping is NOT duplicated into `groups` — it is just
 //!     these children keyed by parent, reconstructable from the taxonomy. With no
-//!     `score_threshold` set, every child is kept.
+//!     `score_threshold` set, every child is kept; `max_results` caps them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,12 @@ use crate::preprocess::{self, Normalization};
 
 /// Per-label keep threshold for flat mode when the config doesn't set one.
 const DEFAULT_THRESHOLD: f32 = 0.5;
+/// How far [`calibrated`] shifts a score on the logit scale. SigLIP's raw
+/// sigmoid against short prompts is tiny — a clear match ~0.005, noise ~0.00001
+/// — so thresholds needed many decimals. Shifted by 7, a clear match scores
+/// about 0.5–0.9 and noise about 0.00–0.10. Tuned on
+/// `google/siglip-base-patch16-224` with a 117-category taxonomy.
+const SCORE_SHIFT: f64 = 7.0;
 /// SigLIP's canonical fixed text sequence length.
 const DEFAULT_MAX_TOKENS: usize = 64;
 /// Prompts per text-tower forward pass at load. Bounds activation memory: a
@@ -59,6 +66,7 @@ enum Mode {
     /// `taxonomy_file`: aggregate per child, group by parent; `label` is child id.
     Taxonomy {
         threshold: f32,
+        max_results: Option<usize>,
         children: Vec<TaxonChild>,
     },
 }
@@ -124,6 +132,7 @@ pub(crate) fn load(
                     // mechanism), taxonomy historically returned every child; an
                     // unset threshold preserves that (0.0 keeps everything).
                     threshold: cfg.score_threshold.unwrap_or(0.0),
+                    max_results: cfg.max_results,
                     children: tax.children.clone(),
                 },
                 tax.children
@@ -224,8 +233,9 @@ impl ImageClassifier for SiglipClassifier {
                 } => flat_classification(&row, &self.labels, *threshold, *max_results),
                 Mode::Taxonomy {
                     threshold,
+                    max_results,
                     children,
-                } => taxonomy_classification(&row, *threshold, children),
+                } => taxonomy_classification(&row, *threshold, *max_results, children),
             })
             .collect();
         Ok(out)
@@ -244,6 +254,20 @@ impl ImageClassifier for SiglipClassifier {
     }
 }
 
+/// A raw SigLIP probability on the calibrated 0–1 scale: `sigmoid(logit(p) +`
+/// [`SCORE_SHIFT`]`)`. Monotonic, so the ranking of labels never changes, and
+/// any raw threshold has an exact calibrated equivalent.
+fn calibrated(p: f32) -> f32 {
+    if p.is_nan() || p <= 0.0 {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return 1.0;
+    }
+    let (p, k) = (f64::from(p), SCORE_SHIFT.exp());
+    (p * k / (1.0 - p + p * k)) as f32
+}
+
 /// Flat mode: every label scoring at/above `threshold`, highest first, capped by
 /// `max_results`. `label` is the label's index in the configured list.
 fn flat_classification(
@@ -255,7 +279,7 @@ fn flat_classification(
     let mut preds = labels
         .iter()
         .zip(row)
-        .map(|(label, &score)| label.predict(score))
+        .map(|(label, &score)| label.predict(calibrated(score)))
         .filter(|p| p.score >= threshold)
         .collect::<Vec<_>>();
     preds.sort_by(|a, b| {
@@ -269,12 +293,18 @@ fn flat_classification(
     Classification { predictions: preds }
 }
 
-/// Taxonomy mode: aggregate each child's prompt scores (mean/max) into one child
-/// score, keep the children scoring at/above their own `threshold` (or the
-/// model's `threshold` when they set none), and return them flat in
-/// `predictions` (highest first; `label` is the child id). The per-parent
-/// grouping is left to the caller, who can reconstruct it from the taxonomy.
-fn taxonomy_classification(row: &[f32], threshold: f32, children: &[TaxonChild]) -> Classification {
+/// Taxonomy mode: aggregate each child's raw prompt scores (mean/max) into one
+/// child score, calibrate it, keep the children scoring at/above their own
+/// `threshold` (or the model's `threshold` when they set none), and return them
+/// flat in `predictions` (highest first, capped by `max_results`; `label` is the
+/// child id). The per-parent grouping is left to the caller, who can
+/// reconstruct it from the taxonomy.
+fn taxonomy_classification(
+    row: &[f32],
+    threshold: f32,
+    max_results: Option<usize>,
+    children: &[TaxonChild],
+) -> Classification {
     let mut predictions = children
         .iter()
         .filter_map(|child| {
@@ -283,6 +313,7 @@ fn taxonomy_classification(row: &[f32], threshold: f32, children: &[TaxonChild])
                 Aggregation::Max => slice.iter().copied().fold(f32::MIN, f32::max),
                 Aggregation::Mean => slice.iter().sum::<f32>() / slice.len() as f32,
             };
+            let score = calibrated(score);
             // A child's own threshold replaces the model's.
             (score >= child.threshold.unwrap_or(threshold))
                 .then(|| Prediction::new(child.id, child.name.clone(), score))
@@ -293,6 +324,9 @@ fn taxonomy_classification(row: &[f32], threshold: f32, children: &[TaxonChild])
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    if let Some(k) = max_results {
+        predictions.truncate(k);
+    }
     Classification { predictions }
 }
 
@@ -479,6 +513,24 @@ mod tests {
         }
     }
 
+    /// The raw SigLIP probability that calibrates to `c`.
+    fn raw(c: f64) -> f32 {
+        let logit = (c / (1.0 - c)).ln() - SCORE_SHIFT;
+        (1.0 / (1.0 + (-logit).exp())) as f32
+    }
+
+    #[test]
+    fn calibration_spreads_tiny_raw_scores_and_keeps_their_order() {
+        // Measured raw scores: a clear match (a dog photo's "dogs") and noise.
+        assert!((calibrated(0.0058) - 0.865).abs() < 0.001);
+        assert!((calibrated(0.00001) - 0.011).abs() < 0.001);
+        assert_eq!((calibrated(0.0), calibrated(1.0)), (0.0, 1.0));
+        let raws = [0.00001f32, 0.0001, 0.0006, 0.0058, 0.05, 0.5];
+        let cals: Vec<f32> = raws.iter().map(|&p| calibrated(p)).collect();
+        assert!(cals.windows(2).all(|w| w[0] < w[1]), "{cals:?}");
+        assert!((calibrated(raw(0.3)) - 0.3).abs() < 1e-5);
+    }
+
     #[test]
     fn a_childs_own_threshold_replaces_the_models() {
         let children = [
@@ -486,9 +538,20 @@ mod tests {
             child(2, 1, Some(0.5)),
             child(3, 2, Some(0.05)),
         ];
-        let c = taxonomy_classification(&[0.2, 0.3, 0.1], 0.15, &children);
+        let row = [raw(0.2), raw(0.3), raw(0.1)];
+        let c = taxonomy_classification(&row, 0.15, None, &children);
         let kept: Vec<u32> = c.predictions.iter().map(|p| p.label).collect();
         // 1 passes the model's 0.15; 2 misses its own 0.5; 3 passes its 0.05.
         assert_eq!(kept, [1, 3]);
+        assert!((c.predictions[0].score - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn max_results_caps_taxonomy_categories() {
+        let children = [child(1, 0, None), child(2, 1, None), child(3, 2, None)];
+        let row = [raw(0.4), raw(0.9), raw(0.6)];
+        let c = taxonomy_classification(&row, 0.0, Some(2), &children);
+        let kept: Vec<u32> = c.predictions.iter().map(|p| p.label).collect();
+        assert_eq!(kept, [2, 3]);
     }
 }

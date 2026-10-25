@@ -4,7 +4,8 @@
 # integer `id`. Their nested tables are CHILD categories — each needs an `id`, a
 # list of `prompts`, an optional `aggregation`: "mean" (the default), "average"
 # (an alias for mean), or "max", controlling how that child's per-prompt scores
-# combine into a single child score, and an optional `threshold` (0 to 1) that
+# combine into a single child score, and an optional `threshold` (0 to 1, at
+# most 2 decimals, on Apollo's calibrated SigLIP score scale) that
 # replaces the model's `score_threshold` for that child (`apollo calibrate
 # --write` sets these from labelled examples).
 #

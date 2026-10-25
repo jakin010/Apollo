@@ -123,10 +123,11 @@ impl Taxonomy {
                         let t = v
                             .as_float()
                             .or_else(|| v.as_integer().map(|i| i as f64))
-                            .filter(|t| (0.0..=1.0).contains(t))
+                            .filter(|&t| crate::validate::is_score_threshold(t))
                             .ok_or_else(|| {
                                 ConfigError::Parse(format!(
-                                    "taxonomy: '{qualified}' threshold must be a number from 0 to 1"
+                                    "taxonomy: '{qualified}' threshold must be a number from 0 to 1 \
+                                     with at most 2 decimals"
                                 ))
                             })?;
                         Some(t as f32)
@@ -224,6 +225,9 @@ aggregation = "max"
         assert_eq!(meals.threshold, None);
         assert!(
             Taxonomy::parse(&SAMPLE.replace("id = 1002", "id = 1002\nthreshold = 2.0")).is_err()
+        );
+        assert!(
+            Taxonomy::parse(&SAMPLE.replace("id = 1002", "id = 1002\nthreshold = 0.255")).is_err()
         );
         assert!(
             Taxonomy::parse(&SAMPLE.replace("id = 1002", "id = 1002\nthreshold = \"x\"")).is_err()

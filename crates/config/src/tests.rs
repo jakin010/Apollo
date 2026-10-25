@@ -123,6 +123,24 @@ fn set_get_remove_roundtrip() {
 }
 
 #[test]
+fn siglip_score_threshold_is_0_to_1_with_two_decimals() {
+    let check = |t: &str| {
+        load::from_str(&format!(
+            "[models.m]\narchitecture = \"siglip\"\nrepo = \"a/b\"\nlabels = [\"cat\"]\nscore_threshold = {t}\n"
+        ))
+        .unwrap()
+        .validate()
+    };
+    for ok in ["0", "0.2", "0.35", "1"] {
+        assert!(check(ok).is_ok(), "{ok} should be accepted");
+    }
+    for bad in ["0.00001", "0.255", "1.5", "-0.1"] {
+        let err = check(bad).unwrap_err().to_string();
+        assert!(err.contains("at most 2 decimals"), "{bad}: {err}");
+    }
+}
+
+#[test]
 fn webhook_url_override_creates_section() {
     let mut cfg = load::from_str("[models.m]\narchitecture = \"vit\"\nrepo = \"a/b\"\n").unwrap();
     assert!(cfg.webhook.is_none());
