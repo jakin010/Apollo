@@ -35,8 +35,9 @@ pub async fn plan(
     share: &VideoShare,
     steps: &[SamplingStep],
     budget: Option<usize>,
+    seed: u64,
 ) -> Result<Vec<FrameRef>, MediaError> {
-    let mut planner = Planner::new(share.info(), steps, budget);
+    let mut planner = Planner::new(share.info(), steps, budget, seed);
     let mut frames = Vec::new();
     while let Some(step) = planner.next_step(share).await? {
         frames.extend(step);
@@ -51,8 +52,9 @@ pub async fn plan(
 ///
 /// Frames close to one an earlier step chose are skipped, and indices run on
 /// across steps in processing order, exactly as planning everything up front
-/// would give: the result depends only on the video and the steps, so a resumed
-/// scan plans the same frames.
+/// would give: the result depends only on the video, the steps and the scan's
+/// `seed` (which places `random` uniform frames), so a resumed scan plans the
+/// same frames.
 ///
 /// `budget` caps the frames planned ([`MAX_PLANNED_FRAMES`] always applies).
 /// Steps take frames in order; the step that does not fit is thinned to what is
@@ -60,6 +62,7 @@ pub async fn plan(
 /// evenly across the video — and later steps get none.
 pub struct Planner {
     steps: Vec<SamplingStep>,
+    seed: u64,
     next: usize,
     max_seek: f64,
     remaining: usize,
@@ -67,7 +70,7 @@ pub struct Planner {
 }
 
 impl Planner {
-    pub fn new(info: &VideoInfo, steps: &[SamplingStep], budget: Option<usize>) -> Self {
+    pub fn new(info: &VideoInfo, steps: &[SamplingStep], budget: Option<usize>, seed: u64) -> Self {
         let mut steps: Vec<SamplingStep> = steps
             .iter()
             .filter(|s| s.method != SamplingKind::Refine)
@@ -76,6 +79,7 @@ impl Planner {
         steps.sort_by_key(|s| s.step);
         Self {
             steps,
+            seed,
             next: 0,
             max_seek: max_seek(info),
             remaining: budget.map_or(MAX_PLANNED_FRAMES, |b| b.min(MAX_PLANNED_FRAMES)),
@@ -106,7 +110,7 @@ impl Planner {
         }
         let step = &self.steps[self.next];
         self.next += 1;
-        let mut samples: Vec<(f64, Option<f32>)> = sampling::step_samples(share, step)
+        let mut samples: Vec<(f64, Option<f32>)> = sampling::step_samples(share, step, self.seed)
             .await?
             .into_iter()
             .filter(|(t, _)| t.is_finite())
@@ -394,6 +398,7 @@ mod tests {
             method,
             fps,
             count,
+            random: false,
             nth: None,
             threshold: None,
             min_gap: None,
@@ -438,7 +443,9 @@ mod tests {
             step(1, SamplingKind::Uniform, Some(3), None),
             step(2, SamplingKind::Uniform, Some(3), None),
         ];
-        let frames = plan(&share(info(9.0, 30.0)), &steps, None).await.unwrap();
+        let frames = plan(&share(info(9.0, 30.0)), &steps, None, 0)
+            .await
+            .unwrap();
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0].index, 0);
         assert!((frames[0].timestamp - 1.5).abs() < 1e-9);
@@ -452,7 +459,9 @@ mod tests {
             step(1, SamplingKind::Uniform, Some(2), None),
             step(2, SamplingKind::Fps, None, Some(1.0)),
         ];
-        let frames = plan(&share(info(8.0, 30.0)), &steps, None).await.unwrap();
+        let frames = plan(&share(info(8.0, 30.0)), &steps, None, 0)
+            .await
+            .unwrap();
         // step1 -> [2,6]; step2 -> 0..7 drop 2 and 6 -> [0,1,3,4,5,7]; total 8
         assert_eq!(frames.len(), 8);
         assert!((frames[0].timestamp - 2.0).abs() < 1e-9); // cheap step first
@@ -468,6 +477,7 @@ mod tests {
             &share(info(60.0, 30.0)),
             &[step(1, SamplingKind::Uniform, Some(2000), None)],
             None,
+            0,
         )
         .await
         .unwrap();
@@ -477,12 +487,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn random_uniform_frames_follow_the_seed() {
+        let random = SamplingStep {
+            random: true,
+            ..step(1, SamplingKind::Uniform, Some(8), None)
+        };
+        let times = |frames: Vec<FrameRef>| frames.iter().map(|f| f.timestamp).collect::<Vec<_>>();
+        let plan_with = |steps: Vec<SamplingStep>, seed| async move {
+            times(
+                plan(&share(info(60.0, 30.0)), &steps, None, seed)
+                    .await
+                    .unwrap(),
+            )
+        };
+        let a = plan_with(vec![random.clone()], 1).await;
+        // One frame in each eighth of the video, all planned at once.
+        assert_eq!(a.len(), 8);
+        for (i, t) in a.iter().enumerate() {
+            assert!((i as f64 * 7.5..(i + 1) as f64 * 7.5).contains(t), "{t}");
+        }
+        // The same seed (a retry, a resume, another model) gives the same frames;
+        // another seed (another task) gives others.
+        assert_eq!(a, plan_with(vec![random.clone()], 1).await);
+        assert_ne!(a, plan_with(vec![random], 2).await);
+        // Steps without `random` ignore the seed.
+        let fixed = step(1, SamplingKind::Uniform, Some(8), None);
+        assert_eq!(
+            plan_with(vec![fixed.clone()], 1).await,
+            plan_with(vec![fixed], 2).await
+        );
+    }
+
+    #[tokio::test]
     async fn plan_is_capped() {
         // 200k well-separated frames would all survive dedupe; the cap holds.
         let frames = plan(
             &share(info(10_000_000.0, 30.0)),
             &[step(1, SamplingKind::Uniform, Some(200_000), None)],
             None,
+            0,
         )
         .await
         .unwrap();
@@ -495,7 +538,9 @@ mod tests {
             step(1, SamplingKind::Uniform, Some(2), None),
             refine_step(2, 0.1, 1.0, 5.0),
         ];
-        let frames = plan(&share(info(8.0, 30.0)), &steps, None).await.unwrap();
+        let frames = plan(&share(info(8.0, 30.0)), &steps, None, 0)
+            .await
+            .unwrap();
         assert_eq!(frames.len(), 2);
     }
 
@@ -554,7 +599,7 @@ mod tests {
             step(2, SamplingKind::Fps, None, Some(1.0)),
             step(3, SamplingKind::Uniform, Some(3), None),
         ];
-        let frames = plan(&share(info(8.0, 30.0)), &steps, Some(6))
+        let frames = plan(&share(info(8.0, 30.0)), &steps, Some(6), 0)
             .await
             .unwrap();
         let times: Vec<f64> = frames.iter().map(|f| f.timestamp).collect();

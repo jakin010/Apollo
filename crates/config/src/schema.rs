@@ -441,6 +441,12 @@ pub struct SamplingStep {
     /// Total frames evenly spaced (`method = "uniform"`).
     #[serde(default)]
     pub count: Option<u32>,
+    /// `method = "uniform"`: place each frame at a random time within its
+    /// stretch of the video instead of at the stretch's midpoint. The times are
+    /// fixed per scan — the same on a retry, a resume and for every model
+    /// scanning the input — but cannot be known before it is submitted.
+    #[serde(default)]
+    pub random: bool,
     /// Take every Nth frame (`method = "every_nth"`).
     #[serde(default)]
     pub nth: Option<u32>,
