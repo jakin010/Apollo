@@ -38,3 +38,8 @@ tempfile = "3"
 [features]
 # Build the binary with GPU support: `cargo build -p apollo --features cuda`.
 cuda = ["apollo-engine/cuda", "apollo-server/cuda"]
+# Faster CPU inference that moves scores in the last digits; off by default.
+# See "CPU speed features" in docs/configuration.md.
+accelerate = ["apollo-inference/accelerate"]
+avx512 = ["apollo-inference/avx512"]
+fast-gelu = ["apollo-inference/fast-gelu"]

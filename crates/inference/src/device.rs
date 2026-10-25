@@ -69,6 +69,7 @@ pub fn open_device(kind: DeviceKind) -> Device {
 /// explicit backend is tried alone and falls back to CPU if it cannot start.
 /// Only backends compiled into this binary are attempted.
 pub fn select_device(preference: DevicePreference) -> (Device, DeviceKind) {
+    init_cpu_threads();
     let candidates: &[DeviceKind] = match preference {
         DevicePreference::Auto => &[DeviceKind::Cuda, DeviceKind::Metal],
         DevicePreference::Cuda => &[DeviceKind::Cuda],
@@ -92,6 +93,21 @@ pub fn select_device(preference: DevicePreference) -> (Device, DeviceKind) {
     }
     tracing::info!("selected CPU device");
     (Device::Cpu, DeviceKind::Cpu)
+}
+
+/// Size rayon's global pool (candle's CPU matmuls, tokenizers) to candle's CPU
+/// thread count: one per physical core the process may use, within its
+/// affinity mask and container CPU quota. Left alone, rayon starts one thread
+/// per logical CPU (hyperthreads, efficiency cores) while candle splits each
+/// matmul into one part per core, so the parts land on slower or shared CPUs.
+/// `RAYON_NUM_THREADS` / `CANDLE_NUM_THREADS` override the count. A no-op if
+/// the pool already exists.
+fn init_cpu_threads() {
+    candle_core::utils::init_global_threadpool();
+    tracing::info!(
+        threads = candle_core::utils::get_num_threads(),
+        "CPU threads for inference"
+    );
 }
 
 /// Try to open device 0 of `kind`; `None` when that backend is not compiled

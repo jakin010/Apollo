@@ -29,6 +29,21 @@ candle-transformers = { version = "0.11", features = ["metal"] }
 # CUDA is opt-in: it needs the NVIDIA toolkit and only builds on Linux/Windows.
 # Do NOT enable it on macOS. Without it, non-macOS builds are CPU-only.
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# Faster CPU inference that moves scores in the last digits (≤ 1e-5), so each one
+# is opt-in and the default build stays bit-for-bit reproducible. `avx512` and
+# `fast-gelu` come from the candle fork's `apollo` branch (the [patch] in the
+# workspace).
+# macOS only: CPU matmuls on Apple's BLAS (the AMX units on Apple silicon),
+# 1.7–3.7× faster than candle's own gemm.
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+# x86-64: gemm's AVX-512 matmul kernels, picked at run time on CPUs that have
+# AVX-512 (Zen 4/5, Xeon): images, video and long texts 1.2–1.7× faster. Small
+# matmuls stay on the AVX2 kernels (the gemm-common [patch] in the workspace), so
+# single short texts are not slower.
+avx512 = ["candle-core/avx512"]
+# Vectorized f32 GELU (within 1e-6 of exact): 1.1–1.2× on BERT and ViT on the
+# CPU. `CANDLE_FAST_GELU=0` turns it off at run time.
+fast-gelu = ["candle-core/fast-gelu"]
 
 [dev-dependencies]
 tempfile = "3"
