@@ -179,11 +179,13 @@ fn parse_keyframe_packets(bytes: &[u8]) -> Vec<f64> {
     times
 }
 
-/// Decoder options for the scene-detection pass: skip non-reference frames and
-/// the deblocking filter. Cut detection does not need full-quality frames; on
-/// the test set this took a third off the decode at 2 threads and still found
-/// every spliced-in clip's cut (94% of all cuts).
-const FAST_SCENE_DECODE: [&str; 4] = ["-skip_frame", "noref", "-skip_loop_filter", "all"];
+/// Decoder options for the scene-detection pass: skip the deblocking filter,
+/// which cut detection does not need. Every frame is decoded, non-reference
+/// frames included: a cut (or a spliced-in frame) can land on a B-frame that
+/// no keyframe marks, and skipping those (`-skip_frame noref`, a third cheaper
+/// on some streams) missed such inserts entirely, as well as some of the
+/// video's own cuts.
+const FAST_SCENE_DECODE: [&str; 2] = ["-skip_loop_filter", "all"];
 
 /// Scene changes above `threshold` (0..1), as `(timestamp, scene score)`.
 /// Backs `scene` sampling.
@@ -469,6 +471,77 @@ noise line\n\
         assert_eq!(
             super::parse_keyframe_packets(out),
             vec![0.0, 5.2, 10.416667]
+        );
+    }
+}
+
+/// Scene detection against the real ffmpeg. Skipped when ffmpeg (or libx264,
+/// for the controlled frame types) is not installed.
+#[cfg(test)]
+mod ffmpeg_tests {
+    use super::*;
+
+    fn have_ffmpeg() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// 2 s of 64x48 test pattern at 24 fps in a fixed I B B B P pattern (no
+    /// B-frame references), with frame 26 — a non-reference B-frame — replaced
+    /// by a solid red frame: a one-frame insert no keyframe marks.
+    fn insert_on_b_frame(dir: &Path) -> Option<std::path::PathBuf> {
+        let path = dir.join("b_insert.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=64x48:rate=24:duration=2")
+            .args(["-f", "lavfi", "-i"])
+            .arg("color=c=red:size=64x48:rate=24:duration=2")
+            .args(["-filter_complex", "[0:v][1:v]overlay=enable='eq(n,26)'"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-x264-params"])
+            .arg("keyint=48:scenecut=0:b-adapt=0:bframes=3:b-pyramid=none")
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        ok.then_some(path)
+    }
+
+    fn frame_types(path: &Path) -> Vec<String> {
+        let out = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "frame=pict_type", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim_matches(',').to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn finds_a_cut_on_a_non_reference_frame() {
+        if !have_ffmpeg() {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = insert_on_b_frame(dir.path()) else {
+            eprintln!("skipping: ffmpeg has no libx264");
+            return;
+        };
+        assert_eq!(
+            frame_types(&path)[26],
+            "B",
+            "the insert must sit on a B-frame"
+        );
+
+        let cuts = scene_cuts(&path, 0.3).await.unwrap();
+        let at = 26.0 / 24.0;
+        assert!(
+            cuts.iter().any(|(t, _)| (t - at).abs() < 0.01),
+            "no cut at {at:.3} s: {cuts:?}"
         );
     }
 }

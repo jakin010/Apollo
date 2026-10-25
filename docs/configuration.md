@@ -246,7 +246,7 @@ Steps run in ascending `step` order (cheapest first, typically). Each step's req
 | `fps` | `fps` (float) | Sample at N frames per second. |
 | `uniform` | `count` (u32) | N frames, evenly spaced across the clip. |
 | `every_nth` | `nth` (u32) | Take every Nth frame. |
-| `scene` | `threshold` (0..1) | One frame per shot change above the threshold. Optional `min_gap` (seconds): of cuts closer together than this, keep only the strongest (highest scene score), capping the cost on fast‑cut video. Detection decodes with non‑reference frames and the deblocking filter skipped, which is about a third cheaper and still finds the cuts that matter. |
+| `scene` | `threshold` (0..1) | One frame per shot change above the threshold. Optional `min_gap` (seconds, default 0): of cuts closer together than this, keep only the strongest (highest scene score). That caps the cost on fast‑cut video, but an insert shorter than `min_gap` has both its cuts (in and out) inside it, and only the frame at the cut *in* shows it, so it is found only when that cut scores higher: about half the time. Leave `min_gap` at 0 where short inserts matter and cap the cost with `max_frames`. Detection decodes every frame, including non‑reference (B‑)frames, where a cut no keyframe marks can land, and skips the deblocking filter. |
 | `refine` | `min_score` (0..1), `window` (s), `fps` | **Look closer.** After every other step has run without a trigger, sample at `fps` within `window` seconds either side of each frame whose trigger score was ambiguous — from `min_score` up to the model's `early_exit.threshold`. Needs the model's `early_exit` labels, and must be the last step(s). Clean, confidently scored video gets no extra frames. |
 
 Frames closer than 0.05 s to one already chosen by an earlier step are skipped, and a resumed scan re-plans exactly the same frames (including `refine`'s, which are planned from the stored scores).
@@ -260,7 +260,8 @@ Two strategies from `config.example.toml`, for different hardware:
 ```toml
 # Sparse but thorough — suited to CPU-only servers. On the test set it used
 # 10-25x fewer frames than progressive_scan on clean video, and still caught
-# 0.5-2 s inserts at hard cuts and brief moments inside a continuous shot.
+# inserts from a single frame to 2 s at hard cuts, and brief moments inside a
+# continuous shot.
 [strategies.coverage_scan]
 aggregation = "max"
 early_exit  = true
@@ -274,7 +275,7 @@ count = 8
 step = 2
 method = "scene"             # a frame at every hard cut: catches short inserts
 threshold = 0.3
-min_gap = 1.0
+min_gap = 0                  # every cut; a larger gap can skip inserts shorter than it
 
 [[strategies.coverage_scan.sampling]]
 step = 3

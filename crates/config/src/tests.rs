@@ -26,6 +26,13 @@ fn parses_and_validates_example() {
         coverage.sampling.last().map(|s| s.method),
         Some(SamplingKind::Refine)
     );
+    // Every scene cut: a min_gap skips about half the inserts shorter than it.
+    let scene = coverage
+        .sampling
+        .iter()
+        .find(|s| s.method == SamplingKind::Scene)
+        .expect("scene step");
+    assert_eq!(scene.min_gap.unwrap_or(0.0), 0.0);
     let scan = cfg.strategies.get("progressive_scan").expect("strategy");
     assert_eq!(scan.sampling[0].method, SamplingKind::Iframes);
     assert!(scan.early_exit);
