@@ -8,6 +8,11 @@ mod status;
 
 use clap::Parser;
 
+// glibc gives candle's large tensor buffers back to the kernel and faults them in again.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     if let Err(e) = cli::Cli::parse().run() {
         // `{:#}` renders the full anyhow context chain.
