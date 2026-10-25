@@ -141,6 +141,44 @@ pub async fn keyframe_timestamps(path: &Path) -> Result<Vec<f64>, MediaError> {
     Ok(parse_float_lines(&stdout))
 }
 
+/// Presentation timestamps of the keyframe packets (absolute, ascending), read
+/// from the container's packet flags without decoding anything: a fraction of
+/// what [`keyframe_timestamps`] costs. Frame extraction uses them to see which
+/// targets one seek can serve.
+pub async fn keyframe_packet_times(path: &Path) -> Result<Vec<f64>, MediaError> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args(INPUT_GUARD)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts_time,flags",
+            "-of",
+            "csv=print_section=0",
+        ])
+        .arg(path);
+    let stdout = capture("ffprobe", &mut cmd, FULL_PASS_TIMEOUT).await?;
+    Ok(parse_keyframe_packets(&stdout))
+}
+
+/// `pts_time,flags` lines → the times of packets flagged `K`, sorted.
+fn parse_keyframe_packets(bytes: &[u8]) -> Vec<f64> {
+    let mut times: Vec<f64> = String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| {
+            let (pts, flags) = line.split_once(',')?;
+            flags
+                .contains('K')
+                .then(|| pts.trim().parse::<f64>().ok())?
+        })
+        .collect();
+    times.sort_by(f64::total_cmp);
+    times.dedup();
+    times
+}
+
 /// Decoder options for the scene-detection pass: skip non-reference frames and
 /// the deblocking filter. Cut detection does not need full-quality frames; on
 /// the test set this took a third off the decode at 2 threads and still found
@@ -421,5 +459,16 @@ noise line\n\
     fn keyframe_lines_tolerate_trailing_separator() {
         let out = b"0.000000,\n2.000000\n\n4.500000\nN/A\n";
         assert_eq!(parse_float_lines(out), vec![0.0, 2.0, 4.5]);
+    }
+
+    #[test]
+    fn keyframe_packets_keep_flagged_times_in_order() {
+        // Packets come in decode order; side-data lines and N/A times are skipped.
+        let out = b"0.000000,K__\n0.133333,___\n0.066667,___\n10.416667,K_\nN/A,K__\n\
+                    5.200000,K\n5.200000,K\n12.5,__D\n";
+        assert_eq!(
+            super::parse_keyframe_packets(out),
+            vec![0.0, 5.2, 10.416667]
+        );
     }
 }

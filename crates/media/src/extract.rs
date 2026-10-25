@@ -15,9 +15,13 @@
 //! * keyframe targets are decoded with `-skip_frame nokey`, skipping every other
 //!   frame.
 //!
-//! Targets further apart than [`MAX_RUN_GAP`] go to separate processes, so sparse
-//! sampling of a long video never decodes the stretches in between. Any target
-//! the batch cannot deliver falls back to the single-frame path.
+//! A run decodes from the keyframe before its first target to just past its
+//! last. Targets further apart than [`MAX_RUN_GAP`] go to separate processes, so
+//! sparse sampling of a long video never decodes the stretches in between —
+//! unless a separate run would start decoding at a keyframe the current run
+//! already decodes past: then the target joins the current run, so no stretch
+//! is decoded twice (videos with long keyframe intervals). Any target the batch
+//! cannot deliver falls back to the single-frame path.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +38,14 @@ use crate::ffmpeg::{self, VideoInfo};
 /// than separate seeks. Decoding the gap costs about as much as a new process
 /// plus seek at ~4 s of 1080p video.
 pub const MAX_RUN_GAP: f64 = 4.0;
+
+/// A run seeks this many seconds before its first target, so a frame just
+/// before it (rounded timestamps) is not skipped by the seek.
+const SEEK_LEAD: f64 = 0.25;
+
+/// A run reads this many seconds past its last target, so that target's frame
+/// is decoded even when frames are stored out of order (B-frames).
+const STOP_PAST_LAST: f64 = 1.0;
 
 /// A frame within this many seconds *before* a target still counts as reaching
 /// it: timestamps from ffprobe are rounded to microseconds, so a frame exactly at
@@ -64,15 +76,18 @@ pub struct FrameRequest {
 }
 
 /// Extract the requested frames as `size`×`size` RGB images, returned in the
-/// order requested.
+/// order requested. `keyframes` are the video's keyframe times, in the
+/// requests' (relative) seconds and ascending; they only decide which targets
+/// share a run (empty: by distance alone), never which frame a target gets.
 pub async fn extract_frames_scaled(
     path: &Path,
     info: &VideoInfo,
     requests: &[FrameRequest],
     size: u32,
+    keyframes: &[f64],
 ) -> Result<Vec<DecodedImage>, MediaError> {
     let mut out: Vec<Option<DecodedImage>> = vec![None; requests.len()];
-    for run in group_runs(requests) {
+    for run in group_runs(requests, keyframes) {
         let times: Vec<f64> = run.iter().map(|&i| requests[i].timestamp).collect();
         let keyframes = run.iter().all(|&i| requests[i].keyframe);
         // A failed batch is not fatal: every target it misses falls back below.
@@ -98,23 +113,28 @@ pub async fn extract_frames_scaled(
 }
 
 /// Group request indices into runs: keyframe targets together, other targets in
-/// ascending time with gaps of at most [`MAX_RUN_GAP`].
-fn group_runs(requests: &[FrameRequest]) -> Vec<Vec<usize>> {
+/// ascending time, each joining the run before it when it is at most
+/// [`MAX_RUN_GAP`] after that run's last target, or when a run of its own would
+/// start decoding at a keyframe that run already decodes past.
+fn group_runs(requests: &[FrameRequest], keyframes: &[f64]) -> Vec<Vec<usize>> {
     let mut order: Vec<usize> = (0..requests.len()).collect();
     order.sort_by(|&a, &b| requests[a].timestamp.total_cmp(&requests[b].timestamp));
-    let (keyframes, others): (Vec<usize>, Vec<usize>) =
+    let (key_targets, others): (Vec<usize>, Vec<usize>) =
         order.into_iter().partition(|&i| requests[i].keyframe);
 
     let mut runs = Vec::new();
-    if !keyframes.is_empty() {
-        runs.push(keyframes);
+    if !key_targets.is_empty() {
+        runs.push(key_targets);
     }
     let mut current: Vec<usize> = Vec::new();
     for i in others {
-        if let Some(&last) = current.last()
-            && requests[i].timestamp - requests[last].timestamp > MAX_RUN_GAP
-        {
-            runs.push(std::mem::take(&mut current));
+        if let Some(&last) = current.last() {
+            let (t, last_t) = (requests[i].timestamp, requests[last].timestamp);
+            let near = t - last_t <= MAX_RUN_GAP;
+            let overlaps = seek_keyframe(keyframes, t) <= last_t + STOP_PAST_LAST;
+            if !near && !overlaps {
+                runs.push(std::mem::take(&mut current));
+            }
         }
         current.push(i);
     }
@@ -122,6 +142,18 @@ fn group_runs(requests: &[FrameRequest]) -> Vec<Vec<usize>> {
         runs.push(current);
     }
     runs
+}
+
+/// Where a run whose first target is `target` starts decoding: the last
+/// keyframe at or before its seek position (0 before the first keyframe).
+/// Without keyframes, `target` itself, so grouping goes by distance alone.
+fn seek_keyframe(keyframes: &[f64], target: f64) -> f64 {
+    if keyframes.is_empty() {
+        return target;
+    }
+    let seek = (target - SEEK_LEAD).max(0.0);
+    let after = keyframes.partition_point(|&k| k <= seek);
+    after.checked_sub(1).map_or(0.0, |i| keyframes[i])
 }
 
 /// Output frame geometry and swscale flags.
@@ -149,8 +181,8 @@ async fn extract_run(
     // `-ss`/`-to` are positions relative to the file start; with `-copyts` the
     // filter's `t` is the absolute presentation time, so targets are shifted by
     // the stream's start time inside the expression.
-    let seek = (first - 0.25).max(0.0);
-    let stop = last + 1.0;
+    let seek = (first - SEEK_LEAD).max(0.0);
+    let stop = last + STOP_PAST_LAST;
     let expr = select_expr(targets.iter().map(|t| t + info.start_time));
 
     let out = loop {
@@ -317,10 +349,57 @@ mod tests {
             req(50.0, true),
             req(11.0, false),
         ];
-        let runs = group_runs(&requests);
+        let runs = group_runs(&requests, &[]);
         // Keyframes (any distance apart) form one run; 10/11/12 are within the
         // gap; 30 is too far from 12.
         assert_eq!(runs, vec![vec![1, 4], vec![2, 5, 3], vec![0]]);
+    }
+
+    #[test]
+    fn seeks_start_at_the_keyframe_before_the_lead() {
+        let keyframes = [0.0, 10.4, 20.8];
+        assert_eq!(seek_keyframe(&keyframes, 3.0), 0.0);
+        assert_eq!(seek_keyframe(&keyframes, 10.65), 10.4); // seek lands exactly on it
+        assert_eq!(seek_keyframe(&keyframes, 10.6), 0.0); // seek just before it
+        assert_eq!(seek_keyframe(&keyframes, 99.0), 20.8);
+        // A video whose first keyframe comes after the start.
+        assert_eq!(seek_keyframe(&[2.0], 1.0), 0.0);
+        // No keyframes known: the target itself, i.e. grouping by distance.
+        assert_eq!(seek_keyframe(&[], 7.5), 7.5);
+    }
+
+    #[test]
+    fn targets_sharing_a_keyframe_share_a_run() {
+        // Keyframes every 10.4 s, as in a long-GOP clip; targets 7.5 s apart.
+        let keyframes = [0.0, 10.4, 20.8, 31.2, 41.6, 52.0];
+        let requests = [
+            req(3.75, false),
+            req(11.25, false),
+            req(18.75, false), // same keyframe (10.4) as 11.25
+            req(26.25, false),
+            req(33.75, false),
+            req(41.5, false), // seeks to 31.2, which the run at 33.75 decodes past
+            req(48.0, false), // seeks to 41.6, before that run stops (41.5 + 1 s)
+            req(56.0, false), // seeks to 52.0, after it: a run of its own
+        ];
+        assert_eq!(
+            group_runs(&requests, &keyframes),
+            vec![vec![0], vec![1, 2], vec![3], vec![4, 5, 6], vec![7]]
+        );
+        // By distance alone every target is on its own.
+        assert_eq!(group_runs(&requests, &[]).len(), requests.len());
+    }
+
+    #[test]
+    fn a_seek_back_into_the_run_joins_it() {
+        // The run [40.9, 41.5] reads to 42.5; 46.0 (4.5 s on) seeks to the
+        // keyframe at 42.0, so it joins rather than decode 42.0..42.5 again.
+        let keyframes = [30.0, 40.5, 42.0];
+        let requests = [req(40.9, false), req(46.0, false), req(41.5, false)];
+        assert_eq!(group_runs(&requests, &keyframes), vec![vec![0, 2, 1]]);
+        // Keyframe targets keep their own run whatever the keyframe list says.
+        let mixed = [req(40.5, true), req(42.0, true), req(41.0, false)];
+        assert_eq!(group_runs(&mixed, &keyframes), vec![vec![0, 1], vec![2]]);
     }
 
     #[test]
@@ -406,7 +485,7 @@ mod ffmpeg_tests {
 
         // At the native 64x48 size the scale filter is a no-op, so each frame
         // must equal what an accurate single-frame seek returns.
-        for run in group_runs(&requests) {
+        for run in group_runs(&requests, &[]) {
             let times: Vec<f64> = run.iter().map(|&i| requests[i].timestamp).collect();
             let keyframes = run.iter().all(|&i| requests[i].keyframe);
             // At the native size a plain scale is a pass-through.
@@ -426,6 +505,86 @@ mod ffmpeg_tests {
         }
     }
 
+    /// 12 s of 64x48 test pattern at 10 fps with a keyframe only every 6 s,
+    /// as in a long-GOP clip.
+    fn long_gop_video(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("long_gop.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=64x48:rate=10")
+            .args([
+                "-t",
+                "12",
+                "-g",
+                "60",
+                "-keyint_min",
+                "60",
+                "-sc_threshold",
+                "0",
+            ])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "could not create the long-GOP video");
+        path
+    }
+
+    #[tokio::test]
+    async fn runs_merged_by_keyframe_return_the_same_frames() {
+        if !have_ffmpeg() {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = long_gop_video(dir.path());
+        let info = ffmpeg::probe(&path).await.unwrap();
+        let keyframes: Vec<f64> = ffmpeg::keyframe_packet_times(&path)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t - info.start_time)
+            .collect();
+        assert_eq!(keyframes.len(), 2, "{keyframes:?}");
+
+        // More than MAX_RUN_GAP apart, but each seek lands on a keyframe the
+        // run before it decodes past: one run instead of three.
+        let requests: Vec<FrameRequest> = [0.55, 5.35, 6.65, 11.55]
+            .into_iter()
+            .map(|timestamp| FrameRequest {
+                timestamp,
+                keyframe: false,
+            })
+            .collect();
+        assert_eq!(group_runs(&requests, &[]).len(), 3);
+        let runs = group_runs(&requests, &keyframes);
+        assert_eq!(runs, vec![vec![0, 1, 2, 3]]);
+
+        // Pixel-identical to an accurate single-frame seek (native size)...
+        let times: Vec<f64> = runs[0].iter().map(|&i| requests[i].timestamp).collect();
+        let native = Output {
+            width: 64,
+            height: 48,
+            flags: "area",
+        };
+        let frames = extract_run(&path, &info, &times, false, &native)
+            .await
+            .unwrap();
+        for (&t, frame) in times.iter().zip(frames) {
+            let got = frame.unwrap_or_else(|| panic!("no frame for target {t}"));
+            let want = ffmpeg::extract_frame(&path, t, None).await.unwrap();
+            assert_eq!(got, want, "frame for target {t}");
+        }
+        // ...and, at a model size, to grouping by distance alone.
+        let merged = extract_frames_scaled(&path, &info, &requests, 32, &keyframes)
+            .await
+            .unwrap();
+        let apart = extract_frames_scaled(&path, &info, &requests, 32, &[])
+            .await
+            .unwrap();
+        assert_eq!(merged, apart);
+    }
+
     #[tokio::test]
     async fn returns_square_frames_in_request_order() {
         if !have_ffmpeg() {
@@ -436,7 +595,7 @@ mod ffmpeg_tests {
         let path = sample_video(dir.path());
         let info = ffmpeg::probe(&path).await.unwrap();
         let requests = requests(&path, &info).await;
-        let frames = extract_frames_scaled(&path, &info, &requests, 32)
+        let frames = extract_frames_scaled(&path, &info, &requests, 32, &[])
             .await
             .unwrap();
         assert_eq!(frames.len(), requests.len());

@@ -1,6 +1,6 @@
 # Operations — metrics, live reload, calibration
 
-This page covers running Apollo day to day: scraping its metrics, changing its config without a restart, and choosing thresholds from labelled examples. For the server's live state at a glance, see `apollo status` in [configuration.md → CLI reference](./configuration.md#cli-reference).
+This page covers running Apollo day to day: scraping its metrics, changing its config without a restart, choosing thresholds from labelled examples, and the memory allocator Linux builds use. For the server's live state at a glance, see `apollo status` in [configuration.md → CLI reference](./configuration.md#cli-reference).
 
 ---
 
@@ -144,3 +144,9 @@ Failed examples (unreadable, too large, …) are listed and left out of the coun
 Run `apollo reload` (or restart) to apply them.
 
 Calibration loads the model on the machine you run it on, with the config's `device` and `cache_dir`, so run it where the weights are already cached to avoid a download.
+
+---
+
+## Memory allocator
+
+Linux builds use [mimalloc](https://github.com/microsoft/mimalloc) as the allocator. glibc's malloc hands candle's large, short-lived tensor buffers back to the kernel, and every forward pass then faults them in again: 1.9 million page faults in one 18 s video scan on a test server. mimalloc keeps the memory, which made CPU video scans 1.2–1.3× faster there, with unchanged scores. The cost is about 120 MB more resident memory. macOS builds stay on the system allocator, since only Linux was measured.

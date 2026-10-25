@@ -30,9 +30,17 @@ inherits = "release"
 debug = true
 strip = false
 
-# candle's Metal strided kernels (copies, broadcast ops) use 64-bit index math,
-# which makes ViT inference on Metal ~2x slower. Our fork switches them to
-# 32-bit; drop this once candle ships the fix (upstream PR pending).
-# Only affects macOS builds: the crate is not compiled on Linux/CUDA targets.
+# candle comes from our fork's `apollo` branch, Apollo's own line of candle 0.11.
+# Among other things, its Metal strided kernels (copies, broadcast ops) use
+# 32-bit index math instead of 64-bit, which makes ViT inference on Metal ~2x
+# faster (upstream PR pending). All four crates come from it, so they stay in step.
 [patch.crates-io]
-candle-metal-kernels = { git = "https://github.com/jakin010/candle", branch = "metal-strided-u32-index" }
+candle-core = { git = "https://github.com/jakin010/candle", branch = "apollo" }
+candle-nn = { git = "https://github.com/jakin010/candle", branch = "apollo" }
+candle-transformers = { git = "https://github.com/jakin010/candle", branch = "apollo" }
+candle-metal-kernels = { git = "https://github.com/jakin010/candle", branch = "apollo" }
+# gemm-common (candle's CPU matmuls, through gemm) from our gemm fork's `apollo`
+# branch: gemm 0.19.0 plus a patch that keeps small matmuls on the AVX2 kernels
+# when the `avx512` feature is on, where AVX-512 would be up to 3x slower. Only
+# affects x86-64 builds with `avx512`; scores are otherwise bit-identical.
+gemm-common = { git = "https://github.com/jakin010/gemm", branch = "apollo" }

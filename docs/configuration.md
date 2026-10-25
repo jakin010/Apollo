@@ -45,6 +45,16 @@ A running server picks up an edited file with `apollo reload` (or `SIGHUP`), wit
 | `max_retries` | u32 | `3` | Times an item is retried after a **transient** failure (network error, HTTP 5xx/408/429, model timeout or load failure, inference error): a failed fetch is re‑fetched, failed models (or the failed pipeline step) re‑run while finished ones are kept. Permanent failures (refused URL, HTTP 4xx, undecodable or over‑limit input) are not retried. `0` = no retries. |
 | `device` | string | `"auto"` | Compute backend for the models. `auto` picks the first that initializes: CUDA (only in `cuda` builds), then Metal (macOS), then CPU. `cpu` always uses the CPU, even on a GPU machine. `metal` / `cuda` pin that backend and fall back to CPU, with a warning, if it can't be used. |
 
+**CPU threads.** Inference on the CPU uses one thread per physical core the server may run on: the performance cores on Apple silicon, and on Linux no more than its CPU affinity (`taskset`) and container CPU limit allow. The count is logged at startup (`CPU threads for inference`). To use fewer, for example when other heavy processes share the machine, set `CANDLE_NUM_THREADS` (or `RAYON_NUM_THREADS`) in the server's environment.
+
+**CPU speed features.** Three build features make inference on the CPU faster, at the cost of bit-for-bit reproducible scores: they move in the last digits (at most 1e-5; no label changed in testing). They are off by default; enable them with `cargo build -p apollo --release --features <name>[,<name>]`.
+
+| Feature | Where | Effect (measured) |
+|---|---|---|
+| `accelerate` | macOS | Matmuls on Apple's BLAS (the AMX units on Apple silicon): 1.7–3.7× faster CPU inference. |
+| `avx512` | x86-64 CPUs with AVX-512 (AMD Zen 4/5, Intel Xeon) | `gemm`'s AVX-512 matmul kernels: images, video and long texts 1.2–1.7× faster, batched short texts 1.2–1.3×. Small matmuls (a few tokens) stay on the AVX2 kernels, so single short texts are not slower. |
+| `fast-gelu` | any CPU | Vectorized GELU: 1.1–1.2× on BERT and ViT models. `CANDLE_FAST_GELU=0` turns it off at run time. |
+
 ---
 
 ## `[webhook]` — outbound delivery
