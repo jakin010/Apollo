@@ -108,7 +108,10 @@ count  = 8
 step      = 2
 method    = "scene"             # a frame at every hard cut: catches short inserts
 threshold = 0.3
-min_gap   = 1.0                 # but at most one per second on fast-cut video
+min_gap   = 0                   # every cut, also ones under a second apart: an insert
+                                # shorter than min_gap would be found only about half
+                                # the time. Cap the cost on fast-cut video with
+                                # max_frames instead.
 
 [[strategies.coverage_scan.sampling]]
 step   = 3
