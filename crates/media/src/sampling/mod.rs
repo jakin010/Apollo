@@ -32,11 +32,20 @@ pub struct FrameRef {
 pub async fn step_samples(
     share: &VideoShare,
     step: &SamplingStep,
+    seed: u64,
 ) -> Result<Vec<(f64, Option<f32>)>, MediaError> {
     let info = share.info();
     let plain = |times: Vec<f64>| times.into_iter().map(|t| (t, None)).collect();
     match step.method {
-        SamplingKind::Uniform => Ok(plain(uniform::timestamps(info, req(step.count, "count")?))),
+        SamplingKind::Uniform => {
+            // A random step's times depend on the scan's seed and the step.
+            let seed = step.random.then(|| step_seed(seed, step.step));
+            Ok(plain(uniform::timestamps(
+                info,
+                req(step.count, "count")?,
+                seed,
+            )))
+        }
         SamplingKind::Fps => Ok(plain(fps::timestamps(info, req(step.fps, "fps")?))),
         SamplingKind::EveryNth => Ok(plain(every_nth::timestamps(info, req(step.nth, "nth")?))),
         // ffmpeg reports these as absolute presentation times; sampling works
@@ -58,6 +67,12 @@ pub async fn step_samples(
         // classified — see [`crate::strategy::refine_plan`].
         SamplingKind::Refine => Ok(Vec::new()),
     }
+}
+
+/// A step's own seed from the scan's, so two random steps of a strategy
+/// differ.
+fn step_seed(seed: u64, step: u32) -> u64 {
+    seed ^ u64::from(step).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 fn relative(info: &VideoInfo, times: Vec<f64>) -> Vec<f64> {

@@ -244,7 +244,7 @@ Steps run in ascending `step` order (cheapest first, typically). Each step's req
 |----------|----------------|---------|
 | `iframes` | *(none)* | Keyframes only — cheapest, no full decode. |
 | `fps` | `fps` (float) | Sample at N frames per second. |
-| `uniform` | `count` (u32) | N frames, evenly spaced across the clip. |
+| `uniform` | `count` (u32) | N frames spread across the clip: one in each of N equal stretches, at its midpoint. With `random = true`, at a random time within each stretch instead, all chosen when the step is planned. The times are fixed per scan (a retry, a resume and every model scanning the input get the same frames) but can't be known before the task exists, so nothing can be placed between them on purpose. |
 | `every_nth` | `nth` (u32) | Take every Nth frame. |
 | `scene` | `threshold` (0..1) | One frame per shot change above the threshold. Optional `min_gap` (seconds, default 0): of cuts closer together than this, keep only the strongest (highest scene score). That caps the cost on fast‑cut video, but an insert shorter than `min_gap` has both its cuts (in and out) inside it, and only the frame at the cut *in* shows it, so it is found only when that cut scores higher: about half the time. Leave `min_gap` at 0 where short inserts matter and cap the cost with `max_frames`. Detection decodes every frame, including non‑reference (B‑)frames, where a cut no keyframe marks can land, and skips the deblocking filter. |
 | `refine` | `min_score` (0..1), `window` (s), `fps` | **Look closer.** After every other step has run without a trigger, sample at `fps` within `window` seconds either side of each frame whose trigger score was ambiguous — from `min_score` up to the model's `early_exit.threshold`. Needs the model's `early_exit` labels, and must be the last step(s). Clean, confidently scored video gets no extra frames. |
@@ -270,6 +270,7 @@ early_exit  = true
 step = 1
 method = "uniform"           # an early, spread-out look; finds long segments fast
 count = 8
+random = true                # a random frame in each eighth: no gaps to aim at
 
 [[strategies.coverage_scan.sampling]]
 step = 2

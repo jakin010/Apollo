@@ -48,6 +48,12 @@ impl Config {
                         s.step, s.method
                     ));
                 }
+                if s.random && s.method != SamplingKind::Uniform {
+                    errs.push(format!(
+                        "strategy '{name}' step {}: 'random' only applies to method 'uniform'",
+                        s.step
+                    ));
+                }
                 if s.min_gap.is_some() && s.method != SamplingKind::Scene {
                     errs.push(format!(
                         "strategy '{name}' step {}: 'min_gap' only applies to method 'scene'",

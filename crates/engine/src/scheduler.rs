@@ -1180,7 +1180,12 @@ impl Engine {
         // step's probe runs in the background; it is cancelled if the scan stops
         // first. Indices run on across steps, so a resumed scan plans the same
         // frames and skips the ones it already has.
-        let mut planner = apollo_media::Planner::new(info, &strategy.sampling, budget);
+        let mut planner = apollo_media::Planner::new(
+            info,
+            &strategy.sampling,
+            budget,
+            scan_seed(scan.task_id, scan.idx),
+        );
         let mut plan: Vec<FrameRef> = Vec::new();
         let mut stopped = false;
         // Held while the batch before its step is classified; dropping it cancels.
@@ -1573,6 +1578,20 @@ fn item_url(input: &Input) -> Option<&Url> {
 }
 
 /// Hex-encoded SHA-256 of a byte slice.
+/// The seed that places a scan's `random` uniform frames: from its task and
+/// item, so a retry, a resume and every model scanning the input plan the
+/// same frames (and share them), while an uploader cannot know them before the
+/// task exists.
+fn scan_seed(task_id: &str, idx: usize) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{task_id}:{idx}").as_bytes());
+    u64::from_le_bytes(
+        digest[..8]
+            .try_into()
+            .expect("a SHA-256 digest has 32 bytes"),
+    )
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1692,6 +1711,13 @@ async fn classify_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scan_seed_is_fixed_per_task_and_item() {
+        assert_eq!(scan_seed("t-1", 0), scan_seed("t-1", 0));
+        assert_ne!(scan_seed("t-1", 0), scan_seed("t-1", 1));
+        assert_ne!(scan_seed("t-1", 0), scan_seed("t-2", 0));
+    }
 
     fn photo(width: u32, height: u32) -> DecodedImage {
         DecodedImage {

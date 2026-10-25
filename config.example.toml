@@ -103,6 +103,8 @@ early_exit  = true
 step   = 1
 method = "uniform"              # an early, spread-out look; finds long segments fast
 count  = 8
+random = true                   # a random frame in each eighth, fixed per scan:
+                                # unpredictable, so there are no gaps to aim at
 
 [[strategies.coverage_scan.sampling]]
 step      = 2

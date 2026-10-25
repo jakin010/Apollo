@@ -26,6 +26,13 @@ fn parses_and_validates_example() {
         coverage.sampling.last().map(|s| s.method),
         Some(SamplingKind::Refine)
     );
+    // The early look is random, so there are no fixed gaps to place content in.
+    let uniform = coverage
+        .sampling
+        .iter()
+        .find(|s| s.method == SamplingKind::Uniform)
+        .expect("uniform step");
+    assert!(uniform.random);
     // Every scene cut: a min_gap skips about half the inserts shorter than it.
     let scene = coverage
         .sampling
@@ -138,6 +145,23 @@ fn siglip_score_threshold_is_0_to_1_with_two_decimals() {
         let err = check(bad).unwrap_err().to_string();
         assert!(err.contains("at most 2 decimals"), "{bad}: {err}");
     }
+}
+
+#[test]
+fn random_only_applies_to_uniform_steps() {
+    let strategy = |method: &str, extra: &str| {
+        load::from_str(&format!(
+            "[strategies.s]\n[[strategies.s.sampling]]\nstep = 1\nmethod = \"{method}\"\n{extra}\nrandom = true\n"
+        ))
+        .unwrap()
+        .validate()
+    };
+    assert!(strategy("uniform", "count = 8").is_ok());
+    let err = strategy("fps", "fps = 1.0").unwrap_err().to_string();
+    assert!(
+        err.contains("'random' only applies to method 'uniform'"),
+        "{err}"
+    );
 }
 
 #[test]

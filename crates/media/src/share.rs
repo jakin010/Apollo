@@ -424,6 +424,7 @@ mod planner_tests {
             method,
             fps: None,
             count,
+            random: false,
             nth: None,
             threshold,
             min_gap: None,
@@ -446,7 +447,7 @@ mod planner_tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let share = sample(dir.path()).await;
-        let mut planner = Planner::new(share.info(), &steps(), None);
+        let mut planner = Planner::new(share.info(), &steps(), None, 0);
 
         let first = planner.next_step(&share).await.unwrap().unwrap();
         assert_eq!(first.len(), 2);
@@ -469,7 +470,7 @@ mod planner_tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let share = sample(dir.path()).await;
-        let mut planner = Planner::new(share.info(), &steps(), None);
+        let mut planner = Planner::new(share.info(), &steps(), None, 0);
         let mut lazy = planner.next_step(&share).await.unwrap().unwrap();
         let warm = share.warm(planner.upcoming().unwrap());
         assert!(warm.is_some());
@@ -479,7 +480,9 @@ mod planner_tests {
         assert_eq!(share.stats().probes_run, 1);
         drop(warm);
         // Same frames and indices as planning every step at once.
-        let eager = crate::strategy::plan(&share, &steps(), None).await.unwrap();
+        let eager = crate::strategy::plan(&share, &steps(), None, 0)
+            .await
+            .unwrap();
         assert_eq!(lazy, eager);
     }
 }
