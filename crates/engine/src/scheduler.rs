@@ -142,6 +142,15 @@ impl Drop for Prefetch {
     }
 }
 
+/// A background task, aborted when dropped (on an early return, say).
+struct Background<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for Background<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The result of fetching an item's input once.
 struct FetchedInput {
     fetched: Fetched,
@@ -1045,6 +1054,12 @@ impl Engine {
         media: LocalMedia,
         want_hash: bool,
     ) -> Result<(Fetched, Option<String>), EngineError> {
+        // Read the keyframe positions, which plan the frame extraction runs,
+        // while the video is probed. Dropped (stopping it) if the video is refused.
+        let mut keyframes = Background(tokio::spawn({
+            let path = media.path().to_path_buf();
+            async move { apollo_media::ffmpeg::keyframe_packet_times(&path).await }
+        }));
         let info = apollo_media::probe(media.path()).await?;
         let max = self.config().limits.max_video_seconds;
         if max > 0 && info.duration > max as f64 {
@@ -1073,7 +1088,11 @@ impl Engine {
         } else {
             None
         };
-        let share = Arc::new(VideoShare::new(media.path().to_path_buf(), info.clone()));
+        let keyframes = (&mut keyframes.0).await.ok().and_then(Result::ok);
+        let share = Arc::new(
+            VideoShare::new(media.path().to_path_buf(), info.clone())
+                .with_keyframe_packets(keyframes),
+        );
         Ok((
             Fetched::Video {
                 _media: media,

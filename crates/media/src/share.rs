@@ -62,6 +62,9 @@ pub struct VideoShare {
     path: PathBuf,
     info: VideoInfo,
     keyframes: OnceCell<Vec<f64>>,
+    /// Keyframe packet times (relative), for planning which frames one
+    /// extraction run decodes. Empty if they could not be read.
+    seek_points: OnceCell<Vec<f64>>,
     /// Keyed by the threshold's bits.
     scenes: Mutex<HashMap<u64, SceneCell>>,
     frames: Mutex<FrameStore>,
@@ -84,6 +87,7 @@ impl VideoShare {
             path,
             info,
             keyframes: OnceCell::new(),
+            seek_points: OnceCell::new(),
             scenes: Mutex::new(HashMap::new()),
             frames: Mutex::new(FrameStore::default()),
             probes_run: AtomicU64::new(0),
@@ -91,6 +95,18 @@ impl VideoShare {
             frames_decoded: AtomicU64::new(0),
             frames_shared: AtomicU64::new(0),
         }
+    }
+
+    /// Use `times` — the keyframe packet times (absolute) read ahead with
+    /// [`ffmpeg::keyframe_packet_times`], e.g. while the video was probed —
+    /// instead of reading them when frames are first extracted. `None` (they
+    /// could not be read): extraction runs are grouped by distance alone.
+    pub fn with_keyframe_packets(self, times: Option<Vec<f64>>) -> Self {
+        let relative = times
+            .map(|times| times.iter().map(|t| t - self.info.start_time).collect())
+            .unwrap_or_default();
+        let _ = self.seek_points.set(relative);
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -113,6 +129,20 @@ impl VideoShare {
     /// Keyframe presentation timestamps (absolute), probed once.
     pub async fn keyframes(&self) -> Result<Vec<f64>, MediaError> {
         self.probe_once(&self.keyframes, || ffmpeg::keyframe_timestamps(&self.path))
+            .await
+    }
+
+    /// Keyframe packet times relative to the video's start, read once without
+    /// decoding. Only used to plan extraction runs, so a failure leaves them
+    /// empty (runs are then grouped by distance alone) instead of failing.
+    async fn seek_points(&self) -> &[f64] {
+        self.seek_points
+            .get_or_init(|| async {
+                ffmpeg::keyframe_packet_times(&self.path)
+                    .await
+                    .map(|times| times.iter().map(|t| t - self.info.start_time).collect())
+                    .unwrap_or_default()
+            })
             .await
     }
 
@@ -257,7 +287,9 @@ impl VideoShare {
         let wanted: Vec<FrameRequest> = slots.iter().map(|(i, _)| requests[*i]).collect();
         // On error the locks are released with the slots still empty, so
         // anyone waiting decodes the frames themselves.
-        let images = extract_frames_scaled(&self.path, &self.info, &wanted, size).await?;
+        let keyframes = self.seek_points().await;
+        let images =
+            extract_frames_scaled(&self.path, &self.info, &wanted, size, keyframes).await?;
         self.frames_decoded
             .fetch_add(images.len() as u64, Ordering::Relaxed);
         let mut decoded = Vec::with_capacity(images.len());
