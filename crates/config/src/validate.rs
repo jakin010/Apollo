@@ -305,6 +305,12 @@ impl Config {
     }
 }
 
+/// A SigLIP score threshold: from 0 to 1, with at most two decimals (scores
+/// are calibrated so that hundredths are fine enough). Tolerates f32 rounding.
+pub(crate) fn is_score_threshold(t: f64) -> bool {
+    (0.0..=1.0).contains(&t) && (t * 100.0 - (t * 100.0).round()).abs() < 1e-4
+}
+
 /// The fields each architecture needs, and those it cannot use.
 fn validate_architecture(label: &str, model: &ModelConfig, errs: &mut Vec<String>) {
     use apollo_domain::ModelInput;
@@ -351,6 +357,13 @@ fn validate_architecture(label: &str, model: &ModelConfig, errs: &mut Vec<String
         Architecture::Vit | Architecture::Siglip => {
             if model.repo.is_empty() {
                 errs.push(format!("model '{label}': `repo` is required"));
+            }
+            if let Some(t) = model.score_threshold
+                && !is_score_threshold(f64::from(t))
+            {
+                errs.push(format!(
+                    "model '{label}': score_threshold must be from 0 to 1 with at most 2 decimals (got {t})"
+                ));
             }
         }
         Architecture::Pdq => {

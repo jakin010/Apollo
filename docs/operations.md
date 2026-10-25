@@ -104,7 +104,7 @@ The request goes over the same owner-only local socket as `apollo status`, so on
 
 ## Threshold calibration
 
-`apollo calibrate` runs a model over labelled examples and reports its precision, recall, F1 and false-positive rate for each label at thresholds 0.05, 0.10, … 0.95. When a label's positive examples score below 0.05, as SigLIP's often do, the table also covers 0.0001 to 0.02. It shows the threshold with the best F1, and the lowest threshold that reaches a target precision (the most recall for that precision). Both are searched over the table's thresholds and every example's own score, so the cut-off between examples is found exactly rather than rounded to the table.
+`apollo calibrate` runs a model over labelled examples and reports its precision, recall, F1 and false-positive rate for each label at thresholds 0.05, 0.10, … 0.95. When a label's positive examples score below 0.05, the table also covers 0.0001 to 0.02. It shows the threshold with the best F1, and the lowest threshold that reaches a target precision (the most recall for that precision). Both are searched over the table's thresholds and every example's own score, so the cut-off between examples is found exactly rather than rounded to the table. For a `siglip` model, whose thresholds have at most 2 decimals, both are searched over every hundredth (0.01 … 0.99) instead, so a recommendation can always be written as it is.
 
 ```bash
 apollo calibrate --model nsfw --data ./labelled --target-precision 0.95

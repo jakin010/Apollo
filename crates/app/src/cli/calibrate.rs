@@ -414,23 +414,50 @@ struct Point {
     fpr: Option<f64>,
 }
 
-/// Low thresholds, for labels scored far below 0.05 (SigLIP's sigmoid scores
-/// often are).
+/// Low thresholds, for labels scored far below 0.05.
 const FINE: [f32; 8] = [0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02];
 
+/// Which thresholds may be recommended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Search {
+    /// Any value: the cut-off between examples is found exactly.
+    Exact,
+    /// Hundredths only (0.01 … 0.99): SigLIP thresholds have at most two
+    /// decimals.
+    Hundredths,
+}
+
+impl Search {
+    fn for_model(cfg: &apollo_config::ModelConfig) -> Self {
+        if cfg.architecture == Architecture::Siglip {
+            Search::Hundredths
+        } else {
+            Search::Exact
+        }
+    }
+}
+
 /// The thresholds the table shows: 0.05, 0.10, … 0.95, preceded by [`FINE`]
-/// when a positive example scores below 0.05.
-fn grid(scored: &[(f32, bool)]) -> Vec<f32> {
+/// when a positive example scores below 0.05 (with an exact search).
+fn grid(scored: &[(f32, bool)], search: Search) -> Vec<f32> {
     let low = scored.iter().any(|&(s, p)| p && s > 0.0 && s < 0.05);
-    let mut out = if low { FINE.to_vec() } else { Vec::new() };
+    let mut out = if low && search == Search::Exact {
+        FINE.to_vec()
+    } else {
+        Vec::new()
+    };
     out.extend((1..=19).map(|i| (i * 5) as f32 / 100.0));
     out
 }
 
-/// The thresholds searched for the best F1 and the recommendation: the grid
-/// plus every example's own score, so the exact cut-off is found.
-fn candidates(scored: &[(f32, bool)]) -> Vec<f32> {
-    let mut out = grid(scored);
+/// The thresholds searched for the best F1 and the recommendation: with an
+/// exact search, the grid plus every example's own score, so the exact
+/// cut-off is found; otherwise every hundredth.
+fn candidates(scored: &[(f32, bool)], search: Search) -> Vec<f32> {
+    if search == Search::Hundredths {
+        return (1..=99).map(|i| i as f32 / 100.0).collect();
+    }
+    let mut out = grid(scored, search);
     out.extend(
         scored
             .iter()
@@ -623,6 +650,7 @@ async fn calibrate(args: CalibrateArgs) -> anyhow::Result<()> {
             .find(|l| l.id == id)
             .map_or_else(|| id.to_string(), |l| l.name.clone())
     };
+    let search = Search::for_model(&model_cfg);
     let mut reports = Vec::new();
     for &id in &evaluated {
         let scored: Vec<(f32, bool)> = scores
@@ -633,7 +661,7 @@ async fn calibrate(args: CalibrateArgs) -> anyhow::Result<()> {
                 Some((s.get(&id).copied().unwrap_or(0.0), t.contains(&id)))
             })
             .collect();
-        let searched = curve(&scored, &candidates(&scored));
+        let searched = curve(&scored, &candidates(&scored, search));
         let positives = scored.iter().filter(|(_, p)| *p).count();
         reports.push(LabelReport {
             id,
@@ -642,7 +670,7 @@ async fn calibrate(args: CalibrateArgs) -> anyhow::Result<()> {
             negatives: scored.len() - positives,
             best_f1: best_f1(&searched).cloned(),
             recommended: recommend(&searched, args.target_precision).cloned(),
-            points: curve(&scored, &grid(&scored)),
+            points: curve(&scored, &grid(&scored, search)),
         });
     }
 
@@ -811,7 +839,7 @@ mod tests {
     fn the_curve_counts_and_rates() {
         // Positives at 0.9 and 0.6; negatives at 0.7 and 0.1.
         let scored = [(0.9, true), (0.6, true), (0.7, false), (0.1, false)];
-        let points = curve(&scored, &grid(&scored));
+        let points = curve(&scored, &grid(&scored, Search::Exact));
         assert_eq!(
             points.len(),
             19,
@@ -837,7 +865,7 @@ mod tests {
         // threshold that leaves out the negative at 0.7. F1 is highest (0.8)
         // from 0.15 to 0.6 (at 0.1 the negative at 0.1 still counts), and the
         // lowest of those is chosen.
-        let searched = curve(&scored, &candidates(&scored));
+        let searched = curve(&scored, &candidates(&scored, Search::Exact));
         assert_eq!(recommend(&searched, 0.95).unwrap().threshold, 0.75);
         let best = best_f1(&searched).unwrap();
         assert!((best.f1.unwrap() - 0.8).abs() < 1e-9);
@@ -846,15 +874,28 @@ mod tests {
 
     #[test]
     fn low_scores_get_a_fine_grid_and_exact_recommendations() {
-        // SigLIP-like: the positive scores 0.0061, negatives 0.0009 and 0.003.
+        // The positive scores 0.0061, negatives 0.0009 and 0.003.
         let scored = [(0.0061, true), (0.0009, false), (0.003, false)];
-        let grid = grid(&scored);
+        let grid = grid(&scored, Search::Exact);
         assert_eq!(grid[0], 0.0001);
         assert_eq!(grid.len(), 8 + 19);
-        let searched = curve(&scored, &candidates(&scored));
+        let searched = curve(&scored, &candidates(&scored, Search::Exact));
         // The lowest threshold that leaves out both negatives.
         assert_eq!(recommend(&searched, 0.95).unwrap().threshold, 0.005);
         assert_eq!(toml_threshold(0.0061234), 0.0061234);
+    }
+
+    #[test]
+    fn siglip_thresholds_are_searched_in_hundredths() {
+        // Calibrated SigLIP scores: the positive 0.4, negatives 0.333 and 0.02.
+        let scored = [(0.4, true), (0.333, false), (0.02, false)];
+        assert_eq!(grid(&scored, Search::Hundredths).len(), 19, "no fine grid");
+        let searched = curve(&scored, &candidates(&scored, Search::Hundredths));
+        // The lowest hundredth above the negative at 0.333, not 0.4 itself.
+        let t = recommend(&searched, 0.95).unwrap().threshold;
+        assert_eq!(toml_threshold(t), 0.34);
+        let hundredths = |t: f32| ((t * 100.0).round() - t * 100.0).abs() < 1e-4;
+        assert!(searched.iter().all(|p| hundredths(p.threshold)));
     }
 
     #[test]
