@@ -124,7 +124,7 @@ apollo calibrate --model nsfw --data ./labelled --write   # then: apollo reload
 
 - **A JSONL manifest:** one `{"path": "...", "labels": [...]}` per line, labels as names or ids, an empty or missing list for a negative. Relative paths resolve from the manifest's directory. Blank lines and `#` comments are ignored.
 
-Images (`jpg`, `png`, `webp`, `gif`, `bmp`, `tiff`), videos (`mp4`, `m4v`, `mov`, `mkv`, `webm`, `avi`) and texts (`txt`, UTF-8, for text models) are recognised by extension.
+Images (`jpg`, `png`, `webp`, `gif`, `bmp`, `tiff`), videos (`mp4`, `m4v`, `mov`, `mkv`, `webm`, `avi`) and texts (`txt`, UTF-8, for text models) are recognised by extension. A model that reads text (`paddleocr_vl`) has no thresholds to calibrate; calibrate the text model that classifies what it reads, on texts.
 
 By default every label that appears in the data is reported, or the model's `early_exit` labels if the data has only negatives. `--label` (repeatable) picks labels instead. An example counts as positive for a label when it is listed under it; every other example is a negative for it.
 

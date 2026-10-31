@@ -26,7 +26,9 @@ use clap::Args;
 use serde::Serialize;
 
 use apollo_config::{Config, edit, load};
-use apollo_domain::{Architecture, Input, ItemState, Label, ModelOutput, ModelState, Url};
+use apollo_domain::{
+    Architecture, Input, ItemState, Label, ModelOutput, ModelState, OutputKind, Url,
+};
 use apollo_engine::{Engine, Run, Submission};
 
 #[derive(Args)]
@@ -374,7 +376,8 @@ async fn score_all(
                     let class = match r.output {
                         Some(ModelOutput::Classification(c)) => c,
                         Some(ModelOutput::Scan(s)) => s.aggregated,
-                        None => Default::default(),
+                        // Refused before anything runs.
+                        Some(ModelOutput::Text(_)) | None => Default::default(),
                     };
                     Ok(class
                         .predictions
@@ -562,6 +565,12 @@ async fn calibrate(args: CalibrateArgs) -> anyhow::Result<()> {
         .get(&args.model)
         .cloned()
         .ok_or_else(|| anyhow!("no model '{}' in the config", args.model))?;
+    if model_cfg.architecture.output() == OutputKind::Text {
+        bail!(
+            "model '{}' reads text and has no thresholds; calibrate the text model that classifies it",
+            args.model
+        );
+    }
 
     let (examples, skipped) = load_dataset(&args.data)?;
     if examples.is_empty() {

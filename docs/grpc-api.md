@@ -70,7 +70,7 @@ Requests cooperative cancellation and returns the task **after** the request: `C
 
 ### `ListModels(ListModelsRequest) → ListModelsResponse`
 
-The configured models and pipelines, so clients need not hard-code them. Each model lists the input kinds it accepts, whether it is enabled and currently loaded, its labels (id and name, as in predictions), its trigger (`[models.<name>.early_exit]`) and its video strategy. Labels are read without loading or downloading the model: from the config for `siglip` and `pdq` (its `categories`), from the cached `config.json` for `vit` and the text models. A `vit` or text model that was never downloaded has no labels listed until its first use.
+The configured models and pipelines, so clients need not hard-code them. Each model lists the input kinds it accepts, what it outputs (a classification, or the text it read), whether it is enabled and currently loaded, its labels (id and name, as in predictions), its trigger (`[models.<name>.early_exit]`) and its video strategy. Labels are read without loading or downloading the model: from the config for `siglip` and `pdq` (its `categories`), from the cached `config.json` for `vit` and the text models. A `vit` or text model that was never downloaded has no labels listed until its first use; a model that reads text (`paddleocr_vl`) has none.
 
 ---
 
@@ -163,8 +163,10 @@ message ModelResult {
   ModelState state = 2;                     // always set
   Error      error = 3;                     // why it failed, when FAILED
   oneof output {                            // set when COMPLETED
-    Classification classification = 4;      // an image, classified once
-    Scan           scan           = 5;      // an image classifier over a video's frames
+    Classification classification = 4;      // an image (or a text), classified once
+    Scan           scan           = 5;      // an image classifier over a video's frames,
+                                            // or a text classifier over a video's text
+    TextOutput     text           = 6;      // the text a model read (OCR)
   }
 }
 
@@ -178,11 +180,22 @@ message Scan {
   uint32           sample_count = 4;        // also set in the SUMMARY view
 }
 
-message Sample {                            // one classified video frame (start == end)
-  uint32 index = 1;                         // position in processing order
+message Sample {                            // one classified video frame (start == end),
+  uint32 index = 1;                         // or one part of a video's text
   double start = 2;                         // seconds into the media
   double end   = 3;
   Classification classification = 4;
+}
+
+message TextOutput {
+  string text     = 1;                      // all of it (a video's parts joined by newlines)
+  string language = 2;                      // when the model reports one (empty for OCR)
+  repeated TimedText parts = 3;             // a video's text, in time order; empty for an image
+}
+
+message TimedText {
+  double start = 1;  double end = 2;        // first and last sampled frame it was read on
+  string text  = 3;
 }
 
 message Segment {
@@ -204,6 +217,8 @@ message Segment {
 - Each prediction has the label's `id` (a class index for `vit` and the text models, a label‑list index for `siglip` with `labels`, a taxonomy child id for `siglip` with a taxonomy, a category id for `pdq`) and its `name` (e.g. `nsfw`, or `food_and_drink.drinks` for a taxonomy child). `ListModels` lists every label a model can predict.
 - For `siglip`, `score` is an independent, calibrated score from 0 to 1: SigLIP's sigmoid shifted so that a clear match scores about 0.5–0.9 (see [configuration → SigLIP scores](./configuration.md#siglip-scores)).
 - Video results come back as a `Scan`: `aggregated` is the roll-up across the classified frames (the strategy's `max` or `mean`), `segments` the stretches where a trigger label fired, and `samples` the individual frames (`FULL` view only). A scan that stopped early (`early_exit`) has only the frames classified up to then.
+- A model that reads text (`paddleocr_vl`) gives a `TextOutput`. For an image, `text` is what it read, empty when there is none. For a video, each sampled frame is read and text repeated on consecutive frames becomes one of the `parts`, with the first and last frame it was read on; `text` is the parts joined by newlines. The `SUMMARY` view keeps all of it.
+- A pipeline step with an `input` (see [configuration → pipelines](./configuration.md#pipelinesname--ordered-gated-model-execution)) classifies the text an earlier step read. For an image it gives a `Classification` of that text (with no predictions when there is none). For a video it gives a `Scan` whose samples are the text's parts (`start` to `end` as read), `aggregated` each label's highest score over the parts, and `segments` the parts where the model's `early_exit` labels reached their threshold. Sampled frames on which no text was read count as clear, like a part below the threshold: a segment never spans one, and the nearest clear sample on each side (or the video's start or end) is its bound.
 
 ### Segments
 
@@ -283,12 +298,21 @@ message ModelInfo {
   repeated Label labels = 7;                // empty if not readable offline
   Trigger trigger = 8;                      // the model's early_exit, if any
   string video_strategy = 9;
+  ModelOutputKind output = 10;              // CLASSIFICATION, or TEXT (it reads text)
+}
+enum ModelOutputKind {
+  MODEL_OUTPUT_KIND_UNSPECIFIED = 0;
+  MODEL_OUTPUT_KIND_CLASSIFICATION = 1;     // a Classification (a Scan over a video)
+  MODEL_OUTPUT_KIND_TEXT = 2;               // a TextOutput
 }
 message Label   { uint32 id = 1; string name = 2; }
 message Trigger { repeated uint32 labels = 1; float threshold = 2; }
 
 message PipelineInfo     { string name = 1; repeated PipelineStepInfo steps = 2; }  // in run order
-message PipelineStepInfo { repeated string models = 1; StopIf stop_if = 2; }
+message PipelineStepInfo {
+  repeated string models = 1;  StopIf stop_if = 2;
+  string input = 3;                         // the earlier model whose text it classifies
+}
 message StopIf           { string model = 1; Trigger trigger = 2; }  // the model it checks
 ```
 
@@ -300,10 +324,12 @@ The input's kind fixes which models are valid for it. Invalid combinations are r
 
 | Input | Valid models |
 |-------|--------------|
-| image | any image model (`vit`, `siglip`, `pdq`) |
+| image | any image model (`vit`, `siglip`, `pdq`, and `paddleocr_vl`, which reads its text) |
 | video | any image model that has a `video_strategy` configured (it is run over sampled frames) |
 | text | any text model (`bert`, `distilbert`, `xlm_roberta`, `modernbert`, `deberta_v2`) |
 | audio | none yet |
+
+In a pipeline, the models of a step with an `input` classify the text an earlier step read, not the task's input, so a pipeline like `ocr → toxicity` takes what `ocr` takes: images and video.
 
 Runtime failures (an unfetchable URL, a decode error, an inference error, a timeout) are **not** rejected up front; they are reported on the task and its model results.
 
@@ -364,6 +390,13 @@ grpcurl -plaintext -H "authorization: $TOKEN" \
 grpcurl -plaintext -H "authorization: $TOKEN" \
   -d "{\"media\": {\"kind\": \"MEDIA_KIND_IMAGE\", \"data\": \"$(base64 < cat.jpg)\"},
        \"models\": {\"names\": [\"general\"]}, \"wait_seconds\": 30}" \
+  localhost:8080 apollo.v1.Inference/Classify
+
+# Read the text in an image and classify it (a pipeline whose second step has
+# input = "ocr").
+grpcurl -plaintext -H "authorization: $TOKEN" \
+  -d '{"media": {"kind": "MEDIA_KIND_IMAGE", "url": "https://example.com/meme.jpg"},
+       "pipeline": "read_and_check", "wait_seconds": 60}' \
   localhost:8080 apollo.v1.Inference/Classify
 
 # Classify a text with a text model.

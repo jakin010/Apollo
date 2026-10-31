@@ -344,6 +344,7 @@ fn model_to_proto(
     let output = m.output.map(|output| match output {
         dom::ModelOutput::Classification(c) => Output::Classification(classification_to_proto(c)),
         dom::ModelOutput::Scan(s) => Output::Scan(scan_to_proto(s, view)),
+        dom::ModelOutput::Text(t) => Output::Text(text_to_proto(t)),
     });
     pb::ModelResult {
         model,
@@ -401,6 +402,22 @@ fn scan_to_proto(s: dom::Scan, view: View) -> pb::Scan {
     }
 }
 
+fn text_to_proto(t: dom::TextOutput) -> pb::TextOutput {
+    pb::TextOutput {
+        text: t.text,
+        language: t.language,
+        parts: t
+            .parts
+            .into_iter()
+            .map(|p| pb::TimedText {
+                start: p.start,
+                end: p.end,
+                text: p.text,
+            })
+            .collect(),
+    }
+}
+
 fn sample_to_proto(s: dom::Sample) -> pb::Sample {
     pb::Sample {
         index: s.index,
@@ -454,6 +471,10 @@ pub(crate) fn catalog_to_proto(catalog: Catalog) -> pb::ListModelsResponse {
                 .collect(),
             trigger: m.trigger.map(trigger),
             video_strategy: m.video_strategy.unwrap_or_default(),
+            output: match m.output {
+                dom::OutputKind::Classification => pb::ModelOutputKind::Classification,
+                dom::OutputKind::Text => pb::ModelOutputKind::Text,
+            } as i32,
         })
         .collect();
     let pipelines = catalog
@@ -470,6 +491,7 @@ pub(crate) fn catalog_to_proto(catalog: Catalog) -> pb::ListModelsResponse {
                         model: g.model,
                         trigger: Some(trigger(g.trigger)),
                     }),
+                    input: s.input.unwrap_or_default(),
                 })
                 .collect(),
         })

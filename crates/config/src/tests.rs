@@ -586,3 +586,166 @@ fn pdq_models_need_a_list_and_categories() {
     std::fs::write(&list, good).unwrap();
     load::load_from(&config).unwrap().validate().unwrap();
 }
+
+fn ocr_pipeline(models: &str, steps: &str) -> String {
+    format!(
+        r#"
+        [models.ocr]
+        architecture = "paddleocr_vl"
+        repo = "PaddlePaddle/PaddleOCR-VL"
+        [models.toxicity]
+        architecture = "bert"
+        repo = "a/t"
+        early_exit = {{ labels = [0], threshold = 0.5 }}
+        [models.nsfw]
+        architecture = "vit"
+        repo = "a/b"
+        {models}
+
+        [pipelines.p]
+        steps = [{steps}]
+        "#
+    )
+}
+
+#[test]
+fn a_step_classifies_text_an_earlier_step_read() {
+    let cfg = load::from_str(&ocr_pipeline(
+        "",
+        r#"{ model = "ocr", order = 1 },
+           { model = "toxicity", order = 2, input = "ocr", stop_if = { labels = [0] } }"#,
+    ))
+    .unwrap();
+    cfg.validate().expect("valid");
+    let steps = cfg.pipelines["p"].ordered_steps();
+    assert_eq!(steps[0].input, None);
+    assert_eq!(steps[1].input.as_deref(), Some("ocr"));
+
+    for (steps, needle) in [
+        (
+            r#"{ model = "toxicity", order = 1, input = "ocr" }, { model = "ocr", order = 2 }"#,
+            "input 'ocr' is not a model of an earlier step",
+        ),
+        (
+            r#"{ model = "nsfw", order = 1 }, { model = "toxicity", order = 2, input = "nsfw" }"#,
+            "input 'nsfw' does not read text",
+        ),
+        (
+            r#"{ model = "ocr", order = 1 }, { model = ["toxicity", "nsfw"], order = 2, input = "ocr" }"#,
+            "'nsfw' is not a text model",
+        ),
+        (
+            r#"{ model = "ocr", order = 1, stop_if = { labels = [1] } }, { model = "toxicity", order = 2 }"#,
+            "stop_if checks 'ocr', which reads text",
+        ),
+    ] {
+        let err = load::from_str(&ocr_pipeline("", steps))
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(needle), "{steps}: {err}");
+    }
+}
+
+#[test]
+fn an_ocr_model_may_share_a_strategy_with_confirm_and_refine() {
+    // Confirm and refine work from scores, so they do nothing for a model that
+    // reads text; the strategy still serves the classifier next to it.
+    let cfg = load::from_str(
+        r#"
+        [strategies.s]
+        early_exit = true
+        confirm = 2
+        [[strategies.s.sampling]]
+        step = 1
+        method = "uniform"
+        count = 8
+        [[strategies.s.sampling]]
+        step = 2
+        method = "refine"
+        min_score = 0.1
+        window = 2.0
+        fps = 5
+
+        [models.m]
+        architecture = "vit"
+        repo = "a/b"
+        video_strategy = "s"
+        early_exit = { labels = [1], threshold = 0.85 }
+
+        [models.ocr]
+        architecture = "paddleocr_vl"
+        repo = "PaddlePaddle/PaddleOCR-VL"
+        video_strategy = "s"
+        "#,
+    )
+    .unwrap();
+    cfg.validate().expect("valid");
+}
+
+#[test]
+fn ocr_models_take_max_pixels_and_max_tokens() {
+    let ok = r#"
+        [models.ocr]
+        architecture = "paddleocr_vl"
+        repo = "PaddlePaddle/PaddleOCR-VL"
+        max_pixels = 500000
+        max_tokens = 256
+        min_confidence = 0.1
+    "#;
+    let cfg = load::from_str(ok).unwrap();
+    cfg.validate().expect("valid");
+    assert_eq!(cfg.models["ocr"].max_pixels, Some(500_000));
+    assert_eq!(cfg.models["ocr"].max_tokens, Some(256));
+
+    for (toml, needle) in [
+        (
+            "[models.k]\narchitecture = \"paddleocr_vl\"\nrepo = \"a/b\"\nmax_pixels = 1000\n",
+            "max_pixels must be at least 147384",
+        ),
+        (
+            "[models.k]\narchitecture = \"paddleocr_vl\"\nrepo = \"a/b\"\nmax_tokens = 0\n",
+            "max_tokens must be at least 1",
+        ),
+        (
+            "[models.k]\narchitecture = \"paddleocr_vl\"\nrepo = \"a/b\"\nmin_confidence = 1.5\n",
+            "min_confidence must be from 0 to 1",
+        ),
+        (
+            "[models.k]\narchitecture = \"vit\"\nrepo = \"a/b\"\nmin_confidence = 0.5\n",
+            "`min_confidence` only applies to paddleocr_vl",
+        ),
+        (
+            "[models.k]\narchitecture = \"paddleocr_vl\"\nrepo = \"a/b\"\nearly_exit = { labels = [1] }\n",
+            "`early_exit` needs labels",
+        ),
+        (
+            "[models.k]\narchitecture = \"paddleocr_vl\"\nrepo = \"a/b\"\nlabels = [\"x\"]\n",
+            "`labels` does not apply",
+        ),
+        (
+            "[models.k]\narchitecture = \"paddleocr_vl\"\nrepo = \"a/b\"\nmulti_label = true\n",
+            "only applies to text models",
+        ),
+        (
+            "[models.k]\narchitecture = \"vit\"\nrepo = \"a/b\"\nmax_pixels = 500000\n",
+            "`max_pixels` only applies to paddleocr_vl",
+        ),
+        (
+            "[models.k]\narchitecture = \"vit\"\nrepo = \"a/b\"\nmax_tokens = 64\n",
+            "only applies to text models and paddleocr_vl",
+        ),
+        (
+            "[models.k]\narchitecture = \"paddleocr_vl\"\n",
+            "`repo` is required",
+        ),
+    ] {
+        let err = load::from_str(toml)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(needle), "{toml}: {err}");
+    }
+}

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use apollo_config::EarlyExit;
-use apollo_domain::{Architecture, Label, MediaKind, ModelInput};
+use apollo_domain::{Architecture, Label, MediaKind, ModelInput, OutputKind};
 
 use crate::Engine;
 use crate::error::EngineError;
@@ -26,6 +26,8 @@ pub struct ModelInfo {
     /// Input kinds it accepts: images (and video, with a video strategy), or
     /// text.
     pub accepts: Vec<MediaKind>,
+    /// What it gives: scores for its labels, or the text it read.
+    pub output: OutputKind,
     pub enabled: bool,
     /// Weights currently in memory.
     pub loaded: bool,
@@ -46,6 +48,9 @@ pub struct PipelineInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PipelineStepInfo {
     pub models: Vec<String>,
+    /// The earlier model whose text the step classifies, instead of the
+    /// item's input.
+    pub input: Option<String>,
     /// The step's gate.
     pub stop_if: Option<Gate>,
 }
@@ -105,6 +110,7 @@ impl Engine {
                     architecture: cfg.architecture,
                     repo: cfg.repo.clone(),
                     accepts,
+                    output: cfg.architecture.output(),
                     enabled: cfg.enabled,
                     loaded,
                     labels,
@@ -131,6 +137,7 @@ impl Engine {
                     .into_iter()
                     .map(|step| PipelineStepInfo {
                         models: step.models().to_vec(),
+                        input: step.input.clone(),
                         stop_if: step.stop_if.as_ref().zip(step.gate_model()).map(
                             |(stop, model)| Gate {
                                 model: model.to_string(),

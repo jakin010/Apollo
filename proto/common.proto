@@ -113,8 +113,11 @@ message ModelResult {
   oneof output {
     // An image (or other single input) classified once.
     Classification classification = 4;
-    // An image classifier run over a video's sampled frames.
+    // An image classifier run over a video's sampled frames, or a text
+    // classifier over the parts of a video's text.
     Scan scan = 5;
+    // The text a model read (OCR), from an image or a video's sampled frames.
+    TextOutput text = 6;
   }
 }
 
@@ -177,7 +180,27 @@ message Scan {
   uint32 sample_count = 4;
 }
 
-// One classified sample: a video frame (`start` == `end`).
+// Text a model read.
+message TextOutput {
+  // All of it: an image's text, or a video's parts joined by newlines.
+  string text = 1;
+  // The text's language, when the model reports one (empty for OCR).
+  string language = 2;
+  // For a video, where each part of the text appears, in time order: text
+  // repeated on consecutive sampled frames is one part. Empty for an image.
+  repeated TimedText parts = 3;
+}
+
+// Text seen from `start` to `end` (the first and last sampled frame it was
+// read on), in seconds.
+message TimedText {
+  double start = 1;
+  double end = 2;
+  string text = 3;
+}
+
+// One classified sample: a video frame (`start` == `end`), or a part of a
+// video's text (from its first to its last frame).
 message Sample {
   // Position in processing order.
   uint32 index = 1;

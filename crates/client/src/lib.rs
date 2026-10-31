@@ -64,13 +64,14 @@ pub use client::{Client, ClientBuilder, ClientError, StreamInit};
 pub use webhook::{WebhookHandler, WebhookReceiver, serve_webhook, serve_webhook_with_shutdown};
 
 // Re-export the wire types so downstreams don't need to depend on `apollo-proto`.
-/// The `ModelResult.output` oneof (`Classification`, `Scan`).
+/// The `ModelResult.output` oneof (`Classification`, `Scan`, `Text`).
 pub use apollo_proto::model_result::Output;
 pub use apollo_proto::{
     Ack, Classification, ClassifyRequest, Error, ErrorType, Label, ListModelsResponse,
-    ListTasksRequest, ListTasksResponse, Media, MediaKind, ModelInfo, ModelResult, ModelState,
-    PipelineInfo, PipelineStepInfo, Prediction, Progress, ResultView, Sample, Scan, Segment,
-    StopIf, Task, TaskEvent, TaskEventType, TaskState, Timestamp, Trigger,
+    ListTasksRequest, ListTasksResponse, Media, MediaKind, ModelInfo, ModelOutputKind, ModelResult,
+    ModelState, PipelineInfo, PipelineStepInfo, Prediction, Progress, ResultView, Sample, Scan,
+    Segment, StopIf, Task, TaskEvent, TaskEventType, TaskState, TextOutput, TimedText, Timestamp,
+    Trigger,
 };
 
 /// The webhook signing scheme (header names, `sign`, `verify`), for verifying

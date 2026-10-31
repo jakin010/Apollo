@@ -43,6 +43,9 @@ pub struct VideoInfo {
     pub fps: f64,
     /// Total frame count, if ffprobe reported it.
     pub frame_count: Option<u64>,
+    /// The size frames are decoded at: upright, after the stream's rotation
+    /// (a portrait phone video is stored landscape with a quarter turn to
+    /// apply, which ffmpeg applies when decoding).
     pub width: u32,
     pub height: u32,
 }
@@ -256,6 +259,62 @@ pub(crate) async fn run(
     Ok(out)
 }
 
+/// Whether ffmpeg decodes a video stream's frames with their sides swapped:
+/// when its rotation, rounded to a whole degree as ffmpeg rounds it, is a
+/// quarter or three-quarter turn (other angles are rotated within the frame's
+/// own size). The rotation comes from the display matrix when ffprobe prints
+/// it (its `rotation` field is cut to a whole degree, not rounded), else from
+/// that field, else from the `rotate` tag older files carry.
+fn quarter_turned(stream: &serde_json::Value) -> bool {
+    let side_data = stream
+        .get("side_data_list")
+        .and_then(|l| l.as_array())
+        .map(|l| l.as_slice())
+        .unwrap_or_default();
+    let matrix = side_data
+        .iter()
+        .find_map(|d| display_rotation(d.get("displaymatrix")?.as_str()?));
+    let field = || side_data.iter().find_map(|d| d.get("rotation")?.as_f64());
+    let tag = || {
+        stream
+            .get("tags")
+            .and_then(|t| t.get("rotate"))
+            .and_then(|r| r.as_str())
+            .and_then(|r| r.trim().parse::<f64>().ok())
+    };
+    matrix
+        .or_else(field)
+        .or_else(tag)
+        .filter(|r| r.is_finite())
+        .is_some_and(|r| (r.round() as i64).rem_euclid(180) == 90)
+}
+
+/// The rotation in degrees of a display matrix as ffprobe prints it (three
+/// rows `index: a b c` of 16.16 fixed-point numbers), computed as libavutil's
+/// `av_display_rotation_get` does.
+fn display_rotation(matrix: &str) -> Option<f64> {
+    let m: Vec<f64> = matrix
+        .lines()
+        .filter_map(|row| row.split_once(':'))
+        .flat_map(|(_, values)| values.split_whitespace().map(str::parse::<f64>))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if m.len() != 9 {
+        return None;
+    }
+    let fixed = |x: f64| x / 65536.0;
+    let scale_x = fixed(m[0]).hypot(fixed(m[3]));
+    let scale_y = fixed(m[1]).hypot(fixed(m[4]));
+    if scale_x == 0.0 || scale_y == 0.0 {
+        return None;
+    }
+    Some(
+        -(fixed(m[1]) / scale_y)
+            .atan2(fixed(m[0]) / scale_x)
+            .to_degrees(),
+    )
+}
+
 fn parse_probe(stdout: &[u8]) -> Result<VideoInfo, MediaError> {
     let v: serde_json::Value = serde_json::from_slice(stdout)
         .map_err(|e| MediaError::Parse(format!("ffprobe json: {e}")))?;
@@ -271,6 +330,12 @@ fn parse_probe(stdout: &[u8]) -> Result<VideoInfo, MediaError> {
 
     let width = video.get("width").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let height = video.get("height").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    // ffmpeg decodes frames upright, so a quarter turn swaps the sides.
+    let (width, height) = if quarter_turned(video) {
+        (height, width)
+    } else {
+        (width, height)
+    };
 
     let fps = video
         .get("avg_frame_rate")
@@ -447,6 +512,46 @@ noise line\n\
     }
 
     #[test]
+    fn probe_reports_the_upright_size_of_rotated_video() {
+        let probe = |extra: &str| {
+            let json = format!(
+                r#"{{"streams":[{{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,
+                "avg_frame_rate":"30/1"{extra}}}],"format":{{"format_name":"mov,mp4","duration":"5"}}}}"#
+            );
+            let info = parse_probe(json.as_bytes()).unwrap();
+            (info.width, info.height)
+        };
+        assert_eq!(probe(""), (1920, 1080));
+        let matrix = |r: &str| {
+            format!(r#","side_data_list":[{{"side_data_type":"Display Matrix","rotation":{r}}}]"#)
+        };
+        assert_eq!(probe(&matrix("90")), (1080, 1920));
+        assert_eq!(probe(&matrix("-90")), (1080, 1920));
+        assert_eq!(probe(&matrix("270")), (1080, 1920));
+        assert_eq!(probe(&matrix("180")), (1920, 1080));
+        // ffmpeg rotates other angles within the frame's size.
+        assert_eq!(probe(&matrix("60")), (1920, 1080));
+        assert_eq!(probe(&matrix("-45")), (1920, 1080));
+        // The display matrix itself, rounded as ffmpeg rounds it, wins over
+        // the `rotation` field ffprobe cuts to a whole degree.
+        let exact = |degrees: f64, printed: i32| {
+            let r = (-degrees).to_radians();
+            let (c, s) = ((r.cos() * 65536.0) as i64, (r.sin() * 65536.0) as i64);
+            format!(
+                r#","side_data_list":[{{"side_data_type":"Display Matrix","displaymatrix":"\n00000000: {c} {s} 0\n00000001: {} {c} 0\n00000002: 0 0 1073741824\n","rotation":{printed}}}]"#,
+                -s
+            )
+        };
+        assert_eq!(probe(&exact(90.0, 90)), (1080, 1920));
+        assert_eq!(probe(&exact(-89.99, -89)), (1080, 1920));
+        assert_eq!(probe(&exact(89.6, 89)), (1080, 1920));
+        assert_eq!(probe(&exact(90.6, 90)), (1920, 1080));
+        assert_eq!(probe(&exact(89.4, 89)), (1920, 1080));
+        assert_eq!(probe(r#","tags":{"rotate":"90"}"#), (1080, 1920));
+        assert_eq!(probe(r#","tags":{"rotate":"0"}"#), (1920, 1080));
+    }
+
+    #[test]
     fn probe_rejects_non_finite_metadata() {
         let json =
             br#"{"streams":[{"codec_type":"video","codec_name":"h264","width":64,"height":64,
@@ -518,6 +623,39 @@ mod ffmpeg_tests {
             .lines()
             .map(|l| l.trim_matches(',').to_string())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_rotated_video_is_probed_and_decoded_upright() {
+        if !have_ffmpeg() {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (plain, rotated) = (dir.path().join("plain.mp4"), dir.path().join("rot.mp4"));
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=96x64:rate=10")
+            .args(["-t", "1", "-pix_fmt", "yuv420p"])
+            .arg(&plain)
+            .status()
+            .is_ok_and(|s| s.success())
+            && std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-display_rotation", "90", "-i"])
+                .arg(&plain)
+                .args(["-c", "copy"])
+                .arg(&rotated)
+                .status()
+                .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("skipping: ffmpeg cannot write a rotated video");
+            return;
+        }
+        let info = probe(&rotated).await.unwrap();
+        assert_eq!((info.width, info.height), (64, 96));
+        // A frame decodes at that size.
+        let frame = extract_frame(&rotated, 0.5, None).await.unwrap();
+        assert_eq!((frame.width, frame.height), (64, 96));
     }
 
     #[tokio::test]

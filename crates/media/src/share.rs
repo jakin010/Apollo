@@ -8,7 +8,7 @@
 //!   (several per ffmpeg pass, as before) and publishes them; anyone asking for
 //!   the same frame meanwhile waits for it, and decodes it themselves if that
 //!   decode was cancelled or failed. Recently decoded frames are kept for later
-//!   askers, up to [`KEPT_FRAMES`].
+//!   askers, up to [`KEPT_FRAMES`] and [`KEPT_BYTES`].
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -20,15 +20,19 @@ use apollo_domain::DecodedImage;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, OwnedMutexGuard};
 
 use crate::error::MediaError;
-use crate::extract::{FrameRequest, extract_frames_scaled};
+use crate::extract::{FrameRequest, extract_frames_sized};
 use crate::ffmpeg::{self, VideoInfo};
 
 /// Decoded frames kept for later askers, per video (most recent first out).
 /// At a 224 px model input a frame is ~150 KB, so this is ~19 MB.
 pub const KEPT_FRAMES: usize = 128;
 
-/// A frame: its timestamp in milliseconds, and its square size.
-type FrameKey = (i64, u32);
+/// And at most this many bytes of them: frames read for their text are kept
+/// near full size (~3 MB each), so only the last few are.
+pub const KEPT_BYTES: usize = 64 << 20;
+
+/// A frame: its timestamp in milliseconds, its width and its height.
+type FrameKey = (i64, u32, u32);
 /// `None` until decoded; whoever holds the lock is (or was) decoding it.
 type FrameSlot = Arc<AsyncMutex<Option<Arc<DecodedImage>>>>;
 /// Scene cuts as `(timestamp, score)`, detected once.
@@ -77,8 +81,10 @@ pub struct VideoShare {
 #[derive(Default)]
 struct FrameStore {
     slots: HashMap<FrameKey, FrameSlot>,
-    /// Decoded keys, oldest first, for eviction.
-    kept: VecDeque<FrameKey>,
+    /// Decoded keys and their sizes in bytes, oldest first, for eviction.
+    kept: VecDeque<(FrameKey, usize)>,
+    /// Bytes of the frames in `kept`.
+    kept_bytes: usize,
 }
 
 impl VideoShare {
@@ -225,6 +231,18 @@ impl VideoShare {
         requests: &[FrameRequest],
         size: u32,
     ) -> Result<Vec<Arc<DecodedImage>>, MediaError> {
+        self.frames_sized(requests, size, size).await
+    }
+
+    /// [`Self::frames`] at `width` x `height` (pass a size with the video's
+    /// shape to keep it).
+    pub async fn frames_sized(
+        &self,
+        requests: &[FrameRequest],
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<Arc<DecodedImage>>, MediaError> {
+        let size = (width, height);
         let mut out: Vec<Option<Arc<DecodedImage>>> = vec![None; requests.len()];
         let mut mine: Vec<(usize, OwnedMutexGuard<Option<Arc<DecodedImage>>>)> = Vec::new();
         let mut theirs: Vec<(usize, FrameSlot)> = Vec::new();
@@ -277,7 +295,7 @@ impl VideoShare {
     async fn decode_into(
         &self,
         requests: &[FrameRequest],
-        size: u32,
+        size: (u32, u32),
         slots: &mut Vec<(usize, OwnedMutexGuard<Option<Arc<DecodedImage>>>)>,
         out: &mut [Option<Arc<DecodedImage>>],
     ) -> Result<(), MediaError> {
@@ -289,33 +307,38 @@ impl VideoShare {
         // anyone waiting decodes the frames themselves.
         let keyframes = self.seek_points().await;
         let images =
-            extract_frames_scaled(&self.path, &self.info, &wanted, size, keyframes).await?;
+            extract_frames_sized(&self.path, &self.info, &wanted, size.0, size.1, keyframes)
+                .await?;
         self.frames_decoded
             .fetch_add(images.len() as u64, Ordering::Relaxed);
         let mut decoded = Vec::with_capacity(images.len());
         for ((i, guard), img) in slots.iter_mut().zip(images) {
+            let bytes = img.data.len();
             let img = Arc::new(img);
             **guard = Some(Arc::clone(&img));
             out[*i] = Some(img);
-            decoded.push(frame_key(requests[*i].timestamp, size));
+            decoded.push((frame_key(requests[*i].timestamp, size), bytes));
         }
         slots.clear();
 
         let mut store = self.frames.lock().unwrap_or_else(|e| e.into_inner());
-        for key in decoded {
-            store.kept.push_back(key);
+        for (key, bytes) in decoded {
+            store.kept.push_back((key, bytes));
+            store.kept_bytes += bytes;
         }
-        while store.kept.len() > KEPT_FRAMES {
-            if let Some(old) = store.kept.pop_front() {
-                store.slots.remove(&old);
-            }
+        while store.kept.len() > KEPT_FRAMES || store.kept_bytes > KEPT_BYTES {
+            let Some((old, bytes)) = store.kept.pop_front() else {
+                break;
+            };
+            store.slots.remove(&old);
+            store.kept_bytes -= bytes;
         }
         Ok(())
     }
 }
 
-fn frame_key(timestamp: f64, size: u32) -> FrameKey {
-    ((timestamp * 1000.0).round() as i64, size)
+fn frame_key(timestamp: f64, (width, height): (u32, u32)) -> FrameKey {
+    ((timestamp * 1000.0).round() as i64, width, height)
 }
 
 #[cfg(test)]
@@ -385,6 +408,24 @@ mod tests {
         // A different size is a different frame.
         share.frames(&at(&[4.0]), 16).await.unwrap();
         assert_eq!(share.stats().frames_decoded, 5);
+    }
+
+    #[tokio::test]
+    async fn frames_come_at_the_width_and_height_asked_for() {
+        if !have_ffmpeg() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let share = sample(dir.path()).await;
+        let wide = share.frames_sized(&at(&[1.0]), 64, 28).await.unwrap();
+        let w = &wide[0];
+        assert_eq!((w.width, w.height, w.data.len()), (64, 28, 64 * 28 * 3));
+        // The same size again is the same frame; a square of its width is not.
+        let again = share.frames_sized(&at(&[1.0]), 64, 28).await.unwrap();
+        assert!(Arc::ptr_eq(w, &again[0]));
+        let square = share.frames(&at(&[1.0]), 64).await.unwrap();
+        assert_eq!((square[0].width, square[0].height), (64, 64));
+        assert_eq!(share.stats().frames_decoded, 2);
     }
 
     #[tokio::test]

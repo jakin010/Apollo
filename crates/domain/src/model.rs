@@ -1,12 +1,14 @@
-//! Shared descriptors: `Architecture` (the model family) and input `Modality`
-//! (image / video / text / future audio).
+//! Shared descriptors: `Architecture` (the model family), what a model takes
+//! and gives (`ModelInput`, `OutputKind`), and input `Modality` (image /
+//! video / text / future audio).
 
 use serde::{Deserialize, Serialize};
 
 /// Concrete model architecture. Selects the candle builder and preprocessing in
 /// `apollo-inference`; add a variant (plus its dispatch arm in `apollo_inference::load`)
 /// to support a new family. Image architectures also take video, by running
-/// over sampled frames; text architectures take text.
+/// over sampled frames; text architectures take text. Most classify;
+/// `paddleocr_vl` reads the text in images instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Architecture {
@@ -26,6 +28,9 @@ pub enum Architecture {
     /// DeBERTa-v2 and -v3 text classifiers.
     #[serde(rename = "deberta_v2")]
     DebertaV2,
+    /// PaddleOCR-VL: reads the text in images (OCR).
+    #[serde(rename = "paddleocr_vl")]
+    PaddleocrVl,
 }
 
 impl Architecture {
@@ -40,13 +45,17 @@ impl Architecture {
             Architecture::XlmRoberta => "xlm_roberta",
             Architecture::Modernbert => "modernbert",
             Architecture::DebertaV2 => "deberta_v2",
+            Architecture::PaddleocrVl => "paddleocr_vl",
         }
     }
 
-    /// The kind of input the architecture classifies.
+    /// The kind of input the architecture takes.
     pub fn input(self) -> ModelInput {
         match self {
-            Architecture::Vit | Architecture::Siglip | Architecture::Pdq => ModelInput::Image,
+            Architecture::Vit
+            | Architecture::Siglip
+            | Architecture::Pdq
+            | Architecture::PaddleocrVl => ModelInput::Image,
             Architecture::Bert
             | Architecture::Distilbert
             | Architecture::XlmRoberta
@@ -54,13 +63,37 @@ impl Architecture {
             | Architecture::DebertaV2 => ModelInput::Text,
         }
     }
+
+    /// What the architecture gives for an input.
+    pub fn output(self) -> OutputKind {
+        match self {
+            Architecture::PaddleocrVl => OutputKind::Text,
+            Architecture::Vit
+            | Architecture::Siglip
+            | Architecture::Pdq
+            | Architecture::Bert
+            | Architecture::Distilbert
+            | Architecture::XlmRoberta
+            | Architecture::Modernbert
+            | Architecture::DebertaV2 => OutputKind::Classification,
+        }
+    }
 }
 
-/// What a model classifies.
+/// What a model takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelInput {
     /// Images, and video frame by frame.
     Image,
+    Text,
+}
+
+/// What a model gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputKind {
+    /// Scores for its labels.
+    Classification,
+    /// The text it reads, with no labels (OCR).
     Text,
 }
 

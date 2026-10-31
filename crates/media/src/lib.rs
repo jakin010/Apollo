@@ -24,7 +24,7 @@ pub mod strategy;
 pub use confirm::Confirm;
 pub use decode::{decode_image, decode_image_as_stored};
 pub use error::MediaError;
-pub use extract::{FrameRequest, extract_frames_scaled};
+pub use extract::{FrameRequest, extract_frames_scaled, extract_frames_sized};
 pub use fetch::{FetchLimits, LocalMedia, fetch};
 pub use ffmpeg::{VideoInfo, extract_frame, extract_frames, probe};
 pub use sampling::FrameRef;

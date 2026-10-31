@@ -171,6 +171,35 @@ fps    = 5
 # repo         = "unitary/toxic-bert"
 # max_tokens   = 128
 
+# --- Reading text in images (OCR) --------------------------------------------
+# PaddleOCR-VL (1.9 GB download) reads the text in images and video frames; a
+# pipeline step with `input` classifies it with text models. ~1.6-2 s per
+# 1080p image or frame on an Apple M1 Max GPU, ~14 s on its CPU: best with a
+# GPU. Images are read in overlapping bands at up to `max_pixels`; a read the
+# model is unsure of from its first token (`min_confidence`) is dropped, as it
+# makes text up for images without any. The weights take ~3.8 GB of memory:
+# raise [app].max_memory to fit them. See docs/configuration.md.
+# [models.ocr]
+# architecture   = "paddleocr_vl"
+# repo           = "PaddlePaddle/PaddleOCR-VL"
+# video_strategy = "text_frames"
+# timeout        = 60              # per image or frame
+# max_pixels     = 602112          # default: 1008x560 for a 16:9 frame
+# min_confidence = 0.2             # default
+#
+# [strategies.text_frames]         # a frame every 2 s, at most 30 per video
+# max_frames = 30                  # (spread evenly over longer videos)
+# [[strategies.text_frames.sampling]]
+# step   = 1
+# method = "fps"
+# fps    = 0.5
+#
+# [pipelines.read_and_check]       # read, then classify what was read
+# steps = [
+#   { model = "ocr", order = 1 },
+#   { model = "toxicity", order = 2, input = "ocr" },
+# ]
+
 # --- Metrics: a Prometheus scrape endpoint ------------------------------------
 # Off by default. `GET /metrics` on its own listener (not the gRPC port). It is
 # not authenticated, so keep it on loopback or behind a firewall. Read at

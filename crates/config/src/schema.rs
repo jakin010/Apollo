@@ -510,7 +510,10 @@ pub struct ModelConfig {
     /// Opts an image-classifier into video input via the named strategy.
     #[serde(default)]
     pub video_strategy: Option<String>,
-    /// Early-exit trigger for video scans (model-specific labels + threshold).
+    /// Early-exit trigger for video scans (model-specific labels + threshold),
+    /// which also marks a scan's segments. For a text model, the labels that
+    /// mark segments when it classifies text read from a video (a pipeline
+    /// step's `input`).
     #[serde(default)]
     pub early_exit: Option<EarlyExit>,
     /// Candidate labels for open-vocabulary architectures (siglip). Each is
@@ -564,6 +567,9 @@ pub struct ModelConfig {
     /// 128; at most the model's own limit. Smaller windows find a short
     /// passage in a long text better; larger ones give each window more
     /// context.
+    ///
+    /// `paddleocr_vl`: the most tokens read from one image (or video frame);
+    /// reading stops there. Defaults to 512.
     #[serde(default)]
     pub max_tokens: Option<usize>,
     /// Text models: score each label independently (sigmoid) instead of as
@@ -571,6 +577,18 @@ pub struct ModelConfig {
     /// `config.json` says (`problem_type = "multi_label_classification"`).
     #[serde(default)]
     pub multi_label: Option<bool>,
+    /// `paddleocr_vl`: images (and video frames) are read at up to this many
+    /// pixels, larger ones scaled down keeping their shape. Smaller is faster
+    /// but loses small text. Defaults to 602112 (1008x560 for a 16:9 frame);
+    /// unlike `[limits].max_pixels`, nothing is refused.
+    #[serde(default)]
+    pub max_pixels: Option<u64>,
+    /// `paddleocr_vl`: keep text only when the model is at least this sure
+    /// (0–1) of its first token. On images without text the model makes text
+    /// up, unsure from the start; that is dropped. Defaults to 0.2; 0 keeps
+    /// everything.
+    #[serde(default)]
+    pub min_confidence: Option<f32>,
 }
 
 /// `[models.<label>.early_exit]` — what counts as a trigger for this model.
@@ -624,6 +642,10 @@ pub struct PipelineStep {
     pub model: StepModels,
     /// Execution position; steps run in ascending `order`, unique per pipeline.
     pub order: u32,
+    /// Classify the text an earlier step's model read (e.g. `input = "ocr"`)
+    /// instead of the item's input. The step's models must be text models.
+    #[serde(default)]
+    pub input: Option<String>,
     /// If set and the gating model's output triggers it (any listed id at or
     /// above the threshold), the pipeline early-exits and later steps are
     /// skipped. Independent of a model's own `[models.<l>.early_exit]` (which

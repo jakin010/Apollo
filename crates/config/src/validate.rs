@@ -5,8 +5,8 @@
 //! [`Config::has_models`].
 
 use crate::error::ConfigError;
-use crate::schema::{Backend, Config, ModelConfig, SamplingKind};
-use apollo_domain::Architecture;
+use crate::schema::{Backend, Config, ModelConfig, PipelineConfig, PipelineStep, SamplingKind};
+use apollo_domain::{Architecture, ModelInput, OutputKind};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -153,11 +153,14 @@ impl Config {
                 ));
             }
             // A refine step looks closer at frames scoring just below the
-            // model's trigger, so it needs the model to define one.
+            // model's trigger, so it needs the model to define one. A model
+            // that reads text has no scores: confirm and refine do nothing
+            // for it, and it may share a strategy that uses them.
             if let Some(strat) = model
                 .video_strategy
                 .as_ref()
                 .and_then(|vs| self.strategies.get(vs))
+                .filter(|_| model.architecture.output() != OutputKind::Text)
             {
                 if strat.confirm > 0 && model.early_exit.is_none() {
                     errs.push(format!(
@@ -193,7 +196,11 @@ impl Config {
                         "model '{label}': early_exit must list at least one label"
                     ));
                 }
-                if model.video_strategy.is_none() {
+                // A text model's trigger marks segments of text read from a
+                // video (a pipeline step's `input`); an image model's only
+                // acts on video scans.
+                if model.video_strategy.is_none() && model.architecture.input() != ModelInput::Text
+                {
                     errs.push(format!(
                         "model '{label}': early_exit has no effect without a video_strategy"
                     ));
@@ -244,6 +251,20 @@ impl Config {
                 if !orders.insert(step.order) {
                     errs.push(format!(
                         "pipeline '{name}': duplicate step order {}",
+                        step.order
+                    ));
+                }
+                if let Some(source) = &step.input {
+                    self.check_step_input(name, pipeline, step, source, &mut errs);
+                }
+                if let Some(gate) = step.gate_model()
+                    && self
+                        .models
+                        .get(gate)
+                        .is_some_and(|m| m.architecture.output() == OutputKind::Text)
+                {
+                    errs.push(format!(
+                        "pipeline '{name}': step {} stop_if checks '{gate}', which reads text and has no labels; gate on a step that classifies its text",
                         step.order
                     ));
                 }
@@ -300,6 +321,47 @@ impl Config {
         }
     }
 
+    /// A step's `input`: a model of an earlier step that reads text, and
+    /// only text models in the step to classify it.
+    fn check_step_input(
+        &self,
+        name: &str,
+        pipeline: &PipelineConfig,
+        step: &PipelineStep,
+        source: &str,
+        errs: &mut Vec<String>,
+    ) {
+        let order = step.order;
+        let earlier = pipeline
+            .steps
+            .iter()
+            .any(|s| s.order < order && s.models().iter().any(|m| m == source));
+        if !earlier {
+            errs.push(format!(
+                "pipeline '{name}': step {order} input '{source}' is not a model of an earlier step"
+            ));
+        } else if self
+            .models
+            .get(source)
+            .is_some_and(|m| m.architecture.output() != OutputKind::Text)
+        {
+            errs.push(format!(
+                "pipeline '{name}': step {order} input '{source}' does not read text (use a model like paddleocr_vl)"
+            ));
+        }
+        for model in step.models() {
+            if self
+                .models
+                .get(model)
+                .is_some_and(|m| m.architecture.input() != ModelInput::Text)
+            {
+                errs.push(format!(
+                    "pipeline '{name}': step {order} classifies the text '{source}' read, but '{model}' is not a text model"
+                ));
+            }
+        }
+    }
+
     /// Number of models defined.
     pub fn model_count(&self) -> usize {
         self.models.len()
@@ -311,6 +373,11 @@ impl Config {
     }
 }
 
+/// The fewest pixels PaddleOCR-VL reads an image at (its
+/// `preprocessor_config.json` `min_pixels`); a smaller `max_pixels` could not
+/// be met.
+const MIN_READ_PIXELS: u64 = 147_384;
+
 /// A SigLIP score threshold: from 0 to 1, with at most two decimals (scores
 /// are calibrated so that hundredths are fine enough). Tolerates f32 rounding.
 pub(crate) fn is_score_threshold(t: f64) -> bool {
@@ -319,7 +386,6 @@ pub(crate) fn is_score_threshold(t: f64) -> bool {
 
 /// The fields each architecture needs, and those it cannot use.
 fn validate_architecture(label: &str, model: &ModelConfig, errs: &mut Vec<String>) {
-    use apollo_domain::ModelInput;
     let arch = model.architecture.as_str();
     // Fields set where they have no meaning, collected apart from `errs` so
     // the arms below can add to it too.
@@ -345,19 +411,38 @@ fn validate_architecture(label: &str, model: &ModelConfig, errs: &mut Vec<String
         ("score_threshold", model.score_threshold.is_some()),
         ("max_results", model.max_results.is_some()),
     ];
-    let text_fields = [
-        ("max_tokens", model.max_tokens.is_some()),
-        ("multi_label", model.multi_label.is_some()),
-    ];
+    let is_text = model.architecture.input() == ModelInput::Text;
+    let reads_text = model.architecture.output() == OutputKind::Text;
     if model.architecture != Architecture::Pdq {
         for (field, set) in pdq_fields {
             not_for(field, set, "only applies to architecture \"pdq\"");
         }
     }
-    if model.architecture.input() != ModelInput::Text {
-        for (field, set) in text_fields {
-            not_for(field, set, "only applies to text models");
-        }
+    if !is_text {
+        not_for(
+            "multi_label",
+            model.multi_label.is_some(),
+            "only applies to text models",
+        );
+    }
+    if !is_text && !reads_text {
+        not_for(
+            "max_tokens",
+            model.max_tokens.is_some(),
+            "only applies to text models and paddleocr_vl",
+        );
+    }
+    if !reads_text {
+        not_for(
+            "max_pixels",
+            model.max_pixels.is_some(),
+            "only applies to paddleocr_vl (see [limits].max_pixels to refuse large images)",
+        );
+        not_for(
+            "min_confidence",
+            model.min_confidence.is_some(),
+            "only applies to paddleocr_vl",
+        );
     }
     match model.architecture {
         Architecture::Vit | Architecture::Siglip => {
@@ -427,10 +512,34 @@ fn validate_architecture(label: &str, model: &ModelConfig, errs: &mut Vec<String
                 model.video_strategy.is_some(),
                 "does not apply to a text model",
             );
+        }
+        Architecture::PaddleocrVl => {
+            if model.repo.is_empty() {
+                errs.push(format!("model '{label}': `repo` is required"));
+            }
+            if model.max_tokens == Some(0) {
+                errs.push(format!("model '{label}': max_tokens must be at least 1"));
+            }
+            if model
+                .min_confidence
+                .is_some_and(|c| !(0.0..=1.0).contains(&c))
+            {
+                errs.push(format!(
+                    "model '{label}': min_confidence must be from 0 to 1"
+                ));
+            }
+            if model.max_pixels.is_some_and(|p| p < MIN_READ_PIXELS) {
+                errs.push(format!(
+                    "model '{label}': max_pixels must be at least {MIN_READ_PIXELS} (the model's smallest input)"
+                ));
+            }
+            for (field, set) in siglip_fields {
+                not_for(field, set, "does not apply");
+            }
             not_for(
                 "early_exit",
                 model.early_exit.is_some(),
-                "only applies to video scans, which text models do not run",
+                "needs labels; this model reads text (classify it with a pipeline step's `input`)",
             );
         }
     }
