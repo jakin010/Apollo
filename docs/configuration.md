@@ -321,7 +321,7 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `architecture` | enum | *(required)* | Image models: `vit` (fixed‑head classifier), `siglip` (open‑vocabulary), or `pdq` (perceptual-hash block list; see [below](#perceptual-hash-block-lists-pdq)). Text models: `bert`, `distilbert`, `xlm_roberta` (also RoBERTa checkpoints; `roberta` is an alias), `modernbert`, `deberta_v2` (also DeBERTa-v3); see [text models](#text-models). |
+| `architecture` | enum | *(required)* | Image models: `vit` (fixed‑head classifier), `siglip` (open‑vocabulary), or `pdq` (perceptual-hash block list; see [below](#perceptual-hash-block-lists-pdq)). Text models: `bert`, `distilbert`, `xlm_roberta` (also RoBERTa checkpoints; `roberta` is an alias), `modernbert`, `deberta_v2` (also DeBERTa-v3); see [text models](#text-models). Reading text in images: `paddleocr_vl`; see [reading text](#reading-text-in-images-paddleocr_vl). |
 | `repo` | string | *(required, except for `pdq`)* | Hugging Face repo. `pdq` has none. |
 | `revision` | string | `"main"` | Repo revision/branch/tag. |
 | `enabled` | bool | `true` | If `false`, the model is rejected at submit time. |
@@ -329,8 +329,8 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 | `max_concurrent` | u32 | `8` | GPU **batch size** for this model's worker. |
 | `timeout` | u32 (secs) | `30` | Max time for one classification — one image, or one sampled video frame — measured from when it is handed to the model's batch queue. Excludes waiting for an admission slot and loading a cold model (loading has its own 30‑minute limit). |
 | `priority` | i32 | `0` | Scheduling priority; higher is admitted from the queue ahead of earlier‑submitted lower‑priority work. May be negative. |
-| `video_strategy` | string | *(none)* | Opts an image classifier into **video** input via the named strategy. |
-| `early_exit` | table | *(none)* | Video‑scan trigger for this model (see below). |
+| `video_strategy` | string | *(none)* | Opts an image model into **video** input via the named strategy. |
+| `early_exit` | table | *(none)* | Video‑scan trigger for this model (see below). For a text model, the labels that mark segments of text read from a video. |
 | `labels` | list | *(empty)* | Candidate labels for open‑vocabulary models (`siglip`). Ignored by `vit` (which gets labels from the weights). Mutually exclusive with `taxonomy_file`. |
 | `prompt_template` | string | *(none)* | Wraps each `siglip` label before encoding, e.g. `"a photo of a {}"` (a `{}` is substituted; otherwise it's a prefix). The bare label is what's returned. |
 | `score_threshold` | f32 | `0.5` (taxonomy: none) | Keep `siglip` labels scoring at/above this: a number from 0 to 1 with at most 2 decimals. SigLIP scores are calibrated: a clear match scores about 0.5–0.9, noise below about 0.1 (see [Scores](#siglip-scores)). For video frame scans with `mean` aggregation, set it lower so labels seen in part of the video survive the average. A taxonomy with no threshold keeps every category. |
@@ -341,12 +341,14 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 | `max_distance` | u32 | `31` | `pdq`: most differing bits (of 256) that still count as a match. |
 | `min_quality` | u32 | `50` | `pdq`: images whose hash quality (0–100) is lower never match. |
 | `match_rotations` | bool | `true` | `pdq`: also match rotated (90°/180°/270°) and mirrored copies. |
-| `max_tokens` | usize | `128` | Text models: tokens per window (at most the model's limit). |
+| `max_tokens` | usize | `128` / `512` | Text models: tokens per window (at most the model's limit; default 128). `paddleocr_vl`: the most tokens read from one image or frame (default 512). |
 | `multi_label` | bool | *(from `config.json`)* | Text models: score each label on its own (sigmoid) instead of as one choice among them (softmax). |
+| `max_pixels` | u64 | `602112` | `paddleocr_vl`: images and video frames are read at up to this many pixels, larger ones scaled down keeping their shape (1008×560 for a 16:9 frame). Unlike `[limits].max_pixels`, nothing is refused. At least 147384, at most 2822400 (the model's range). |
+| `min_confidence` | f32 | `0.2` | `paddleocr_vl`: keep a read only when its first token is at least this likely (0–1); see [reading text](#reading-text-in-images-paddleocr_vl). `0` keeps everything. |
 
 ### `[models.<label>.early_exit]`
 
-What counts as a trigger during a **video** frame scan (has no effect without `video_strategy`). A trigger stops the scan early when the strategy's `early_exit` is on, steers its `confirm` and `refine` steps, and defines the scan's **segments**: the stretches of the video where a trigger label reached the threshold (see [gRPC API → Segments](./grpc-api.md#segments)). A model without `early_exit` gets no segments.
+What counts as a trigger during a **video** frame scan (an image model needs a `video_strategy` for it to have any effect). A trigger stops the scan early when the strategy's `early_exit` is on, steers its `confirm` and `refine` steps, and defines the scan's **segments**: the stretches of the video where a trigger label reached the threshold (see [gRPC API → Segments](./grpc-api.md#segments)). A model without `early_exit` gets no segments. A text model's `early_exit` marks the segments of a video's text it classifies in a pipeline (a step's [`input`](#pipelinesname--ordered-gated-model-execution)); a model that reads text has none.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -410,8 +412,21 @@ A multi‑model step can gate too; `stop_if.model` then names whose output is ch
 | `model` | string or list | The model to run, or models to run concurrently (each must exist under `[models.*]`). |
 | `order` | u32 | Execution position; unique within the pipeline. |
 | `stop_if` | table | Optional gate: `{ model = "...", labels = [...], threshold = ... }`. `model` may be left out when the step runs one model. |
+| `input` | string | Optional: classify the text this earlier model read (a `paddleocr_vl` model of an earlier step) instead of the task's input. The step's models must be text models. |
 
-Validation rejects a step with no models, an unknown model, a model that appears in more than one step, a `stop_if.model` that is not one of its step's models, and a multi‑model step whose `stop_if` names no model.
+A step with an `input` reads its text from the earlier step's result, so OCR and a text classifier chain:
+
+```toml
+[pipelines.read_and_check]
+steps = [
+  { model = "ocr", order = 1 },
+  { model = ["toxicity", "injection"], order = 2, input = "ocr" },
+]
+```
+
+For an image, each text model classifies what `ocr` read (with no predictions when it read nothing). For a video, it classifies each part of the text (what was on screen from one time to another) and gives a scan of them: each label's highest score over the parts, and segments where its `early_exit` labels fired. Such a pipeline takes what its first models take: an image or a video, not a text.
+
+Validation rejects a step with no models, an unknown model, a model that appears in more than one step, a `stop_if.model` that is not one of its step's models, a multi‑model step whose `stop_if` names no model, a `stop_if` on a model that reads text (it has no labels), and an `input` that is not a text-reading model of an earlier step or whose step runs a model that is not a text model.
 
 ---
 
@@ -488,7 +503,47 @@ The repo needs a `config.json` (with `id2label`, which gives the labels), `model
 
 The same text without it scored 0.001. Text shorter than a window is classified in one piece, so short texts are unaffected.
 
-Text models take neither `video_strategy` nor `early_exit` (they run no video scans), nor the `siglip` or `pdq` fields. They work in sets and pipelines like any model; a pipeline's models all need to accept the input.
+Text models take no `video_strategy` (they run no video scans), nor the `siglip` or `pdq` fields; their `early_exit` only marks segments when they classify text read from a video. They work in sets and pipelines like any model; a pipeline's models all need to accept the input, except those of a step that classifies text an earlier step read (its `input`).
+
+---
+
+## Reading text in images (`paddleocr_vl`)
+
+A `paddleocr_vl` model reads the text in images and video frames (OCR) with [PaddleOCR-VL](https://huggingface.co/PaddlePaddle/PaddleOCR-VL), a 0.9B vision-language model that reads 109 languages. It gives the text, not scores: chain it to [text models](#text-models) with a pipeline step's `input` to classify what it read.
+
+```toml
+[models.ocr]
+architecture   = "paddleocr_vl"
+repo           = "PaddlePaddle/PaddleOCR-VL"   # 1.9 GB download
+video_strategy = "text_frames"
+timeout        = 60                            # per image or frame
+# max_pixels     = 602112                     # the defaults
+# max_tokens     = 512
+# min_confidence = 0.2
+
+[strategies.text_frames]                       # a frame every 2 s
+[[strategies.text_frames.sampling]]
+step   = 1
+method = "fps"
+fps    = 0.5
+```
+
+**How an image is read.** The image keeps its shape and is scaled to at most `max_pixels`. The model is made to read text regions, not whole scenes: given a busy video frame, it missed a clear caption or made text up, where it read the caption at once from a strip holding it. So an image is read in three overlapping horizontal bands, each half its height and a quarter apart, so any line under a quarter of the image's height lies whole in one of them. Lines read twice where bands overlap are kept once, in their place (the lines two bands share end the one's reading and start the other's, in the same order, which tells copies from look-alike lines such as numbered items or repeated names); a line cut by a band's edge, read as a fragment or with garbled characters, gives way to the whole line from the next band. One case stays ambiguous: a short line just above a longer one that begins with it ("haha" above "hahaha") can merge into it, as a cut fragment would; its words stay in the text. Images under 448 pixels high (after scaling) are read whole, and so are images too small for half of them to keep their scale (a band is read at no fewer than the model's minimum of 147,384 pixels): with `max_pixels` under 294,768, images are read whole, except very thin strips that the model's minimum scales up. `max_tokens` counts the tokens of all of an image's bands together.
+
+**No text.** Given an image without text, the model makes some up ("The quick brown fox…", "1", a note that the image holds no chart), unsure of it from the first token on. A read whose first token is less likely than `min_confidence` is dropped, and the model stops there, so images without text are also the quickest. Measured on whole images, made-up text started at 0.03–0.11 and real text at 0.57–1.00; read in bands, small text on a busy photo that the whole image gave at 0.10 started at 0.9.
+
+**Video.** The model's `video_strategy` picks the frames, as for an image model; early exit, `confirm` and `refine` work from scores, so they do nothing here (the model may share a strategy that uses them). Frames are extracted upright (a phone video's rotation applied) at the size the model reads them at. Text read on consecutive frames is merged into one part (whitespace and line breaks aside), with the times of the first and last frame it was on; a frame without text ends a part. When a text model classifies the parts, the frames without text count as clear: a segment never spans one, and they bound the segments. An interrupted scan (a crash, a restart) reads its frames again on resume.
+
+**Cost.** Reading is far slower than classifying, and best on a GPU. Measured on an Apple M1 Max, per image at the default `max_pixels`:
+
+| | 0.6 MP image (e.g. a 1080p frame) | Small image (≤ 0.25 MP) |
+|---|---|---|
+| Metal | 1.6–2.0 s | 0.4–0.9 s |
+| CPU (10 cores) | ~14 s | 3–4.5 s |
+
+The weights take about 3.8 GB of memory (read as f32), so raise `[app].max_memory` (4 GB by default) to fit them next to your other models, or Apollo refuses new work once they are loaded. On a CPU, lower `max_pixels` (at 0.4 megapixels, digits and punctuation started to slip on the test images), sample video sparsely, and keep `timeout` above a frame's reading time. The model reads one image at a time (`max_concurrent` does not batch its reads), each image answered as soon as it is read; a video's frames are read one after another, each within `timeout`. Images of different tasks queue for the model, and as for any model, `timeout` counts from when an image joins that queue, so raise it when many images may wait at once. An image whose sides are more than 200 times apart cannot be read and fails at once. Results are cached like any model's: the same image or video is read once.
+
+**What reads well.** Captions and memes, chat screenshots, watermarks, signs, documents, text in other scripts (Chinese read correctly), faint, rotated and script fonts. Text much smaller than the image (22-pixel print on a 1080p frame read correctly at 0.6 megapixels) depends on `max_pixels`.
 
 ---
 
@@ -525,9 +580,9 @@ SigLIP's own sigmoid probabilities against short prompts are tiny: a clear match
 
 `apollo start` validates the config before serving and reports **all** problems at once. Enforced rules include:
 
-- **Strategies:** `confirm` at most 8 with `confirm_window` in (0.05, 5] s, and only for models that define `early_exit`; at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`, `refine`→`min_score` + `window` + `fps`); `min_gap` only on `scene` and ≥ 0; `refine` steps after all others, with `min_score` in 0..1, `window` in (0, 60] s and `fps` in (0, 60]. A model using a strategy with `refine` must define `early_exit`, with a `threshold` above the step's `min_score`.
-- **Models:** `repo` is required, except for `pdq`; text models cannot set `video_strategy` or `early_exit`, `max_tokens` is at least 16, and `max_tokens`/`multi_label` only apply to text models; a `pdq` model needs a `hash_list` whose lines parse and name its `categories`, and cannot set `labels`, `taxonomy_file`, `prompt_template`, `score_threshold` or `max_results` (while the `pdq` fields are rejected on other architectures); `video_strategy` must name a defined strategy; `early_exit` must list at least one label **and** requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
-- **Pipelines:** at least one step; no empty step; every `model` must be defined, and in at most one step; unique `order`s; a `stop_if` must list at least one label id, and name its step's model (`stop_if.model`) when the step runs several.
+- **Strategies:** `confirm` at most 8 with `confirm_window` in (0.05, 5] s, and only for models that define `early_exit`; at least one sampling step; unique `step` numbers; each method's required parameter present (`fps`→`fps`, `uniform`→`count`, `every_nth`→`nth`, `scene`→`threshold`, `refine`→`min_score` + `window` + `fps`); `min_gap` only on `scene` and ≥ 0; `refine` steps after all others, with `min_score` in 0..1, `window` in (0, 60] s and `fps` in (0, 60]. A model using a strategy with `refine` must define `early_exit`, with a `threshold` above the step's `min_score`. A `paddleocr_vl` model is exempt from both rules: `confirm` and `refine` do nothing for it.
+- **Models:** `repo` is required, except for `pdq`; text models cannot set `video_strategy`; `multi_label` only applies to text models, and `max_tokens` to text models (at least 16) and `paddleocr_vl` (at least 1); `max_pixels` (at least 147384) and `min_confidence` (0 to 1) only apply to `paddleocr_vl`, which cannot set `early_exit` or the `siglip` fields; a `pdq` model needs a `hash_list` whose lines parse and name its `categories`, and cannot set `labels`, `taxonomy_file`, `prompt_template`, `score_threshold` or `max_results` (while the `pdq` fields are rejected on other architectures); `video_strategy` must name a defined strategy; `early_exit` must list at least one label, and on an image model requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
+- **Pipelines:** at least one step; no empty step; every `model` must be defined, and in at most one step; unique `order`s; a `stop_if` must list at least one label id, name its step's model (`stop_if.model`) when the step runs several, and not check a `paddleocr_vl` model (it has no labels); a step's `input` must be a `paddleocr_vl` model of an earlier step, and the step's models text models.
 - **Taxonomies:** a category `threshold` must be a number from 0 to 1 with at most 2 decimals, as must a `siglip` model's `score_threshold`.
 - **Database:** selecting `postgres`/`surrealdb` requires the matching `[database.<backend>]` section.
 

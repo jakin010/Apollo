@@ -15,7 +15,8 @@
 //!
 //! Video inputs are handled one frame at a time through this same image path
 //! (the scheduler samples frames and submits them as ordinary image jobs); there
-//! is no separate whole-clip path. Text models take text jobs the same way.
+//! is no separate whole-clip path. Text models take text jobs the same way, and
+//! models that read text (OCR) take image jobs and answer with the text.
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -32,7 +33,7 @@ use apollo_inference::LoadedModel;
 use crate::error::EngineError;
 use crate::metrics::ModelMetrics;
 
-type ClassifyReply = oneshot::Sender<Result<Classification, EngineError>>;
+type RunReply = oneshot::Sender<Result<Output, EngineError>>;
 /// Answers a load request with the model's input shape.
 type LoadReply = oneshot::Sender<Result<InputShape, EngineError>>;
 
@@ -52,7 +53,15 @@ pub(crate) struct InputShape {
 /// Builds a model on the worker thread. Errors are reported as text.
 pub(crate) type Loader = Box<dyn Fn() -> Result<LoadedModel, String> + Send>;
 
-/// What a job classifies.
+/// What a model gave for one input.
+#[derive(Debug)]
+pub(crate) enum Output {
+    Classification(Classification),
+    /// The text a model read.
+    Text(String),
+}
+
+/// What a job runs on.
 pub(crate) enum Payload {
     /// Shared, so several models can classify one decoded image without
     /// copying it.
@@ -62,12 +71,9 @@ pub(crate) enum Payload {
 
 /// A unit of work for a model worker.
 pub(crate) enum Job {
-    /// Classify one input, merged with other pending inputs into a single
-    /// batched forward pass.
-    Classify {
-        input: Payload,
-        reply: ClassifyReply,
-    },
+    /// Run the model on one input (classify it, or read its text), merged
+    /// with other pending inputs into a single batch.
+    Run { input: Payload, reply: RunReply },
     /// Make sure the weights are resident; replies with the model's input shape
     /// once they are (or the load error).
     Load { reply: LoadReply },
@@ -134,20 +140,30 @@ impl ModelHandle {
         &self,
         image: Arc<DecodedImage>,
     ) -> Result<Classification, EngineError> {
-        self.classify(Payload::Image(image)).await
+        classification(self.run(Payload::Image(image)).await?)
     }
 
     pub(crate) async fn classify_text(
         &self,
         text: Arc<str>,
     ) -> Result<Classification, EngineError> {
-        self.classify(Payload::Text(text)).await
+        classification(self.run(Payload::Text(text)).await?)
     }
 
-    async fn classify(&self, input: Payload) -> Result<Classification, EngineError> {
+    /// The text in an image, from a model that reads text.
+    pub(crate) async fn read_image(&self, image: Arc<DecodedImage>) -> Result<String, EngineError> {
+        match self.run(Payload::Image(image)).await? {
+            Output::Text(text) => Ok(text),
+            Output::Classification(_) => Err(EngineError::Incompatible(
+                "the model classifies images; it does not read text".into(),
+            )),
+        }
+    }
+
+    async fn run(&self, input: Payload) -> Result<Output, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Job::Classify { input, reply })
+            .send(Job::Run { input, reply })
             .map_err(|_| EngineError::WorkerGone)?;
         rx.await.map_err(|_| EngineError::WorkerGone)?
     }
@@ -220,7 +236,7 @@ impl Worker {
                 Ok(Job::Load { reply }) => {
                     let _ = reply.send(self.ensure_loaded());
                 }
-                Ok(Job::Classify { input, reply }) => match self.ensure_loaded() {
+                Ok(Job::Run { input, reply }) => match self.ensure_loaded() {
                     Ok(_) => self.run_batch(input, reply, &rx),
                     Err(e) => {
                         let _ = reply.send(Err(e));
@@ -251,16 +267,7 @@ impl Worker {
                 // kernels / allocates buffers and can take seconds, which would
                 // otherwise eat into the first real request's timeout.
                 let started = std::time::Instant::now();
-                let warm = DecodedImage {
-                    width: 1,
-                    height: 1,
-                    data: vec![0; 3],
-                };
-                let warm_up = || match &m {
-                    LoadedModel::Image(m) => m.classify(&[&warm]).map(drop),
-                    LoadedModel::Text(m) => m.classify(&["warm up"]).map(drop),
-                };
-                match catch_unwind(AssertUnwindSafe(warm_up)) {
+                match catch_unwind(AssertUnwindSafe(|| m.warm_up())) {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         tracing::warn!(model = %self.spec.name, error = %e, "warm-up inference failed")
@@ -300,17 +307,23 @@ impl Worker {
     }
 
     /// Merge `first` plus whatever else is queued (up to the batch size) into one
-    /// forward pass, then fan the per-input results back to each caller. Load
+    /// batch, then fan the per-input results back to each caller. Load
     /// requests found while draining are answered immediately (the model is
     /// resident). An input of the wrong kind for the model (text for an image
     /// model, or the reverse) fails on its own.
-    fn run_batch(&mut self, first: Payload, first_reply: ClassifyReply, rx: &Receiver<Job>) {
-        let batch = self.spec.batch.max(1);
+    fn run_batch(&mut self, first: Payload, first_reply: RunReply, rx: &Receiver<Job>) {
+        // A model that reads text reads one image at a time anyway: batching
+        // would only hold each reply (and the caller's timeout) until the
+        // whole batch was read, and fail it with any other image's error.
+        let batch = match self.model {
+            Some(LoadedModel::ImageToText(_)) => 1,
+            _ => self.spec.batch.max(1),
+        };
         let mut jobs = Vec::with_capacity(batch);
         jobs.push((first, first_reply));
         while jobs.len() < batch {
             match rx.try_recv() {
-                Ok(Job::Classify { input, reply }) => jobs.push((input, reply)),
+                Ok(Job::Run { input, reply }) => jobs.push((input, reply)),
                 Ok(Job::Load { reply }) => {
                     let _ = reply.send(self.ensure_loaded());
                 }
@@ -326,30 +339,44 @@ impl Worker {
             }
             return;
         };
-        let wrong_kind = |reply: ClassifyReply, what: &str| {
+        let wrong_kind = |reply: RunReply, what: &str| {
             let _ = reply.send(Err(EngineError::Incompatible(format!(
                 "model '{}' does not take {what}",
                 self.spec.name
             ))));
         };
         let mut replies = Vec::with_capacity(jobs.len());
+        let mut images = Vec::new();
+        let mut take_images = |jobs: Vec<(Payload, RunReply)>| {
+            for (input, reply) in jobs {
+                match input {
+                    Payload::Image(img) => {
+                        images.push(img);
+                        replies.push(reply);
+                    }
+                    Payload::Text(_) => wrong_kind(reply, "text"),
+                }
+            }
+        };
         let outcome = match model {
             LoadedModel::Image(m) => {
-                let mut images = Vec::with_capacity(jobs.len());
-                for (input, reply) in jobs {
-                    match input {
-                        Payload::Image(img) => {
-                            images.push(img);
-                            replies.push(reply);
-                        }
-                        Payload::Text(_) => wrong_kind(reply, "text"),
-                    }
-                }
+                take_images(jobs);
                 if images.is_empty() {
                     return;
                 }
                 let views: Vec<&DecodedImage> = images.iter().map(|img| img.as_ref()).collect();
-                self.timed(views.len(), || m.classify(&views))
+                self.timed(views.len(), || classified(m.classify(&views)))
+            }
+            LoadedModel::ImageToText(m) => {
+                take_images(jobs);
+                if images.is_empty() {
+                    return;
+                }
+                let views: Vec<&DecodedImage> = images.iter().map(|img| img.as_ref()).collect();
+                self.timed(views.len(), || {
+                    m.read(&views)
+                        .map(|texts| texts.into_iter().map(Output::Text).collect())
+                })
             }
             LoadedModel::Text(m) => {
                 let mut texts = Vec::with_capacity(jobs.len());
@@ -366,18 +393,14 @@ impl Worker {
                     return;
                 }
                 let views: Vec<&str> = texts.iter().map(|t| t.as_ref()).collect();
-                self.timed(views.len(), || m.classify(&views))
+                self.timed(views.len(), || classified(m.classify(&views)))
             }
         };
         self.deliver(outcome, replies);
     }
 
-    /// Run one forward pass of `n` inputs, timed and with panics caught.
-    fn timed(
-        &self,
-        n: usize,
-        f: impl FnOnce() -> Result<Vec<Classification>, apollo_inference::InferenceError>,
-    ) -> std::thread::Result<Result<Vec<Classification>, apollo_inference::InferenceError>> {
+    /// Run one batch of `n` inputs, timed and with panics caught.
+    fn timed(&self, n: usize, f: impl FnOnce() -> BatchResult) -> std::thread::Result<BatchResult> {
         let metrics = &self.spec.metrics;
         metrics.batch_size.observe(n as f64);
         let started = std::time::Instant::now();
@@ -387,11 +410,7 @@ impl Worker {
     }
 
     /// Hand each caller its result, or the batch's error.
-    fn deliver(
-        &mut self,
-        outcome: std::thread::Result<Result<Vec<Classification>, apollo_inference::InferenceError>>,
-        replies: Vec<ClassifyReply>,
-    ) {
+    fn deliver(&mut self, outcome: std::thread::Result<BatchResult>, replies: Vec<RunReply>) {
         let metrics = Arc::clone(&self.spec.metrics);
         let err = match outcome {
             // A non-finite score means the forward pass went wrong (e.g. a GPU
@@ -442,21 +461,44 @@ impl Worker {
     }
 }
 
+/// What a batch gave: an output per input, or the error.
+type BatchResult = Result<Vec<Output>, apollo_inference::InferenceError>;
+
+fn classified(
+    results: Result<Vec<Classification>, apollo_inference::InferenceError>,
+) -> BatchResult {
+    results.map(|cs| cs.into_iter().map(Output::Classification).collect())
+}
+
+fn classification(output: Output) -> Result<Classification, EngineError> {
+    match output {
+        Output::Classification(c) => Ok(c),
+        Output::Text(_) => Err(EngineError::Incompatible(
+            "the model reads text; it does not classify".into(),
+        )),
+    }
+}
+
 fn input_shape(model: &LoadedModel) -> InputShape {
     match model {
         LoadedModel::Image(m) => InputShape {
             size: m.input_size(),
             resize_ahead: m.resizes_to_input(),
         },
-        LoadedModel::Text(_) => InputShape {
+        // Images are sized by the model itself (see
+        // `apollo_inference::read_size`).
+        LoadedModel::Text(_) | LoadedModel::ImageToText(_) => InputShape {
             size: 0,
             resize_ahead: false,
         },
     }
 }
 
-fn has_non_finite(c: &Classification) -> bool {
-    c.predictions.iter().any(|p| !p.score.is_finite())
+fn has_non_finite(output: &Output) -> bool {
+    match output {
+        Output::Classification(c) => c.predictions.iter().any(|p| !p.score.is_finite()),
+        Output::Text(_) => false,
+    }
 }
 
 fn panic_message(panic: &Box<dyn Any + Send>) -> String {
@@ -560,6 +602,81 @@ mod tests {
             image.classify_image(img(3)).await.unwrap().predictions[0].label,
             3
         );
+    }
+
+    /// Reads every image as "w<width>"; nothing on width 1.
+    struct FakeReader;
+
+    impl apollo_inference::ImageToText for FakeReader {
+        fn read(&self, images: &[&DecodedImage]) -> Result<Vec<String>, InferenceError> {
+            Ok(images
+                .iter()
+                .map(|img| match img.width {
+                    1 => String::new(),
+                    w => format!("w{w}"),
+                })
+                .collect())
+        }
+    }
+
+    /// Reads every image after `ms_per_image`, failing on width 2.
+    struct SlowReader {
+        ms_per_image: u64,
+    }
+
+    impl apollo_inference::ImageToText for SlowReader {
+        fn read(&self, images: &[&DecodedImage]) -> Result<Vec<String>, InferenceError> {
+            images
+                .iter()
+                .map(|img| {
+                    std::thread::sleep(Duration::from_millis(self.ms_per_image));
+                    if img.width == 2 {
+                        Err(InferenceError::Preprocess("unreadable".into()))
+                    } else {
+                        Ok(format!("w{}", img.width))
+                    }
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_are_answered_one_by_one() {
+        let h = Arc::new(spawn_with(|| {
+            LoadedModel::ImageToText(Box::new(SlowReader { ms_per_image: 150 }))
+        }));
+        h.ensure_loaded().await.unwrap();
+        let started = std::time::Instant::now();
+        let read = |w: u32| {
+            let h = Arc::clone(&h);
+            tokio::spawn(async move { (h.read_image(img(w)).await, started.elapsed()) })
+        };
+        let (a, b, c) = (read(3), read(2), read(5));
+        let (a, b, c) = (a.await.unwrap(), b.await.unwrap(), c.await.unwrap());
+        // Each read is answered when it is done, not when the last one is.
+        assert_eq!(a.0.unwrap(), "w3");
+        assert!(a.1 < Duration::from_millis(400), "{:?}", a.1);
+        // One image's error is its own.
+        assert!(b.0.unwrap_err().to_string().contains("unreadable"));
+        assert_eq!(c.0.unwrap(), "w5");
+    }
+
+    #[tokio::test]
+    async fn models_that_read_text_answer_with_it() {
+        let reader = spawn_with(|| LoadedModel::ImageToText(Box::new(FakeReader)));
+        // Images are sized by the model, not to a square.
+        let shape = reader.ensure_loaded().await.unwrap();
+        assert_eq!((shape.size, shape.resize_ahead), (0, false));
+        assert_eq!(reader.read_image(img(7)).await.unwrap(), "w7");
+        assert_eq!(reader.read_image(img(1)).await.unwrap(), "");
+        let err = reader.classify_image(img(3)).await.unwrap_err();
+        assert!(err.to_string().contains("reads text"), "{err}");
+        let err = reader.classify_text(Arc::from("hi")).await.unwrap_err();
+        assert!(err.to_string().contains("does not take text"), "{err}");
+
+        let classifier = spawn_with(|| LoadedModel::Image(Box::new(Fake)));
+        let err = classifier.read_image(img(3)).await.unwrap_err();
+        assert!(err.to_string().contains("does not read text"), "{err}");
     }
 
     fn spawn(loads: Arc<AtomicUsize>, fail_first: bool, keep: bool) -> ModelHandle {

@@ -86,14 +86,27 @@ pub async fn extract_frames_scaled(
     size: u32,
     keyframes: &[f64],
 ) -> Result<Vec<DecodedImage>, MediaError> {
+    extract_frames_sized(path, info, requests, size, size, keyframes).await
+}
+
+/// [`extract_frames_scaled`] at `width`×`height`: frames are scaled to it as
+/// they are, so a size with the video's shape keeps theirs.
+pub async fn extract_frames_sized(
+    path: &Path,
+    info: &VideoInfo,
+    requests: &[FrameRequest],
+    width: u32,
+    height: u32,
+    keyframes: &[f64],
+) -> Result<Vec<DecodedImage>, MediaError> {
     let mut out: Vec<Option<DecodedImage>> = vec![None; requests.len()];
     for run in group_runs(requests, keyframes) {
         let times: Vec<f64> = run.iter().map(|&i| requests[i].timestamp).collect();
         let keyframes = run.iter().all(|&i| requests[i].keyframe);
         // A failed batch is not fatal: every target it misses falls back below.
         let output = Output {
-            width: size,
-            height: size,
+            width,
+            height,
             flags: SCALE_FLAGS,
         };
         if let Ok(frames) = extract_run(path, info, &times, keyframes, &output).await {
@@ -106,7 +119,7 @@ pub async fn extract_frames_scaled(
     for (req, frame) in requests.iter().zip(out) {
         images.push(match frame {
             Some(img) => img,
-            None => fallback(path, req.timestamp, size).await?,
+            None => fallback(path, req.timestamp, width, height).await?,
         });
     }
     Ok(images)
@@ -300,18 +313,23 @@ fn select_expr(targets: impl Iterator<Item = f64>) -> String {
 }
 
 /// Single-frame path (one process, PNG), scaled to `size` in Rust.
-async fn fallback(path: &Path, timestamp: f64, size: u32) -> Result<DecodedImage, MediaError> {
+async fn fallback(
+    path: &Path,
+    timestamp: f64,
+    width: u32,
+    height: u32,
+) -> Result<DecodedImage, MediaError> {
     // The frame is resized right away, so no extra pixel cap is applied here
     // beyond the resolution check done when the video was probed.
     let img = ffmpeg::extract_frame(path, timestamp, None).await?;
-    tokio::task::spawn_blocking(move || resize(&img, size))
+    tokio::task::spawn_blocking(move || resize(&img, width, height))
         .await
         .map_err(|e| MediaError::Decode(format!("resize task failed: {e}")))?
 }
 
-/// Resize an RGB image to `size`×`size`.
-fn resize(img: &DecodedImage, size: u32) -> Result<DecodedImage, MediaError> {
-    if img.width == size && img.height == size {
+/// Resize an RGB image to `width`×`height`.
+fn resize(img: &DecodedImage, width: u32, height: u32) -> Result<DecodedImage, MediaError> {
+    if img.width == width && img.height == height {
         return Ok(img.clone());
     }
     let view = image::ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(
@@ -320,10 +338,11 @@ fn resize(img: &DecodedImage, size: u32) -> Result<DecodedImage, MediaError> {
         img.data.as_slice(),
     )
     .ok_or_else(|| MediaError::Decode("frame buffer does not match its dimensions".into()))?;
-    let resized = image::imageops::resize(&view, size, size, image::imageops::FilterType::Triangle);
+    let resized =
+        image::imageops::resize(&view, width, height, image::imageops::FilterType::Triangle);
     Ok(DecodedImage {
-        width: size,
-        height: size,
+        width,
+        height,
         data: resized.into_raw(),
     })
 }
@@ -418,9 +437,11 @@ mod tests {
             height: 2,
             data: vec![7; 12],
         };
-        assert_eq!(resize(&img, 2).unwrap(), img);
-        let big = resize(&img, 4).unwrap();
+        assert_eq!(resize(&img, 2, 2).unwrap(), img);
+        let big = resize(&img, 4, 4).unwrap();
         assert_eq!((big.width, big.height, big.data.len()), (4, 4, 48));
+        let wide = resize(&img, 6, 2).unwrap();
+        assert_eq!((wide.width, wide.height, wide.data.len()), (6, 2, 36));
     }
 }
 

@@ -204,7 +204,8 @@ fn model_discovery() {
     message(&mi["labels"], 7, ".apollo.v1.Label", Repeated);
     message(&mi["trigger"], 8, ".apollo.v1.Trigger", Optional);
     scalar(&mi["video_strategy"], 9, Type::String, Optional);
-    assert_eq!(mi.len(), 9);
+    enumeration(&mi["output"], 10, ".apollo.v1.ModelOutputKind", Optional);
+    assert_eq!(mi.len(), 10);
 
     let l = fields_by_name(&msgs["Label"]);
     scalar(&l["id"], 1, Type::Uint32, Optional);
@@ -224,7 +225,8 @@ fn model_discovery() {
     let ps = fields_by_name(&msgs["PipelineStepInfo"]);
     scalar(&ps["models"], 1, Type::String, Repeated);
     message(&ps["stop_if"], 2, ".apollo.v1.StopIf", Optional);
-    assert_eq!(ps.len(), 2);
+    scalar(&ps["input"], 3, Type::String, Optional);
+    assert_eq!(ps.len(), 3);
 
     let si = fields_by_name(&msgs["StopIf"]);
     scalar(&si["model"], 1, Type::String, Optional);
@@ -272,7 +274,20 @@ fn task_and_results() {
         Optional,
     );
     message(&m["scan"], 5, ".apollo.v1.Scan", Optional);
-    assert_eq!(m.len(), 5);
+    message(&m["text"], 6, ".apollo.v1.TextOutput", Optional);
+    assert_eq!(m.len(), 6);
+
+    let to = fields_by_name(&msgs["TextOutput"]);
+    scalar(&to["text"], 1, Type::String, Optional);
+    scalar(&to["language"], 2, Type::String, Optional);
+    message(&to["parts"], 3, ".apollo.v1.TimedText", Repeated);
+    assert_eq!(to.len(), 3);
+
+    let tt = fields_by_name(&msgs["TimedText"]);
+    scalar(&tt["start"], 1, Type::Double, Optional);
+    scalar(&tt["end"], 2, Type::Double, Optional);
+    scalar(&tt["text"], 3, Type::String, Optional);
+    assert_eq!(tt.len(), 3);
 
     let e = fields_by_name(&msgs["Error"]);
     enumeration(&e["kind"], 1, ".apollo.v1.ErrorType", Optional);
@@ -376,6 +391,10 @@ fn enum_values() {
     assert_eq!(ResultView::Unspecified as i32, 0);
     assert_eq!(ResultView::Summary as i32, 1);
     assert_eq!(ResultView::Full as i32, 2);
+
+    assert_eq!(ModelOutputKind::Unspecified as i32, 0);
+    assert_eq!(ModelOutputKind::Classification as i32, 1);
+    assert_eq!(ModelOutputKind::Text as i32, 2);
 
     assert_eq!(TaskEventType::Unspecified as i32, 0);
     assert_eq!(TaskEventType::Progress as i32, 1);

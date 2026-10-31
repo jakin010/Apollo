@@ -9,9 +9,10 @@ pub mod result;
 pub mod task;
 
 pub use image::DecodedImage;
-pub use model::{Architecture, Modality, ModelInput};
+pub use model::{Architecture, Modality, ModelInput, OutputKind};
 pub use result::{
-    Classification, Label, ModelOutput, Prediction, Sample, Scan, Segment, select_top,
+    Classification, Label, ModelOutput, Prediction, Sample, Scan, Segment, TextOutput, TimedText,
+    select_top,
 };
 pub use task::{
     ErrorKind, Input, Item, ItemState, MediaKind, ModelResult, ModelState, ParseStateError, Task,

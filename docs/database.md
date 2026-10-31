@@ -43,7 +43,7 @@ Migrations are **idempotent** and run automatically inside `open()` at startup, 
 Values are stored in backend‑native columns where it helps queries (ids, states, timestamps, flags) and as **JSON** where the shape is rich:
 
 - **Lifecycle states** (`TaskState`, `ItemState`, `ModelState`) are stored as their lowercase string tokens (`queued`, `processing`, `completed`, `retrying`, `done`, `skipped`, `failed`, `cancelled`).
-- **Model outputs** (`Classification` / `Scan`) and **cache entries** are stored as serialized JSON. Outputs stored before the API redesign (`FrameScan` with `frames`) still read back.
+- **Model outputs** (`Classification` / `Scan` / `Text`) and **cache entries** are stored as serialized JSON. Outputs stored before the API redesign (`FrameScan` with `frames`) still read back.
 - **Errors** (the typed `TaskError`: a category + message) are stored as JSON; a value that doesn't parse is read back as an uncategorized error carrying the raw text.
 - **Timestamps** (`created_at` / `updated_at`) are UNIX seconds.
 
@@ -95,7 +95,7 @@ One row per `(item, model)`. `PRIMARY KEY (task_id, item_idx, label)`, cascading
 | `task_id`, `item_idx` | TEXT/INTEGER | → `items(task_id, idx)`. |
 | `label` | TEXT | Model label. |
 | `state` | TEXT | `ModelState` token. |
-| `output_json` | TEXT | Serialized `ModelOutput` (`Classification`/`Scan`), when done. |
+| `output_json` | TEXT | Serialized `ModelOutput` (`Classification`/`Scan`, or `Text` for a model that reads text), when done. |
 | `error` | TEXT | Model‑level error as JSON, if failed. |
 | `steps_completed` | INTEGER | Reserved for skipping finished sampling steps on resume; not used yet (resume relies on the `frames` rows). |
 
@@ -158,7 +158,7 @@ If `[database].retention` is set (e.g. `"30d"`), a background timer periodically
 
 When `[cache]` is enabled, model outputs are cached so identical inputs skip inference:
 
-- **Content cache** (`cache` table): keyed by the input's **content hash** + model + revision. A hit returns the stored `ModelOutput` directly.
+- **Content cache** (`cache` table): keyed by the input's **content hash** + model + revision. A hit returns the stored `ModelOutput` directly, unless it is not the kind of output the model gives now (its label was repointed at a model that reads text, or back). A pipeline step with an `input` is keyed by the text it classifies instead, and not cached when that text is empty.
 - **URL→content hint** (`url_cache` table): maps a URL's hash to the content hash it last resolved to, so a repeated URL can reach the content cache without re‑downloading.
 
 Freshness is controlled by `[cache].ttl_secs`: a lookup passes a lower bound on `created_at`, so entries older than the TTL are ignored, and an hourly job deletes them. Omit `ttl_secs` for entries that never expire. Keying on `revision` means bumping a model's revision naturally invalidates its cached outputs.

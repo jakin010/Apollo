@@ -1,11 +1,13 @@
-//! `apollo-inference` — load Hugging Face image and text classifiers with
-//! candle and run them on the best available device.
+//! `apollo-inference` — load Hugging Face image and text classifiers, and
+//! models that read the text in images, with candle and run them on the best
+//! available device.
 //!
 //! [`select_device`] picks CUDA → Metal → CPU (Metal is compiled in automatically
 //! on macOS; CUDA is opt-in via the `cuda` feature). [`load`] downloads a model
 //! from the Hub (cached) and returns a [`LoadedModel`]: an [`ImageClassifier`]
-//! (images, and video frame by frame) or a [`TextClassifier`]. The `arch`
-//! module is the seam where model families plug in.
+//! (images, and video frame by frame), a [`TextClassifier`], or an
+//! [`ImageToText`] model (OCR). The `arch` module is the seam where model
+//! families plug in.
 //!
 //! Loading and inference are synchronous (candle + safetensors mmap + Hub I/O);
 //! the async engine runs them on blocking threads.
@@ -62,18 +64,72 @@ pub trait TextClassifier: Send + Sync {
     fn labels(&self) -> &[Label];
 }
 
-/// A loaded model, by the kind of input it classifies.
+/// A model that reads the text in images (OCR), one image at a time.
+pub trait ImageToText: Send + Sync {
+    /// The text in each image, one string per input (empty when there is
+    /// none). Each image is scaled by the model itself (see [`read_size`]).
+    fn read(&self, images: &[&DecodedImage]) -> Result<Vec<String>, InferenceError>;
+    /// A short run that gets the device ready (GPU kernels compiled, buffers
+    /// allocated), so the first real image doesn't pay for it.
+    fn warm_up(&self) -> Result<(), InferenceError> {
+        let blank = DecodedImage {
+            width: 1,
+            height: 1,
+            data: vec![0; 3],
+        };
+        self.read(&[&blank]).map(drop)
+    }
+}
+
+/// A loaded model, by what it takes and gives.
 pub enum LoadedModel {
     Image(Box<dyn ImageClassifier>),
     Text(Box<dyn TextClassifier>),
+    /// Reads the text in images.
+    ImageToText(Box<dyn ImageToText>),
 }
 
 impl LoadedModel {
+    /// The labels it predicts; none for a model that reads text.
     pub fn labels(&self) -> &[Label] {
         match self {
             LoadedModel::Image(m) => m.labels(),
             LoadedModel::Text(m) => m.labels(),
+            LoadedModel::ImageToText(_) => &[],
         }
+    }
+
+    /// Run a tiny input through the model: the first run compiles GPU kernels
+    /// and allocates buffers, and can take seconds that would otherwise come
+    /// out of the first real request's timeout.
+    pub fn warm_up(&self) -> Result<(), InferenceError> {
+        match self {
+            LoadedModel::Image(m) => {
+                let warm = DecodedImage {
+                    width: 1,
+                    height: 1,
+                    data: vec![0; 3],
+                };
+                m.classify(&[&warm]).map(drop)
+            }
+            LoadedModel::Text(m) => m.classify(&["warm up"]).map(drop),
+            LoadedModel::ImageToText(m) => m.warm_up(),
+        }
+    }
+}
+
+/// The size a model that reads text (`paddleocr_vl`) reads an image of
+/// `width`×`height` at: its shape kept, scaled to the model's pixel range
+/// (capped by the config's `max_pixels`), each side on its patch grid. Video
+/// frames are extracted at this size. `None` for other architectures (they
+/// take a fixed square, see [`ImageClassifier::input_size`]), or when the
+/// image is too long and thin for the model.
+pub fn read_size(cfg: &ModelConfig, width: u32, height: u32) -> Option<(u32, u32)> {
+    match cfg.architecture {
+        Architecture::PaddleocrVl => {
+            arch::paddleocr_vl::fit(width, height, arch::paddleocr_vl::max_pixels(cfg))
+        }
+        _ => None,
     }
 }
 
@@ -99,6 +155,8 @@ pub fn labels(cfg: &ModelConfig, cache_dir: Option<&Path>) -> Option<Vec<Label>>
             None => Some(Label::indexed(&cfg.labels)),
         },
         Architecture::Pdq => arch::pdq::category_labels(cfg).ok(),
+        // Reads text; no labels.
+        Architecture::PaddleocrVl => Some(Vec::new()),
         Architecture::Vit
         | Architecture::Bert
         | Architecture::Distilbert
@@ -169,6 +227,12 @@ pub fn load(
             Ok(LoadedModel::Text(Box::new(arch::text::load(
                 &hub, cfg, device,
             )?)))
+        }
+        Architecture::PaddleocrVl => {
+            let hub = loader::Hub::open(cfg, cache_dir)?;
+            Ok(LoadedModel::ImageToText(Box::new(
+                arch::paddleocr_vl::load(&hub, cfg, device)?,
+            )))
         }
     }
 }

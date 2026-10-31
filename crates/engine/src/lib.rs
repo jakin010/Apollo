@@ -370,7 +370,9 @@ impl Engine {
 
     /// Resolve what to run to the item's model list (a pipeline's models in
     /// step order, so they get the same compatibility checks as a direct list)
-    /// and pipeline name, and validate the models against the input's modality.
+    /// and pipeline name, and validate the models against the input's modality
+    /// (a pipeline step with an `input` classifies text an earlier step read,
+    /// so its models are only checked to be enabled).
     fn resolve(
         &self,
         input: &Input,
@@ -384,6 +386,20 @@ impl Engine {
                     .pipelines
                     .get(name)
                     .ok_or_else(|| EngineError::Config(format!("unknown pipeline '{name}'")))?;
+                let (on_text, on_input): (Vec<_>, Vec<_>) = p
+                    .ordered_steps()
+                    .into_iter()
+                    .partition(|step| step.input.is_some());
+                let names = |steps: Vec<&apollo_config::PipelineStep>| -> Vec<String> {
+                    steps
+                        .into_iter()
+                        .flat_map(|s| s.models().iter().cloned())
+                        .collect()
+                };
+                live.registry
+                    .validate_item(&live.config, input, &names(on_input))?;
+                live.registry
+                    .validate_text_steps(&live.config, &names(on_text))?;
                 (p.models(), Some(name.clone()))
             }
             Run::Models(models) => {
@@ -393,10 +409,10 @@ impl Engine {
                         "model '{dup}' is listed twice"
                     )));
                 }
+                live.registry.validate_item(&live.config, input, models)?;
                 (models.clone(), None)
             }
         };
-        live.registry.validate_item(&live.config, input, &models)?;
         // Inline text is checked now; an uploaded one when it is read.
         if let Input::Text(text) = input
             && let Some(max) = live.config.limits.max_text_bytes()

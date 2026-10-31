@@ -145,14 +145,7 @@ impl Registry {
         }
         let modality = input.modality();
         for label in models {
-            let Some(model) = config.models.get(label) else {
-                return Err(EngineError::UnknownModel(label.clone()));
-            };
-            if !model.enabled {
-                return Err(EngineError::Incompatible(format!(
-                    "model '{label}' is disabled"
-                )));
-            }
+            let model = enabled_model(config, label)?;
             // Image models take images, and video as a per-frame scan (with a
             // configured video_strategy); text models take text.
             let takes = model.architecture.input();
@@ -190,6 +183,34 @@ impl Registry {
         }
         Ok(())
     }
+
+    /// Check models that classify text an earlier pipeline step read (a
+    /// step's `input`) rather than the item's input: known and enabled.
+    /// That they are text models, reading the text of a model that reads
+    /// text, is checked when the config is loaded.
+    pub(crate) fn validate_text_steps(
+        &self,
+        config: &Config,
+        models: &[String],
+    ) -> Result<(), EngineError> {
+        for label in models {
+            enabled_model(config, label)?;
+        }
+        Ok(())
+    }
+}
+
+/// The config of model `label`, when it is defined and enabled.
+fn enabled_model<'a>(config: &'a Config, label: &str) -> Result<&'a ModelConfig, EngineError> {
+    let Some(model) = config.models.get(label) else {
+        return Err(EngineError::UnknownModel(label.to_string()));
+    };
+    if !model.enabled {
+        return Err(EngineError::Incompatible(format!(
+            "model '{label}' is disabled"
+        )));
+    }
+    Ok(model)
 }
 
 fn spawn(

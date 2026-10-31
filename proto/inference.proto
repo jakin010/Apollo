@@ -165,6 +165,16 @@ message ModelInfo {
   Trigger trigger = 8;
   // Strategy used for video input; empty if the model takes no video.
   string video_strategy = 9;
+  // What the model gives: scores for its labels, or the text it read.
+  ModelOutputKind output = 10;
+}
+
+enum ModelOutputKind {
+  MODEL_OUTPUT_KIND_UNSPECIFIED = 0;
+  // A Classification (or a Scan, over a video).
+  MODEL_OUTPUT_KIND_CLASSIFICATION = 1;
+  // A TextOutput: the text it read (OCR).
+  MODEL_OUTPUT_KIND_TEXT = 2;
 }
 
 message Label {
@@ -188,6 +198,9 @@ message PipelineStepInfo {
   repeated string models = 1;
   // When set and `stop_if.model`'s output triggers, later steps are skipped.
   StopIf stop_if = 2;
+  // The earlier model whose text the step's models classify, instead of the
+  // task's input; empty when they classify the input.
+  string input = 3;
 }
 
 message StopIf {

@@ -1,5 +1,6 @@
-//! Result shapes: `Prediction`, `Classification`, and `Scan` (`aggregated`, the
-//! flagged `Segment`s, and per-sample `Sample`s with times).
+//! Result shapes: `Prediction`, `Classification`, `Scan` (`aggregated`, the
+//! flagged `Segment`s, and per-sample `Sample`s with times), and `TextOutput`
+//! (text a model read, with where it appears in a video).
 
 use serde::{Deserialize, Serialize};
 
@@ -124,6 +125,104 @@ pub struct Scan {
     pub samples: Vec<Sample>,
 }
 
+/// Text a model read (OCR) from an image or a video.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TextOutput {
+    /// All of it: an image's text, or a video's parts joined by newlines.
+    pub text: String,
+    /// The language, when the model reports one (empty for OCR).
+    #[serde(default)]
+    pub language: String,
+    /// For a video, where each part of the text appears, in time order;
+    /// empty for an image.
+    #[serde(default)]
+    pub parts: Vec<TimedText>,
+    /// For a video, the times of the sampled frames on which no text was
+    /// read, in time order. Kept so that classifying the parts can tell a
+    /// stretch without text from one that was not sampled (not part of the
+    /// API).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blank: Vec<f64>,
+}
+
+/// Text seen from `start` to `end`: on consecutive sampled frames of a video.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimedText {
+    /// First and last sample it was read on, in seconds.
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
+impl TextOutput {
+    /// A still image's text.
+    pub fn still(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ..Self::default()
+        }
+    }
+
+    /// The text read on a video's sampled frames, given as (time, text) in
+    /// time order: consecutive frames with the same text (whitespace,
+    /// line breaks included, aside) become one part, laid out as on its first
+    /// frame. Frames without text are listed in `blank`; they end a part, so
+    /// text that disappears and comes back is two parts.
+    pub fn from_frames<'a>(frames: impl IntoIterator<Item = (f64, &'a str)>) -> Self {
+        let mut parts: Vec<TimedText> = Vec::new();
+        let mut blank = Vec::new();
+        // The words of the part the previous frame continued (none after a
+        // frame without text).
+        let mut open: Option<String> = None;
+        for (at, text) in frames {
+            let text = normalize_whitespace(text);
+            if text.is_empty() {
+                blank.push(at);
+                open = None;
+                continue;
+            }
+            let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            match parts.last_mut() {
+                Some(last) if open.as_deref() == Some(words.as_str()) => last.end = at,
+                _ => parts.push(TimedText {
+                    start: at,
+                    end: at,
+                    text,
+                }),
+            }
+            open = Some(words);
+        }
+        let text = parts
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            text,
+            language: String::new(),
+            parts,
+            blank,
+        }
+    }
+}
+
+/// `text` with each run of whitespace made one space (a newline stays one
+/// newline), trimmed.
+fn normalize_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
 /// The output of a completed model run — the API `oneof`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelOutput {
@@ -132,6 +231,8 @@ pub enum ModelOutput {
     /// An image-classifier run over a video.
     #[serde(alias = "FrameScan")]
     Scan(Scan),
+    /// Text a model read (OCR).
+    Text(TextOutput),
 }
 
 /// Select the predictions to return: the top 5 by score, unioned with any label
@@ -169,6 +270,48 @@ mod tests {
         assert_eq!(scan.samples[0].start, 2.5);
         assert_eq!(scan.samples[0].end(), 2.5);
         assert!(scan.segments.is_empty());
+    }
+
+    #[test]
+    fn video_text_merges_repeats_into_parts() {
+        let out = TextOutput::from_frames([
+            (0.0, "  SALE  today "),
+            (1.0, "SALE today"),
+            (2.0, ""),
+            (3.0, "SALE today"),
+            (4.0, "Line one\n\n  line   two"),
+            (5.0, "Line one\nline two"),
+        ]);
+        let parts: Vec<(f64, f64, &str)> = out
+            .parts
+            .iter()
+            .map(|p| (p.start, p.end, p.text.as_str()))
+            .collect();
+        assert_eq!(
+            parts,
+            vec![
+                (0.0, 1.0, "SALE today"),
+                // A frame without text ends a part.
+                (3.0, 3.0, "SALE today"),
+                (4.0, 5.0, "Line one\nline two"),
+            ]
+        );
+        assert_eq!(out.text, "SALE today\nSALE today\nLine one\nline two");
+        assert_eq!(out.blank, [2.0]);
+        let none = TextOutput::from_frames([(0.0, " ")]);
+        assert!(none.parts.is_empty());
+        assert_eq!(none.blank, [0.0]);
+        // A line break is whitespace too: the same caption wrapped
+        // differently on the next frame is the same part, laid out as first.
+        let wrapped = TextOutput::from_frames([(0.0, "SALE today"), (2.0, "SALE\ntoday")]);
+        assert_eq!(wrapped.parts.len(), 1);
+        assert_eq!(
+            (wrapped.parts[0].end, wrapped.parts[0].text.as_str()),
+            (2.0, "SALE today")
+        );
+        // Stored text from before `blank` existed reads back without it.
+        let old: TextOutput = serde_json::from_str(r#"{"text":"a","parts":[]}"#).unwrap();
+        assert!(old.blank.is_empty());
     }
 
     #[test]

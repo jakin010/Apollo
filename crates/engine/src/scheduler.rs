@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use apollo_config::{EarlyExit, ModelConfig, SamplingKind, StrategyConfig};
+use apollo_config::{Aggregation, EarlyExit, ModelConfig, SamplingKind, StrategyConfig};
 use apollo_domain::{
     Classification, DecodedImage, Input, Item, ItemState, MediaKind, Modality, ModelOutput,
-    ModelResult, ModelState, Sample, TaskError, Url,
+    ModelResult, ModelState, OutputKind, Sample, TaskError, TextOutput, Url,
 };
 use apollo_media::{
     Confirm, FrameRef, FrameRequest, LocalMedia, MediaError, VideoInfo, VideoShare,
@@ -86,7 +86,7 @@ impl StillImage {
     }
 }
 
-/// What every model of an item's parallel set shares.
+/// What every model of an item's parallel set (or pipeline step) shares.
 struct ModelRun<'a> {
     task_id: &'a str,
     idx: usize,
@@ -96,6 +96,9 @@ struct ModelRun<'a> {
     url_hash: Option<&'a str>,
     fresh_after: i64,
     cancel: &'a AtomicBool,
+    /// For a pipeline step with an `input`: the text that step's model read,
+    /// which the models classify instead of the item's input.
+    text_input: Option<&'a TextOutput>,
 }
 
 /// How one model of a parallel set ended.
@@ -114,6 +117,11 @@ enum SetOutcome {
 /// Frames extracted per ffmpeg batch. The next batch is extracted while the
 /// current one is classified.
 const EXTRACT_CHUNK: usize = 32;
+
+/// Frames extracted per ffmpeg batch for a model that reads text: they are
+/// near full size (~3 MB each), and each takes seconds to read, so a few at a
+/// time is enough.
+const READ_CHUNK: usize = 8;
 
 /// One model's frame scan over a fetched video.
 #[derive(Clone, Copy)]
@@ -329,6 +337,7 @@ impl Engine {
                 url_hash: url_hash.as_deref(),
                 fresh_after,
                 cancel: &cancel,
+                text_input: None,
             };
             let outcomes =
                 futures::future::join_all(todo.iter().map(|label| self.run_set_model(&ctx, label)))
@@ -441,9 +450,22 @@ impl Engine {
     async fn run_set_model(&self, ctx: &ModelRun<'_>, label: &str) -> SetOutcome {
         let (task_id, idx) = (ctx.task_id, ctx.idx);
 
+        // A model classifying text read in an earlier step is cached by that
+        // text (the same text gives the same result, whatever it was read
+        // from), and has no url hint: its result is not the item's. Text with
+        // nothing in it is not cached: it is not classified at all.
+        let text_hash = ctx
+            .text_input
+            .filter(|text| ctx.content_hash.is_some() && has_text(text, ctx.fetched))
+            .map(|text| text_input_hash(text, ctx.fetched));
+        let (content_hash, url_hash) = match ctx.text_input {
+            Some(_) => (text_hash.as_deref(), None),
+            None => (ctx.content_hash, ctx.url_hash),
+        };
+
         // Content-cache fast path: identical bytes already classified by this
         // model + revision -> reuse the stored output, skip inference.
-        if let Some(ch) = ctx.content_hash {
+        if let Some(ch) = content_hash {
             let rev = self.model_revision(label);
             match self
                 .inner
@@ -451,6 +473,12 @@ impl Engine {
                 .cache_lookup(ch, label, &rev, ctx.fresh_after)
                 .await
             {
+                // A label repointed at another kind of model (a classifier
+                // turned text reader, or back) at the same revision keeps
+                // the old outputs in the cache; those are not its results.
+                Ok(Some(output)) if !self.gives(label, &output) => {
+                    tracing::debug!(task = %task_id, model = %label, "cached output of another kind; ignored");
+                }
                 Ok(Some(output)) => {
                     let done = ModelResult::done(output);
                     let _ = self
@@ -458,7 +486,7 @@ impl Engine {
                         .storage
                         .upsert_model_result(task_id, idx, label, &done)
                         .await;
-                    if let Some(uh) = ctx.url_hash {
+                    if let Some(uh) = url_hash {
                         let _ = self
                             .inner
                             .storage
@@ -489,12 +517,16 @@ impl Engine {
         // The model's `timeout` bounds each individual classification — a single
         // image, or *each frame* of a video scan — not the whole video, and not
         // the time to load a cold model.
-        let outcome = match self
-            .run_model(task_id, idx, label, ctx.item, ctx.fetched, ctx.cancel)
-            .await
-        {
+        let run = match ctx.text_input {
+            Some(text) => self.run_on_text(label, ctx.fetched, text, ctx.cancel).await,
+            None => {
+                self.run_model(task_id, idx, label, ctx.item, ctx.fetched, ctx.cancel)
+                    .await
+            }
+        };
+        let outcome = match run {
             Ok(output) => {
-                self.store_in_cache(task_id, label, ctx.content_hash, ctx.url_hash, &output)
+                self.store_in_cache(task_id, label, content_hash, url_hash, &output)
                     .await;
                 SetOutcome::Finished(ModelResult::done(output))
             }
@@ -599,6 +631,25 @@ impl Engine {
                     .cloned()
                     .collect();
                 if !todo.is_empty() {
+                    // A step with an `input` classifies the text that model
+                    // read; it finished in an earlier step (a failure there
+                    // fails the pipeline before this step).
+                    let text_input = match &step.input {
+                        None => None,
+                        Some(source) => {
+                            match item.results.get(source).and_then(|r| r.output.as_ref()) {
+                                Some(ModelOutput::Text(text)) => Some(text.clone()),
+                                _ => {
+                                    let err = TaskError::internal(format!(
+                                        "pipeline '{pipeline}': model '{source}' read no text for step {}",
+                                        step.order
+                                    ));
+                                    self.fail_item(task_id, idx, &item, err).await;
+                                    return;
+                                }
+                            }
+                        }
+                    };
                     let ctx = ModelRun {
                         task_id,
                         idx,
@@ -608,6 +659,7 @@ impl Engine {
                         url_hash,
                         fresh_after,
                         cancel,
+                        text_input: text_input.as_ref(),
                     };
                     let outcomes = futures::future::join_all(
                         todo.iter().map(|model| self.run_set_model(&ctx, model)),
@@ -756,7 +808,11 @@ impl Engine {
                 .cache_lookup(&content_hash, label, &rev, fresh_after)
                 .await
             {
-                Ok(Some(output)) => resolved.push((label.clone(), output)),
+                // Not the kind of output the model gives now (see
+                // `run_set_model`): run the item instead.
+                Ok(Some(output)) if self.gives(label, &output) => {
+                    resolved.push((label.clone(), output))
+                }
                 _ => return false,
             }
         }
@@ -872,8 +928,29 @@ impl Engine {
         }
     }
 
+    /// The worker of model `label`, once its weights are loaded, and the
+    /// model's input shape. A cold model may download and load for up to
+    /// [`MODEL_LOAD_TIMEOUT`] before the per-classification clock starts, so
+    /// first use is not reported as a timeout.
+    async fn loaded(&self, label: &str) -> Result<(Arc<ModelHandle>, InputShape), EngineError> {
+        let handle = self
+            .live()
+            .registry
+            .get(label)
+            .ok_or_else(|| EngineError::UnknownModel(label.to_string()))?;
+        match tokio::time::timeout(MODEL_LOAD_TIMEOUT, handle.ensure_loaded()).await {
+            Ok(loaded) => Ok((handle, loaded?)),
+            Err(_) => Err(EngineError::ModelUnavailable(format!(
+                "model '{label}' did not load within {}s",
+                MODEL_LOAD_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
     /// Run a single model against the already-fetched input, choosing the path by
-    /// input modality (image → one classification; video → per-frame scan).
+    /// input modality (image → one classification; video → per-frame scan) and
+    /// by what the model gives (a model that reads text reads the image, or the
+    /// video's sampled frames).
     async fn run_model(
         &self,
         task_id: &str,
@@ -883,44 +960,58 @@ impl Engine {
         fetched: &Fetched,
         cancel: &AtomicBool,
     ) -> Result<ModelOutput, EngineError> {
-        let handle = self
-            .live()
-            .registry
-            .get(label)
-            .ok_or_else(|| EngineError::UnknownModel(label.to_string()))?;
-
-        // Wait for a cold model to download/load before starting the per-
-        // classification clock, so first use is not reported as a timeout.
-        let shape = match tokio::time::timeout(MODEL_LOAD_TIMEOUT, handle.ensure_loaded()).await {
-            Ok(loaded) => loaded?,
-            Err(_) => {
-                return Err(EngineError::ModelUnavailable(format!(
-                    "model '{label}' did not load within {}s",
-                    MODEL_LOAD_TIMEOUT.as_secs()
-                )));
-            }
-        };
+        let (handle, shape) = self.loaded(label).await?;
+        let reads_text = self.model_cfg(label)?.architecture.output() == OutputKind::Text;
 
         let timeout = self.model_timeout(label);
         match (item.input.modality(), fetched) {
+            (Modality::Image, Fetched::Image(still)) if reads_text => {
+                // An image too long and thin for the model fails for good,
+                // not as a read to retry.
+                let model = self.model_cfg(label)?;
+                let (w, h) = (still.full.width, still.full.height);
+                if apollo_inference::read_size(&model, w, h).is_none() {
+                    return Err(EngineError::Incompatible(format!(
+                        "model '{label}' cannot read a {w}x{h} image (its sides are too far apart)"
+                    )));
+                }
+                // The model sizes the image itself, from the full one.
+                let on_timeout = format!("model '{label}' timed out reading an image");
+                let text = with_timeout(
+                    timeout,
+                    handle.read_image(Arc::clone(&still.full)),
+                    &on_timeout,
+                )
+                .await?;
+                Ok(ModelOutput::Text(TextOutput::still(text)))
+            }
+            (Modality::Video, Fetched::Video { info, share, .. }) if reads_text => {
+                let scan = FrameScanRun {
+                    task_id,
+                    idx,
+                    label,
+                    handle: &handle,
+                    share,
+                    info,
+                    input_size: 0,
+                    timeout,
+                    cancel,
+                };
+                self.run_text_scan(&scan).await
+            }
             (Modality::Image, Fetched::Image(still)) => {
                 // One image: the whole classification is bounded by `timeout`,
                 // which starts once the image is resized for the model.
                 let img = still.input_for(shape).await?;
                 let on_timeout = format!("model '{label}' timed out classifying image");
-                let c =
-                    classify_with_timeout(timeout, handle.classify_image(img), &on_timeout).await?;
+                let c = with_timeout(timeout, handle.classify_image(img), &on_timeout).await?;
                 Ok(ModelOutput::Classification(c))
             }
             (Modality::Text, Fetched::Text(text)) => {
                 // One text, all its windows: bounded by `timeout`.
                 let on_timeout = format!("model '{label}' timed out classifying text");
-                let c = classify_with_timeout(
-                    timeout,
-                    handle.classify_text(Arc::clone(text)),
-                    &on_timeout,
-                )
-                .await?;
+                let c = with_timeout(timeout, handle.classify_text(Arc::clone(text)), &on_timeout)
+                    .await?;
                 Ok(ModelOutput::Classification(c))
             }
             (Modality::Video, Fetched::Video { info, share, .. }) => {
@@ -943,6 +1034,149 @@ impl Engine {
                 "input/model mismatch for '{label}'"
             ))),
         }
+    }
+
+    /// A model that reads text, over a video: the frames its strategy's steps
+    /// plan (early exit, confirmation and refining work from scores, so they
+    /// have nothing to act on), extracted at the size the model reads them at
+    /// and read one at a time, each bounded by `timeout`. The model reads one
+    /// image at a time anyway, and a frame waiting behind this scan's others
+    /// would spend its timeout on their reads. Text repeated on consecutive
+    /// frames becomes one timed part. Not checkpointed: an interrupted scan
+    /// reads its frames again.
+    async fn run_text_scan(&self, scan: &FrameScanRun<'_>) -> Result<ModelOutput, EngineError> {
+        let FrameScanRun {
+            task_id,
+            idx,
+            label,
+            handle,
+            share,
+            info,
+            timeout,
+            cancel,
+            ..
+        } = *scan;
+        let model = self.model_cfg(label)?;
+        let strategy = self.strategy_for(&model)?;
+        let (width, height) = apollo_inference::read_size(&model, info.width, info.height)
+            .ok_or_else(|| {
+                EngineError::Incompatible(format!(
+                    "model '{label}' cannot read {}x{} frames (their sides are too far apart)",
+                    info.width, info.height
+                ))
+            })?;
+        let budget = strategy.max_frames.map(|m| m as usize);
+        let mut planner =
+            apollo_media::Planner::new(info, &strategy.sampling, budget, scan_seed(task_id, idx));
+        let on_timeout = format!("model '{label}' timed out reading a video frame");
+        let metrics = self.inner.metrics.model(label);
+        let mut read: Vec<(f64, String)> = Vec::new();
+        // Held while the step before its probe is read; dropping it cancels.
+        let mut _warmup: Option<apollo_media::Warmup> = None;
+        while let Some(step) = planner.next_step(share).await? {
+            _warmup = planner.upcoming().and_then(|next| share.warm(next));
+            for chunk in step.chunks(READ_CHUNK) {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(EngineError::Cancelled);
+                }
+                let frames = share
+                    .frames_sized(&frame_requests(chunk), width, height)
+                    .await?;
+                for (fref, img) in chunk.iter().zip(frames) {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(EngineError::Cancelled);
+                    }
+                    let text = with_timeout(timeout, handle.read_image(img), &on_timeout).await?;
+                    read.push((fref.timestamp, text));
+                    metrics.scan_frames.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        metrics.scans.fetch_add(1, Ordering::Relaxed);
+        read.sort_by(|a, b| a.0.total_cmp(&b.0));
+        tracing::debug!(model = %label, frames = read.len(), "text scan done");
+        Ok(ModelOutput::Text(TextOutput::from_frames(
+            read.iter().map(|(at, text)| (*at, text.as_str())),
+        )))
+    }
+
+    /// Classify text an earlier pipeline step read (`input = "<model>"`): an
+    /// image's text once, giving a classification (with no predictions when
+    /// there is no text); a video's parts one by one, giving a scan of them —
+    /// each label's highest score, and segments where the model's `early_exit`
+    /// labels reach its threshold. The video's frames without text count as
+    /// clear samples for the segments (ending one, and bounding it), but are
+    /// not listed. Parts go to the model a batch at a time, each
+    /// classification bounded by the model's `timeout` from when its batch
+    /// is sent, and a cancel stops between batches.
+    async fn run_on_text(
+        &self,
+        label: &str,
+        fetched: &Fetched,
+        text: &TextOutput,
+        cancel: &AtomicBool,
+    ) -> Result<ModelOutput, EngineError> {
+        let timeout = self.model_timeout(label);
+        let on_timeout = format!("model '{label}' timed out classifying text");
+        if let Fetched::Video { info, .. } = fetched {
+            let model = self.model_cfg(label)?;
+            let batch = model.max_concurrent.max(1) as usize;
+            let mut samples = Vec::with_capacity(text.parts.len() + text.blank.len());
+            if !text.parts.is_empty() {
+                let (handle, _) = self.loaded(label).await?;
+                for (n, chunk) in text.parts.chunks(batch).enumerate() {
+                    if cancel.load(Ordering::SeqCst) {
+                        return Err(EngineError::Cancelled);
+                    }
+                    let calls = chunk.iter().map(|part| {
+                        with_timeout(
+                            timeout,
+                            handle.classify_text(Arc::from(part.text.as_str())),
+                            &on_timeout,
+                        )
+                    });
+                    let results = futures::future::join_all(calls).await;
+                    for (i, (part, classification)) in chunk.iter().zip(results).enumerate() {
+                        samples.push(Sample {
+                            index: (n * batch + i) as u32,
+                            start: part.start,
+                            end: part.end,
+                            classification: classification?,
+                        });
+                    }
+                }
+            }
+            let parts = samples.len() as u32;
+            for (i, &at) in text.blank.iter().enumerate() {
+                samples.push(Sample::frame(
+                    parts + i as u32,
+                    at,
+                    Classification::default(),
+                ));
+            }
+            let flagging = model
+                .early_exit
+                .as_ref()
+                .map(|EarlyExit { labels, threshold }| aggregate::Flagging {
+                    labels,
+                    threshold: *threshold,
+                    rule: None,
+                });
+            let mut scan = aggregate::scan(samples, Aggregation::Max, flagging, info.duration);
+            scan.samples.retain(|s| s.index < parts);
+            return Ok(ModelOutput::Scan(scan));
+        }
+        if text.text.trim().is_empty() {
+            return Ok(ModelOutput::Classification(Classification::default()));
+        }
+        let (handle, _) = self.loaded(label).await?;
+        let c = with_timeout(
+            timeout,
+            handle.classify_text(Arc::from(text.text.as_str())),
+            &on_timeout,
+        )
+        .await?;
+        Ok(ModelOutput::Classification(c))
     }
 
     /// Fetch the input once: download (with fallback), then decode an image or
@@ -1461,7 +1695,7 @@ impl Engine {
     ) -> (Vec<Sample>, Option<EngineError>) {
         let timeout_msg = format!("model '{}' timed out classifying a video frame", scan.label);
         let calls = imgs.iter().map(|img| {
-            classify_with_timeout(
+            with_timeout(
                 scan.timeout,
                 scan.handle.classify_image(Arc::clone(img)),
                 &timeout_msg,
@@ -1507,6 +1741,16 @@ impl Engine {
             .get(label)
             .cloned()
             .ok_or_else(|| EngineError::UnknownModel(label.to_string()))
+    }
+
+    /// Whether `output` is the kind of output model `label` gives now: text
+    /// for a model that reads text, a classification (or a scan) otherwise.
+    fn gives(&self, label: &str, output: &ModelOutput) -> bool {
+        let Ok(model) = self.model_cfg(label) else {
+            return false;
+        };
+        let reads_text = matches!(output, ModelOutput::Text(_));
+        reads_text == (model.architecture.output() == OutputKind::Text)
     }
 
     fn model_timeout(&self, label: &str) -> Duration {
@@ -1557,6 +1801,8 @@ fn output_triggers(out: &ModelOutput, labels: &[u32], threshold: f32) -> bool {
     let class = match out {
         ModelOutput::Classification(c) => c,
         ModelOutput::Scan(scan) => &scan.aggregated,
+        // No labels (validation keeps gates off models that read text).
+        ModelOutput::Text(_) => return false,
     };
     apollo_media::triggered(class, labels, threshold)
 }
@@ -1590,6 +1836,35 @@ fn scan_seed(task_id: &str, idx: usize) -> u64 {
             .try_into()
             .expect("a SHA-256 digest has 32 bytes"),
     )
+}
+
+/// The cache key of text read in an earlier step: an image's text hashes as
+/// the text itself (so it shares results with the same text sent directly); a
+/// video's parts as their times and texts, with its frames without text and
+/// its length (which bound the segments). A video's key starts with bytes
+/// that are not UTF-8, so no text sent directly can hash to it.
+fn text_input_hash(text: &TextOutput, fetched: &Fetched) -> String {
+    match fetched {
+        Fetched::Video { info, .. } => {
+            let mut key = b"\xff\xfeapollo timed text v1\n".to_vec();
+            key.extend(format!("{}\n", info.duration).bytes());
+            for part in &text.parts {
+                key.extend(format!("{} {} {:?}\n", part.start, part.end, part.text).bytes());
+            }
+            key.extend(format!("blank {:?}\n", text.blank).bytes());
+            sha256_hex(&key)
+        }
+        _ => sha256_hex(text.text.as_bytes()),
+    }
+}
+
+/// Whether text read in an earlier step has anything to classify: an image's
+/// text that is not blank, or a video with parts.
+fn has_text(text: &TextOutput, fetched: &Fetched) -> bool {
+    match fetched {
+        Fetched::Video { .. } => !text.parts.is_empty(),
+        _ => !text.text.trim().is_empty(),
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1695,13 +1970,13 @@ fn frame_requests(refs: &[FrameRef]) -> Vec<FrameRequest> {
         .collect()
 }
 
-/// Bound a single classification future by `timeout`; an elapse becomes a
-/// `Timeout` error carrying `on_timeout`.
-async fn classify_with_timeout(
+/// Bound a single classification (or read) future by `timeout`; an elapse
+/// becomes a `Timeout` error carrying `on_timeout`.
+async fn with_timeout<T>(
     timeout: Duration,
-    fut: impl std::future::Future<Output = Result<Classification, EngineError>>,
+    fut: impl std::future::Future<Output = Result<T, EngineError>>,
     on_timeout: &str,
-) -> Result<Classification, EngineError> {
+) -> Result<T, EngineError> {
     match tokio::time::timeout(timeout, fut).await {
         Ok(result) => result,
         Err(_) => Err(EngineError::Timeout(on_timeout.to_string())),
@@ -1711,6 +1986,49 @@ async fn classify_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_text_is_cached_by_the_text() {
+        let still = Fetched::Image(StillImage::new(photo(4, 4)));
+        // An image's text keys like the same text sent directly.
+        assert_eq!(
+            text_input_hash(&TextOutput::still("hello"), &still),
+            sha256_hex(b"hello")
+        );
+        // A video's parts key with their times and the video's length.
+        let parts = TextOutput::from_frames([(1.0, "hello"), (2.0, "hello"), (5.0, "bye")]);
+        let video = |duration: f64| {
+            let info = VideoInfo {
+                duration,
+                start_time: 0.0,
+                fps: 25.0,
+                frame_count: None,
+                width: 64,
+                height: 48,
+            };
+            Fetched::Video {
+                _media: LocalMedia::adopt(std::env::temp_dir().join("apollo-unused.mp4")),
+                share: Arc::new(VideoShare::new("unused.mp4".into(), info.clone())),
+                info,
+            }
+        };
+        let a = text_input_hash(&parts, &video(10.0));
+        assert_ne!(a, sha256_hex(parts.text.as_bytes()));
+        assert_ne!(a, text_input_hash(&parts, &video(20.0)));
+        let moved = TextOutput::from_frames([(1.0, "hello"), (3.0, "hello"), (5.0, "bye")]);
+        assert_ne!(a, text_input_hash(&moved, &video(10.0)));
+        // Frames without text bound the segments, so they are part of the key.
+        let gap =
+            TextOutput::from_frames([(1.0, "hello"), (2.0, "hello"), (3.0, ""), (5.0, "bye")]);
+        assert_ne!(a, text_input_hash(&gap, &video(10.0)));
+        // Nothing to classify: blank text, a video with no parts.
+        assert!(!has_text(&TextOutput::still(" \n"), &still));
+        assert!(has_text(&TextOutput::still("hi"), &still));
+        assert!(!has_text(
+            &TextOutput::from_frames([(0.0, "")]),
+            &video(10.0)
+        ));
+    }
 
     #[test]
     fn a_scan_seed_is_fixed_per_task_and_item() {

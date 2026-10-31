@@ -694,3 +694,65 @@ async fn text_and_image_models_only_take_their_own_input() {
         .unwrap();
     assert_eq!(toxicity.accepts, [MediaKind::Text]);
 }
+
+const OCR_PIPELINE: &str = r#"
+    [models.ocr]
+    architecture = "paddleocr_vl"
+    repo = "test/ocr"
+    video_strategy = "s"
+    [models.toxicity]
+    architecture = "bert"
+    repo = "test/toxic-bert"
+
+    [strategies.s]
+    [[strategies.s.sampling]]
+    step = 1
+    method = "uniform"
+    count = 4
+
+    [pipelines.read_and_check]
+    steps = [
+        { model = "ocr", order = 1 },
+        { model = "toxicity", order = 2, input = "ocr" },
+    ]
+"#;
+
+#[tokio::test]
+async fn a_pipeline_classifies_the_text_an_earlier_step_reads() {
+    let f = fixture_with(OCR_PIPELINE).await;
+    let check = |input: &Input, run: Run| f.engine.check_submission(input, &run);
+    let video = Input::Video(apollo_domain::Url {
+        main: "https://example.com/a.mp4".into(),
+        fallback: None,
+    });
+    // The text model takes the text the OCR model reads, so the pipeline
+    // takes what the OCR model takes: images and video.
+    let pipeline = || Run::Pipeline("read_and_check".into());
+    check(&image(), pipeline()).unwrap();
+    check(&video, pipeline()).unwrap();
+    check(&image(), Run::Models(vec!["ocr".into()])).unwrap();
+    for (input, run, needle) in [
+        (
+            Input::Text("hi".into()),
+            pipeline(),
+            "is an image model and does not take text input",
+        ),
+        (
+            image(),
+            Run::Models(vec!["toxicity".into()]),
+            "is a text model and does not take image input",
+        ),
+    ] {
+        let err = check(&input, run).unwrap_err().to_string();
+        assert!(err.contains(needle), "{err}");
+    }
+
+    let catalog = f.engine.catalog().await.unwrap();
+    let ocr = catalog.models.iter().find(|m| m.name == "ocr").unwrap();
+    assert_eq!(ocr.output, apollo_domain::OutputKind::Text);
+    assert_eq!(ocr.accepts, [MediaKind::Image, MediaKind::Video]);
+    assert!(ocr.labels.is_empty());
+    let steps = &catalog.pipelines[0].steps;
+    assert_eq!(steps[0].input, None);
+    assert_eq!(steps[1].input.as_deref(), Some("ocr"));
+}
