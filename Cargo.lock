@@ -904,7 +904,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/jakin010/candle?branch=apollo#925b42af19ed01f3ebf177f4fe142a3316d9181d"
+source = "git+https://github.com/jakin010/candle?branch=apollo#576350313ca7c3a7840dffe37d91707b396d3c27"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -936,7 +936,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.11.0"
-source = "git+https://github.com/jakin010/candle?branch=apollo#925b42af19ed01f3ebf177f4fe142a3316d9181d"
+source = "git+https://github.com/jakin010/candle?branch=apollo#576350313ca7c3a7840dffe37d91707b396d3c27"
 dependencies = [
  "cudaforge",
 ]
@@ -944,7 +944,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.11.0"
-source = "git+https://github.com/jakin010/candle?branch=apollo#925b42af19ed01f3ebf177f4fe142a3316d9181d"
+source = "git+https://github.com/jakin010/candle?branch=apollo#576350313ca7c3a7840dffe37d91707b396d3c27"
 dependencies = [
  "block2",
  "half",
@@ -959,7 +959,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/jakin010/candle?branch=apollo#925b42af19ed01f3ebf177f4fe142a3316d9181d"
+source = "git+https://github.com/jakin010/candle?branch=apollo#576350313ca7c3a7840dffe37d91707b396d3c27"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -977,7 +977,7 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.11.0"
-source = "git+https://github.com/jakin010/candle?branch=apollo#925b42af19ed01f3ebf177f4fe142a3316d9181d"
+source = "git+https://github.com/jakin010/candle?branch=apollo#576350313ca7c3a7840dffe37d91707b396d3c27"
 dependencies = [
  "accelerate-src",
  "byteorder",
