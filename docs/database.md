@@ -13,7 +13,7 @@ All of this sits behind one `Storage` trait; the `[database].backend` setting se
 | Backend | Status | Notes |
 |---------|--------|-------|
 | **`sqlite`** | Implemented (default) | Embedded file database. Best for single‑node deployments. |
-| **`surrealdb`** | Implemented | Remote SurrealDB (3.1.x) over `ws(s)://` / `http(s)://`. |
+| **`surrealdb`** | Implemented | Remote SurrealDB 4.x (tested with 4.0.0-beta.1) over `ws(s)://` / `http(s)://`. |
 | **`postgres`** | Future seam | Config shape exists; selecting it currently fails at startup with an "unsupported backend" error. |
 
 Selection and per‑backend settings live under `[database]` — see [configuration.md → Database](./configuration.md#database--persistence). Choosing `surrealdb` (or `postgres`) requires its matching sub‑section.
@@ -134,6 +134,20 @@ The SurrealDB backend models the same data with `SCHEMALESS` tables and explicit
 - **Indexes:** `task(state)`, `task(created_at)`, `task(request_id)`, `item(task_id)`, `item(webhook_delivered, state)`, `model_result(task_id, item_idx)`, `frame(task_id, item_idx, label)`.
 
 Records use composite record ids (e.g. `item:[task_id, idx]`, `model_result:[task_id, item_idx, label]`) mirroring the SQLite primary keys, so the same lifecycle, checkpointing, and cache semantics apply.
+
+### SurrealDB versions and upgrades
+
+Apollo uses the SurrealDB 4.0.0-beta.1 client and is tested against a 4.0.0-beta.1 server. The client also accepts 3.x servers, but that combination is not tested. SurrealDB 4.0 is a pre-release; SurrealDB advises keeping production on a stable release.
+
+- **Prefer `ws(s)://`.** Over `http(s)://` every request carries the token from signing in, and SurrealDB's root token lasts 1 hour by default. Once it expires, every storage call fails until Apollo restarts. A `ws(s)://` connection stays signed in and reconnects by itself after a dropped connection or a server restart.
+- **Changing the server's credentials needs an Apollo restart.** After a reconnect the client signs in again with the credentials it started with. If that fails, the connection stays broken.
+
+Upgrading a 3.x server to 4.0 (see SurrealDB's [3.x to 4.x guide](https://surrealdb.com/docs/build/migrating/from-old-surrealdb-versions/3x-to-4x)):
+
+1. **Deploy this Apollo build first.** Builds on the 3.x client refuse 4.x servers at startup; this one accepts the 3.x server meanwhile.
+2. **Export the data, check the file, and keep it.** For example `surreal export --endpoint … --username … --password … --namespace <ns> --database <db> backup.surql`, run with the 3.x CLI. Before 4.0 an export can stop part-way without an error, so make sure the file is complete, e.g. by importing it into a scratch 3.x server. The upgrade is one-way: 3.x can't open the datastore again afterwards.
+3. **Start 4.0 on the same datastore.** It converts the data on its first start, with no separate migration command. A RocksDB or SurrealKV datastore is rewritten, so leave free disk for a second copy. `/health` doesn't answer until the conversion finishes, so give health checks time. On a datastore several nodes share (e.g. TiKV), first move every node to the latest 3.3 and follow the guide's cluster steps.
+4. **Optionally, once every node runs 4.0,** run `REBUILD INDEX task_created ON task;` on its own (outside a transaction). Results are correct without it; it only speeds up task listings filtered by creation time.
 
 ---
 

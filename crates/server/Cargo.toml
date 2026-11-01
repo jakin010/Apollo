@@ -10,10 +10,11 @@ apollo-proto  = { path = "../proto" }
 tonic = { workspace = true, features = ["tls-ring", "tls-native-roots", "tls-webpki-roots"] }
 tonic-reflection = "0.14"
 tonic-health = "0.14"
-# TLS serving: the dependency tree compiles both rustls backends (ring via
-# tonic, aws-lc-rs via reqwest/surrealdb), so a process default must be chosen
-# explicitly before tonic builds a server config.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# TLS: the dependency tree compiles both rustls backends (ring via tonic,
+# aws-lc-rs via reqwest/surrealdb), so a process default must be chosen
+# explicitly before tonic builds a server config or the SurrealDB client opens a
+# wss:// connection (see `install_crypto_provider`, which picks aws-lc-rs).
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 prost = "0.14"
 futures = "0.3"
 pasetors = "0.7"

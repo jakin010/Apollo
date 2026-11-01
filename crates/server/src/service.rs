@@ -446,12 +446,17 @@ fn may_access(caller: Option<&Caller>, task: &apollo_domain::Task) -> bool {
     }
 }
 
-/// Make `ring` the process-wide rustls crypto provider (unless one is already
-/// set). rustls only picks a default automatically when exactly one backend is
-/// compiled in; this binary links both `ring` and `aws-lc-rs`, and tonic's server
-/// TLS setup relies on the process default, so without this it panics.
-fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+/// Make `aws-lc-rs` the process-wide rustls crypto provider (unless one is
+/// already set). rustls only picks a default automatically when exactly one
+/// backend is compiled in; this binary links both `ring` and `aws-lc-rs`, and
+/// both tonic's server TLS setup and the SurrealDB client's `wss://` connection
+/// rely on the process default, so without this they panic. Every other TLS
+/// client (media downloads, webhooks, model downloads) uses the default once one
+/// is set, so this picks `aws-lc-rs`, which reqwest falls back to anyway and
+/// which accepts everything `ring` does plus P-521 certificates. The binary calls
+/// it first thing; [`serve`] calls it again before serving TLS (a no-op once set).
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 /// PEM material for serving TLS.

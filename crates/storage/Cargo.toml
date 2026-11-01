@@ -10,9 +10,23 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 async-trait = "0.1"
 serde_json = "1"
 thiserror = "2"
-# SurrealDB backend (remote server over ws(s)/http(s)). Pinned 3.1.x; bump for 4.x.
-surrealdb = { version = "3.1", default-features = false, features = ["protocol-ws", "protocol-http", "rustls"] }
+# SurrealDB backend (remote server over ws(s)/http(s)). Pinned exactly while 4.x is in beta.
+surrealdb = { version = "=4.0.0-beta.1", default-features = false, features = ["protocol-ws", "protocol-http", "rustls"] }
+# Unused directly: these hold the SDK's own crates at the same beta. The SDK asks
+# for them with caret requirements, which a later beta also satisfies, so a plain
+# `cargo update` would otherwise mix betas. Bump them together with `surrealdb`.
+surrealdb-cnf = { version = "=4.0.0-beta.1", default-features = false }
+surrealdb-common = { version = "=4.0.0-beta.1", default-features = false }
+surrealdb-engine-api = { version = "=4.0.0-beta.1", default-features = false }
+surrealdb-iam = { version = "=4.0.0-beta.1", default-features = false }
+surrealdb-parse-common = { version = "=4.0.0-beta.1", default-features = false }
+surrealdb-rpc = { version = "=4.0.0-beta.1", default-features = false }
+surrealdb-types = { version = "=4.0.0-beta.1", default-features = false }
+surrealdb-types-derive = { version = "=4.0.0-beta.1", default-features = false }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tempfile = "3"
+# The workspace links two rustls backends, so the SurrealDB test picks one before
+# a wss:// URL needs it (the binary does this in main).
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
