@@ -14,6 +14,8 @@ use clap::Parser;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
+    // Before anything opens a TLS connection, e.g. storage over wss://.
+    apollo_server::install_crypto_provider();
     if let Err(e) = cli::Cli::parse().run() {
         // `{:#}` renders the full anyhow context chain.
         eprintln!("apollo: {e:#}");

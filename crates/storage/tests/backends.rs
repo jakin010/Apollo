@@ -14,9 +14,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use apollo_config::{SqliteConfig, SurrealdbConfig};
 use apollo_domain::{
     Classification, Input, Item, ItemState, ModelOutput, ModelResult, ModelState, Prediction,
-    Sample, Task, TaskState, Url,
+    Sample, Task, TaskError, TaskState, Url,
 };
 use apollo_storage::{SqliteStorage, Storage, SurrealStorage, TaskQuery};
+
+/// Real task ids are hyphenated UUIDs; one test task uses that shape.
+const UUID_ID: &str = "3f2a8c1e-9b4d-4e1a-8f00-0123456789ab";
 
 fn now() -> i64 {
     SystemTime::now()
@@ -121,6 +124,16 @@ async fn exercise(store: &dyn Storage) {
         Some("anon2")
     );
 
+    // --- steps marker on a model with no result row yet: starts processing
+    assert_eq!(store.steps_completed("t1", 0, "general").await.unwrap(), 0);
+    store
+        .set_steps_completed("t1", 0, "general", 5)
+        .await
+        .unwrap();
+    assert_eq!(store.steps_completed("t1", 0, "general").await.unwrap(), 5);
+    let t = store.get_task("t1").await.unwrap().unwrap();
+    assert_eq!(t.items[0].results["general"].state, ModelState::Processing);
+
     // --- per-model results + frame checkpoints
     let out = ModelOutput::Classification(Classification {
         predictions: vec![Prediction::new(7, "seven", 0.99)],
@@ -129,6 +142,16 @@ async fn exercise(store: &dyn Storage) {
         .upsert_model_result("t1", 0, "general", &ModelResult::done(out.clone()))
         .await
         .unwrap();
+    // A result write keeps the steps marker, and a marker write keeps the result.
+    assert_eq!(store.steps_completed("t1", 0, "general").await.unwrap(), 5);
+    store
+        .set_steps_completed("t1", 0, "general", 6)
+        .await
+        .unwrap();
+    assert_eq!(store.steps_completed("t1", 0, "general").await.unwrap(), 6);
+    let t = store.get_task("t1").await.unwrap().unwrap();
+    assert_eq!(t.items[0].results["general"].state, ModelState::Done);
+    assert_eq!(t.items[0].results["general"].output, Some(out.clone()));
     store
         .upsert_model_result("t1", 0, "nsfw", &ModelResult::processing())
         .await
@@ -189,12 +212,12 @@ async fn exercise(store: &dyn Storage) {
     );
 
     // --- conditional cancel: active -> cancelled; finished stays finished
-    store.create_task(&sample_task("t2")).await.unwrap();
-    assert!(store.cancel_task_if_active("t2").await.unwrap());
-    let t2 = store.get_task("t2").await.unwrap().unwrap();
+    store.create_task(&sample_task(UUID_ID)).await.unwrap();
+    assert!(store.cancel_task_if_active(UUID_ID).await.unwrap());
+    let t2 = store.get_task(UUID_ID).await.unwrap().unwrap();
     assert_eq!(t2.state, TaskState::Cancelled);
     assert!(t2.finished_at.is_some(), "a cancelled task is finished");
-    assert!(!store.cancel_task_if_active("t2").await.unwrap());
+    assert!(!store.cancel_task_if_active(UUID_ID).await.unwrap());
     store
         .set_task_state("t1", TaskState::Completed)
         .await
@@ -203,7 +226,9 @@ async fn exercise(store: &dyn Storage) {
     let done = store.get_task("t1").await.unwrap().unwrap();
     assert_eq!(done.state, TaskState::Completed);
     let finished = done.finished_at.expect("a completed task is finished");
-    // A later write keeps the first finish time.
+    // A later write keeps the first finish time. Times are whole seconds, so wait
+    // past the next one for this to be able to fail.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     store
         .set_task_state("t1", TaskState::Completed)
         .await
@@ -212,6 +237,21 @@ async fn exercise(store: &dyn Storage) {
         store.get_task("t1").await.unwrap().unwrap().finished_at,
         Some(finished)
     );
+    // Reopening clears it; finishing again sets a new one.
+    store
+        .set_task_state("t1", TaskState::Processing)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_task("t1").await.unwrap().unwrap().finished_at,
+        None
+    );
+    store
+        .set_task_state("t1", TaskState::Completed)
+        .await
+        .unwrap();
+    let refinished = store.get_task("t1").await.unwrap().unwrap().finished_at;
+    assert!(refinished.is_some_and(|t| t > finished));
     assert!(!store.cancel_task_if_active("missing").await.unwrap());
 
     // --- webhook delivery flag
@@ -219,15 +259,46 @@ async fn exercise(store: &dyn Storage) {
         .set_item_state("t1", 0, ItemState::Completed, None)
         .await
         .unwrap();
+    // Only t1's item is terminal; the others (anon, anon2, the UUID task) are
+    // still queued and must not be listed.
     let pending = store.items_pending_webhook().await.unwrap();
-    assert!(
+    assert_eq!(
         pending
             .iter()
-            .any(|p| p.task_id == "t1" && p.item_index == 0)
+            .map(|p| (p.task_id.as_str(), p.item_index))
+            .collect::<Vec<_>>(),
+        [("t1", 0)]
     );
     store.mark_webhook_delivered("t1", 0).await.unwrap();
     let pending = store.items_pending_webhook().await.unwrap();
     assert!(!pending.iter().any(|p| p.task_id == "t1"));
+    // Failed and cancelled items are pending too; queued and processing ones are
+    // not. Compared as a set: the query has no defined order.
+    // A kind other than the fallback's, so storing the message alone would fail.
+    let err = TaskError::fetch("fetch failed");
+    store
+        .set_item_state("anon", 0, ItemState::Failed, Some(&err))
+        .await
+        .unwrap();
+    store
+        .set_item_state("anon2", 0, ItemState::Cancelled, None)
+        .await
+        .unwrap();
+    store
+        .set_item_state(UUID_ID, 0, ItemState::Processing, None)
+        .await
+        .unwrap();
+    let mut pending: Vec<(String, usize)> = store
+        .items_pending_webhook()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.task_id, p.item_index))
+        .collect();
+    pending.sort();
+    assert_eq!(pending, vec![("anon".into(), 0), ("anon2".into(), 0)]);
+    let anon = store.get_task("anon").await.unwrap().unwrap();
+    assert_eq!(anon.items[0].error, Some(err));
 
     // --- result cache + purge
     store.cache_store("h", "m", "main", &out).await.unwrap();
@@ -251,6 +322,30 @@ async fn exercise(store: &dyn Storage) {
             .unwrap()
             .is_none(),
         "entries older than the freshness bound are ignored"
+    );
+    assert!(
+        store
+            .url_cache_lookup("u", "m", "main", now() + 3600)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .cache_lookup("h", "m", "other", 0)
+            .await
+            .unwrap()
+            .is_none(),
+        "another revision misses"
+    );
+    // Storing again replaces the entry.
+    let newer = ModelOutput::Classification(Classification {
+        predictions: vec![Prediction::new(8, "eight", 0.5)],
+    });
+    store.cache_store("h", "m", "main", &newer).await.unwrap();
+    assert_eq!(
+        store.cache_lookup("h", "m", "main", 0).await.unwrap(),
+        Some(newer)
     );
     assert_eq!(store.purge_cache_before(now() - 3600).await.unwrap(), 0);
     assert_eq!(store.purge_cache_before(now() + 10).await.unwrap(), 2);
@@ -338,9 +433,10 @@ async fn exercise(store: &dyn Storage) {
         .set_task_state("anon", TaskState::Completed)
         .await
         .unwrap();
-    // t1, t2, anon and p2 are finished.
+    // t1, the UUID task, anon and p2 are finished.
     assert_eq!(store.purge_finished_before(now() + 10).await.unwrap(), 4);
     assert!(store.get_task("t1").await.unwrap().is_none());
+    assert!(store.get_task(UUID_ID).await.unwrap().is_none());
     assert!(
         store
             .load_samples("t1", 0, "nsfw")
@@ -348,6 +444,17 @@ async fn exercise(store: &dyn Storage) {
             .unwrap()
             .is_empty()
     );
+    // No children were left behind: the id can be used again from scratch.
+    store.create_task(&sample_task("t1")).await.unwrap();
+    let again = store.get_task("t1").await.unwrap().unwrap();
+    assert_eq!(again.items.len(), 1);
+    assert_eq!(again.items[0].results["general"].state, ModelState::Queued);
+    assert_eq!(store.steps_completed("t1", 0, "general").await.unwrap(), 0);
+    assert!(
+        store.get_task("p1").await.unwrap().is_some(),
+        "active tasks stay"
+    );
+    assert_eq!(store.purge_finished_before(now() + 10).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -389,6 +496,7 @@ async fn surreal_backend_contract() {
         user: user.clone(),
         password: password.clone(),
     };
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let store = SurrealStorage::connect(&cfg).await.unwrap();
 
     // Run the contract, then always drop the throwaway database.

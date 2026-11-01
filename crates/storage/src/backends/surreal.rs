@@ -1,5 +1,5 @@
-//! SurrealDB backend, targeting the `surrealdb` Rust SDK 3.1.x (a remote server
-//! reached over `ws(s)://` or `http(s)://`). Implements [`crate::Storage`].
+//! SurrealDB backend, targeting the `surrealdb` Rust SDK 4.0.0-beta.1 (a remote
+//! server reached over `ws(s)://` or `http(s)://`). Implements [`crate::Storage`].
 //!
 //! Data model mirrors the SQLite backend's relational shape, but as SurrealDB
 //! records with deterministic composite (array) record ids, so every fine-grained
@@ -14,11 +14,12 @@
 //! exactly as in SQLite, so they round-trip through `serde_json` and are opaque to
 //! SurrealDB — this keeps storage robust across SurrealDB version changes.
 //!
-//! Upgrade notes: the dependency is pinned `3.1` (allowing future 3.x). The whole
-//! SurrealDB surface used here is confined to this file — `engine::any::connect`,
-//! `Root` auth, `use_ns`/`use_db`, and `query`/`bind`/`take` — plus the SurrealQL
-//! in the `const` statements below. Moving to a new major (4.x) means bumping the
-//! version literal and revisiting only this module.
+//! Upgrade notes: the dependency is pinned to exactly `4.0.0-beta.1` while 4.x is
+//! in beta, since a later beta may still break things. The whole SurrealDB surface
+//! used here is confined to this file — `engine::any::connect`, `Root` auth,
+//! `use_ns`/`use_db`, and `query`/`bind`/`take` — plus the SurrealQL in the
+//! `const` statements below. Moving to another version means bumping the version
+//! literal and revisiting only this module.
 
 use async_trait::async_trait;
 use surrealdb::Surreal;
@@ -89,8 +90,8 @@ const CREATE_TASK: &str = "
 ";
 
 // ------------------------------- row types -------------------------------
-// Deserialized from query results / serialized for binds. In SurrealDB 3.x these
-// implement `SurrealValue` (via derive); complex fields are opaque JSON strings.
+// Deserialized from query results / serialized for binds. These implement
+// `SurrealValue` (via derive); complex fields are opaque JSON strings.
 
 #[derive(SurrealValue)]
 struct TaskStateRow {

@@ -211,7 +211,7 @@ Connects to a remote SurrealDB over `ws(s)://` or `http(s)://`.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `url` | string | *(required)* | SurrealDB endpoint. |
+| `url` | string | *(required)* | SurrealDB endpoint. Prefer `ws(s)://`: an `http(s)://` connection stops working once its sign-in token expires (see [database.md → SurrealDB versions and upgrades](./database.md#surrealdb-versions-and-upgrades)). |
 | `namespace` | string | *(required)* | Namespace. |
 | `database` | string | *(required)* | Database name. |
 | `user` | string | *(none)* | Username (omit user/password for an unauthenticated server). |

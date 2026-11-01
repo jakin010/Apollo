@@ -23,5 +23,8 @@ mod service;
 mod webhook;
 
 pub use auth::{AuthInterceptor, AuthSettings, Caller, KeyError, Revocation};
-pub use service::{InferenceService, TlsSettings, inference_service, serve, serve_with_shutdown};
+pub use service::{
+    InferenceService, TlsSettings, inference_service, install_crypto_provider, serve,
+    serve_with_shutdown,
+};
 pub use webhook::GrpcWebhookSink;
