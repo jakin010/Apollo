@@ -43,6 +43,8 @@ mod watch;
 mod webhook;
 mod worker;
 
+#[cfg(test)]
+mod multi_instance_tests;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 #[cfg(test)]

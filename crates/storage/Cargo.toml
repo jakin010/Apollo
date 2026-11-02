@@ -23,6 +23,9 @@ surrealdb-parse-common = { version = "=4.0.0-beta.1", default-features = false }
 surrealdb-rpc = { version = "=4.0.0-beta.1", default-features = false }
 surrealdb-types = { version = "=4.0.0-beta.1", default-features = false }
 surrealdb-types-derive = { version = "=4.0.0-beta.1", default-features = false }
+# For `testing` (the `test-util` feature) only.
+tokio = { workspace = true, features = ["time"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
@@ -30,3 +33,8 @@ tempfile = "3"
 # The workspace links two rustls backends, so the SurrealDB test picks one before
 # a wss:// URL needs it (the binary does this in main).
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+
+[features]
+# `apollo_storage::testing` (a throwaway SurrealDB database), for other
+# crates' tests only.
+test-util = ["dep:tokio", "dep:rustls"]

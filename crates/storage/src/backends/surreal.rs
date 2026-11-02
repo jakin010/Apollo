@@ -18,8 +18,9 @@
 //! in beta, since a later beta may still break things. The whole SurrealDB surface
 //! used here is confined to this file — `engine::any::connect`, `Root` auth,
 //! `use_ns`/`use_db`, and `query`/`bind`/`take` — plus the SurrealQL in the
-//! `const` statements below. Moving to another version means bumping the version
-//! literal and revisiting only this module.
+//! `const` statements below (and, for tests, the throwaway databases in
+//! `testing.rs` and `tests/backends.rs`). Moving to another version means bumping
+//! the version literal and revisiting only those.
 
 use async_trait::async_trait;
 use surrealdb::Surreal;
