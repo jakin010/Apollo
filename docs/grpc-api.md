@@ -341,9 +341,12 @@ Runtime failures (an unfetchable URL, a decode error, an inference error, a time
 |-----------|-------------|
 | Missing `media` / `run`, unknown/disabled/duplicate model, incompatible input, unknown pipeline, metadata or `wait_seconds` over its limit, bad `page_token` | `INVALID_ARGUMENT` |
 | Unknown task id, or a task that belongs to another caller | `NOT_FOUND` |
-| Backpressure (queue full or memory ceiling exceeded), content over the upload cap | `RESOURCE_EXHAUSTED` |
+| Overloaded: `[app].max_pending` inputs in flight, the memory ceiling exceeded, or a model's own `max_pending` reached | `RESOURCE_EXHAUSTED`, with metadata `apollo-overloaded: queue`, `memory` or `model` |
+| Content over the upload cap | `RESOURCE_EXHAUSTED`, with metadata `grpc-retry-pushback-ms: -1` |
 | Missing/invalid auth token (when auth is enabled) | `UNAUTHENTICATED` |
 | Everything else | `INTERNAL` |
+
+Nothing is kept when a request is refused as overloaded, so the same request may be sent to another instance. It's usually refused before any content arrives: `ClassifyStream` at its `init` frame, and an inline-content `Classify` before its bytes are written to disk. If the instance fills up while an upload is arriving, the refusal comes after it and the bytes are discarded. With several instances, a proxy or client retries it elsewhere on the `apollo-overloaded` tag (see [operations.md → Several instances](./operations.md#several-instances-sending-work-to-a-less-busy-one)). The upload cap is the same on every instance, so that refusal carries `grpc-retry-pushback-ms: -1`, which tells gRPC retry policies not to retry it.
 
 ---
 

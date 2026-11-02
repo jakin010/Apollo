@@ -271,6 +271,9 @@ fn calibration_config(
         .cloned()
         .ok_or_else(|| anyhow!("no model '{model}' in the config"))?;
     m.enabled = true;
+    // Every example is submitted before any is waited for, so the model's own
+    // admission limit must not refuse one (`[app].max_pending` is lifted below).
+    m.max_pending = 0;
     if m.architecture == Architecture::Siglip {
         m.score_threshold = Some(0.0);
         m.max_results = None;
@@ -292,6 +295,8 @@ fn calibration_config(
     cfg.cache = None;
     cfg.metrics.enabled = false;
     cfg.app.max_pending = 0;
+    // Nor may the memory cap refuse one partway (this run is the only work).
+    cfg.app.max_memory = "0".into();
     cfg.database = apollo_config::DatabaseConfig {
         sqlite: Some(apollo_config::SqliteConfig {
             path: scratch.join("calibrate.db").to_string_lossy().into_owned(),
@@ -843,6 +848,20 @@ fn render(r: &Report, cfg: &apollo_config::ModelConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calibration_lifts_the_admission_limits() {
+        // Every example is submitted before any is waited for.
+        let config = apollo_config::load::from_str(
+            "[app]\nmax_pending = 4\n[models.ocr]\narchitecture = \"vit\"\nrepo = \"a/b\"\nmax_pending = 2\n",
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = calibration_config(&config, "ocr", dir.path(), Vec::new()).unwrap();
+        assert_eq!(cfg.app.max_pending, 0);
+        assert_eq!(cfg.models["ocr"].max_pending, 0);
+        assert_eq!(cfg.app.max_memory_bytes(), None, "no memory cap");
+    }
 
     #[test]
     fn the_curve_counts_and_rates() {

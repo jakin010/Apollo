@@ -26,8 +26,8 @@ struct Worker {
 
 /// The parts of a model's config (and the files it reads: a taxonomy, a hash
 /// list) its loaded state depends on. Fields read per use — `timeout`,
-/// `priority`, `video_strategy`, `early_exit` — are left out, so changing them
-/// keeps the loaded model.
+/// `priority`, `max_pending`, `video_strategy`, `early_exit` — are left out,
+/// so changing them keeps the loaded model.
 #[derive(PartialEq)]
 struct LoadKey {
     config: ModelConfig,
@@ -40,6 +40,7 @@ impl LoadKey {
         let mut config = model.clone();
         config.timeout = 0;
         config.priority = 0;
+        config.max_pending = 0;
         config.video_strategy = None;
         config.early_exit = None;
         Self {

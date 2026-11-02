@@ -33,3 +33,5 @@ tempfile = "3"
 [features]
 # Forward GPU backends to the inference crate.
 cuda = ["apollo-inference/cuda"]
+# `apollo_engine::testing`, for other crates' tests only.
+test-util = []

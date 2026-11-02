@@ -503,6 +503,14 @@ pub struct ModelConfig {
     /// Max processing seconds per (input, model); queue wait excluded.
     #[serde(default = "crate::defaults::timeout")]
     pub timeout: u32,
+    /// Most accepted, unfinished inputs that run this model. Past it, a
+    /// submission is refused as overloaded, like `[app].max_pending` but per
+    /// model, so a proxy or client can send it to another instance. The model
+    /// works through its inputs one batch at a time, so this is how many it
+    /// can start soon (OCR reads one image at a time). 0 (the default) is no
+    /// limit of its own.
+    #[serde(default)]
+    pub max_pending: u32,
     /// Scheduling priority: higher is admitted from the queue ahead of
     /// earlier-submitted lower-priority work. Defaults to 0; may be negative.
     #[serde(default)]

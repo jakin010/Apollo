@@ -10,7 +10,7 @@ use apollo_config::{Config, DatabaseConfig, SqliteConfig};
 use apollo_domain::{
     ErrorKind, Input, Item, ItemState, MediaKind, ModelResult, ModelState, Task, TaskState,
 };
-use apollo_storage::Storage;
+use apollo_storage::{Storage, TaskQuery};
 
 use crate::{Engine, EngineError, Run, Submission};
 
@@ -467,13 +467,13 @@ async fn a_reload_keeps_unchanged_models_and_replaces_changed_ones() {
     let before = f.engine.live();
     let handle = |live: &crate::live::Live, m: &str| live.registry.get(m).unwrap();
 
-    // nsfw: only its timeout changes (read per use) -> kept.
+    // nsfw: only its timeout and admission limit change (read per use) -> kept.
     // category: its labels change (baked into the loaded model) -> reloaded.
     // general: enabled now -> added. A new strategy and pipeline, too.
     let changed = PIPELINE
         .replace(
             "repo = \"test/nsfw\"",
-            "repo = \"test/nsfw\"\n    timeout = 99",
+            "repo = \"test/nsfw\"\n    timeout = 99\n    max_pending = 3",
         )
         .replace(
             "labels = [\"food\", \"sports\"]",
@@ -502,6 +502,7 @@ async fn a_reload_keeps_unchanged_models_and_replaces_changed_ones() {
         &handle(&after, "category")
     ));
     assert_eq!(after.config.models["nsfw"].timeout, 99);
+    assert_eq!(after.config.models["nsfw"].max_pending, 3);
     assert_eq!(f.engine.config_generation().0, 2);
 
     // The new labels are listed at once.
@@ -755,4 +756,346 @@ async fn a_pipeline_classifies_the_text_an_earlier_step_reads() {
     let steps = &catalog.pipelines[0].steps;
     assert_eq!(steps[0].input, None);
     assert_eq!(steps[1].input.as_deref(), Some("ocr"));
+}
+
+const LIMITED: &str = r#"
+    [app]
+    max_pending = 4
+    [models.ocr]
+    architecture = "vit"
+    repo = "test/ocr"
+    max_pending = 2
+    [models.nsfw]
+    architecture = "vit"
+    repo = "test/nsfw"
+"#;
+
+#[tokio::test]
+async fn a_model_limit_refuses_only_that_models_work() {
+    let f = fixture_with(LIMITED).await;
+    let labels = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let reason = |r: Result<crate::Reservation, EngineError>| match r {
+        Err(EngineError::Overloaded { reason, .. }) => Some(reason),
+        Err(e) => panic!("unexpected error {e}"),
+        Ok(_) => None,
+    };
+    let ocr = Run::Models(labels(&["ocr"]));
+
+    // Two OCR inputs fill its limit; the third is refused, nsfw still fits.
+    let first = f.engine.reserve(&labels(&["ocr"])).unwrap();
+    let _second = f.engine.reserve(&labels(&["ocr"])).unwrap();
+    assert_eq!(
+        reason(f.engine.reserve(&labels(&["ocr"]))),
+        Some(crate::Overload::Model)
+    );
+    assert!(matches!(
+        f.engine.check_submission(&image(), &ocr),
+        Err(EngineError::Overloaded {
+            reason: crate::Overload::Model,
+            ..
+        })
+    ));
+    let nsfw = f.engine.reserve(&labels(&["nsfw"])).unwrap();
+    // An input running both models counts toward both.
+    assert_eq!(
+        reason(f.engine.reserve(&labels(&["nsfw", "ocr"]))),
+        Some(crate::Overload::Model)
+    );
+
+    let status = f.engine.status().await.unwrap();
+    let admitted = |label: &str| {
+        status
+            .models
+            .iter()
+            .find(|m| m.label == label)
+            .unwrap()
+            .admitted
+    };
+    assert_eq!(
+        (status.items_in_flight, admitted("ocr"), admitted("nsfw")),
+        (3, 2, 1)
+    );
+
+    // A finished input gives its place back.
+    drop(first);
+    f.engine.check_submission(&image(), &ocr).unwrap();
+    let _third = f.engine.reserve(&labels(&["ocr"])).unwrap();
+
+    // [app].max_pending (4) still caps the total, whatever the model.
+    let _fourth = f.engine.reserve(&labels(&["nsfw"])).unwrap();
+    assert_eq!(
+        reason(f.engine.reserve(&labels(&["nsfw"]))),
+        Some(crate::Overload::Queue)
+    );
+
+    drop(nsfw);
+    let text = f.engine.metrics_text().await.unwrap();
+    assert!(
+        text.contains("apollo_submissions_overloaded_total{reason=\"model\"} 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("apollo_model_items_admitted{model=\"ocr\"} 2"),
+        "{text}"
+    );
+}
+
+/// An engine on `LIMITED` whose task writes wait for `release`.
+async fn held_engine(
+    fail: bool,
+) -> (
+    Engine,
+    Arc<dyn Storage>,
+    Arc<tokio::sync::Semaphore>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(&dir, LIMITED);
+    let storage = apollo_storage::open(&config.database).await.unwrap();
+    let (held, release) = crate::testing::HeldCreate::new(storage.clone(), fail);
+    let engine = Engine::new(Arc::new(config), Arc::new(held), None);
+    (engine, storage, release, dir)
+}
+
+/// A submission that fails its fetch at once (local files are refused), so
+/// its task finishes without a model or the network.
+fn local_file_submission() -> Submission {
+    Submission {
+        input: Input::Image(apollo_domain::Url {
+            main: "file:///nonexistent/apollo-test.png".into(),
+            fallback: None,
+        }),
+        run: Run::Models(vec!["nsfw".into()]),
+        metadata: Default::default(),
+        request_id: None,
+    }
+}
+
+async fn in_flight_drops_to_zero(engine: &Engine) {
+    for _ in 0..200 {
+        if engine.status().await.unwrap().items_in_flight == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("in_flight never returned to 0");
+}
+
+#[tokio::test]
+async fn a_submission_dropped_while_storing_still_runs_its_task() {
+    let (engine, storage, release, _dir) = held_engine(false).await;
+
+    // The client gives up while the task is being written.
+    let gave_up = tokio::time::timeout(
+        Duration::from_millis(100),
+        engine.submit(local_file_submission(), None),
+    )
+    .await;
+    assert!(
+        gave_up.is_err(),
+        "the write is held, so the submit can't finish"
+    );
+    assert_eq!(engine.status().await.unwrap().items_in_flight, 1);
+
+    // The write then finishes, the task runs to its end, and the reservation
+    // comes back.
+    release.add_permits(1);
+    in_flight_drops_to_zero(&engine).await;
+    let tasks = storage.load_incomplete_tasks().await.unwrap();
+    assert!(tasks.is_empty(), "nothing is left unrun: {tasks:?}");
+    let all = storage
+        .list_tasks(&TaskQuery {
+            owner: None,
+            states: Vec::new(),
+            created_after: None,
+            created_before: None,
+            limit: 10,
+            after: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.tasks.len(), 1);
+    assert_eq!(
+        all.tasks[0].state,
+        TaskState::Failed,
+        "local files are refused"
+    );
+}
+
+#[tokio::test]
+async fn a_task_that_cant_be_stored_gives_its_reservation_back() {
+    let (engine, _storage, release, _dir) = held_engine(true).await;
+    release.add_permits(1);
+    let err = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Storage(_)), "{err}");
+    assert_eq!(engine.status().await.unwrap().items_in_flight, 0);
+
+    // Also when the caller went away before the write failed.
+    let gave_up = tokio::time::timeout(
+        Duration::from_millis(100),
+        engine.submit(local_file_submission(), None),
+    )
+    .await;
+    assert!(gave_up.is_err());
+    release.add_permits(1);
+    in_flight_drops_to_zero(&engine).await;
+}
+
+#[tokio::test]
+async fn a_cancelled_item_waiting_for_a_slot_gives_back_its_place() {
+    let f = fixture_with(
+        r#"
+        [app]
+        max_concurrent = 1
+        [models.nsfw]
+        architecture = "vit"
+        repo = "test/nsfw"
+        max_pending = 1
+        "#,
+    )
+    .await;
+    // The only slot is taken, so the submitted item waits for it.
+    let held = f.engine.inner.gate.clone().acquire(0).await;
+    let task = f
+        .engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if f.engine.status().await.unwrap().slots_waiting == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        f.engine.status().await.unwrap().slots_waiting,
+        1,
+        "the item is waiting for the slot"
+    );
+    assert!(matches!(
+        f.engine
+            .check_submission(&image(), &Run::Models(vec!["nsfw".into()])),
+        Err(EngineError::Overloaded { .. })
+    ));
+
+    // Cancelling frees its place at once, though no slot has come free.
+    f.engine.cancel(&task.id).await.unwrap();
+    in_flight_drops_to_zero(&f.engine).await;
+    let status = f.engine.status().await.unwrap();
+    assert_eq!((status.slots_busy, status.slots_waiting), (1, 0));
+    f.engine
+        .check_submission(&image(), &Run::Models(vec!["nsfw".into()]))
+        .unwrap();
+    let stored = f.storage.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Cancelled);
+    assert_eq!(stored.items[0].state, ItemState::Cancelled);
+
+    drop(held);
+    assert_eq!(f.engine.status().await.unwrap().slots_busy, 0);
+}
+
+#[tokio::test]
+async fn a_repeat_waits_for_a_dropped_submission_to_be_stored() {
+    let (engine, storage, release, _dir) = held_engine(false).await;
+    let keyed = || Submission {
+        request_id: Some("r".into()),
+        ..local_file_submission()
+    };
+
+    // The first caller gives up while its task is being stored.
+    let gave_up =
+        tokio::time::timeout(Duration::from_millis(100), engine.submit(keyed(), None)).await;
+    assert!(gave_up.is_err());
+
+    // A repeat, and the server's lookup, wait for that store rather than
+    // treating the repeat as new.
+    let repeat = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.submit(keyed(), None).await }
+    });
+    let lookup = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.find_request_settled(None, "r").await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!repeat.is_finished() && !lookup.is_finished());
+    // Another key doesn't wait for that store.
+    let other = tokio::time::timeout(
+        Duration::from_millis(500),
+        engine.find_request_settled(None, "other"),
+    )
+    .await
+    .expect("an unrelated key isn't blocked");
+    assert_eq!(other.unwrap(), None);
+
+    release.add_permits(1); // only the first store; the repeat stores nothing
+    // Bounded, so a broken lock fails here instead of hanging on the held store.
+    let repeat = tokio::time::timeout(Duration::from_secs(10), repeat)
+        .await
+        .expect("the repeat finished")
+        .unwrap()
+        .unwrap();
+    assert!(repeat.existing, "{repeat:?}");
+    let stored = storage.find_task_by_request(None, "r").await.unwrap();
+    assert_eq!(stored.as_deref(), Some(repeat.id.as_str()));
+    assert_eq!(lookup.await.unwrap().unwrap(), stored);
+    in_flight_drops_to_zero(&engine).await;
+}
+
+#[tokio::test]
+async fn a_cancel_landing_with_a_slot_wins() {
+    let f = fixture_with("[app]\nmax_concurrent = 1\n").await;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    for _ in 0..50 {
+        let held = f.engine.inner.gate.clone().acquire(0).await;
+        let mut wait = Box::pin(f.engine.slot_or_cancel(0, &cancel));
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        // The cancel and the free slot both arrive before the wait runs again.
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        f.engine.inner.cancelled.notify_waiters();
+        drop(held);
+        assert!(
+            wait.await.is_none(),
+            "a cancelled item never takes the slot"
+        );
+        assert_eq!(
+            f.engine.inner.gate.snapshot(),
+            (1, 0, 0),
+            "and it isn't lost"
+        );
+        cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_ends_a_retry_backoff_at_once() {
+    let f = fixture().await;
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sleeping = tokio::spawn({
+        let engine = f.engine.clone();
+        let cancel = cancel.clone();
+        async move {
+            engine
+                .sleep_or_cancel(Duration::from_secs(30), &cancel)
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    f.engine.inner.cancelled.notify_waiters();
+    let cancelled = tokio::time::timeout(Duration::from_secs(2), sleeping)
+        .await
+        .expect("the backoff ended on cancel")
+        .unwrap();
+    assert!(cancelled);
+    // Uncancelled, it sleeps the whole time.
+    let plain = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        !f.engine
+            .sleep_or_cancel(Duration::from_millis(20), &plain)
+            .await
+    );
 }

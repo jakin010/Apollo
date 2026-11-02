@@ -2,6 +2,28 @@
 
 use apollo_domain::{ErrorKind, TaskError};
 
+/// Which limit refused a submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overload {
+    /// `[app].max_pending` inputs are already in flight.
+    Queue,
+    /// The process is over `[app].max_memory`.
+    Memory,
+    /// A model's `max_pending` inputs are already in flight.
+    Model,
+}
+
+impl Overload {
+    /// The name clients and metrics see (`queue`, `memory`, `model`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Overload::Queue => "queue",
+            Overload::Memory => "memory",
+            Overload::Model => "model",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("storage error: {0}")]
@@ -31,8 +53,10 @@ pub enum EngineError {
     #[error("unknown task '{0}'")]
     UnknownTask(String),
 
-    #[error("overloaded: {0}")]
-    Overloaded(String),
+    /// Refused for capacity, before anything was stored, so the same request
+    /// may be sent to another instance.
+    #[error("overloaded: {message}")]
+    Overloaded { reason: Overload, message: String },
 
     #[error("cancelled")]
     Cancelled,
@@ -68,7 +92,7 @@ impl EngineError {
             EngineError::UnknownModel(_)
             | EngineError::Incompatible(_)
             | EngineError::UnknownTask(_)
-            | EngineError::Overloaded(_)
+            | EngineError::Overloaded { .. }
             | EngineError::Cancelled
             | EngineError::Config(_)
             | EngineError::ShuttingDown => false,

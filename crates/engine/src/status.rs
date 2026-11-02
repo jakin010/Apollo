@@ -50,6 +50,9 @@ pub struct ModelStatus {
     pub input_size: Option<u32>,
     /// Requests waiting for the worker.
     pub queued_jobs: usize,
+    /// Inputs accepted and not finished that run this model (what its
+    /// `max_pending` is checked against).
+    pub admitted: usize,
     /// Times the weights were loaded (idle unloads make this grow).
     pub loads: u64,
     /// Images (and video frames) classified.
@@ -90,6 +93,11 @@ impl Engine {
             None => None,
         };
 
+        let admitted = inner
+            .admitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let models = live
             .config
             .models
@@ -106,6 +114,7 @@ impl Engine {
                     batch: cfg.max_concurrent.max(1) as usize,
                     input_size: worker.as_ref().and_then(|w| w.input_size),
                     queued_jobs: worker.as_ref().map_or(0, |w| w.queued_jobs),
+                    admitted: admitted.get(label).copied().unwrap_or(0),
                     loads: worker.as_ref().map_or(0, |w| w.loads),
                     classified: worker.as_ref().map_or(0, |w| w.classified),
                     last_used: worker.as_ref().and_then(|w| w.last_used),

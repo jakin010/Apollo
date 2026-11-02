@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use apollo_domain::{Input, Task, TaskError, TaskState};
 
-use crate::Engine;
 use crate::aggregate;
 use crate::error::EngineError;
+use crate::{Engine, Reservation};
 
 /// Resume attempts before a task is declared poison and failed.
 const MAX_RESUME_ATTEMPTS: u32 = 3;
@@ -49,11 +49,13 @@ impl Engine {
             }
             tracing::info!(task = %task.id, attempts, "resuming task");
             // Count resumed items toward the in-flight backpressure gauge.
-            self.inner
-                .in_flight
-                .fetch_add(task.items.len(), Ordering::SeqCst);
+            let reservations = task
+                .items
+                .iter()
+                .map(|item| self.reserve_resumed(&item.models))
+                .collect();
             let engine = self.clone();
-            tokio::spawn(async move { engine.run_task(task).await });
+            tokio::spawn(async move { engine.run_task(task, reservations).await });
             resumed += 1;
         }
         Ok(resumed)
@@ -120,8 +122,9 @@ impl Engine {
 
     /// Drive one task to completion: mark it processing, run every item
     /// concurrently (each bounded by the global semaphore), then mark it completed
-    /// once all items are terminal.
-    pub(crate) async fn run_task(&self, task: Task) {
+    /// once all items are terminal. `reservations` holds one per item, in item
+    /// order; each item gives its own back when it ends.
+    pub(crate) async fn run_task(&self, task: Task, reservations: Vec<Reservation>) {
         let task_id = task.id.clone();
         let n_items = task.items.len();
 
@@ -142,7 +145,7 @@ impl Engine {
                 .await
         {
             tracing::error!(task = %task_id, error = %e, "failed to mark task processing");
-            self.inner.in_flight.fetch_sub(n_items, Ordering::SeqCst);
+            // Dropping `reservations` gives every item's back.
             self.inner.cancels.lock().unwrap().remove(&task_id);
             return;
         }
@@ -151,12 +154,13 @@ impl Engine {
         // while they run.
         let pinned = self.pinned();
         let mut handles = Vec::with_capacity(n_items);
-        for (idx, item) in task.items.into_iter().enumerate() {
+        debug_assert_eq!(reservations.len(), n_items);
+        for ((idx, item), reservation) in task.items.into_iter().enumerate().zip(reservations) {
             let engine = pinned.clone();
             let tid = task_id.clone();
             let token = cancel.clone();
             handles.push(tokio::spawn(async move {
-                engine.run_item(tid, idx, item, token).await
+                engine.run_item(tid, idx, item, token, reservation).await
             }));
         }
         for h in handles {

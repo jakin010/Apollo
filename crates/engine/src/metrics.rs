@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use apollo_domain::ItemState;
 
-use crate::{Engine, EngineError};
+use crate::{Engine, EngineError, Overload};
 
 /// Upper bounds (seconds) for latency histograms: 5 ms to 2 min.
 const SECONDS: &[f64] = &[
@@ -129,6 +129,8 @@ impl ModelMetrics {
 pub(crate) struct Metrics {
     /// By outcome: `accepted`, `existing`, `invalid`, `overloaded`, `error`.
     submissions: CounterVec,
+    /// Overloaded submissions, by the limit that refused them.
+    overloaded: CounterVec,
     /// By final state.
     items_finished: CounterVec,
     /// Bytes fetched for remote and local-file inputs (not uploads).
@@ -147,6 +149,7 @@ impl Metrics {
     pub(crate) fn new() -> Self {
         Self {
             submissions: CounterVec::default(),
+            overloaded: CounterVec::default(),
             items_finished: CounterVec::default(),
             fetch_bytes: AtomicU64::new(0),
             fetch_seconds: Histogram::new(SECONDS),
@@ -170,6 +173,10 @@ impl Metrics {
 
     pub(crate) fn submission(&self, outcome: &'static str) {
         self.submissions.inc(&[outcome]);
+    }
+
+    pub(crate) fn overloaded(&self, reason: Overload) {
+        self.overloaded.inc(&[reason.as_str()]);
     }
 
     pub(crate) fn item_finished(&self, state: ItemState) {
@@ -224,6 +231,12 @@ impl Engine {
             "Submissions, by outcome (accepted, existing, invalid, overloaded, error).",
             &["outcome"],
             &m.submissions,
+        );
+        out.counter_vec(
+            "apollo_submissions_overloaded_total",
+            "Overloaded submissions, by the limit that refused them (queue, memory, model).",
+            &["reason"],
+            &m.overloaded,
         );
         out.counter_vec(
             "apollo_items_finished_total",
@@ -343,6 +356,15 @@ impl Engine {
         for s in &status.models {
             let v = s.queued_jobs as f64;
             out.sample("apollo_model_queued_jobs", &[("model", &s.label)], v);
+        }
+        out.family(
+            "apollo_model_items_admitted",
+            "gauge",
+            "Inputs accepted and not finished that run the model (checked against its max_pending).",
+        );
+        for s in &status.models {
+            let v = s.admitted as f64;
+            out.sample("apollo_model_items_admitted", &[("model", &s.label)], v);
         }
 
         let models: Vec<(String, Arc<ModelMetrics>)> = m
