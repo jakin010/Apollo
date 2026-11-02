@@ -28,7 +28,9 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
 # End-to-end webhook tests deliver to the SDK's signature-verifying receiver.
 apollo-client = { path = "../client" }
-# Service tests run a real engine over a temp SQLite database.
+# Service tests run a real engine over a temp SQLite database, and hold its
+# task writes (`apollo_engine::testing`).
+apollo-engine  = { path = "../engine", features = ["test-util"] }
 apollo-config  = { path = "../config" }
 apollo-storage = { path = "../storage" }
 tempfile = "3"

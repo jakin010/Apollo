@@ -16,6 +16,8 @@ pub mod backends;
 pub mod error;
 pub mod resume;
 pub mod retention;
+#[cfg(feature = "test-util")]
+pub mod testing;
 
 pub use backends::{SqliteStorage, SurrealStorage};
 pub use error::StorageError;

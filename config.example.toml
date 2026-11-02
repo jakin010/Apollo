@@ -186,6 +186,8 @@ fps    = 5
 # timeout        = 60              # per image or frame
 # max_pixels     = 602112          # default: 1008x560 for a 16:9 frame
 # min_confidence = 0.2             # default
+# max_pending    = 2               # with several instances: refuse a 3rd unfinished
+#                                  # input so a proxy sends it to another one
 #
 # [strategies.text_frames]         # a frame every 2 s, at most 30 per video
 # max_frames = 30                  # (spread evenly over longer videos)

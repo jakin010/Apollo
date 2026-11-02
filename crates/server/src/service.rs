@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use futures::Stream;
 use tokio::io::AsyncWriteExt;
+use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status, transport::Server};
@@ -106,10 +107,17 @@ impl Inference for InferenceService {
                 if let Some(max) = self.engine.max_upload_bytes()
                     && bytes.len() as u64 > max
                 {
-                    return Err(Status::resource_exhausted(format!(
-                        "content exceeds the {max}-byte limit"
-                    )));
+                    return Err(too_large(format!("content exceeds the {max}-byte limit")));
                 }
+                // Refuse a request this instance can't take before writing its
+                // bytes to disk (a proxy may resend it elsewhere).
+                let probe = Input::Bytes {
+                    path: PathBuf::new(),
+                    kind,
+                };
+                self.engine
+                    .check_submission(&probe, &accept.run)
+                    .map_err(engine_to_status)?;
                 let (path, mut file) = self.create_upload().await?;
                 let written = async {
                     file.write_all(&bytes).await?;
@@ -194,9 +202,7 @@ impl Inference for InferenceService {
                         if let Some(max) = cap
                             && total > max
                         {
-                            return Err(Status::resource_exhausted(format!(
-                                "upload exceeds the {max}-byte limit"
-                            )));
+                            return Err(too_large(format!("upload exceeds the {max}-byte limit")));
                         }
                         saw_data = true;
                         file.write_all(&bytes)
@@ -342,7 +348,7 @@ impl InferenceService {
         };
         let Some(id) = self
             .engine
-            .find_request(accept.owner.as_deref(), rid)
+            .find_request_settled(accept.owner.as_deref(), rid)
             .await
             .map_err(engine_to_status)?
         else {
@@ -492,9 +498,32 @@ fn engine_to_status(e: EngineError) -> Status {
             Status::invalid_argument(e.to_string())
         }
         EngineError::UnknownTask(_) => Status::not_found(e.to_string()),
-        EngineError::Overloaded(_) => Status::resource_exhausted(e.to_string()),
+        EngineError::Overloaded { reason, .. } => {
+            // Nothing was stored, so the request may be sent to another
+            // instance; the tag lets a proxy or client tell this apart from a
+            // size limit, which every instance would refuse.
+            let mut status = Status::resource_exhausted(e.to_string());
+            status.metadata_mut().insert(
+                OVERLOADED_HEADER,
+                MetadataValue::from_static(reason.as_str()),
+            );
+            status
+        }
         other => Status::internal(other.to_string()),
     }
+}
+
+/// Response metadata on an overloaded refusal: `queue`, `memory` or `model`.
+const OVERLOADED_HEADER: &str = "apollo-overloaded";
+
+/// A size-limit refusal. Every instance would refuse it too, so it tells gRPC
+/// retry policies not to retry (`grpc-retry-pushback-ms: -1`).
+fn too_large(message: String) -> Status {
+    let mut status = Status::resource_exhausted(message);
+    status
+        .metadata_mut()
+        .insert("grpc-retry-pushback-ms", MetadataValue::from_static("-1"));
+    status
 }
 
 /// Wrap an [`Engine`] as a tonic service with the PASETO auth interceptor applied,
@@ -584,8 +613,14 @@ mod tests {
     }
 
     async fn fixture() -> Fixture {
+        fixture_with("").await
+    }
+
+    /// A fixture whose config also has the TOML given (models are never loaded).
+    async fn fixture_with(toml: &str) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let mut config: Config = apollo_config::load::from_str("").unwrap();
+        let mut config: Config = apollo_config::load::from_str(toml).unwrap();
+        config.validate().unwrap();
         config.database = DatabaseConfig {
             sqlite: Some(SqliteConfig {
                 path: dir.path().join("t.db").to_string_lossy().into_owned(),
@@ -746,7 +781,7 @@ mod tests {
         let svc = InferenceService::new(f.engine.clone());
         let code = |r: Result<Response<Task>, Status>| r.unwrap_err().code();
 
-        // No such model: the inline content was staged, then removed.
+        // No such model: refused before the inline content is staged.
         let err = code(
             svc.classify(Request::new(classify_data(&["nope"], "")))
                 .await,
@@ -769,6 +804,213 @@ mod tests {
             );
         }
         assert_eq!(uploads(&f.engine), 0);
+    }
+
+    /// Over `[app].max_memory` (any process is over 1kb), so every submission
+    /// is refused as overloaded.
+    const OVER_MEMORY: &str = r#"
+        [app]
+        max_memory = "1kb"
+        [models.nsfw]
+        architecture = "vit"
+        repo = "test/nsfw"
+    "#;
+
+    #[tokio::test]
+    async fn an_overloaded_instance_refuses_inline_content_before_staging_it() {
+        let f = fixture_with(OVER_MEMORY).await;
+        let svc = InferenceService::new(f.engine.clone());
+        let status = svc
+            .classify(Request::new(classify_data(&["nsfw"], "")))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            status.metadata().get(OVERLOADED_HEADER).unwrap(),
+            "memory",
+            "{status:?}"
+        );
+        assert_eq!(uploads(&f.engine), 0, "nothing was written to disk");
+    }
+
+    #[tokio::test]
+    async fn refusals_tell_a_proxy_whether_another_instance_may_take_them() {
+        let f = fixture_with(OVER_MEMORY).await;
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let (stop, stopped) = oneshot::channel::<()>();
+        tokio::spawn(serve_with_shutdown(
+            f.engine.clone(),
+            addr,
+            async {
+                let _ = stopped.await;
+            },
+            AuthInterceptor::disabled(),
+            None,
+        ));
+        let mut client = loop {
+            match apollo_proto::inference_client::InferenceClient::connect(format!("http://{addr}"))
+                .await
+            {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+
+        // Overloaded: tagged with the reason, so it may go to another instance.
+        let status = client
+            .classify(classify_data(&["nsfw"], ""))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(status.metadata().get(OVERLOADED_HEADER).unwrap(), "memory");
+        assert!(status.metadata().get("grpc-retry-pushback-ms").is_none());
+
+        // Too large: every instance would refuse it, so no tag and no retries.
+        let big = too_large("content exceeds the 1-byte limit".into());
+        assert_eq!(big.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(big.metadata().get("grpc-retry-pushback-ms").unwrap(), "-1");
+        assert!(big.metadata().get(OVERLOADED_HEADER).is_none());
+        let _ = stop.send(());
+    }
+
+    #[tokio::test]
+    async fn a_repeat_during_the_first_store_gets_the_task_not_a_refusal() {
+        // One nsfw input at a time, so the first submission's reservation fills
+        // the model's limit while its task is being stored.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: Config = apollo_config::load::from_str(
+            "[models.nsfw]\narchitecture = \"vit\"\nrepo = \"test/nsfw\"\nmax_pending = 1\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        config.database = DatabaseConfig {
+            sqlite: Some(SqliteConfig {
+                path: dir.path().join("t.db").to_string_lossy().into_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        config.app.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        let (held, release) = apollo_engine::testing::HeldCreate::new(storage.clone(), false);
+        let engine = Engine::new(Arc::new(config), Arc::new(held), None);
+        let svc = InferenceService::new(engine.clone());
+
+        // The first caller gives up while its task is being stored.
+        let first = Submission {
+            input: Input::Image(Url {
+                main: "file:///nonexistent/apollo-test.png".into(),
+                fallback: None,
+            }),
+            run: Run::Models(vec!["nsfw".into()]),
+            metadata: Default::default(),
+            request_id: Some("r".into()),
+        };
+        let gave_up =
+            tokio::time::timeout(Duration::from_millis(100), engine.submit(first, None)).await;
+        assert!(gave_up.is_err());
+
+        // Its repeat, with inline content, waits for that store instead of
+        // being refused by the first one's reservation.
+        let repeat = tokio::spawn(async move {
+            svc.classify(Request::new(classify_data(&["nsfw"], "r")))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!repeat.is_finished());
+        release.add_permits(1);
+        let task = tokio::time::timeout(Duration::from_secs(10), repeat)
+            .await
+            .expect("the repeat finished")
+            .unwrap()
+            .expect("the first task, not RESOURCE_EXHAUSTED")
+            .into_inner();
+        let stored = storage.find_task_by_request(None, "r").await.unwrap();
+        assert_eq!(Some(task.id), stored);
+        assert_eq!(uploads(&engine), 0, "a repeat stages nothing");
+    }
+
+    #[tokio::test]
+    async fn size_limits_tell_clients_not_to_retry_anywhere() {
+        let f = fixture_with(
+            r#"
+            [limits]
+            max_download = "1b"
+            [models.nsfw]
+            architecture = "vit"
+            repo = "test/nsfw"
+            "#,
+        )
+        .await;
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let (stop, stopped) = oneshot::channel::<()>();
+        tokio::spawn(serve_with_shutdown(
+            f.engine.clone(),
+            addr,
+            async {
+                let _ = stopped.await;
+            },
+            AuthInterceptor::disabled(),
+            None,
+        ));
+        let mut client = loop {
+            match apollo_proto::inference_client::InferenceClient::connect(format!("http://{addr}"))
+                .await
+            {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let too_large = |status: Status| {
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{status:?}");
+            assert_eq!(
+                status.metadata().get("grpc-retry-pushback-ms").unwrap(),
+                "-1"
+            );
+            assert!(status.metadata().get(OVERLOADED_HEADER).is_none());
+        };
+
+        // Inline content (3 bytes) over the 1-byte cap.
+        too_large(
+            client
+                .classify(classify_data(&["nsfw"], ""))
+                .await
+                .unwrap_err(),
+        );
+        // A stream that passes its init check, then goes over the cap.
+        use apollo_proto::{ClassifyChunk, ClassifyStreamInit, ModelList, classify_stream_init};
+        let chunks = vec![
+            ClassifyChunk {
+                payload: Some(Payload::Init(ClassifyStreamInit {
+                    kind: apollo_proto::MediaKind::Image as i32,
+                    run: Some(classify_stream_init::Run::Models(ModelList {
+                        names: vec!["nsfw".into()],
+                    })),
+                    ..Default::default()
+                })),
+            },
+            ClassifyChunk {
+                payload: Some(Payload::Data(vec![1, 2, 3])),
+            },
+        ];
+        too_large(
+            client
+                .classify_stream(futures::stream::iter(chunks))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(uploads(&f.engine), 0);
+        let _ = stop.send(());
     }
 
     #[tokio::test]

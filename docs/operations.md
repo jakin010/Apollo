@@ -29,6 +29,7 @@ All metrics are prefixed `apollo_`. Counters start at zero when the server start
 | `apollo_config_generation` | gauge | | Configs applied since start: 1 for the startup config, then one more per reload. |
 | `apollo_config_loaded_timestamp_seconds` | gauge | | When the running config was applied. |
 | `apollo_submissions_total` | counter | `outcome` | Submissions: `accepted`, `existing` (a repeated `request_id`), `invalid`, `overloaded` (backpressure), `error`. |
+| `apollo_submissions_overloaded_total` | counter | `reason` | Overloaded submissions by the limit that refused them: `queue` (`[app].max_pending`), `memory` (`[app].max_memory`), `model` (a model's `max_pending`). |
 | `apollo_items_finished_total` | counter | `state` | Inputs that finished: `completed`, `failed`, `cancelled`. |
 | `apollo_tasks` | gauge | `state` | Tasks in the database by state (until [retention](./database.md#retention) purges them). |
 | `apollo_items_in_flight` | gauge | | Inputs accepted and not finished. |
@@ -43,6 +44,7 @@ All metrics are prefixed `apollo_`. Counters start at zero when the server start
 | `apollo_webhook_deliveries_total` | counter | `event`, `result` | Delivery attempts: `progress` / `finished`, `ok` / `error`. |
 | `apollo_model_loaded` | gauge | `model` | 1 while the model's weights are in memory. |
 | `apollo_model_queued_jobs` | gauge | `model` | Requests waiting for the model's worker. |
+| `apollo_model_items_admitted` | gauge | `model` | Inputs accepted and not finished that run the model (what its `max_pending` is checked against). |
 | `apollo_model_inferences_total` | counter | `model` | Images (and video frames) classified. |
 | `apollo_model_failures_total` | counter | `model` | Images whose forward pass failed. |
 | `apollo_model_batch_size` | histogram | `model` | Images per forward pass. |
@@ -65,6 +67,56 @@ rate(apollo_model_batch_size_sum[5m]) / rate(apollo_model_batch_size_count[5m])
 # Share of submissions shed by backpressure.
 rate(apollo_submissions_total{outcome="overloaded"}[5m]) / rate(apollo_submissions_total[5m])
 ```
+
+---
+
+## Several instances: sending work to a less busy one
+
+With Apollo on several servers, a busy instance refuses work it can't start soon, and a proxy or the client sends that request to another instance.
+
+**What "busy" means.** A refusal is `RESOURCE_EXHAUSTED` with metadata `apollo-overloaded`, whose value says which limit was reached:
+
+- `queue`: `[app].max_pending` inputs are in flight;
+- `memory`: the process is over `[app].max_memory`;
+- `model`: a model's own `[models.<label>].max_pending` is reached.
+
+Nothing is kept when a request is refused as overloaded, so the same request can be sent again elsewhere. It's usually refused before any content arrives (at a `ClassifyStream` init frame, or before inline content is written to disk). But if the instance fills up while an upload is arriving, the refusal comes after it, and the received bytes are discarded. Size limits are different: every instance would refuse them, so they carry `grpc-retry-pushback-ms: -1` and no tag.
+
+Free slots alone don't show how busy a server is. Each model works through its inputs one batch at a time, and OCR reads one image at a time. So set `max_pending` on heavy models: for OCR on a CPU, `max_pending = 2` refuses a third OCR input while two are unfinished (one being read, one waiting), even if the server has free slots for other models. An input counts toward its models from when it's accepted until it finishes; a pipeline input counts toward every model in the pipeline, including later steps and ones a `stop_if` may skip. A cancelled input stops counting at once. Keep `[app].max_pending` at about 3–4× `[app].max_concurrent`, so a full server refuses early rather than queueing minutes of work. `apollo_model_items_admitted` and `apollo_model_queued_jobs` show which model is the bottleneck.
+
+**A proxy.** Balance every request separately with an HTTP/2-aware proxy. With an L4 or DNS balancer, one client's connection stays on one server. Classify returns at once, so open-request counts say little about load; retrying refusals is what moves the work. An Envoy route might look like this (a sketch: the `apollo` cluster needs HTTP/2, and TLS when the servers are on other hosts):
+
+```yaml
+routes:
+  - match: { prefix: "/apollo.v1.Inference/Classify" }   # Classify and ClassifyStream
+    request_body_buffer_limit: 5242880 # so a refused inline Classify can be resent
+    route:
+      cluster: apollo
+      timeout: 0s                      # wait_seconds may hold a call for up to 300 s,
+      idle_timeout: 0s                 # silent until it answers (Envoy's default is 5 min)
+      retry_policy:
+        retry_on: retriable-headers,connect-failure,refused-stream
+        retriable_headers:
+          - name: apollo-overloaded
+            present_match: true
+        num_retries: 2                 # instances − 1
+        retry_host_predicate:
+          - name: envoy.retry_host_predicates.previous_hosts
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.retry.host.previous_hosts.v3.PreviousHostsPredicate
+        host_selection_retry_max_attempts: 3
+  - match: { prefix: "/" }
+    route: { cluster: apollo, timeout: 0s, idle_timeout: 0s }   # WatchTask streams can be quiet
+```
+
+Envoy resends only a request that still fits its buffer: `request_body_buffer_limit` above covers inline content up to gRPC's 4 MiB message limit. On an Envoy without that field, raise the listener's `per_connection_buffer_limit_bytes` (1 MiB by default) together with the route's `per_request_buffer_limit_bytes`. Resend large `ClassifyStream` uploads from the client. Also raise the cluster's `circuit_breakers` `max_retries` above its default of 3, or bursts aren't retried.
+
+**In the client.** Keep a connection to each instance. When a `Classify` or `ClassifyStream` is refused with `apollo-overloaded`, or the connection fails, send it to the next instance. Don't resend after an ambiguous error (a reset or a deadline): the first instance may have taken it.
+
+**A shared database.** Instances that share one SurrealDB database aren't safe yet. A restarting instance resumes every unfinished task in the database, including ones other instances are running, and a cancel or watch reaches only the instance that runs the task. Until that is fixed, give each instance its own database (`[database.surrealdb].database`). Each instance then knows only its own tasks:
+
+- `GetTask`, `WatchTask`, `CancelTask` and `ListTasks` must reach the instance that accepted the task. A proxy that balances every request sends them anywhere, so behind one, get results with `wait_seconds` or a webhook, or make those calls from a client that keeps one connection per instance.
+- A `request_id` only deduplicates within one instance. Don't resend through the proxy after an ambiguous error: another instance would run the request again.
 
 ---
 

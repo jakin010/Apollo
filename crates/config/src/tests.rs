@@ -63,7 +63,19 @@ fn defaults_apply_to_minimal_model() {
     assert!(m.enabled);
     assert_eq!(m.max_concurrent, 8);
     assert_eq!(m.timeout, 30);
+    assert_eq!(m.max_pending, 0, "no per-model admission limit by default");
     assert_eq!(cfg.app.port, 8080);
+
+    let limited = load::from_str(
+        r#"
+        [models.ocr]
+        architecture = "paddleocr_vl"
+        repo = "a/b"
+        max_pending = 2
+        "#,
+    )
+    .unwrap();
+    assert_eq!(limited.models["ocr"].max_pending, 2);
 }
 
 #[test]

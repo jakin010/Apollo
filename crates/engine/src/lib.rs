@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use apollo_config::Config;
 use apollo_domain::{Input, Item, Task};
@@ -44,12 +44,16 @@ mod webhook;
 mod worker;
 
 #[cfg(test)]
+mod multi_instance_tests;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
+#[cfg(test)]
 mod tests;
 
 pub use aggregate::task_error;
 pub use apollo_storage::{TaskCursor, TaskPage, TaskQuery};
 pub use catalog::{Catalog, Gate, ModelInfo, PipelineInfo, PipelineStepInfo, Trigger};
-pub use error::EngineError;
+pub use error::{EngineError, Overload};
 pub use live::ReloadReport;
 pub use registry::RegistryChanges;
 pub use status::{EngineStatus, ModelStatus, TaskCounts};
@@ -117,24 +121,52 @@ struct Inner {
     /// (`[app].max_concurrent`; restart-only).
     gate: Arc<PriorityGate>,
     /// Items currently queued or processing (admission backpressure counter).
+    /// Changed only through [`Reservation`]s.
     in_flight: AtomicUsize,
+    /// Of those, how many run each model (by label), for the models'
+    /// `max_pending`. Labels with none are absent.
+    admitted: Mutex<HashMap<String, usize>>,
     /// Per-task cooperative cancellation signals, keyed by task id.
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Woken on every cancel, so items waiting for a slot can check theirs.
+    cancelled: tokio::sync::Notify,
     /// Ids of changed tasks, announced by the storage wrapper.
     changes: broadcast::Sender<Arc<str>>,
-    /// Serializes submissions that carry a `request_id`, so two concurrent
-    /// ones cannot both create a task.
-    idempotency: tokio::sync::Mutex<()>,
+    /// One lock per `(owner, request_id)` in use: serializes submissions with
+    /// the same key, so two concurrent ones cannot both create a task. Held
+    /// until the task is stored, even when the submitting call is dropped
+    /// first. Other keys never wait on it.
+    idempotency: Mutex<RequestLocks>,
 }
 
-/// Decrements the in-flight item counter on drop. One guard is created at the
-/// start of `run_item`, so the reservation is released on every exit path
-/// (normal, error, cancellation, or panic).
-pub(crate) struct InFlightGuard(pub(crate) Engine);
+/// Locks by `(owner, request_id)`; an entry nobody holds is dropped.
+type RequestLocks = HashMap<(Option<String>, String), Weak<tokio::sync::Mutex<()>>>;
 
-impl Drop for InFlightGuard {
+/// One accepted, unfinished item's share of the admission counters: one unit
+/// of `in_flight` and one per model it runs. Given back on drop, so every way
+/// an item ends (finished, failed, cancelled, panicked, or a submission whose
+/// task could not be stored) releases it exactly once.
+pub(crate) struct Reservation {
+    inner: Arc<Inner>,
+    models: Vec<String>,
+}
+
+impl Drop for Reservation {
     fn drop(&mut self) {
-        self.0.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+        let mut admitted = self
+            .inner
+            .admitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for label in &self.models {
+            if let Some(n) = admitted.get_mut(label) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    admitted.remove(label);
+                }
+            }
+        }
     }
 }
 
@@ -180,9 +212,11 @@ impl Engine {
                 metrics,
                 gate,
                 in_flight: AtomicUsize::new(0),
+                admitted: Mutex::new(HashMap::new()),
                 cancels: Mutex::new(HashMap::new()),
+                cancelled: tokio::sync::Notify::new(),
                 changes,
-                idempotency: tokio::sync::Mutex::new(()),
+                idempotency: Mutex::new(HashMap::new()),
             }),
             pinned: None,
         };
@@ -274,10 +308,20 @@ impl Engine {
         owner: Option<String>,
     ) -> Result<Submitted, EngineError> {
         let result = self.submit_once(submission, owner).await;
-        self.inner.metrics.submission(match &result {
-            Ok(Submitted { existing: true, .. }) => "existing",
-            Ok(_) => "accepted",
-            Err(EngineError::Overloaded(_)) => "overloaded",
+        self.record_submission(result.as_ref().map(|s| s.existing));
+        result
+    }
+
+    /// Count a submission's outcome: `Ok(existing)` or the error it got.
+    fn record_submission(&self, outcome: Result<bool, &EngineError>) {
+        let metrics = &self.inner.metrics;
+        metrics.submission(match outcome {
+            Ok(true) => "existing",
+            Ok(false) => "accepted",
+            Err(EngineError::Overloaded { reason, .. }) => {
+                metrics.overloaded(*reason);
+                "overloaded"
+            }
             Err(
                 EngineError::UnknownModel(_)
                 | EngineError::Incompatible(_)
@@ -285,7 +329,6 @@ impl Engine {
             ) => "invalid",
             Err(_) => "error",
         });
-        result
     }
 
     async fn submit_once(
@@ -293,8 +336,8 @@ impl Engine {
         submission: Submission,
         owner: Option<String>,
     ) -> Result<Submitted, EngineError> {
-        let _serialized = match &submission.request_id {
-            Some(_) => Some(self.inner.idempotency.lock().await),
+        let serialized = match &submission.request_id {
+            Some(rid) => Some(self.request_lock(owner.as_deref(), rid).lock_owned().await),
             None => None,
         };
         if let Some(rid) = &submission.request_id
@@ -307,14 +350,7 @@ impl Engine {
 
         // Backpressure: shed load instead of growing memory without bound.
         self.check_memory()?;
-        let max_pending = self.live().max_pending;
-        let prev = self.inner.in_flight.fetch_add(1, Ordering::SeqCst);
-        if max_pending > 0 && prev + 1 > max_pending {
-            self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
-            return Err(EngineError::Overloaded(format!(
-                "queue full ({prev} items in flight, limit {max_pending})"
-            )));
-        }
+        let reservation = self.reserve(&models)?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let mut task = Task::new(
@@ -324,19 +360,108 @@ impl Engine {
         );
         task.metadata = submission.metadata;
         task.request_id = submission.request_id;
-        if let Err(e) = self.inner.storage.create_task(&task).await {
-            // Release the reservation: no run_items will be spawned to do it.
-            self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
-            return Err(e.into());
-        }
-        tracing::info!(task = %task.id, "task submitted");
 
+        // Store and start the task in a task of its own, which this call only
+        // waits for. A caller that goes away meanwhile (a client cancel or
+        // deadline drops this future) then neither leaks the reservation nor
+        // leaves a stored task that nothing runs: the write finishes, and the
+        // task either starts or gives the reservation back. The idempotency
+        // lock is held until the task is stored, for the same reason.
         let engine = self.clone();
-        tokio::spawn(async move { engine.run_task(task).await });
-        Ok(Submitted {
-            id,
-            existing: false,
+        let stored = tokio::spawn(async move {
+            let _serialized = serialized;
+            engine.inner.storage.create_task(&task).await?;
+            tracing::info!(task = %task.id, "task submitted");
+            let runner = engine.clone();
+            tokio::spawn(async move { runner.run_task(task, vec![reservation]).await });
+            Ok::<(), EngineError>(())
+        });
+        match stored.await {
+            Ok(Ok(())) => Ok(Submitted {
+                id,
+                existing: false,
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(EngineError::Join(e.to_string())),
+        }
+    }
+
+    /// Room for one more item that runs `models`: refused when `[app].max_pending`
+    /// items are in flight or one of the models has its own `max_pending`.
+    fn reserve(&self, models: &[String]) -> Result<Reservation, EngineError> {
+        let live = self.live();
+        // Held across the check and the increments, so concurrent submissions
+        // can't both take a model's last place.
+        let mut admitted = self
+            .inner
+            .admitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        check_models(&live, &admitted, models)?;
+        let max_pending = live.max_pending;
+        let prev = self.inner.in_flight.fetch_add(1, Ordering::SeqCst);
+        if max_pending > 0 && prev + 1 > max_pending {
+            self.inner.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return Err(queue_full(prev, max_pending));
+        }
+        for label in models {
+            *admitted.entry(label.clone()).or_default() += 1;
+        }
+        Ok(Reservation {
+            inner: Arc::clone(&self.inner),
+            models: models.to_vec(),
         })
+    }
+
+    /// A reservation for an item accepted before (resumed after a restart),
+    /// whatever the limits say now.
+    pub(crate) fn reserve_resumed(&self, models: &[String]) -> Reservation {
+        self.inner.in_flight.fetch_add(1, Ordering::SeqCst);
+        let mut admitted = self
+            .inner
+            .admitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for label in models {
+            *admitted.entry(label.clone()).or_default() += 1;
+        }
+        Reservation {
+            inner: Arc::clone(&self.inner),
+            models: models.to_vec(),
+        }
+    }
+
+    /// Like [`Engine::find_request`], but first waits for submissions still
+    /// storing their task, so a repeat that arrives meanwhile finds it instead
+    /// of being checked as a new submission (and maybe refused as overloaded
+    /// by the first one's reservation).
+    pub async fn find_request_settled(
+        &self,
+        owner: Option<&str>,
+        request_id: &str,
+    ) -> Result<Option<String>, EngineError> {
+        let lock = self.request_lock(owner, request_id);
+        let _settled = lock.lock().await;
+        self.find_request(owner, request_id).await
+    }
+
+    /// The lock for submissions with `owner`'s `request_id`.
+    fn request_lock(&self, owner: Option<&str>, request_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .inner
+            .idempotency
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Forget keys nobody holds any more, so this stays as small as the
+        // number of keyed submissions in progress.
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let key = (owner.map(str::to_string), request_id.to_string());
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 
     /// The task `owner` submitted with `request_id`, if any.
@@ -356,14 +481,30 @@ impl Engine {
     /// validation plus a capacity check. Lets `ClassifyStream` reject a request
     /// before accepting any upload bytes. `submit` repeats every check.
     pub fn check_submission(&self, input: &Input, run: &Run) -> Result<(), EngineError> {
-        self.resolve(input, run)?;
+        let result = self.check_room(input, run);
+        // A refusal here ends the request, so count it like one from `submit`.
+        if let Err(e) = &result {
+            self.record_submission(Err(e));
+        }
+        result
+    }
+
+    fn check_room(&self, input: &Input, run: &Run) -> Result<(), EngineError> {
+        let (models, _) = self.resolve(input, run)?;
         self.check_memory()?;
-        let max_pending = self.live().max_pending;
+        let live = self.live();
+        {
+            let admitted = self
+                .inner
+                .admitted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            check_models(&live, &admitted, &models)?;
+        }
+        let max_pending = live.max_pending;
         let pending = self.inner.in_flight.load(Ordering::SeqCst);
         if max_pending > 0 && pending >= max_pending {
-            return Err(EngineError::Overloaded(format!(
-                "queue full ({pending} items in flight, limit {max_pending})"
-            )));
+            return Err(queue_full(pending, max_pending));
         }
         Ok(())
     }
@@ -482,6 +623,8 @@ impl Engine {
                 .clone();
             token.store(true, Ordering::SeqCst);
         }
+        // Items waiting for a slot stop waiting (and give back their place).
+        self.inner.cancelled.notify_waiters();
         // Conditional write: if the task finished in the meantime it stays
         // finished rather than being relabelled as cancelled.
         if !self.inner.storage.cancel_task_if_active(task_id).await? {
@@ -502,12 +645,46 @@ impl Engine {
         };
         if used >= limit {
             const MIB: u64 = 1024 * 1024;
-            return Err(EngineError::Overloaded(format!(
-                "memory limit reached ({} MiB in use >= {} MiB cap)",
-                used / MIB,
-                limit / MIB
-            )));
+            return Err(EngineError::Overloaded {
+                reason: Overload::Memory,
+                message: format!(
+                    "memory limit reached ({} MiB in use >= {} MiB cap)",
+                    used / MIB,
+                    limit / MIB
+                ),
+            });
         }
         Ok(())
+    }
+}
+
+/// Refuse an item when one of its `models` already has its own `max_pending`
+/// items admitted.
+fn check_models(
+    live: &Live,
+    admitted: &HashMap<String, usize>,
+    models: &[String],
+) -> Result<(), EngineError> {
+    for label in models {
+        let limit = live
+            .config
+            .models
+            .get(label)
+            .map_or(0, |m| m.max_pending as usize);
+        let n = admitted.get(label).copied().unwrap_or(0);
+        if limit > 0 && n >= limit {
+            return Err(EngineError::Overloaded {
+                reason: Overload::Model,
+                message: format!("model '{label}' has {n} inputs in flight, limit {limit}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn queue_full(in_flight: usize, limit: usize) -> EngineError {
+    EngineError::Overloaded {
+        reason: Overload::Queue,
+        message: format!("queue full ({in_flight} items in flight, limit {limit})"),
     }
 }

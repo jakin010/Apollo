@@ -178,9 +178,10 @@ impl Engine {
         idx: usize,
         mut item: Item,
         cancel: Arc<AtomicBool>,
+        reservation: crate::Reservation,
     ) {
         // Release the admission reservation on every exit path.
-        let _inflight = crate::InFlightGuard(self.clone());
+        let _reservation = reservation;
 
         // recover() already re-fired webhooks for terminal items.
         if aggregate::item_terminal(item.state) {
@@ -222,12 +223,13 @@ impl Engine {
         // The slot is held while fetching and running models, and released while
         // backing off between retries.
         let priority = self.item_priority(&item);
-        let mut permit = Some(self.inner.gate.clone().acquire(priority).await);
-        // Waiting for a slot can take a while; honour a cancel that arrived meanwhile.
-        if cancel.load(Ordering::SeqCst) {
+        // Waiting for a slot can take a while: a cancel meanwhile ends the wait,
+        // so the item stops counting toward the admission limits at once.
+        let Some(granted) = self.slot_or_cancel(priority, &cancel).await else {
             self.cancel_item(&task_id, idx).await;
             return;
-        }
+        };
+        let mut permit = Some(granted);
 
         if let Err(e) = self
             .inner
@@ -426,15 +428,21 @@ impl Engine {
         self.notify_item_change(task_id, idx).await;
 
         permit.take();
-        tokio::time::sleep(retry_backoff(item.retries)).await;
-        if cancel.load(Ordering::SeqCst) {
+        // A cancel during the backoff or the wait for a slot ends it at once,
+        // so the item stops counting toward the admission limits.
+        if self
+            .sleep_or_cancel(retry_backoff(item.retries), cancel)
+            .await
+        {
             self.cancel_item(task_id, idx).await;
             return false;
         }
-        *permit = Some(self.inner.gate.clone().acquire(priority).await);
-        if cancel.load(Ordering::SeqCst) {
-            self.cancel_item(task_id, idx).await;
-            return false;
+        match self.slot_or_cancel(priority, cancel).await {
+            Some(granted) => *permit = Some(granted),
+            None => {
+                self.cancel_item(task_id, idx).await;
+                return false;
+            }
         }
         let _ = self
             .inner
@@ -1761,6 +1769,53 @@ impl Engine {
             .map(|m| m.timeout)
             .unwrap_or(30);
         Duration::from_secs(secs as u64)
+    }
+
+    /// A gate slot at `priority`, or `None` once `cancel` is set (checked again
+    /// on every cancel, so a waiting item doesn't wait for a slot to find out).
+    pub(crate) async fn slot_or_cancel(
+        &self,
+        priority: i32,
+        cancel: &AtomicBool,
+    ) -> Option<GatePermit> {
+        let mut acquire = Box::pin(self.inner.gate.clone().acquire(priority));
+        loop {
+            // Registered before the check, so a cancel between the two still
+            // wakes this wait.
+            let notified = self.inner.cancelled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if cancel.load(Ordering::SeqCst) {
+                return None; // dropping `acquire` gives back a slot handed over
+            }
+            tokio::select! {
+                permit = &mut acquire => {
+                    // A grant and a cancel can land together; the cancel wins,
+                    // and dropping the permit passes the slot on.
+                    return (!cancel.load(Ordering::SeqCst)).then_some(permit);
+                }
+                () = &mut notified => {}
+            }
+        }
+    }
+
+    /// Sleep for `duration`, or less if `cancel` is set meanwhile. Returns
+    /// whether the item was cancelled.
+    pub(crate) async fn sleep_or_cancel(&self, duration: Duration, cancel: &AtomicBool) -> bool {
+        let sleep = tokio::time::sleep(duration);
+        tokio::pin!(sleep);
+        loop {
+            let notified = self.inner.cancelled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if cancel.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::select! {
+                () = &mut sleep => return cancel.load(Ordering::SeqCst),
+                () = &mut notified => {}
+            }
+        }
     }
 
     /// An item's scheduling priority: the maximum `priority` among the models it
