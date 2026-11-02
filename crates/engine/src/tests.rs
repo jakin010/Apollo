@@ -399,10 +399,16 @@ async fn a_watch_follows_a_task_until_it_finishes() {
             .unwrap();
     });
 
+    // Each write is announced: the watch keeps up well within the time it
+    // would take to read the task again on its own.
     let mut states = Vec::new();
-    while let Some(t) = watch.next().await.unwrap() {
-        states.push(t.state);
-    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(t) = watch.next().await.unwrap() {
+            states.push(t.state);
+        }
+    })
+    .await
+    .expect("announced changes arrive at once");
     writer.await.unwrap();
     assert_eq!(states.last(), Some(&TaskState::Completed));
     assert!(states.len() >= 2, "{states:?}");
@@ -450,7 +456,8 @@ async fn waiting_returns_the_finished_task_or_the_latest_state() {
         .unwrap()
         .unwrap();
     assert_eq!(fast.state, TaskState::Failed);
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // Announced, so well before a watch would read it again anyway.
+    assert!(started.elapsed() < Duration::from_secs(1));
 
     assert!(
         f.engine
@@ -1097,5 +1104,232 @@ async fn a_cancel_ends_a_retry_backoff_at_once() {
         !f.engine
             .sleep_or_cancel(Duration::from_millis(20), &plain)
             .await
+    );
+}
+
+const NSFW_ONLY: &str = r#"
+    [models.nsfw]
+    architecture = "vit"
+    repo = "test/nsfw"
+"#;
+
+/// Run `task` as resumed work (the way `recover` starts it), to its end.
+async fn run_resumed(engine: &Engine, task: Task) {
+    let reservations = task
+        .items
+        .iter()
+        .map(|item| engine.reserve_resumed(&item.models))
+        .collect();
+    engine.run_task(task, reservations).await;
+}
+
+#[tokio::test]
+async fn a_late_runner_leaves_a_finished_task_as_it_ended() {
+    let f = fixture_with(NSFW_ONLY).await;
+    let late = |id: &str| {
+        let mut t = task(id, TaskState::Processing, ItemState::Queued, None);
+        t.items[0].models = vec!["nsfw".into()];
+        t.items[0].input = local_file_submission().input;
+        t
+    };
+    // Each finished after this runner loaded it: one cancelled (elsewhere,
+    // so this engine has no signal for it), one completed.
+    for id in ["cancelled", "completed"] {
+        f.storage.create_task(&late(id)).await.unwrap();
+    }
+    assert!(f.storage.cancel_task_if_active("cancelled").await.unwrap());
+    assert!(
+        f.storage
+            .set_task_state("completed", TaskState::Completed)
+            .await
+            .unwrap()
+    );
+
+    for id in ["cancelled", "completed"] {
+        run_resumed(&f.engine, late(id)).await;
+    }
+    let cancelled = f.storage.get_task("cancelled").await.unwrap().unwrap();
+    assert_eq!(
+        cancelled.state,
+        TaskState::Cancelled,
+        "the start write lost"
+    );
+    assert!(cancelled.finished_at.is_some());
+    // Its item is finished, as cancelled, without being run (its refused
+    // input would have failed it).
+    assert_eq!(cancelled.items[0].state, ItemState::Cancelled);
+    let completed = f.storage.get_task("completed").await.unwrap().unwrap();
+    assert_eq!(completed.state, TaskState::Completed);
+    assert_eq!(completed.items[0].state, ItemState::Queued, "nothing ran");
+    assert_eq!(f.engine.status().await.unwrap().items_in_flight, 0);
+}
+
+#[tokio::test]
+async fn a_late_runner_leaves_a_finished_item_alone() {
+    let f = fixture_with(NSFW_ONLY).await;
+    // This runner's copy says queued; meanwhile another runner finished it.
+    let mut late = Task::new(
+        "t",
+        vec![Item::new(image(), vec!["nsfw".into()], None)],
+        None,
+    );
+    late.items[0].input = local_file_submission().input;
+    f.storage.create_task(&late).await.unwrap();
+    assert!(
+        f.storage
+            .set_item_state("t", 0, ItemState::Completed, None)
+            .await
+            .unwrap()
+    );
+
+    run_resumed(&f.engine, late).await;
+    let stored = f.storage.get_task("t").await.unwrap().unwrap();
+    // Had it run, its refused input would have failed it.
+    assert_eq!(stored.items[0].state, ItemState::Completed);
+    assert_eq!(stored.items[0].error, None);
+    assert!(
+        stored.items[0]
+            .results
+            .values()
+            .all(|r| r.state != ModelState::Failed),
+        "{stored:?}"
+    );
+    assert_eq!(stored.state, TaskState::Completed, "the rollup still runs");
+}
+
+#[tokio::test]
+async fn a_keyed_tasks_id_comes_from_its_owner_and_key() {
+    let id = crate::request_task_id;
+    assert_eq!(id(Some("alice"), "r"), id(Some("alice"), "r"));
+    let ids = [
+        id(Some("alice"), "r"),
+        id(Some("bob"), "r"),
+        id(Some("alice"), "s"),
+        id(None, "r"),
+        id(Some(""), "r"),
+        // Where the owner ends can't be moved into the key.
+        id(Some("al"), "icer"),
+    ];
+    let distinct: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(distinct.len(), ids.len(), "{ids:?}");
+    for i in &ids {
+        uuid::Uuid::parse_str(i).unwrap();
+    }
+
+    // A task stored under the key's id after this instance looked for the
+    // key (by another instance) is the one the submission gets.
+    let f = fixture_with(NSFW_ONLY).await;
+    let first = Task::new(
+        id(None, "k"),
+        vec![Item::new(image(), vec!["nsfw".into()], None)],
+        None,
+    );
+    f.storage.create_task(&first).await.unwrap();
+    let keyed = Submission {
+        request_id: Some("k".into()),
+        ..local_file_submission()
+    };
+    let got = f.engine.submit(keyed, None).await.unwrap();
+    assert_eq!((got.id.as_str(), got.existing), (first.id.as_str(), true));
+    assert_eq!(f.engine.status().await.unwrap().items_in_flight, 0);
+    let text = f.engine.metrics_text().await.unwrap();
+    assert!(
+        text.contains("apollo_submissions_total{outcome=\"existing\"} 1"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn only_files_directly_in_the_upload_dir_are_read_or_removed() {
+    let f = fixture_with(NSFW_ONLY).await;
+    let dir = f.engine.ensure_upload_dir().unwrap();
+    for (path, staged) in [
+        (dir.join("a.bin"), true),
+        (dir.join("sub").join("a.bin"), false),
+        (dir.join("..").join("a.bin"), false),
+        (dir.clone(), false),
+        (PathBuf::from("/etc/hosts"), false),
+    ] {
+        assert_eq!(f.engine.is_staged_upload(&path), staged, "{path:?}");
+    }
+
+    // A task row pointing elsewhere: the file is neither read nor removed.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let file = elsewhere.path().join("private.png");
+    std::fs::write(&file, b"keep me").unwrap();
+    let mut row = task(
+        "t",
+        TaskState::Queued,
+        ItemState::Queued,
+        Some(file.clone()),
+    );
+    row.items[0].models = vec!["nsfw".into()];
+    f.storage.create_task(&row).await.unwrap();
+    assert_eq!(f.engine.recover().await.unwrap(), 1);
+    in_flight_drops_to_zero(&f.engine).await;
+    let stored = f.storage.get_task("t").await.unwrap().unwrap();
+    let error = stored.items[0].error.clone().unwrap();
+    assert_eq!(error.kind, ErrorKind::Fetch, "{error:?}");
+    assert!(error.message.contains("not an upload"), "{error:?}");
+    assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
+}
+
+#[tokio::test]
+async fn a_watch_sees_changes_nobody_announced() {
+    let f = fixture().await;
+    f.storage
+        .create_task(&task(
+            "t",
+            TaskState::Processing,
+            ItemState::Processing,
+            None,
+        ))
+        .await
+        .unwrap();
+    let mut watch = f.engine.watch("t");
+    assert_eq!(
+        watch.next().await.unwrap().unwrap().state,
+        TaskState::Processing
+    );
+    // Written past this engine, as another instance would: not announced.
+    f.storage
+        .set_item_state("t", 0, ItemState::Completed, None)
+        .await
+        .unwrap();
+    f.storage
+        .set_task_state("t", TaskState::Completed)
+        .await
+        .unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(10), watch.next())
+        .await
+        .expect("the watch reads the task again")
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen.state, TaskState::Completed);
+}
+
+#[tokio::test]
+async fn a_returning_key_isnt_stopped_by_an_old_cancel() {
+    let f = fixture_with(NSFW_ONLY).await;
+    // This engine cancelled an earlier task with this key's id that another
+    // instance ran, so it kept the signal; that task is gone now.
+    let id = crate::request_task_id(None, "k");
+    f.engine.inner.cancels.lock().unwrap().insert(
+        id.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    );
+
+    let keyed = Submission {
+        request_id: Some("k".into()),
+        ..local_file_submission()
+    };
+    let got = f.engine.submit(keyed, None).await.unwrap();
+    assert_eq!(got.id, id);
+    in_flight_drops_to_zero(&f.engine).await;
+    let stored = f.storage.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.state,
+        TaskState::Failed,
+        "it ran: its input is refused"
     );
 }

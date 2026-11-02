@@ -1129,7 +1129,12 @@ mod tests {
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first.state(), apollo_proto::TaskState::Queued);
         f.engine.cancel("w").await.unwrap();
-        let last = stream.next().await.unwrap().unwrap();
+        // Announced: sooner than a watch would read the task again anyway.
+        let last = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("the cancel arrives at once")
+            .unwrap()
+            .unwrap();
         assert_eq!(last.state(), apollo_proto::TaskState::Cancelled);
         assert!(stream.next().await.is_none(), "the stream ends");
     }

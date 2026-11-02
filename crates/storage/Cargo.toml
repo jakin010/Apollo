@@ -23,8 +23,9 @@ surrealdb-parse-common = { version = "=4.0.0-beta.1", default-features = false }
 surrealdb-rpc = { version = "=4.0.0-beta.1", default-features = false }
 surrealdb-types = { version = "=4.0.0-beta.1", default-features = false }
 surrealdb-types-derive = { version = "=4.0.0-beta.1", default-features = false }
+# Pauses between retries of a conflicting schema write.
+tokio = { workspace = true, features = ["time"] }
 # For `testing` (the `test-util` feature) only.
-tokio = { workspace = true, features = ["time"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"], optional = true }
 
 [dev-dependencies]
@@ -37,4 +38,4 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 [features]
 # `apollo_storage::testing` (a throwaway SurrealDB database), for other
 # crates' tests only.
-test-util = ["dep:tokio", "dep:rustls"]
+test-util = ["dep:rustls"]

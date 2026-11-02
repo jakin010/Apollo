@@ -160,6 +160,8 @@ On startup the engine loads every task still in a non‑terminal state, fully re
 - `tasks.attempts` (bumped per resume, given back on graceful shutdown) to **fail a poison task** once it exceeds its cap instead of crash‑looping — its items are marked failed, its webhook fires, and its staged upload is removed,
 - `items.webhook_delivered` to redeliver any `FINISHED` webhook event that a crash left un‑acknowledged.
 
+State writes only apply to an unfinished task or item: the first finish wins, so a late or second runner can't reopen a task, overwrite a cancel, or start an item another runner finished (one already partway through it can still overwrite its model results). An upload is read, and removed, only from the server's own upload directory (`[app].cache_dir/uploads`), whatever path a task's row holds; anything else fails the item.
+
 ---
 
 ## Retention

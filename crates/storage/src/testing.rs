@@ -29,6 +29,19 @@ impl SurrealScratch {
     /// `None` when `APOLLO_TEST_SURREAL_URL` isn't set, so the test can skip;
     /// a panic instead when `APOLLO_TEST_REQUIRE_SURREAL` is set.
     pub async fn create() -> Option<Self> {
+        let scratch = Self::create_empty().await?;
+        SurrealStorage::connect(&scratch.config)
+            .await
+            .expect("connecting to the test database")
+            .migrate()
+            .await
+            .expect("migrating the test database");
+        Some(scratch)
+    }
+
+    /// Like [`SurrealScratch::create`], without the schema: as a new
+    /// database is before the first instance starts on it.
+    pub async fn create_empty() -> Option<Self> {
         let Ok(url) = std::env::var("APOLLO_TEST_SURREAL_URL") else {
             assert!(
                 std::env::var_os("APOLLO_TEST_REQUIRE_SURREAL").is_none(),
@@ -86,9 +99,6 @@ impl SurrealScratch {
             .use_db(config.database.clone())
             .await
             .expect("selecting the test database");
-        retry(|| async { SurrealStorage::connect(&config).await?.migrate().await })
-            .await
-            .expect("migrating the test database");
         Some(Self { config, admin })
     }
 

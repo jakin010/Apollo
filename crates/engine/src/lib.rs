@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use apollo_config::Config;
 use apollo_domain::{Input, Item, Task};
-use apollo_storage::Storage;
+use apollo_storage::{Storage, StorageError};
 use tokio::sync::broadcast;
 
 mod aggregate;
@@ -272,6 +272,18 @@ impl Engine {
         base.join("uploads")
     }
 
+    /// Whether `path` is a file directly in [`Engine::upload_dir`], where the
+    /// server stages uploads. A task's upload path is read from the database,
+    /// which other instances (or anyone who can write to it) share, so a file
+    /// anywhere else is never read or removed.
+    pub(crate) fn is_staged_upload(&self, path: &std::path::Path) -> bool {
+        path.parent() == Some(self.upload_dir().as_path())
+            && matches!(
+                path.components().next_back(),
+                Some(std::path::Component::Normal(_))
+            )
+    }
+
     /// Create the upload directory if needed — owner-only (`0700`) on Unix — and
     /// return it.
     pub fn ensure_upload_dir(&self) -> std::io::Result<PathBuf> {
@@ -352,7 +364,12 @@ impl Engine {
         self.check_memory()?;
         let reservation = self.reserve(&models)?;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        // A keyed task's id comes from its key, so two instances sharing the
+        // database can't both store one: the second finds the first.
+        let id = match &submission.request_id {
+            Some(rid) => request_task_id(owner.as_deref(), rid),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
         let mut task = Task::new(
             id.clone(),
             vec![Item::new(submission.input, models, pipeline)],
@@ -370,17 +387,29 @@ impl Engine {
         let engine = self.clone();
         let stored = tokio::spawn(async move {
             let _serialized = serialized;
-            engine.inner.storage.create_task(&task).await?;
+            if task.request_id.is_some() {
+                // A keyed id comes back once retention has removed its task. A
+                // cancel signal this instance kept for that earlier task (one
+                // it didn't run) mustn't stop this one: nothing can cancel this
+                // one before it's stored.
+                engine.inner.cancels.lock().unwrap().remove(&task.id);
+            }
+            match engine.inner.storage.create_task(&task).await {
+                Ok(()) => {}
+                // Another instance stored this key's task after this one
+                // looked for it: that's the task.
+                Err(StorageError::TaskExists(_)) if task.request_id.is_some() => {
+                    return Ok(true);
+                }
+                Err(e) => return Err(e.into()),
+            }
             tracing::info!(task = %task.id, "task submitted");
             let runner = engine.clone();
             tokio::spawn(async move { runner.run_task(task, vec![reservation]).await });
-            Ok::<(), EngineError>(())
+            Ok::<bool, EngineError>(false)
         });
         match stored.await {
-            Ok(Ok(())) => Ok(Submitted {
-                id,
-                existing: false,
-            }),
+            Ok(Ok(existing)) => Ok(Submitted { id, existing }),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(EngineError::Join(e.to_string())),
         }
@@ -613,24 +642,25 @@ impl Engine {
         if aggregate::task_terminal(task.state) {
             return Ok(());
         }
-        // Set the signal, creating the token if run_task has not registered one
-        // yet (so a not-yet-started run picks it up via the same map entry).
-        {
+        // The token, created if run_task hasn't registered one yet, so a run
+        // that starts meanwhile shares it (its start write then sees the
+        // cancel, and sets it).
+        let token = {
             let mut map = self.inner.cancels.lock().unwrap();
-            let token = map
-                .entry(task_id.to_string())
+            map.entry(task_id.to_string())
                 .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                .clone();
-            token.store(true, Ordering::SeqCst);
-        }
-        // Items waiting for a slot stop waiting (and give back their place).
-        self.inner.cancelled.notify_waiters();
-        // Conditional write: if the task finished in the meantime it stays
-        // finished rather than being relabelled as cancelled.
+                .clone()
+        };
+        // The stored state first, so an item that stops on the signal rolls
+        // the task up as cancelled. Conditional: if the task finished in the
+        // meantime it stays finished rather than being relabelled as cancelled.
         if !self.inner.storage.cancel_task_if_active(task_id).await? {
             self.inner.cancels.lock().unwrap().remove(task_id);
             return Ok(());
         }
+        token.store(true, Ordering::SeqCst);
+        // Items waiting for a slot stop waiting (and give back their place).
+        self.inner.cancelled.notify_waiters();
         tracing::info!(task = %task_id, "task cancellation requested");
         Ok(())
     }
@@ -656,6 +686,28 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// The id of the task `owner` submits with `request_id`: a UUID made from a
+/// SHA-256 hash of both, the same on every instance.
+fn request_task_id(owner: Option<&str>, request_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"apollo task\0");
+    match owner {
+        Some(owner) => {
+            hash.update([1]);
+            hash.update((owner.len() as u64).to_be_bytes());
+            hash.update(owner.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+    hash.update(request_id.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash.finalize()[..16]);
+    uuid::Builder::from_custom_bytes(bytes)
+        .into_uuid()
+        .to_string()
 }
 
 /// Refuse an item when one of its `models` already has its own `max_pending`

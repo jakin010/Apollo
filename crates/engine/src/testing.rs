@@ -45,7 +45,7 @@ impl Storage for HeldCreate {
     async fn get_task(&self, id: &str) -> Result<Option<Task>, StorageError> {
         self.inner.get_task(id).await
     }
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<(), StorageError> {
+    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<bool, StorageError> {
         self.inner.set_task_state(id, state).await
     }
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool, StorageError> {
@@ -57,8 +57,19 @@ impl Storage for HeldCreate {
         item: usize,
         state: ItemState,
         error: Option<&apollo_domain::TaskError>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         self.inner.set_item_state(task_id, item, state, error).await
+    }
+    async fn set_item_failed(
+        &self,
+        task_id: &str,
+        item: usize,
+        error: &apollo_domain::TaskError,
+        models: &[String],
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .set_item_failed(task_id, item, error, models)
+            .await
     }
     async fn find_task_by_request(
         &self,

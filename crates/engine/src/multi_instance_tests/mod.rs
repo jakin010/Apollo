@@ -323,10 +323,12 @@ impl Drop for Instance {
 enum Call {
     CreateTask(String),
     GetTask(String),
-    SetTaskState(String, TaskState),
+    /// With whether it was written.
+    SetTaskState(String, TaskState, bool),
     /// With whether the task was still active.
     CancelIfActive(String, bool),
-    SetItemState(String, usize, ItemState),
+    /// With whether it was written.
+    SetItemState(String, usize, ItemState, bool),
     ModelResult(String, usize, String, ModelState),
     /// With the new count.
     IncrementAttempts(String, u32),
@@ -370,6 +372,20 @@ impl Log {
     /// Wait for a matching entry.
     async fn wait_for(&self, what: &str, f: impl Fn(&str, &Call) -> bool) {
         wait_until(what, || self.count(&f) > 0).await;
+    }
+
+    /// Once `who` has no item of `task` in flight: wait for the finished
+    /// webhook it owes, if it finished an item of `task` (another runner may
+    /// have finished them first).
+    async fn settled(&self, who: &'static str, task: &str) {
+        let finished_one = self.count(|w, c| {
+            w == who
+                && matches!(c, Call::SetItemState(id, _, state, true)
+                    if id == task && crate::aggregate::item_terminal(*state))
+        }) > 0;
+        if finished_one {
+            self.delivered(who, task).await;
+        }
     }
 
     /// Wait for `who`'s finished webhook for `task` to be marked delivered:
@@ -499,10 +515,12 @@ impl Storage for Probe {
         self.done(Call::GetTask(id.into()));
         r
     }
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<(), StorageError> {
-        let call = self.pass(Call::SetTaskState(id.into(), state)).await;
+    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<bool, StorageError> {
+        self.pass(Call::SetTaskState(id.into(), state, false)).await;
         let r = self.inner.set_task_state(id, state).await;
-        self.done(call);
+        if let Ok(written) = &r {
+            self.done(Call::SetTaskState(id.into(), state, *written));
+        }
         r
     }
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool, StorageError> {
@@ -519,12 +537,31 @@ impl Storage for Probe {
         item: usize,
         state: ItemState,
         error: Option<&apollo_domain::TaskError>,
-    ) -> Result<(), StorageError> {
-        let call = self
-            .pass(Call::SetItemState(task_id.into(), item, state))
+    ) -> Result<bool, StorageError> {
+        self.pass(Call::SetItemState(task_id.into(), item, state, false))
             .await;
         let r = self.inner.set_item_state(task_id, item, state, error).await;
-        self.done(call);
+        if let Ok(written) = &r {
+            self.done(Call::SetItemState(task_id.into(), item, state, *written));
+        }
+        r
+    }
+    async fn set_item_failed(
+        &self,
+        task_id: &str,
+        item: usize,
+        error: &apollo_domain::TaskError,
+        models: &[String],
+    ) -> Result<bool, StorageError> {
+        let call = |written| Call::SetItemState(task_id.into(), item, ItemState::Failed, written);
+        self.pass(call(false)).await;
+        let r = self
+            .inner
+            .set_item_failed(task_id, item, error, models)
+            .await;
+        if let Ok(written) = &r {
+            self.done(call(*written));
+        }
         r
     }
     async fn find_task_by_request(
@@ -977,4 +1014,34 @@ async fn instances_share_only_the_database() {
         assert_eq!(fleet.task(&t).await.state, TaskState::Processing);
     })
     .await;
+}
+
+/// Instances starting together on a new database all set its schema up:
+/// SurrealDB refuses some of their racing schema writes, which are retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn instances_starting_together_on_a_new_database_all_start() {
+    // A race, so it takes a few rounds to show.
+    for _ in 0..20 {
+        let Some(db) = SurrealScratch::create_empty().await else {
+            return;
+        };
+        let starts: Vec<_> = (0..8)
+            .map(|_| {
+                let config = db.config();
+                tokio::spawn(async move { SurrealStorage::connect(&config).await?.migrate().await })
+            })
+            .collect();
+        let mut failed = Vec::new();
+        for start in starts {
+            if let Err(e) = start.await.unwrap() {
+                failed.push(e.to_string());
+            }
+        }
+        db.remove().await;
+        assert!(
+            failed.is_empty(),
+            "{} of 8 instances failed to start: {failed:?}",
+            failed.len()
+        );
+    }
 }

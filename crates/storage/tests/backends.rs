@@ -16,7 +16,7 @@ use apollo_domain::{
     Classification, Input, Item, ItemState, ModelOutput, ModelResult, ModelState, Prediction,
     Sample, Task, TaskError, TaskState, Url,
 };
-use apollo_storage::{SqliteStorage, Storage, SurrealStorage, TaskQuery};
+use apollo_storage::{SqliteStorage, Storage, StorageError, SurrealStorage, TaskQuery};
 
 /// Real task ids are hyphenated UUIDs; one test task uses that shape.
 const UUID_ID: &str = "3f2a8c1e-9b4d-4e1a-8f00-0123456789ab";
@@ -226,33 +226,39 @@ async fn exercise(store: &dyn Storage) {
     let done = store.get_task("t1").await.unwrap().unwrap();
     assert_eq!(done.state, TaskState::Completed);
     let finished = done.finished_at.expect("a completed task is finished");
-    // A later write keeps the first finish time. Times are whole seconds, so wait
-    // past the next one for this to be able to fail.
+    // The first finish wins: a later write, finishing it again, otherwise or
+    // reopening it, changes nothing, and the first finish time stays. Times
+    // are whole seconds, so wait past the next one for this to be able to fail.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    store
-        .set_task_state("t1", TaskState::Completed)
-        .await
-        .unwrap();
+    for state in [
+        TaskState::Completed,
+        TaskState::Failed,
+        TaskState::Processing,
+    ] {
+        assert!(
+            !store.set_task_state("t1", state).await.unwrap(),
+            "{state:?} over a finished task"
+        );
+    }
+    let kept = store.get_task("t1").await.unwrap().unwrap();
     assert_eq!(
-        store.get_task("t1").await.unwrap().unwrap().finished_at,
-        Some(finished)
+        (kept.state, kept.finished_at),
+        (TaskState::Completed, Some(finished))
     );
-    // Reopening clears it; finishing again sets a new one.
-    store
-        .set_task_state("t1", TaskState::Processing)
-        .await
-        .unwrap();
-    assert_eq!(
-        store.get_task("t1").await.unwrap().unwrap().finished_at,
-        None
-    );
-    store
-        .set_task_state("t1", TaskState::Completed)
-        .await
-        .unwrap();
-    let refinished = store.get_task("t1").await.unwrap().unwrap().finished_at;
-    assert!(refinished.is_some_and(|t| t > finished));
     assert!(!store.cancel_task_if_active("missing").await.unwrap());
+    assert!(
+        !store
+            .set_task_state("missing", TaskState::Failed)
+            .await
+            .unwrap()
+    );
+
+    // A second task with a stored id is refused, and the first is kept.
+    match store.create_task(&sample_task("t1")).await {
+        Err(StorageError::TaskExists(id)) => assert_eq!(id, "t1"),
+        other => panic!("a duplicate create: {other:?}"),
+    }
+    assert_eq!(store.get_task("t1").await.unwrap().unwrap(), kept);
 
     // --- webhook delivery flag
     store
@@ -272,6 +278,24 @@ async fn exercise(store: &dyn Storage) {
     store.mark_webhook_delivered("t1", 0).await.unwrap();
     let pending = store.items_pending_webhook().await.unwrap();
     assert!(!pending.iter().any(|p| p.task_id == "t1"));
+    // A finished item keeps its state.
+    for state in [ItemState::Processing, ItemState::Failed] {
+        assert!(
+            !store.set_item_state("t1", 0, state, None).await.unwrap(),
+            "{state:?} over a finished item"
+        );
+    }
+    assert_eq!(
+        store.get_task("t1").await.unwrap().unwrap().items[0].state,
+        ItemState::Completed
+    );
+    assert!(
+        !store
+            .set_item_state("t1", 7, ItemState::Failed, None)
+            .await
+            .unwrap(),
+        "no such item"
+    );
     // Failed and cancelled items are pending too; queued and processing ones are
     // not. Compared as a set: the query has no defined order.
     // A kind other than the fallback's, so storing the message alone would fail.
@@ -455,6 +479,59 @@ async fn exercise(store: &dyn Storage) {
         "active tasks stay"
     );
     assert_eq!(store.purge_finished_before(now() + 10).await.unwrap(), 0);
+
+    // --- failing an item: the item and the listed models, in one write
+    store.create_task(&sample_task("f1")).await.unwrap();
+    let err = TaskError::fetch("unreachable");
+    let general = ["general".to_string()];
+    assert!(
+        store
+            .set_item_failed("f1", 0, &err, &general)
+            .await
+            .unwrap()
+    );
+    let f1 = store.get_task("f1").await.unwrap().unwrap();
+    assert_eq!(f1.items[0].state, ItemState::Failed);
+    assert_eq!(f1.items[0].error.as_ref(), Some(&err));
+    assert_eq!(f1.items[0].results["general"].state, ModelState::Failed);
+    assert_eq!(f1.items[0].results["general"].error.as_ref(), Some(&err));
+    assert_ne!(f1.items[0].results["nsfw"].state, ModelState::Failed);
+    // Once finished, nothing more is written.
+    let nsfw = ["nsfw".to_string()];
+    assert!(!store.set_item_failed("f1", 0, &err, &nsfw).await.unwrap());
+    assert_eq!(store.get_task("f1").await.unwrap().unwrap(), f1);
+    assert!(!store.set_item_failed("f1", 7, &err, &nsfw).await.unwrap());
+
+    // --- a retried item goes on, and finishes
+    store.create_task(&sample_task("r1")).await.unwrap();
+    for state in [
+        ItemState::Processing,
+        ItemState::Retrying,
+        ItemState::Processing,
+        ItemState::Retrying,
+        ItemState::Completed,
+    ] {
+        assert!(
+            store.set_item_state("r1", 0, state, None).await.unwrap(),
+            "{state:?}"
+        );
+    }
+
+    // --- two writers storing one id at the same moment: one stores it, the
+    // other is told it exists
+    for round in 0..5 {
+        let id = format!("dup{round}");
+        let task = sample_task(&id);
+        let (first, second) = tokio::join!(store.create_task(&task), store.create_task(&task));
+        let outcome = |r: Result<(), StorageError>| match r {
+            Ok(()) => "stored",
+            Err(StorageError::TaskExists(_)) => "exists",
+            Err(e) => panic!("{id}: {e}"),
+        };
+        let mut outcomes = [outcome(first), outcome(second)];
+        outcomes.sort();
+        assert_eq!(outcomes, ["exists", "stored"], "{id}");
+    }
 }
 
 #[tokio::test]

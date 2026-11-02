@@ -67,6 +67,25 @@ const SCHEMA: &str = "
     DEFINE INDEX IF NOT EXISTS frame_key ON TABLE frame FIELDS task_id, item_idx, label;
 ";
 
+/// Fail an item that hasn't finished, and the listed models with it, in one
+/// transaction; its last result (index 3, after BEGIN, LET and IF) says
+/// whether it did.
+const FAIL_ITEM: &str = "
+    BEGIN TRANSACTION;
+    LET $won = (UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error
+        WHERE state IN ['queued', 'processing', 'retrying'] RETURN VALUE state);
+    IF array::len($won) > 0 {
+        FOR $label IN $models {
+            UPSERT type::record('model_result', [$tid, $idx, $label]) SET
+                task_id = $tid, item_idx = $idx, label = $label,
+                state = $mstate, output_json = NONE, error = $error;
+        };
+        UPDATE type::record('task', $tid) SET updated_at = $ts;
+    };
+    array::len($won) > 0;
+    COMMIT TRANSACTION;
+";
+
 /// Persist a task, its items, and any pre-existing model results in one
 /// transaction. `FOR` loops keep the bound parameter set fixed regardless of how
 /// many items the task has.
@@ -148,7 +167,7 @@ struct PendingRow {
     idx: i64,
 }
 
-#[derive(SurrealValue)]
+#[derive(Clone, SurrealValue)]
 struct ItemInsert {
     idx: i64,
     input_json: String,
@@ -171,7 +190,7 @@ struct SampleInsert {
     class_json: String,
 }
 
-#[derive(SurrealValue)]
+#[derive(Clone, SurrealValue)]
 struct ModelInsert {
     item_idx: i64,
     label: String,
@@ -312,8 +331,27 @@ impl SurrealStorage {
 #[async_trait]
 impl Storage for SurrealStorage {
     async fn migrate(&self) -> Result<()> {
-        self.db.query(SCHEMA).await?.check()?;
-        Ok(())
+        // Instances starting together on a new database define the schema at
+        // the same moment, and SurrealDB refuses some of them with a write
+        // conflict: try again, a little later.
+        let mut tries = 0u64;
+        loop {
+            match self.db.query(SCHEMA).await.and_then(|r| r.check()) {
+                Ok(_) => return Ok(()),
+                Err(e) if tries < 8 && e.to_string().contains("conflict") => {
+                    tries += 1;
+                    let jitter = u64::from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .subsec_nanos()
+                            % 20,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20 * tries + jitter)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     async fn create_task(&self, task: &Task) -> Result<()> {
@@ -343,42 +381,67 @@ impl Storage for SurrealStorage {
             }
         }
 
-        self.db
-            .query(CREATE_TASK)
-            .bind(("tid", task.id.clone()))
-            .bind(("tstate", task.state.as_str().to_string()))
-            .bind(("owner", task.owner.clone()))
-            .bind(("metadata", crate::metadata_to_json(&task.metadata)?))
-            .bind(("rid", task.request_id.clone()))
-            .bind(("ts", ts))
-            .bind(("items", items))
-            .bind(("mrs", mrs))
-            .await?
-            .check()?;
-        Ok(())
+        let metadata = crate::metadata_to_json(&task.metadata)?;
+        let mut tries = 0;
+        loop {
+            let created = self
+                .db
+                .query(CREATE_TASK)
+                .bind(("tid", task.id.clone()))
+                .bind(("tstate", task.state.as_str().to_string()))
+                .bind(("owner", task.owner.clone()))
+                .bind(("metadata", metadata.clone()))
+                .bind(("rid", task.request_id.clone()))
+                .bind(("ts", ts))
+                .bind(("items", items.clone()))
+                .bind(("mrs", mrs.clone()))
+                .await
+                .and_then(|resp| resp.check());
+            let Err(e) = created else {
+                return Ok(());
+            };
+            // Another writer may have stored this id first: reported as
+            // "already exists", or, when the two writes overlapped, as a
+            // failed commit. Either way it rolled back; look.
+            let mut resp = self
+                .db
+                .query("SELECT VALUE key FROM ONLY type::record('task', $tid)")
+                .bind(("tid", task.id.clone()))
+                .await?;
+            let stored: Option<String> = resp.take(0)?;
+            if stored.is_some() {
+                return Err(StorageError::TaskExists(task.id.clone()));
+            }
+            // Not stored: a conflict with some other write; try again.
+            tries += 1;
+            if tries == 3 {
+                return Err(e.into());
+            }
+        }
     }
 
     async fn get_task(&self, id: &str) -> Result<Option<Task>> {
         self.load_task(id).await
     }
 
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<()> {
-        // A finished task keeps its first finish time.
+    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<bool> {
+        // Conditional on the current state, like `cancel_task_if_active`.
         let query = if crate::is_terminal(state) {
-            "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts,
-                finished_at = IF finished_at THEN finished_at ELSE $ts END"
+            "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts, finished_at = $ts
+             WHERE state IN ['queued', 'processing'] RETURN VALUE state"
         } else {
-            "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts,
-                finished_at = NONE"
+            "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts
+             WHERE state IN ['queued', 'processing'] RETURN VALUE state"
         };
-        self.db
+        let mut resp = self
+            .db
             .query(query)
             .bind(("tid", id.to_string()))
             .bind(("state", state.as_str().to_string()))
             .bind(("ts", now()))
-            .await?
-            .check()?;
-        Ok(())
+            .await?;
+        let vals: Vec<String> = resp.take(0)?;
+        Ok(!vals.is_empty())
     }
 
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool> {
@@ -406,16 +469,47 @@ impl Storage for SurrealStorage {
         item: usize,
         state: ItemState,
         error: Option<&TaskError>,
-    ) -> Result<()> {
-        self.db
-            .query("UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error")
+    ) -> Result<bool> {
+        let mut resp = self
+            .db
+            .query(
+                "UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error
+                 WHERE state IN ['queued', 'processing', 'retrying'] RETURN VALUE state",
+            )
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
             .bind(("state", state.as_str().to_string()))
             .bind(("error", crate::error_to_json(error)?))
+            .await?;
+        let vals: Vec<String> = resp.take(0)?;
+        if vals.is_empty() {
+            return Ok(false);
+        }
+        self.touch(task_id).await?;
+        Ok(true)
+    }
+
+    async fn set_item_failed(
+        &self,
+        task_id: &str,
+        item: usize,
+        error: &TaskError,
+        models: &[String],
+    ) -> Result<bool> {
+        let mut resp = self
+            .db
+            .query(FAIL_ITEM)
+            .bind(("tid", task_id.to_string()))
+            .bind(("idx", item as i64))
+            .bind(("state", ItemState::Failed.as_str().to_string()))
+            .bind(("mstate", ModelState::Failed.as_str().to_string()))
+            .bind(("error", crate::error_to_json(Some(error))?))
+            .bind(("models", models.to_vec()))
+            .bind(("ts", now()))
             .await?
             .check()?;
-        self.touch(task_id).await
+        let written: Option<bool> = resp.take(3)?;
+        Ok(written == Some(true))
     }
 
     async fn upsert_model_result(

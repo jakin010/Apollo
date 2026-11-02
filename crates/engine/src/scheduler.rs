@@ -231,13 +231,22 @@ impl Engine {
         };
         let mut permit = Some(granted);
 
-        if let Err(e) = self
+        match self
             .inner
             .storage
             .set_item_state(&task_id, idx, ItemState::Processing, None)
             .await
         {
-            tracing::error!(task = %task_id, item = idx, error = %e, "set item processing");
+            Ok(true) => {}
+            // It finished meanwhile: another runner (an instance that took
+            // the task over) ran it.
+            Ok(false) => {
+                tracing::info!(task = %task_id, item = idx, "item already finished; not running it");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(task = %task_id, item = idx, error = %e, "set item processing")
+            }
         }
         self.notify_item_change(&task_id, idx).await;
 
@@ -397,7 +406,7 @@ impl Engine {
     /// wire still reports the task as processing), notify, and back off. The
     /// concurrency slot is released during the backoff so a retrying item never
     /// blocks other work. Returns `false` if the task was cancelled meanwhile (the
-    /// item is then already marked cancelled).
+    /// item is then already marked cancelled), or the item finished elsewhere.
     #[allow(clippy::too_many_arguments)]
     async fn retry_after_failure(
         &self,
@@ -416,11 +425,14 @@ impl Engine {
             .storage
             .set_item_retries(task_id, idx, item.retries)
             .await;
-        let _ = self
+        if let Ok(false) = self
             .inner
             .storage
             .set_item_state(task_id, idx, ItemState::Retrying, Some(&err))
-            .await;
+            .await
+        {
+            return false;
+        }
         tracing::warn!(
             task = %task_id, item = idx, attempt = item.retries, max,
             error = %err.message, "item attempt failed; will retry"
@@ -444,12 +456,13 @@ impl Engine {
                 return false;
             }
         }
-        let _ = self
-            .inner
-            .storage
-            .set_item_state(task_id, idx, ItemState::Processing, None)
-            .await;
-        true
+        !matches!(
+            self.inner
+                .storage
+                .set_item_state(task_id, idx, ItemState::Processing, None)
+                .await,
+            Ok(false)
+        )
     }
 
     /// Run one model of a parallel set or pipeline step: content-cache fast
@@ -772,16 +785,48 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Persist an item's final `state`. `false` when it had already finished
+    /// (another runner finished it): its runner reports it, this one doesn't.
+    async fn finish_item(
+        &self,
+        task_id: &str,
+        idx: usize,
+        state: ItemState,
+        error: Option<&TaskError>,
+    ) -> bool {
+        match self
+            .inner
+            .storage
+            .set_item_state(task_id, idx, state, error)
+            .await
+        {
+            Ok(written) => {
+                if !written {
+                    tracing::info!(
+                        task = %task_id, item = idx, state = state.as_str(),
+                        "item already finished; not finishing it again"
+                    );
+                }
+                written
+            }
+            Err(e) => {
+                tracing::error!(
+                    task = %task_id, item = idx, state = state.as_str(), error = %e,
+                    "could not store the item's final state"
+                );
+                true
+            }
+        }
+    }
+
     /// Finalize an item as completed: persist the state, roll up the task, and
     /// fire the terminal webhook.
     async fn complete_item(&self, task_id: &str, idx: usize) {
-        if let Err(e) = self
-            .inner
-            .storage
-            .set_item_state(task_id, idx, ItemState::Completed, None)
+        if !self
+            .finish_item(task_id, idx, ItemState::Completed, None)
             .await
         {
-            tracing::error!(task = %task_id, item = idx, error = %e, "set item completed");
+            return;
         }
         self.inner.metrics.item_finished(ItemState::Completed);
         self.rollup_task_state(task_id).await;
@@ -840,45 +885,51 @@ impl Engine {
 
     /// Mark an item cancelled (preserving any results already produced), roll the
     /// task state up, and fire the terminal webhook.
-    async fn cancel_item(&self, task_id: &str, idx: usize) {
-        let _ = self
-            .inner
-            .storage
-            .set_item_state(
-                task_id,
-                idx,
-                ItemState::Cancelled,
-                Some(&TaskError::cancelled("cancelled")),
-            )
-            .await;
+    pub(crate) async fn cancel_item(&self, task_id: &str, idx: usize) {
+        let cancelled = TaskError::cancelled("cancelled");
+        if !self
+            .finish_item(task_id, idx, ItemState::Cancelled, Some(&cancelled))
+            .await
+        {
+            return;
+        }
         self.inner.metrics.item_finished(ItemState::Cancelled);
         self.rollup_task_state(task_id).await;
         self.deliver_webhook(task_id, idx).await;
     }
 
-    /// Mark the item (and its not-yet-done models) failed, then fire the webhook.
-    /// Preserves results from models that already finished on a prior run, and
-    /// the errors of models that already failed.
+    /// Mark the item (and its not-yet-done models) failed, in one write, then
+    /// fire the webhook. Preserves results from models that already finished on
+    /// a prior run, and the errors of models that already failed. If the item
+    /// finished meanwhile (elsewhere), nothing is written or reported.
     pub(crate) async fn fail_item(&self, task_id: &str, idx: usize, item: &Item, err: TaskError) {
-        for label in &item.models {
-            let failed = item
-                .results
-                .get(label)
-                .is_some_and(|r| r.state == ModelState::Failed);
-            if model_done(item, label) || failed {
-                continue;
-            }
-            let _ = self
-                .inner
-                .storage
-                .upsert_model_result(task_id, idx, label, &ModelResult::failed(err.clone()))
-                .await;
-        }
-        let _ = self
+        let models: Vec<String> = item
+            .models
+            .iter()
+            .filter(|label| {
+                let failed = item
+                    .results
+                    .get(*label)
+                    .is_some_and(|r| r.state == ModelState::Failed);
+                !model_done(item, label) && !failed
+            })
+            .cloned()
+            .collect();
+        match self
             .inner
             .storage
-            .set_item_state(task_id, idx, ItemState::Failed, Some(&err))
-            .await;
+            .set_item_failed(task_id, idx, &err, &models)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(task = %task_id, item = idx, "item already finished; not failing it");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(task = %task_id, item = idx, error = %e, "could not store the item's failure")
+            }
+        }
         self.inner.metrics.item_finished(ItemState::Failed);
         self.rollup_task_state(task_id).await;
         self.deliver_webhook(task_id, idx).await;
@@ -922,7 +973,9 @@ impl Engine {
     /// Best-effort removal of `Input::Bytes` upload files for a finished task.
     fn cleanup_uploads(&self, items: &[Item]) {
         for item in items {
-            if let Input::Bytes { path, .. } = &item.input {
+            if let Input::Bytes { path, .. } = &item.input
+                && self.is_staged_upload(path)
+            {
                 match std::fs::remove_file(path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1190,6 +1243,14 @@ impl Engine {
     /// Fetch the input once: download (with fallback), then decode an image or
     /// probe a video.
     async fn fetch_item(&self, input: &Input) -> Result<FetchedInput, EngineError> {
+        if let Input::Bytes { path, .. } = input
+            && !self.is_staged_upload(path)
+        {
+            return Err(EngineError::Media(MediaError::Refused(format!(
+                "{} is not an upload this server staged",
+                path.display()
+            ))));
+        }
         let want_hash = self.cache_enabled();
         let (media, video) = match input {
             Input::Image(url) => (self.fetch_url(url).await?, false),

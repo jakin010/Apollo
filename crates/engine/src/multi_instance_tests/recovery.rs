@@ -24,9 +24,9 @@ async fn a_starting_instance_reruns_a_task_another_is_running() {
         fleet.log.delivered("a", &t).await;
         if let Some(download) = download_b {
             download.reply(Reply::Garbage);
-            fleet.log.delivered("b", &t).await;
         }
         b.wait_idle().await;
+        fleet.log.settled("b", &t).await;
 
         assert_eq!(
             (resumed, origin.hits(), fleet.log.finished(&t).len()),
@@ -39,7 +39,6 @@ async fn a_starting_instance_reruns_a_task_another_is_running() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until conditional state writes (the start write only on an active task)"]
 async fn a_stale_start_undoes_a_cancel() {
     fleet_test(|fleet| async move {
         let origin = Origin::start();
@@ -67,12 +66,13 @@ async fn a_stale_start_undoes_a_cancel() {
         let after_b = fleet.task(&t).await;
 
         download_a.reply(Reply::Garbage);
-        fleet.log.delivered("a", &t).await;
+        a.wait_idle().await;
+        fleet.log.settled("a", &t).await;
         if let Some(download) = download_b {
             download.reply(Reply::Garbage);
-            fleet.log.delivered("b", &t).await;
         }
         b.wait_idle().await;
+        fleet.log.settled("b", &t).await;
         let end = fleet.task(&t).await;
 
         assert_eq!(
@@ -153,9 +153,9 @@ async fn nobody_takes_over_a_dead_instances_task() {
         let state = fleet.task(&t).await.state;
         if let Some(download) = taken {
             download.reply(Reply::Garbage);
-            fleet.log.delivered("b", &t).await;
         }
         b.wait_idle().await;
+        fleet.log.settled("b", &t).await;
 
         assert!(
             fleet.log.count(|who, _| who == "b") > 0 && finished(fleet.task(&t).await.state),
@@ -267,6 +267,48 @@ async fn a_starting_instance_counts_others_work_as_its_own() {
             room.is_ok(),
             "B refuses new work as if A's tasks were its own: {room:?}"
         );
+    })
+    .await;
+}
+
+/// Not ignored: the poison guard leaves a task cancelled meanwhile cancelled,
+/// with its items finished as cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_cancelled_while_failed_as_poison_ends_cancelled() {
+    fleet_test(|fleet| async move {
+        let a = fleet.start("a", NSFW).await;
+        let b = fleet.start("b", NSFW).await;
+        // A task that has used up its resume attempts.
+        let mut task = Task::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![apollo_domain::Item::new(
+                refused().input,
+                vec!["nsfw".into()],
+                None,
+            )],
+            None,
+        );
+        task.state = TaskState::Processing;
+        fleet.store.create_task(&task).await.unwrap();
+        for _ in 0..3 {
+            fleet.store.increment_attempts(&task.id).await.unwrap();
+        }
+
+        // B's start loads it; it's cancelled (through A) before B fails it.
+        let hold = b.hold_storage(1, |c| matches!(c, Call::IncrementAttempts(..)));
+        let starting = b.spawn(|e| async move { e.recover().await.unwrap() });
+        hold.entered("b counts the task's attempt").await;
+        a.cancel(&task.id).await;
+        hold.release();
+        assert_eq!(starting.await.unwrap(), 0, "failed as poison, not resumed");
+        fleet.log.settled("b", &task.id).await;
+
+        let end = fleet.task(&task.id).await;
+        assert_eq!(
+            (end.state, end.items[0].state),
+            (TaskState::Cancelled, ItemState::Cancelled)
+        );
+        assert_eq!(fleet.log.finished(&task.id), [("b", TaskState::Cancelled)]);
     })
     .await;
 }

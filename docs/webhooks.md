@@ -43,7 +43,7 @@ message Ack {}   // empty acknowledgement
 ## Delivery semantics
 
 - **One `FINISHED` event per task**, plus progress events on the way. Every `Classify` submits a single input, so a task finishes once.
-- **At‑least‑once.** Apollo persists a "delivered" flag and only sets it after a successful call, but a crash between finishing and the flag being set causes a redelivery. **Receivers must dedupe on `task.id`.**
+- **At‑least‑once.** Apollo persists a "delivered" flag and only sets it after a successful call, but a crash between finishing and the flag being set causes a redelivery. **Receivers must dedupe on `task.id`** (with `task.created_at` if clients reuse a `request_id` for longer than `[database].retention`: a key reused once its task is purged makes a new task with the same id).
 - **Retries on failure.** A failed `FINISHED` delivery is retried right away (three attempts in a few seconds), then by a background loop every `[webhook].redelivery_secs` seconds (default 60; `0` disables periodic retry), and on server **restart**, recovered from the persisted flag. `attempt` counts the attempts of the current round, so it starts again at 1 for each redelivery pass.
 - **Progress events are best‑effort** and may arrive after the task has finished; a progress event is dropped when the task has already finished by the time it is sent. Go by `task.state` (or `type`), not by arrival order.
 

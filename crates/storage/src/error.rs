@@ -11,6 +11,10 @@ pub enum StorageError {
     #[error("surrealdb error: {0}")]
     Surreal(String),
 
+    /// [`crate::Storage::create_task`]: a task with this id is already stored.
+    #[error("task '{0}' already exists")]
+    TaskExists(String),
+
     #[error("corrupt stored data: {0}")]
     Corrupt(String),
 

@@ -6,17 +6,16 @@ use super::*;
 use apollo_domain::{ErrorKind, Item};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until the task id comes from the request_id (a second create finds the \
-            first, also for tasks without an owner)"]
 async fn one_request_id_through_two_instances_makes_two_tasks() {
     fleet_test(|fleet| async move {
         let a = fleet.start("a", NSFW).await;
         let b = fleet.start("b", NSFW).await;
 
         /// Submit `owner`'s `request_id` through A, then (a client's retry)
-        /// through B while A is still storing the first try. Returns the
-        /// number of tasks with that key, whether the retry got the first
-        /// task, and whether it was flagged as existing.
+        /// through B while A is still storing the first try; then both
+        /// stores go ahead at once. Returns the number of tasks with that
+        /// key, whether both got the same task, and whether exactly one was
+        /// flagged as existing.
         async fn twice(
             fleet: &Fleet,
             a: &Instance,
@@ -36,16 +35,15 @@ async fn one_request_id_through_two_instances_makes_two_tasks() {
             store_a.entered("a stores the task").await;
             let retry = b.spawn(move |e| async move { e.submit(retry, owner_b).await });
             store_b.entered("b gets as far as storing a task").await;
+            // Both stores go ahead at once, so their writes overlap.
             store_a.release();
-            let first = first.await.unwrap().unwrap();
             store_b.release();
+            let first = first.await.unwrap().unwrap();
             let retry = retry.await.unwrap().unwrap();
             a.wait_idle().await;
             b.wait_idle().await;
-            fleet.log.delivered("a", &first.id).await;
-            if retry.id != first.id {
-                fleet.log.delivered("b", &retry.id).await;
-            }
+            fleet.log.settled("a", &first.id).await;
+            fleet.log.settled("b", &retry.id).await;
             let tasks = fleet
                 .tasks(None)
                 .await
@@ -54,7 +52,12 @@ async fn one_request_id_through_two_instances_makes_two_tasks() {
                     t.owner.as_deref() == owner && t.request_id.as_deref() == Some(request_id)
                 })
                 .count();
-            (tasks, retry.id == first.id, retry.existing)
+            // Either may have stored it; the other got it as existing.
+            (
+                tasks,
+                retry.id == first.id,
+                first.existing != retry.existing,
+            )
         }
 
         let alice = twice(&fleet, &a, &b, Some("alice"), "r").await;
@@ -63,8 +66,8 @@ async fn one_request_id_through_two_instances_makes_two_tasks() {
             [alice, nobody],
             [(1, true, true); 2],
             "the same request_id through two instances made separate tasks, for \
-             alice and for no owner: (tasks with the key, the retry got the first \
-             task, flagged existing)"
+             alice and for no owner: (tasks with the key, both got the same \
+             task, exactly one flagged existing)"
         );
     })
     .await;
@@ -121,11 +124,9 @@ async fn an_upload_to_a_dead_instance_fails_elsewhere_at_once() {
         let away = uploads.with_extension("elsewhere");
         std::fs::rename(&uploads, &away).unwrap();
         let b = fleet.start("b", NSFW).await;
-        let resumed = b.recover().await;
+        b.recover().await;
         b.wait_idle().await;
-        if resumed > 0 {
-            fleet.log.delivered("b", &t).await;
-        }
+        fleet.log.settled("b", &t).await;
         std::fs::rename(&away, &uploads).unwrap();
         let task = fleet.task(&t).await;
 
@@ -139,7 +140,6 @@ async fn an_upload_to_a_dead_instance_fails_elsewhere_at_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until upload paths are checked (only <upload_dir>/<uuid>.bin)"]
 async fn a_task_row_makes_an_instance_read_and_delete_any_file() {
     fleet_test(|fleet| async move {
         let lists = tempfile::tempdir().unwrap();
@@ -208,13 +208,11 @@ async fn an_instance_without_the_model_fails_a_task_it_takes_over() {
                 .reply(Reply::Bytes(ppm(16, 16, 1)));
         }
         b.wait_idle().await;
-        if resumed > 0 {
-            fleet.log.delivered("b", &t).await;
-        }
+        fleet.log.settled("b", &t).await;
         let task = fleet.task(&t).await;
 
         assert!(
-            !finished(task.state),
+            resumed == 0 && !finished(task.state),
             "B finished a task for a model it doesn't have: {:?}",
             task.items[0].results.get("special")
         );
@@ -274,8 +272,6 @@ async fn differently_configured_instances_share_cached_results() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until a watch re-reads the task now and then, within 4 s (changes \
-            elsewhere aren't announced)"]
 async fn a_wait_on_another_instance_misses_the_finish() {
     fleet_test(|fleet| async move {
         let origin = Origin::start();

@@ -298,7 +298,13 @@ impl Storage for SqliteStorage {
         .bind(crate::metadata_to_json(&task.metadata)?)
         .bind(task.request_id.as_deref())
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(d) if d.is_unique_violation() => {
+                StorageError::TaskExists(task.id.clone())
+            }
+            _ => e.into(),
+        })?;
 
         for (idx, item) in task.items.iter().enumerate() {
             let input_json = serde_json::to_string(&item.input)?;
@@ -346,22 +352,20 @@ impl Storage for SqliteStorage {
         self.load_task(id).await
     }
 
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<()> {
+    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<bool> {
         let ts = now();
         let finished = crate::is_terminal(state).then_some(ts);
-        sqlx::query(
-            "UPDATE tasks SET state = ?, updated_at = ?,
-                finished_at = CASE WHEN ? IS NULL THEN NULL ELSE COALESCE(finished_at, ?) END
-             WHERE id = ?",
+        let res = sqlx::query(
+            "UPDATE tasks SET state = ?, updated_at = ?, finished_at = ?
+             WHERE id = ? AND state IN ('queued', 'processing')",
         )
         .bind(state.as_str())
         .bind(ts)
         .bind(finished)
-        .bind(finished)
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool> {
@@ -465,15 +469,70 @@ impl Storage for SqliteStorage {
         item: usize,
         state: ItemState,
         error: Option<&TaskError>,
-    ) -> Result<()> {
-        sqlx::query("UPDATE items SET state = ?, error = ? WHERE task_id = ? AND idx = ?")
-            .bind(state.as_str())
-            .bind(crate::error_to_json(error)?)
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE items SET state = ?, error = ?
+             WHERE task_id = ? AND idx = ? AND state IN ('queued', 'processing', 'retrying')",
+        )
+        .bind(state.as_str())
+        .bind(crate::error_to_json(error)?)
+        .bind(task_id)
+        .bind(item as i64)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Ok(false);
+        }
+        self.touch(task_id).await?;
+        Ok(true)
+    }
+
+    async fn set_item_failed(
+        &self,
+        task_id: &str,
+        item: usize,
+        error: &TaskError,
+        models: &[String],
+    ) -> Result<bool> {
+        let error_json = crate::error_to_json(Some(error))?;
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query(
+            "UPDATE items SET state = ?, error = ?
+             WHERE task_id = ? AND idx = ? AND state IN ('queued', 'processing', 'retrying')",
+        )
+        .bind(ItemState::Failed.as_str())
+        .bind(&error_json)
+        .bind(task_id)
+        .bind(item as i64)
+        .execute(&mut *tx)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Ok(false); // dropping `tx` rolls it back
+        }
+        for label in models {
+            sqlx::query(
+                "INSERT INTO model_results (task_id, item_idx, label, state, output_json, error)
+                 VALUES (?, ?, ?, ?, NULL, ?)
+                 ON CONFLICT(task_id, item_idx, label) DO UPDATE SET
+                    state = excluded.state,
+                    output_json = excluded.output_json,
+                    error = excluded.error",
+            )
             .bind(task_id)
             .bind(item as i64)
-            .execute(&self.pool)
+            .bind(label)
+            .bind(ModelState::Failed.as_str())
+            .bind(&error_json)
+            .execute(&mut *tx)
             .await?;
-        self.touch(task_id).await
+        }
+        sqlx::query("UPDATE tasks SET updated_at = ? WHERE id = ?")
+            .bind(now())
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn upsert_model_result(
@@ -984,14 +1043,28 @@ mod tests {
         assert_eq!(t.state, TaskState::Cancelled);
 
         // A finished task is never flipped to cancelled.
-        store
-            .set_task_state("task-1", TaskState::Completed)
-            .await
-            .unwrap();
-        assert!(!store.cancel_task_if_active("task-1").await.unwrap());
-        let t = store.get_task("task-1").await.unwrap().unwrap();
+        let mut done = sample_task();
+        done.id = "task-2".into();
+        store.create_task(&done).await.unwrap();
+        assert!(
+            store
+                .set_task_state("task-2", TaskState::Completed)
+                .await
+                .unwrap()
+        );
+        assert!(!store.cancel_task_if_active("task-2").await.unwrap());
+        let t = store.get_task("task-2").await.unwrap().unwrap();
         assert_eq!(t.state, TaskState::Completed);
         assert!(!store.cancel_task_if_active("missing").await.unwrap());
+        // Nor is a cancelled one finished otherwise.
+        assert!(
+            !store
+                .set_task_state("task-1", TaskState::Completed)
+                .await
+                .unwrap()
+        );
+        let t = store.get_task("task-1").await.unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Cancelled);
 
         cleanup(&cfg);
     }

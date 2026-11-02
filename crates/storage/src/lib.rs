@@ -111,25 +111,45 @@ pub trait Storage: Send + Sync {
     // ----------------------------- lifecycle -----------------------------
 
     /// Persist a freshly submitted task (and its items) in one transaction.
+    /// Fails with [`StorageError::TaskExists`], writing nothing, when a task
+    /// with its id is already stored.
     async fn create_task(&self, task: &Task) -> Result<(), StorageError>;
 
     /// Load a full task, reconstructing per-model results. Backs `GetTask`.
     async fn get_task(&self, id: &str) -> Result<Option<Task>, StorageError>;
 
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<(), StorageError>;
+    /// Set the state of a task that is still `Queued` or `Processing`. A
+    /// finished task keeps its state, so the first finish wins over any later
+    /// write (from a stale runner, or another instance sharing the database).
+    /// Returns whether the state was written.
+    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<bool, StorageError>;
 
     /// Mark a task `Cancelled` only if it is still `Queued` or `Processing`, in
     /// one conditional write, so a cancel can never overwrite a task that has
     /// just finished. Returns whether the state changed.
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool, StorageError>;
 
+    /// Set the state (and error) of an item that hasn't finished. A completed,
+    /// failed or cancelled item keeps its state. Returns whether it was
+    /// written.
     async fn set_item_state(
         &self,
         task_id: &str,
         item: usize,
         state: ItemState,
         error: Option<&TaskError>,
-    ) -> Result<(), StorageError>;
+    ) -> Result<bool, StorageError>;
+
+    /// Fail an item that hasn't finished with `error`, and each of `models`
+    /// with it, in one transaction. Nothing is written when the item has
+    /// finished already. Returns whether it was written.
+    async fn set_item_failed(
+        &self,
+        task_id: &str,
+        item: usize,
+        error: &TaskError,
+        models: &[String],
+    ) -> Result<bool, StorageError>;
 
     /// The id of the task `owner` created with idempotency key `request_id`, if
     /// any (`owner` is `None` for tasks submitted without authentication).

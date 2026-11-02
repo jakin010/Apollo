@@ -65,10 +65,25 @@ impl Engine {
     /// unfinished item (so the wire reports an error and the webhook fires), and
     /// let the rollup remove its staged upload.
     async fn fail_poison_task(&self, task: &Task) -> Result<(), EngineError> {
-        self.inner
+        if !self
+            .inner
             .storage
             .set_task_state(&task.id, TaskState::Failed)
-            .await?;
+            .await?
+        {
+            // It finished meanwhile (elsewhere). If it was cancelled, its
+            // items still finish, as cancelled; otherwise they ended already.
+            if let Some(now) = self.inner.storage.get_task(&task.id).await?
+                && now.state == TaskState::Cancelled
+            {
+                for (idx, item) in now.items.iter().enumerate() {
+                    if !aggregate::item_terminal(item.state) {
+                        self.cancel_item(&task.id, idx).await;
+                    }
+                }
+            }
+            return Ok(());
+        }
         let err = TaskError::internal(format!(
             "task interrupted by {MAX_RESUME_ATTEMPTS} crashes; giving up"
         ));
@@ -80,6 +95,17 @@ impl Engine {
         // Covers a task whose items were all already terminal.
         self.rollup_task_state(&task.id).await;
         Ok(())
+    }
+
+    /// The task's stored state, if it can be read.
+    async fn stored_state(&self, task_id: &str) -> Option<TaskState> {
+        match self.inner.storage.get_task(task_id).await {
+            Ok(task) => task.map(|t| t.state),
+            Err(e) => {
+                tracing::warn!(task = %task_id, error = %e, "could not read the task");
+                None
+            }
+        }
     }
 
     /// Remove `ClassifyStream` upload files no longer referenced by any incomplete
@@ -137,17 +163,39 @@ impl Engine {
                 .clone()
         };
 
-        if !cancel.load(Ordering::SeqCst)
-            && let Err(e) = self
+        // Mark it processing, unless it has finished meanwhile (cancelled, or
+        // finished by another instance sharing the database): then there is
+        // nothing left to run. A cancel through this instance that lands
+        // meanwhile is still recorded, by the items at their first checkpoint.
+        if !cancel.load(Ordering::SeqCst) {
+            let started = self
                 .inner
                 .storage
                 .set_task_state(&task_id, TaskState::Processing)
-                .await
-        {
-            tracing::error!(task = %task_id, error = %e, "failed to mark task processing");
-            // Dropping `reservations` gives every item's back.
-            self.inner.cancels.lock().unwrap().remove(&task_id);
-            return;
+                .await;
+            let stop = match started {
+                Ok(true) => false,
+                Ok(false) if cancel.load(Ordering::SeqCst) => false,
+                // Cancelled through the database only (from another
+                // instance): the items still finish, as cancelled.
+                Ok(false) if self.stored_state(&task_id).await == Some(TaskState::Cancelled) => {
+                    cancel.store(true, Ordering::SeqCst);
+                    false
+                }
+                Ok(false) => {
+                    tracing::info!(task = %task_id, "task already finished; not running it");
+                    true
+                }
+                Err(e) => {
+                    tracing::error!(task = %task_id, error = %e, "failed to mark task processing");
+                    true
+                }
+            };
+            if stop {
+                // Dropping `reservations` gives every item's back.
+                self.inner.cancels.lock().unwrap().remove(&task_id);
+                return;
+            }
         }
 
         // The items run on the config in effect now, even if it is reloaded

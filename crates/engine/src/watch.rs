@@ -23,6 +23,9 @@ use crate::error::EngineError;
 /// watcher just reloads its task).
 pub(crate) const CHANGE_BUFFER: usize = 1024;
 
+/// How long a watch waits for an announcement before reading the task again.
+const REREAD: Duration = Duration::from_secs(2);
+
 /// A [`Storage`] that announces each changed task id on `changes`.
 pub(crate) struct Notifying {
     pub(crate) inner: Arc<dyn Storage>,
@@ -53,10 +56,12 @@ impl Storage for Notifying {
         self.inner.get_task(id).await
     }
 
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<(), StorageError> {
-        self.inner.set_task_state(id, state).await?;
-        self.changed(id);
-        Ok(())
+    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<bool, StorageError> {
+        let written = self.inner.set_task_state(id, state).await?;
+        if written {
+            self.changed(id);
+        }
+        Ok(written)
     }
 
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool, StorageError> {
@@ -73,12 +78,32 @@ impl Storage for Notifying {
         item: usize,
         state: ItemState,
         error: Option<&TaskError>,
-    ) -> Result<(), StorageError> {
-        self.inner
+    ) -> Result<bool, StorageError> {
+        let written = self
+            .inner
             .set_item_state(task_id, item, state, error)
             .await?;
-        self.changed(task_id);
-        Ok(())
+        if written {
+            self.changed(task_id);
+        }
+        Ok(written)
+    }
+
+    async fn set_item_failed(
+        &self,
+        task_id: &str,
+        item: usize,
+        error: &TaskError,
+        models: &[String],
+    ) -> Result<bool, StorageError> {
+        let written = self
+            .inner
+            .set_item_failed(task_id, item, error, models)
+            .await?;
+        if written {
+            self.changed(task_id);
+        }
+        Ok(written)
     }
 
     async fn find_task_by_request(
@@ -282,17 +307,20 @@ impl TaskWatch {
         }
     }
 
-    /// Wait until the task may have changed: its id is announced, or
-    /// announcements were missed.
+    /// Wait until the task may have changed: its id is announced,
+    /// announcements were missed, or [`REREAD`] has passed (another instance
+    /// sharing the database changes tasks without announcing it here).
     async fn changed(&mut self) {
+        let deadline = tokio::time::Instant::now() + REREAD;
         loop {
-            match self.changes.recv().await {
-                Ok(id) if *id == *self.id => return,
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(_)) => return,
+            match tokio::time::timeout_at(deadline, self.changes.recv()).await {
+                Err(_) => return,
+                Ok(Ok(id)) if *id == *self.id => return,
+                Ok(Ok(_)) => {}
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => return,
                 // No more announcements (cannot happen while the engine
                 // lives, since the watch holds it): reload once more, then end.
-                Err(broadcast::error::RecvError::Closed) => {
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
                     self.closed = true;
                     return;
                 }

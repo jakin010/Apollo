@@ -37,7 +37,7 @@ A validation failure returns `INVALID_ARGUMENT` and no task is created. On succe
 - with `wait_seconds = 0` (the default), as it is now (usually `QUEUED`);
 - otherwise once it finishes, or after `wait_seconds` with whatever state it reached by then. Either way you get a `Task` back; check `state`.
 
-**Idempotency:** with a `request_id`, submitting again with the same `request_id` (as the same caller) returns the existing task instead of creating a new one, whatever the new request contains. Use it to retry a `Classify` that timed out without risking a duplicate. Keys are scoped to the caller (token subject), so two callers can use the same key.
+**Idempotency:** with a `request_id`, submitting again with the same `request_id` (as the same caller) returns the existing task instead of creating a new one, whatever the new request contains. Use it to retry a `Classify` that timed out without risking a duplicate. Keys are scoped to the caller (token subject), so two callers can use the same key. The task's id is made from the caller and the key, so a retry through another instance sharing the database gets the same task. A key is remembered while its task is stored: once [retention](./database.md#retention) removes the task, the same key makes a new task, with the same id.
 
 **Inline content:** `media.data` carries the bytes themselves instead of a `url`. It is bounded by the gRPC message size (4 MiB by default) and by `[limits].max_download`; stream larger files with `ClassifyStream`. The server stages the bytes to a private upload file and removes it when the task finishes.
 
@@ -56,7 +56,7 @@ Returns the current `Task`. `view` picks the result detail: `SUMMARY` (the defau
 
 ### `WatchTask(WatchTaskRequest) → stream Task`
 
-Sends the task as it is now, then again each time it changes (it starts processing, a model finishes, a retry begins, …), and ends the stream after sending it `COMPLETED`, `FAILED` or `CANCELLED`. Updates may be coalesced: a burst of changes can arrive as one message carrying the latest state. Use it when you can't receive webhooks and don't want to poll. `view` works as for `GetTask`.
+Sends the task as it is now, then again each time it changes (it starts processing, a model finishes, a retry begins, …), and ends the stream after sending it `COMPLETED`, `FAILED` or `CANCELLED`. Updates may be coalesced: a burst of changes can arrive as one message carrying the latest state. A change made by another instance sharing the database shows up within about 2 seconds. Use it when you can't receive webhooks and don't want to poll. `view` works as for `GetTask`.
 
 ### `ListTasks(ListTasksRequest) → ListTasksResponse`
 

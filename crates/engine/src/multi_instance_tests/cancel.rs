@@ -45,14 +45,16 @@ async fn a_cancel_through_another_instance_doesnt_stop_the_task() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until conditional state writes (the first terminal state wins)"]
 async fn finishing_overwrites_a_cancel_from_another_instance() {
     fleet_test(|fleet| async move {
         let a = fleet.start("a", NSFW).await;
         let b = fleet.start("b", NSFW).await;
         // A's item has failed; A has read the task to roll it up, and is about
         // to write it failed.
-        let hold = a.hold_storage(1, |c| matches!(c, Call::SetTaskState(_, s) if finished(*s)));
+        let hold = a.hold_storage(
+            1,
+            |c| matches!(c, Call::SetTaskState(_, s, _) if finished(*s)),
+        );
         let t = a.submit(refused()).await.id;
         hold.entered("a marks the task failed").await;
 
@@ -72,7 +74,6 @@ async fn finishing_overwrites_a_cancel_from_another_instance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until conditional state writes (a finished item stays finished)"]
 async fn a_second_runner_overwrites_a_finished_result() {
     fleet_test(|fleet| async move {
         let url = "file:///nonexistent/apollo-test.png";
