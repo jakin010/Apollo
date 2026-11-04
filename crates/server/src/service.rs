@@ -572,27 +572,62 @@ pub async fn serve_with_shutdown<F>(
 where
     F: Future<Output = ()>,
 {
+    router(engine, addr, auth, tls.as_ref())
+        .await?
+        .serve_with_shutdown(addr, shutdown)
+        .await
+}
+
+/// [`serve_with_shutdown`] on a listener the caller has bound already (so a
+/// taken port fails the start before anything else happens).
+pub async fn serve_on<F>(
+    engine: Engine,
+    listener: tokio::net::TcpListener,
+    shutdown: F,
+    auth: AuthInterceptor,
+    tls: Option<TlsSettings>,
+) -> Result<(), tonic::transport::Error>
+where
+    F: Future<Output = ()>,
+{
+    let addr = listener
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+    router(engine, addr, auth, tls.as_ref())
+        .await?
+        .serve_with_incoming_shutdown(
+            tonic::transport::server::TcpIncoming::from(listener),
+            shutdown,
+        )
+        .await
+}
+
+/// The services, ready to serve on `addr`.
+async fn router(
+    engine: Engine,
+    addr: SocketAddr,
+    auth: AuthInterceptor,
+    tls: Option<&TlsSettings>,
+) -> Result<tonic::transport::server::Router, tonic::transport::Error> {
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<InferenceServer<InferenceService>>()
         .await;
     let mut builder = Server::builder();
-    if let Some(tls) = &tls {
+    if let Some(tls) = tls {
         install_crypto_provider();
         builder = builder.tls_config(tls.server_config())?;
     }
     tracing::info!(
         %addr,
         tls = tls.is_some(),
-        mutual_tls = tls.as_ref().is_some_and(|t| t.client_ca_pem.is_some()),
+        mutual_tls = tls.is_some_and(|t| t.client_ca_pem.is_some()),
         "serving Inference gRPC (reflection + health enabled)"
     );
-    builder
+    Ok(builder
         .add_service(inference_service(engine, auth))
         .add_service(reflection_service())
-        .add_service(health_service)
-        .serve_with_shutdown(addr, shutdown)
-        .await
+        .add_service(health_service))
 }
 
 #[cfg(test)]
@@ -673,11 +708,11 @@ mod tests {
         let f = fixture().await;
         let svc = InferenceService::new(f.engine.clone());
         f.storage
-            .create_task(&stored_task("alice-task", Some("alice")))
+            .create_task(&stored_task("alice-task", Some("alice")), None, None)
             .await
             .unwrap();
         f.storage
-            .create_task(&stored_task("anon-task", None))
+            .create_task(&stored_task("anon-task", None), None, None)
             .await
             .unwrap();
 
@@ -1020,7 +1055,7 @@ mod tests {
         let mut earlier = stored_task("earlier", Some("alice"));
         earlier.request_id = Some("upload-42".into());
         earlier.metadata = [("ref".to_string(), "42".to_string())].into();
-        f.storage.create_task(&earlier).await.unwrap();
+        f.storage.create_task(&earlier, None, None).await.unwrap();
 
         let task = svc
             .classify(as_caller(
@@ -1055,7 +1090,7 @@ mod tests {
         let svc = InferenceService::new(f.engine.clone());
         for (id, owner) in [("a1", "alice"), ("a2", "alice"), ("b1", "bob")] {
             f.storage
-                .create_task(&stored_task(id, Some(owner)))
+                .create_task(&stored_task(id, Some(owner)), None, None)
                 .await
                 .unwrap();
         }
@@ -1110,7 +1145,7 @@ mod tests {
         let f = fixture().await;
         let svc = InferenceService::new(f.engine.clone());
         f.storage
-            .create_task(&stored_task("w", Some("alice")))
+            .create_task(&stored_task("w", Some("alice")), None, None)
             .await
             .unwrap();
         let watch = |subject| {

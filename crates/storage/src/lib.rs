@@ -14,6 +14,7 @@ use apollo_domain::{ItemState, ModelOutput, ModelResult, Sample, Task, TaskError
 
 pub mod backends;
 pub mod error;
+pub mod lease;
 pub mod resume;
 pub mod retention;
 #[cfg(feature = "test-util")]
@@ -21,6 +22,7 @@ pub mod testing;
 
 pub use backends::{SqliteStorage, SurrealStorage};
 pub use error::StorageError;
+pub use lease::{ClaimMode, Claimable, Fence, Held, Lease, Renewal};
 
 /// Serialize a task error to the JSON stored in an `error` column.
 fn error_to_json(error: Option<&TaskError>) -> Result<Option<String>, StorageError> {
@@ -110,45 +112,58 @@ pub trait Storage: Send + Sync {
 
     // ----------------------------- lifecycle -----------------------------
 
-    /// Persist a freshly submitted task (and its items) in one transaction.
-    /// Fails with [`StorageError::TaskExists`], writing nothing, when a task
-    /// with its id is already stored.
-    async fn create_task(&self, task: &Task) -> Result<(), StorageError>;
+    /// Persist a freshly submitted task (and its items) in one transaction,
+    /// claimed by `lease` when given, and pinned to `pin` (the node its input
+    /// is local to) when given. Fails with [`StorageError::TaskExists`],
+    /// writing nothing, when a task with its id is already stored.
+    async fn create_task(
+        &self,
+        task: &Task,
+        lease: Option<&Lease<'_>>,
+        pin: Option<&str>,
+    ) -> Result<(), StorageError>;
 
     /// Load a full task, reconstructing per-model results. Backs `GetTask`.
     async fn get_task(&self, id: &str) -> Result<Option<Task>, StorageError>;
 
-    /// Set the state of a task that is still `Queued` or `Processing`. A
-    /// finished task keeps its state, so the first finish wins over any later
-    /// write (from a stale runner, or another instance sharing the database).
-    /// Returns whether the state was written.
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<bool, StorageError>;
+    /// Set the state of a task that is still `Queued` or `Processing`, and
+    /// still claimed as `fence` says. A finished task keeps its state, so the
+    /// first finish wins over any later write (from a stale runner, or another
+    /// instance sharing the database). Returns whether the state was written.
+    async fn set_task_state(
+        &self,
+        id: &str,
+        state: TaskState,
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError>;
 
     /// Mark a task `Cancelled` only if it is still `Queued` or `Processing`, in
     /// one conditional write, so a cancel can never overwrite a task that has
     /// just finished. Returns whether the state changed.
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool, StorageError>;
 
-    /// Set the state (and error) of an item that hasn't finished. A completed,
-    /// failed or cancelled item keeps its state. Returns whether it was
-    /// written.
+    /// Set the state (and error) of an item that hasn't finished, while its
+    /// task is claimed as `fence` says. A completed, failed or cancelled item
+    /// keeps its state. Returns whether it was written.
     async fn set_item_state(
         &self,
         task_id: &str,
         item: usize,
         state: ItemState,
         error: Option<&TaskError>,
+        fence: Fence<'_>,
     ) -> Result<bool, StorageError>;
 
     /// Fail an item that hasn't finished with `error`, and each of `models`
-    /// with it, in one transaction. Nothing is written when the item has
-    /// finished already. Returns whether it was written.
+    /// with it, in one transaction, while its task is claimed as `fence` says.
+    /// Nothing is written otherwise. Returns whether it was written.
     async fn set_item_failed(
         &self,
         task_id: &str,
         item: usize,
         error: &TaskError,
         models: &[String],
+        fence: Fence<'_>,
     ) -> Result<bool, StorageError>;
 
     /// The id of the task `owner` created with idempotency key `request_id`, if
@@ -163,15 +178,17 @@ pub trait Storage: Send + Sync {
     /// id). Backs `ListTasks`.
     async fn list_tasks(&self, query: &TaskQuery) -> Result<TaskPage, StorageError>;
 
-    /// Insert or update the result for one (item, model). Leaves frame progress
-    /// and the steps-completed marker untouched.
+    /// Insert or update the result for one (item, model), while its task is
+    /// claimed as `fence` says. Leaves frame progress and the steps-completed
+    /// marker untouched. Returns whether it was written.
     async fn upsert_model_result(
         &self,
         task_id: &str,
         item: usize,
         label: &str,
         result: &ModelResult,
-    ) -> Result<(), StorageError>;
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError>;
 
     // ------------------------- scan checkpoint --------------------------
 
@@ -219,18 +236,61 @@ pub trait Storage: Send + Sync {
     /// `apollo status`.
     async fn count_tasks_by_state(&self) -> Result<Vec<(TaskState, u64)>, StorageError>;
 
-    /// All tasks still in a non-terminal state, fully reconstructed, for
-    /// re-queueing on startup.
+    /// All tasks still in a non-terminal state, fully reconstructed (the
+    /// upload sweep keeps their files).
     async fn load_incomplete_tasks(&self) -> Result<Vec<Task>, StorageError>;
 
-    /// Bump and return the resume attempt count. The engine fails a task once
-    /// this exceeds its cap, so a poison task can't crash-loop.
+    /// Bump and return the resume attempt count. [`Storage::claim_task`] bumps
+    /// it itself; this is for tools and tests.
     async fn increment_attempts(&self, id: &str) -> Result<u32, StorageError>;
 
-    /// Undo one resume attempt for every incomplete task (never below zero).
-    /// Called on a graceful shutdown, so that only interruptions by a crash count
-    /// toward the poison-task cap. Returns the number of tasks adjusted.
-    async fn release_resume_attempts(&self) -> Result<u64, StorageError>;
+    // ------------------------------- leases ------------------------------
+
+    /// Whether other processes may share this database (SurrealDB): then
+    /// leases decide who runs what. SQLite is one process's file.
+    fn shared(&self) -> bool;
+
+    /// Tasks a claim in `mode` may take, oldest first (creation time, then
+    /// id), after `after`: unfinished ones, and cancelled ones with unfinished
+    /// items (to finish them, as cancelled). Leaves out the ids in `skip`, and
+    /// (except in [`ClaimMode::Force`]) tasks pinned to a node other than
+    /// `node` whose lease ended less than `grace` ago.
+    async fn claimable_tasks(
+        &self,
+        mode: ClaimMode,
+        node: &str,
+        skip: &[String],
+        grace: std::time::Duration,
+        after: Option<&TaskCursor>,
+        limit: usize,
+    ) -> Result<Vec<Claimable>, StorageError>;
+
+    /// Claim the task `id` with `lease`, if it is still claimable as for
+    /// [`Storage::claimable_tasks`]. Bumps its resume attempts when the claim
+    /// it replaces was never handed back (its holder stopped: a crash), not
+    /// when it was released or never claimed. Returns the attempts after the
+    /// claim, or `None` when it wasn't claimable any more.
+    async fn claim_task(
+        &self,
+        id: &str,
+        lease: &Lease<'_>,
+        mode: ClaimMode,
+        grace: std::time::Duration,
+    ) -> Result<Option<u32>, StorageError>;
+
+    /// Renew each held claim for `ttl`, whatever its task's state, and say for
+    /// each (in order) whether it is still held. Doesn't count as a change to
+    /// the task.
+    async fn renew_claims(
+        &self,
+        held: &[Held],
+        ttl: std::time::Duration,
+    ) -> Result<Vec<Renewal>, StorageError>;
+
+    /// Hand held claims back (a graceful stop): the tasks are claimable at
+    /// once, and the next claim counts no attempt. Returns how many were
+    /// still held.
+    async fn release_claims(&self, held: &[Held]) -> Result<u64, StorageError>;
 
     // -------------------------- webhook delivery -------------------------
 
@@ -240,13 +300,16 @@ pub trait Storage: Send + Sync {
 
     async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError>;
 
-    /// Persist an item's retry count (compared against `[app].max_retries`).
+    /// Persist an item's retry count (compared against `[app].max_retries`),
+    /// while its task is claimed as `fence` says. Returns whether it was
+    /// written.
     async fn set_item_retries(
         &self,
         task_id: &str,
         item: usize,
         retries: u32,
-    ) -> Result<(), StorageError>;
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError>;
 
     // ------------------------------ retention ----------------------------
 

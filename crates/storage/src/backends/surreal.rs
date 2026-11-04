@@ -22,6 +22,8 @@
 //! `testing.rs` and `tests/backends.rs`). Moving to another version means bumping
 //! the version literal and revisiting only those.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
@@ -37,7 +39,14 @@ use apollo_domain::{
 use crate::error::StorageError;
 use crate::now;
 use crate::resume::PendingWebhook;
-use crate::{Storage, TaskCursor, TaskPage, TaskQuery};
+use crate::{
+    ClaimMode, Claimable, Fence, Held, Lease, Renewal, Storage, TaskCursor, TaskPage, TaskQuery,
+};
+
+/// Who holds a claim, for operators: `<node>/<process>`.
+fn holder(lease: &Lease<'_>) -> String {
+    format!("{}/{}", lease.node, lease.process)
+}
 
 type Result<T> = std::result::Result<T, StorageError>;
 
@@ -67,24 +76,99 @@ const SCHEMA: &str = "
     DEFINE INDEX IF NOT EXISTS frame_key ON TABLE frame FIELDS task_id, item_idx, label;
 ";
 
-/// Fail an item that hasn't finished, and the listed models with it, in one
-/// transaction; its last result (index 3, after BEGIN, LET and IF) says
-/// whether it did.
-const FAIL_ITEM: &str = "
-    BEGIN TRANSACTION;
-    LET $won = (UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error
-        WHERE state IN ['queued', 'processing', 'retrying'] RETURN VALUE state);
-    IF array::len($won) > 0 {
-        FOR $label IN $models {
-            UPSERT type::record('model_result', [$tid, $idx, $label]) SET
-                task_id = $tid, item_idx = $idx, label = $label,
-                state = $mstate, output_json = NONE, error = $error;
-        };
-        UPDATE type::record('task', $tid) SET updated_at = $ts;
+/// A runner's fence: no fence, or the task's claim is still the token.
+///
+/// A fenced write is one statement (an `IF` block), which SurrealDB runs as one
+/// transaction and re-runs itself on a write conflict. It also writes the task
+/// row (its `updated_at`), so it conflicts with a takeover's claim of that row:
+/// a stale runner's write and the new claim can't both commit.
+macro_rules! held {
+    () => {
+        "$fence = NONE OR (SELECT VALUE claim FROM ONLY type::record('task', $tid)) = $fence"
     };
-    array::len($won) > 0;
-    COMMIT TRANSACTION;
-";
+}
+
+/// Set an unfinished item's state while the fence holds; returns whether it
+/// did.
+const SET_ITEM_STATE: &str = concat!(
+    "IF ",
+    held!(),
+    " {
+        LET $won = (UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error
+            WHERE state IN ['queued', 'processing', 'retrying'] RETURN VALUE state);
+        IF array::len($won) > 0 { UPDATE type::record('task', $tid) SET updated_at = $ts; };
+        array::len($won) > 0
+    } ELSE { false }"
+);
+
+/// Fail an unfinished item, and the listed models with it, while the fence
+/// holds; returns whether it did.
+const FAIL_ITEM: &str = concat!(
+    "IF ",
+    held!(),
+    " {
+        LET $won = (UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error
+            WHERE state IN ['queued', 'processing', 'retrying'] RETURN VALUE state);
+        IF array::len($won) > 0 {
+            FOR $label IN $models {
+                UPSERT type::record('model_result', [$tid, $idx, $label]) SET
+                    task_id = $tid, item_idx = $idx, label = $label,
+                    state = $mstate, output_json = NONE, error = $error;
+            };
+            UPDATE type::record('task', $tid) SET updated_at = $ts;
+        };
+        array::len($won) > 0
+    } ELSE { false }"
+);
+
+/// Insert or update a model result while the fence holds. UPSERT only touches
+/// the listed fields, so the `steps_completed` marker and the frame rows are
+/// left intact.
+const UPSERT_RESULT: &str = concat!(
+    "IF ",
+    held!(),
+    " {
+        UPSERT type::record('model_result', [$tid, $idx, $label]) SET
+            task_id = $tid, item_idx = $idx, label = $label,
+            state = $state, output_json = $output, error = $error;
+        UPDATE type::record('task', $tid) SET updated_at = $ts;
+        true
+    } ELSE { false }"
+);
+
+/// Set an item's retry count while the fence holds.
+const SET_RETRIES: &str = concat!(
+    "IF ",
+    held!(),
+    " {
+        LET $set = (UPDATE type::record('item', [$tid, $idx]) SET retries = $retries RETURN VALUE retries);
+        IF array::len($set) > 0 { UPDATE type::record('task', $tid) SET updated_at = $ts; };
+        array::len($set) > 0
+    } ELSE { false }"
+);
+
+/// Claimable states: unfinished, or cancelled with unfinished items (`$tid`'s,
+/// for a claim of one task).
+const CLAIMABLE_STATE: &str = "(state IN ['queued', 'processing']
+    OR (state = 'cancelled' AND array::len((SELECT VALUE idx FROM item
+        WHERE task_id = $tid AND state IN ['queued', 'processing', 'retrying'] LIMIT 1)) > 0))";
+
+/// Pinned to another node, and that node's lease ended less than `$grace`
+/// ago: not claimable, unless it's cancelled (finishing it reads no input).
+const PIN_OPEN: &str = "(state = 'cancelled' OR pin = NONE OR pin = $node
+    OR (lease_until != NONE AND lease_until < time::now() - $grace))";
+
+/// The lease condition for `mode`. A missing `lease_until` is guarded
+/// explicitly: `NONE < time::now()` is true.
+fn lease_open(mode: ClaimMode) -> &'static str {
+    match mode {
+        ClaimMode::Force => "true",
+        ClaimMode::Open => "claim = NONE",
+        ClaimMode::Expired => {
+            "(claim = NONE OR (lease_until != NONE AND lease_until < time::now()))"
+        }
+    }
+}
 
 /// Persist a task, its items, and any pre-existing model results in one
 /// transaction. `FOR` loops keep the bound parameter set fixed regardless of how
@@ -93,7 +177,9 @@ const CREATE_TASK: &str = "
     BEGIN TRANSACTION;
     CREATE type::record('task', $tid) SET
         key = $tid, state = $tstate, attempts = 0, created_at = $ts, updated_at = $ts,
-        owner = $owner, metadata_json = $metadata, request_id = $rid;
+        owner = $owner, metadata_json = $metadata, request_id = $rid,
+        claim = $claim, claimed_by = $holder, pin = $pin,
+        lease_until = IF $claim = NONE THEN NONE ELSE time::now() + $ttl END;
     FOR $it IN $items {
         CREATE type::record('item', [$tid, $it.idx]) SET
             task_id = $tid, idx = $it.idx, input_json = $it.input_json,
@@ -162,6 +248,16 @@ struct StepsRow {
 }
 
 #[derive(SurrealValue)]
+struct ClaimableRow {
+    key: String,
+    state: String,
+    created_at: i64,
+    abandoned_pin: Option<String>,
+    pinned_here: bool,
+    stale: bool,
+}
+
+#[derive(SurrealValue)]
 struct PendingRow {
     task_id: String,
     idx: i64,
@@ -222,17 +318,6 @@ impl SurrealStorage {
             .use_db(cfg.database.clone())
             .await?;
         Ok(Self { db })
-    }
-
-    /// Bump a task's `updated_at` (retention and recency tracking).
-    async fn touch(&self, id: &str) -> Result<()> {
-        self.db
-            .query("UPDATE type::record('task', $tid) SET updated_at = $ts")
-            .bind(("tid", id.to_string()))
-            .bind(("ts", now()))
-            .await?
-            .check()?;
-        Ok(())
     }
 
     /// Shared reconstruction used by `get_task` and `load_incomplete_tasks`.
@@ -354,7 +439,12 @@ impl Storage for SurrealStorage {
         }
     }
 
-    async fn create_task(&self, task: &Task) -> Result<()> {
+    async fn create_task(
+        &self,
+        task: &Task,
+        lease: Option<&Lease<'_>>,
+        pin: Option<&str>,
+    ) -> Result<()> {
         let ts = now();
         let mut items = Vec::with_capacity(task.items.len());
         let mut mrs = Vec::new();
@@ -395,6 +485,10 @@ impl Storage for SurrealStorage {
                 .bind(("ts", ts))
                 .bind(("items", items.clone()))
                 .bind(("mrs", mrs.clone()))
+                .bind(("claim", lease.map(|l| l.token.to_string())))
+                .bind(("holder", lease.map(holder)))
+                .bind(("ttl", lease.map_or(Duration::ZERO, |l| l.ttl)))
+                .bind(("pin", pin.map(str::to_string)))
                 .await
                 .and_then(|resp| resp.check());
             let Err(e) = created else {
@@ -412,11 +506,20 @@ impl Storage for SurrealStorage {
             if stored.is_some() {
                 return Err(StorageError::TaskExists(task.id.clone()));
             }
-            // Not stored: a conflict with some other write; try again.
+            // Not stored: a conflict with some other write; try again, a
+            // little later each time (writers racing in lockstep drift apart).
             tries += 1;
-            if tries == 3 {
+            if tries == 6 {
                 return Err(e.into());
             }
+            let jitter = u64::from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos()
+                    % 20,
+            );
+            tokio::time::sleep(Duration::from_millis(20 * tries + jitter)).await;
         }
     }
 
@@ -424,14 +527,17 @@ impl Storage for SurrealStorage {
         self.load_task(id).await
     }
 
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<bool> {
-        // Conditional on the current state, like `cancel_task_if_active`.
+    async fn set_task_state(&self, id: &str, state: TaskState, fence: Fence<'_>) -> Result<bool> {
+        // Conditional on the current state, like `cancel_task_if_active`, and
+        // on the claim.
         let query = if crate::is_terminal(state) {
             "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts, finished_at = $ts
-             WHERE state IN ['queued', 'processing'] RETURN VALUE state"
+             WHERE state IN ['queued', 'processing'] AND ($fence = NONE OR claim = $fence)
+             RETURN VALUE state"
         } else {
             "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts
-             WHERE state IN ['queued', 'processing'] RETURN VALUE state"
+             WHERE state IN ['queued', 'processing'] AND ($fence = NONE OR claim = $fence)
+             RETURN VALUE state"
         };
         let mut resp = self
             .db
@@ -439,6 +545,7 @@ impl Storage for SurrealStorage {
             .bind(("tid", id.to_string()))
             .bind(("state", state.as_str().to_string()))
             .bind(("ts", now()))
+            .bind(("fence", fence.token().map(str::to_string)))
             .await?;
         let vals: Vec<String> = resp.take(0)?;
         Ok(!vals.is_empty())
@@ -469,24 +576,20 @@ impl Storage for SurrealStorage {
         item: usize,
         state: ItemState,
         error: Option<&TaskError>,
+        fence: Fence<'_>,
     ) -> Result<bool> {
         let mut resp = self
             .db
-            .query(
-                "UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error
-                 WHERE state IN ['queued', 'processing', 'retrying'] RETURN VALUE state",
-            )
+            .query(SET_ITEM_STATE)
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
             .bind(("state", state.as_str().to_string()))
             .bind(("error", crate::error_to_json(error)?))
+            .bind(("fence", fence.token().map(str::to_string)))
+            .bind(("ts", now()))
             .await?;
-        let vals: Vec<String> = resp.take(0)?;
-        if vals.is_empty() {
-            return Ok(false);
-        }
-        self.touch(task_id).await?;
-        Ok(true)
+        let written: Option<bool> = resp.take(0)?;
+        Ok(written == Some(true))
     }
 
     async fn set_item_failed(
@@ -495,6 +598,7 @@ impl Storage for SurrealStorage {
         item: usize,
         error: &TaskError,
         models: &[String],
+        fence: Fence<'_>,
     ) -> Result<bool> {
         let mut resp = self
             .db
@@ -505,10 +609,10 @@ impl Storage for SurrealStorage {
             .bind(("mstate", ModelState::Failed.as_str().to_string()))
             .bind(("error", crate::error_to_json(Some(error))?))
             .bind(("models", models.to_vec()))
+            .bind(("fence", fence.token().map(str::to_string)))
             .bind(("ts", now()))
-            .await?
-            .check()?;
-        let written: Option<bool> = resp.take(3)?;
+            .await?;
+        let written: Option<bool> = resp.take(0)?;
         Ok(written == Some(true))
     }
 
@@ -518,28 +622,26 @@ impl Storage for SurrealStorage {
         item: usize,
         label: &str,
         result: &ModelResult,
-    ) -> Result<()> {
+        fence: Fence<'_>,
+    ) -> Result<bool> {
         let output_json = match &result.output {
             Some(o) => Some(serde_json::to_string(o)?),
             None => None,
         };
-        // UPSERT only touches the listed fields, so a concurrent `steps_completed`
-        // marker and the frame rows are left intact.
-        self.db
-            .query(
-                "UPSERT type::record('model_result', [$tid, $idx, $label]) SET
-                    task_id = $tid, item_idx = $idx, label = $label,
-                    state = $state, output_json = $output, error = $error",
-            )
+        let mut resp = self
+            .db
+            .query(UPSERT_RESULT)
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
             .bind(("label", label.to_string()))
             .bind(("state", result.state.as_str().to_string()))
             .bind(("output", output_json))
             .bind(("error", crate::error_to_json(result.error.as_ref())?))
-            .await?
-            .check()?;
-        self.touch(task_id).await
+            .bind(("fence", fence.token().map(str::to_string)))
+            .bind(("ts", now()))
+            .await?;
+        let written: Option<bool> = resp.take(0)?;
+        Ok(written == Some(true))
     }
 
     async fn append_samples(
@@ -778,17 +880,176 @@ impl Storage for SurrealStorage {
         Ok(vals.into_iter().next().unwrap_or(0) as u32)
     }
 
-    async fn release_resume_attempts(&self) -> Result<u64> {
+    fn shared(&self) -> bool {
+        true
+    }
+
+    async fn claimable_tasks(
+        &self,
+        mode: ClaimMode,
+        node: &str,
+        skip: &[String],
+        grace: Duration,
+        after: Option<&TaskCursor>,
+        limit: usize,
+    ) -> Result<Vec<Claimable>> {
+        let pin = if mode == ClaimMode::Force {
+            "true"
+        } else {
+            PIN_OPEN
+        };
+        let cursor = if after.is_some() {
+            " AND (created_at > $cur_ts OR (created_at = $cur_ts AND key > $cur_id))"
+        } else {
+            ""
+        };
+        let filter = format!(
+            "{} AND {pin} AND key NOTINSIDE $skip{cursor}",
+            lease_open(mode)
+        );
+        let fields = "key, state, created_at,
+            (IF state != 'cancelled' AND pin != NONE AND pin != $node THEN pin ELSE NONE END)
+                AS abandoned_pin,
+            (pin = $node) AS pinned_here,
+            ((claim = NONE AND lease_until = NONE)
+                OR (lease_until != NONE AND lease_until < time::now() - $grace)) AS stale";
+        // Unfinished tasks, then cancelled ones with unfinished items (found
+        // through those items, not by scanning every cancelled task kept).
+        let sql = format!(
+            "SELECT {fields} FROM task WHERE state IN ['queued', 'processing'] AND {filter}
+                ORDER BY created_at, key LIMIT $limit;
+             LET $open = array::distinct((SELECT VALUE task_id FROM item
+                WHERE state IN ['queued', 'processing', 'retrying']));
+             SELECT {fields} FROM task WHERE state = 'cancelled' AND key INSIDE $open AND {filter}
+                ORDER BY created_at, key LIMIT $limit;"
+        );
+        let (cur_ts, cur_id) = after.map_or((0, String::new()), |c| (c.created_at, c.id.clone()));
         let mut resp = self
             .db
-            .query(
-                "UPDATE task SET attempts -= 1
-                 WHERE state IN ['queued', 'processing'] AND attempts > 0
-                 RETURN VALUE attempts",
-            )
+            .query(sql)
+            .bind(("node", node.to_string()))
+            .bind(("skip", skip.to_vec()))
+            .bind(("grace", grace))
+            .bind(("cur_ts", cur_ts))
+            .bind(("cur_id", cur_id))
+            .bind(("limit", limit.max(1) as i64))
             .await?;
-        let vals: Vec<i64> = resp.take(0)?;
-        Ok(vals.len() as u64)
+        let mut rows: Vec<ClaimableRow> = resp.take(0)?;
+        let cancelled: Vec<ClaimableRow> = resp.take(2)?;
+        rows.extend(cancelled);
+        rows.sort_by(|a, b| (a.created_at, &a.key).cmp(&(b.created_at, &b.key)));
+        rows.truncate(limit.max(1));
+        rows.into_iter()
+            .map(|r| {
+                Ok(Claimable {
+                    id: r.key,
+                    state: r.state.parse()?,
+                    created_at: r.created_at,
+                    abandoned_pin: r.abandoned_pin,
+                    pinned_here: r.pinned_here,
+                    stale: r.stale,
+                })
+            })
+            .collect()
+    }
+
+    async fn claim_task(
+        &self,
+        id: &str,
+        lease: &Lease<'_>,
+        mode: ClaimMode,
+        grace: Duration,
+    ) -> Result<Option<u32>> {
+        let pin = if mode == ClaimMode::Force {
+            "true"
+        } else {
+            PIN_OPEN
+        };
+        // SET's right-hand sides see the record as it was: `claim` is the one
+        // being replaced.
+        let sql = format!(
+            "UPDATE type::record('task', $tid) SET
+                attempts += IF claim != NONE THEN 1 ELSE 0 END,
+                claim = $claim, claimed_by = $holder, lease_until = time::now() + $ttl
+             WHERE {CLAIMABLE_STATE} AND {} AND {pin}
+             RETURN VALUE attempts",
+            lease_open(mode)
+        );
+        let mut resp = self
+            .db
+            .query(sql)
+            .bind(("tid", id.to_string()))
+            .bind(("claim", lease.token.to_string()))
+            .bind(("holder", holder(lease)))
+            .bind(("ttl", lease.ttl))
+            .bind(("node", lease.node.to_string()))
+            .bind(("grace", grace))
+            .await?;
+        let attempts: Vec<i64> = resp.take(0)?;
+        Ok(attempts.first().map(|&n| n as u32))
+    }
+
+    async fn renew_claims(&self, held: &[Held], ttl: Duration) -> Result<Vec<Renewal>> {
+        // One statement per claim: each runs (and may conflict) on its own.
+        let mut out = Vec::with_capacity(held.len());
+        for chunk in held.chunks(64) {
+            let sql: String = (0..chunk.len())
+                .map(|i| {
+                    format!(
+                        "UPDATE type::record('task', $id{i}) SET lease_until = time::now() + $ttl
+                         WHERE claim = $tok{i} RETURN VALUE state;"
+                    )
+                })
+                .collect();
+            let mut q = self.db.query(sql).bind(("ttl", ttl));
+            for (i, h) in chunk.iter().enumerate() {
+                q = q
+                    .bind((format!("id{i}"), h.task_id.clone()))
+                    .bind((format!("tok{i}"), h.token.clone()));
+            }
+            let mut resp = q.await?;
+            for i in 0..chunk.len() {
+                out.push(match resp.take::<Vec<String>>(i) {
+                    Ok(states) => match states.first() {
+                        Some(s) => Renewal::Held(s.parse()?),
+                        None => Renewal::Lost,
+                    },
+                    Err(_) => Renewal::Unknown,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn release_claims(&self, held: &[Held]) -> Result<u64> {
+        let mut released = 0;
+        for chunk in held.chunks(64) {
+            let sql: String = (0..chunk.len())
+                .map(|i| {
+                    format!(
+                        "UPDATE type::record('task', $id{i})
+                         SET claim = NONE, claimed_by = NONE, lease_until = time::now()
+                         WHERE claim = $tok{i} RETURN VALUE key;"
+                    )
+                })
+                .collect();
+            let mut q = self.db.query(sql);
+            for (i, h) in chunk.iter().enumerate() {
+                q = q
+                    .bind((format!("id{i}"), h.task_id.clone()))
+                    .bind((format!("tok{i}"), h.token.clone()));
+            }
+            let mut resp = q.await?;
+            for i in 0..chunk.len() {
+                if resp
+                    .take::<Vec<String>>(i)
+                    .is_ok_and(|keys| !keys.is_empty())
+                {
+                    released += 1;
+                }
+            }
+        }
+        Ok(released)
     }
 
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>> {
@@ -820,15 +1081,24 @@ impl Storage for SurrealStorage {
         Ok(())
     }
 
-    async fn set_item_retries(&self, task_id: &str, item: usize, retries: u32) -> Result<()> {
-        self.db
-            .query("UPDATE type::record('item', [$tid, $idx]) SET retries = $retries")
+    async fn set_item_retries(
+        &self,
+        task_id: &str,
+        item: usize,
+        retries: u32,
+        fence: Fence<'_>,
+    ) -> Result<bool> {
+        let mut resp = self
+            .db
+            .query(SET_RETRIES)
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
             .bind(("retries", retries as i64))
-            .await?
-            .check()?;
-        self.touch(task_id).await
+            .bind(("fence", fence.token().map(str::to_string)))
+            .bind(("ts", now()))
+            .await?;
+        let written: Option<bool> = resp.take(0)?;
+        Ok(written == Some(true))
     }
 
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64> {

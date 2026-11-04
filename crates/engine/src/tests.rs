@@ -10,7 +10,7 @@ use apollo_config::{Config, DatabaseConfig, SqliteConfig};
 use apollo_domain::{
     ErrorKind, Input, Item, ItemState, MediaKind, ModelResult, ModelState, Task, TaskState,
 };
-use apollo_storage::{Storage, TaskQuery};
+use apollo_storage::{Fence, Storage, TaskQuery};
 
 use crate::{Engine, EngineError, Run, Submission};
 
@@ -86,12 +86,16 @@ async fn poison_task_is_failed_reported_and_cleaned_up() {
     let f = fixture().await;
     let upload = staged_upload(&f.engine, "poison.bin");
     f.storage
-        .create_task(&task(
-            "t",
-            TaskState::Processing,
-            ItemState::Processing,
-            Some(upload.clone()),
-        ))
+        .create_task(
+            &task(
+                "t",
+                TaskState::Processing,
+                ItemState::Processing,
+                Some(upload.clone()),
+            ),
+            Some(&crashed_claim()),
+            None,
+        )
         .await
         .unwrap();
     // Three crashes already happened; this recovery is the fourth attempt.
@@ -113,11 +117,19 @@ async fn poison_task_is_failed_reported_and_cleaned_up() {
 async fn cancel_never_overwrites_a_finished_task() {
     let f = fixture().await;
     f.storage
-        .create_task(&task("q", TaskState::Queued, ItemState::Queued, None))
+        .create_task(
+            &task("q", TaskState::Queued, ItemState::Queued, None),
+            None,
+            None,
+        )
         .await
         .unwrap();
     f.storage
-        .create_task(&task("c", TaskState::Completed, ItemState::Completed, None))
+        .create_task(
+            &task("c", TaskState::Completed, ItemState::Completed, None),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -139,12 +151,16 @@ async fn cancelled_task_upload_is_removed_once_its_item_stops() {
     let f = fixture().await;
     let upload = staged_upload(&f.engine, "cancel.bin");
     f.storage
-        .create_task(&task(
-            "t",
-            TaskState::Processing,
-            ItemState::Processing,
-            Some(upload.clone()),
-        ))
+        .create_task(
+            &task(
+                "t",
+                TaskState::Processing,
+                ItemState::Processing,
+                Some(upload.clone()),
+            ),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -155,7 +171,7 @@ async fn cancelled_task_upload_is_removed_once_its_item_stops() {
 
     // The item reaches its cancellation checkpoint (what cancel_item persists).
     f.storage
-        .set_item_state("t", 0, ItemState::Cancelled, None)
+        .set_item_state("t", 0, ItemState::Cancelled, None, Fence::Unchecked)
         .await
         .unwrap();
     f.engine.rollup_task_state("t").await;
@@ -167,25 +183,74 @@ async fn cancelled_task_upload_is_removed_once_its_item_stops() {
     assert_eq!(t.state, TaskState::Cancelled);
 }
 
+/// The claim of a run that crashed: never handed back.
+fn crashed_claim() -> apollo_storage::Lease<'static> {
+    apollo_storage::Lease {
+        token: "crashed",
+        node: "gone",
+        process: "p",
+        ttl: Duration::from_secs(60),
+    }
+}
+
 #[tokio::test]
-async fn graceful_shutdown_does_not_count_as_a_crash() {
+async fn shutdown_hands_back_only_its_own_claims() {
     let f = fixture().await;
     f.storage
-        .create_task(&task(
-            "t",
-            TaskState::Processing,
-            ItemState::Processing,
+        .create_task(
+            &task("t", TaskState::Processing, ItemState::Processing, None),
+            Some(&crashed_claim()),
             None,
-        ))
+        )
         .await
         .unwrap();
-    f.storage.increment_attempts("t").await.unwrap();
-    f.storage.increment_attempts("t").await.unwrap();
+    // And one this engine runs.
+    let mine = apollo_storage::Lease {
+        token: "mine",
+        node: f.engine.node(),
+        ..crashed_claim()
+    };
+    f.storage
+        .create_task(
+            &task("m", TaskState::Processing, ItemState::Processing, None),
+            Some(&mine),
+            None,
+        )
+        .await
+        .unwrap();
+    let _run = f.engine.register("m", "mine".into()).unwrap();
 
     f.engine.shutdown().await;
 
-    // The next resume lands on 2, not 3.
-    assert_eq!(f.storage.increment_attempts("t").await.unwrap(), 2);
+    // Its own was handed back: taking it counts no attempt.
+    let later = apollo_storage::Lease {
+        token: "later",
+        ..crashed_claim()
+    };
+    assert_eq!(
+        f.storage
+            .claim_task(
+                "m",
+                &later,
+                apollo_storage::ClaimMode::Force,
+                Duration::ZERO
+            )
+            .await
+            .unwrap(),
+        Some(0)
+    );
+
+    // Not this engine's claim: still a crash's, so taking it over counts one.
+    let next = apollo_storage::Lease {
+        token: "next",
+        ..crashed_claim()
+    };
+    let attempts = f
+        .storage
+        .claim_task("t", &next, apollo_storage::ClaimMode::Force, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(attempts, Some(1));
 }
 
 #[tokio::test]
@@ -205,20 +270,27 @@ async fn upload_dir_is_private() {
 async fn status_reports_tasks_queue_and_models() {
     let f = fixture().await;
     f.storage
-        .create_task(&task("q", TaskState::Queued, ItemState::Queued, None))
-        .await
-        .unwrap();
-    f.storage
-        .create_task(&task("c", TaskState::Completed, ItemState::Completed, None))
-        .await
-        .unwrap();
-    f.storage
-        .create_task(&task(
-            "c2",
-            TaskState::Completed,
-            ItemState::Completed,
+        .create_task(
+            &task("q", TaskState::Queued, ItemState::Queued, None),
             None,
-        ))
+            None,
+        )
+        .await
+        .unwrap();
+    f.storage
+        .create_task(
+            &task("c", TaskState::Completed, ItemState::Completed, None),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    f.storage
+        .create_task(
+            &task("c2", TaskState::Completed, ItemState::Completed, None),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -246,7 +318,7 @@ async fn a_repeated_request_id_returns_the_existing_task() {
     let mut earlier = task("earlier", TaskState::Completed, ItemState::Completed, None);
     earlier.request_id = Some("order-7".into());
     earlier.owner = Some("alice".into());
-    f.storage.create_task(&earlier).await.unwrap();
+    f.storage.create_task(&earlier, None, None).await.unwrap();
 
     // The lookup comes first, so even a submission that would not validate
     // (no such model) gets the earlier task back.
@@ -367,7 +439,11 @@ async fn a_watch_follows_a_task_until_it_finishes() {
     // Writes through the engine's storage are announced.
     let storage = f.engine.inner.storage.clone();
     storage
-        .create_task(&task("w", TaskState::Queued, ItemState::Queued, None))
+        .create_task(
+            &task("w", TaskState::Queued, ItemState::Queued, None),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -380,21 +456,21 @@ async fn a_watch_follows_a_task_until_it_finishes() {
     let writer = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         storage
-            .set_item_state("w", 0, ItemState::Processing, None)
+            .set_item_state("w", 0, ItemState::Processing, None, Fence::Unchecked)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let done = ModelResult::skipped();
         storage
-            .upsert_model_result("w", 0, "m", &done)
+            .upsert_model_result("w", 0, "m", &done, Fence::Unchecked)
             .await
             .unwrap();
         storage
-            .set_item_state("w", 0, ItemState::Completed, None)
+            .set_item_state("w", 0, ItemState::Completed, None, Fence::Unchecked)
             .await
             .unwrap();
         storage
-            .set_task_state("w", TaskState::Completed)
+            .set_task_state("w", TaskState::Completed, Fence::Unchecked)
             .await
             .unwrap();
     });
@@ -421,12 +497,11 @@ async fn waiting_returns_the_finished_task_or_the_latest_state() {
     let storage = f.engine.inner.storage.clone();
     for id in ["slow", "fast"] {
         storage
-            .create_task(&task(
-                id,
-                TaskState::Processing,
-                ItemState::Processing,
+            .create_task(
+                &task(id, TaskState::Processing, ItemState::Processing, None),
                 None,
-            ))
+                None,
+            )
             .await
             .unwrap();
     }
@@ -446,7 +521,9 @@ async fn waiting_returns_the_finished_task_or_the_latest_state() {
     let s = storage.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(30)).await;
-        s.set_task_state("fast", TaskState::Failed).await.unwrap();
+        s.set_task_state("fast", TaskState::Failed, Fence::Unchecked)
+            .await
+            .unwrap();
     });
     let started = std::time::Instant::now();
     let fast = f
@@ -1113,14 +1190,29 @@ const NSFW_ONLY: &str = r#"
     repo = "test/nsfw"
 "#;
 
-/// Run `task` as resumed work (the way `recover` starts it), to its end.
+/// Run `task` as resumed work (the way `recover` starts it), to its end: the
+/// run claims it first, if it still may (otherwise its claim is one nobody
+/// stored, and its writes are fenced out).
 async fn run_resumed(engine: &Engine, task: Task) {
+    let token = uuid::Uuid::new_v4().to_string();
+    let _ = engine
+        .inner
+        .storage
+        .claim_task(
+            &task.id,
+            &engine.lease(&token),
+            apollo_storage::ClaimMode::Force,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    let run = engine.register(&task.id, token).unwrap();
     let reservations = task
         .items
         .iter()
         .map(|item| engine.reserve_resumed(&item.models))
         .collect();
-    engine.run_task(task, reservations).await;
+    engine.run_task(task, run, reservations).await;
 }
 
 #[tokio::test]
@@ -1135,12 +1227,12 @@ async fn a_late_runner_leaves_a_finished_task_as_it_ended() {
     // Each finished after this runner loaded it: one cancelled (elsewhere,
     // so this engine has no signal for it), one completed.
     for id in ["cancelled", "completed"] {
-        f.storage.create_task(&late(id)).await.unwrap();
+        f.storage.create_task(&late(id), None, None).await.unwrap();
     }
     assert!(f.storage.cancel_task_if_active("cancelled").await.unwrap());
     assert!(
         f.storage
-            .set_task_state("completed", TaskState::Completed)
+            .set_task_state("completed", TaskState::Completed, Fence::Unchecked)
             .await
             .unwrap()
     );
@@ -1174,10 +1266,10 @@ async fn a_late_runner_leaves_a_finished_item_alone() {
         None,
     );
     late.items[0].input = local_file_submission().input;
-    f.storage.create_task(&late).await.unwrap();
+    f.storage.create_task(&late, None, None).await.unwrap();
     assert!(
         f.storage
-            .set_item_state("t", 0, ItemState::Completed, None)
+            .set_item_state("t", 0, ItemState::Completed, None, Fence::Unchecked)
             .await
             .unwrap()
     );
@@ -1224,7 +1316,7 @@ async fn a_keyed_tasks_id_comes_from_its_owner_and_key() {
         vec![Item::new(image(), vec!["nsfw".into()], None)],
         None,
     );
-    f.storage.create_task(&first).await.unwrap();
+    f.storage.create_task(&first, None, None).await.unwrap();
     let keyed = Submission {
         request_id: Some("k".into()),
         ..local_file_submission()
@@ -1264,7 +1356,7 @@ async fn only_files_directly_in_the_upload_dir_are_read_or_removed() {
         Some(file.clone()),
     );
     row.items[0].models = vec!["nsfw".into()];
-    f.storage.create_task(&row).await.unwrap();
+    f.storage.create_task(&row, None, None).await.unwrap();
     assert_eq!(f.engine.recover().await.unwrap(), 1);
     in_flight_drops_to_zero(&f.engine).await;
     let stored = f.storage.get_task("t").await.unwrap().unwrap();
@@ -1278,12 +1370,11 @@ async fn only_files_directly_in_the_upload_dir_are_read_or_removed() {
 async fn a_watch_sees_changes_nobody_announced() {
     let f = fixture().await;
     f.storage
-        .create_task(&task(
-            "t",
-            TaskState::Processing,
-            ItemState::Processing,
+        .create_task(
+            &task("t", TaskState::Processing, ItemState::Processing, None),
             None,
-        ))
+            None,
+        )
         .await
         .unwrap();
     let mut watch = f.engine.watch("t");
@@ -1293,11 +1384,11 @@ async fn a_watch_sees_changes_nobody_announced() {
     );
     // Written past this engine, as another instance would: not announced.
     f.storage
-        .set_item_state("t", 0, ItemState::Completed, None)
+        .set_item_state("t", 0, ItemState::Completed, None, Fence::Unchecked)
         .await
         .unwrap();
     f.storage
-        .set_task_state("t", TaskState::Completed)
+        .set_task_state("t", TaskState::Completed, Fence::Unchecked)
         .await
         .unwrap();
     let seen = tokio::time::timeout(Duration::from_secs(10), watch.next())
@@ -1306,30 +1397,4 @@ async fn a_watch_sees_changes_nobody_announced() {
         .unwrap()
         .unwrap();
     assert_eq!(seen.state, TaskState::Completed);
-}
-
-#[tokio::test]
-async fn a_returning_key_isnt_stopped_by_an_old_cancel() {
-    let f = fixture_with(NSFW_ONLY).await;
-    // This engine cancelled an earlier task with this key's id that another
-    // instance ran, so it kept the signal; that task is gone now.
-    let id = crate::request_task_id(None, "k");
-    f.engine.inner.cancels.lock().unwrap().insert(
-        id.clone(),
-        Arc::new(std::sync::atomic::AtomicBool::new(true)),
-    );
-
-    let keyed = Submission {
-        request_id: Some("k".into()),
-        ..local_file_submission()
-    };
-    let got = f.engine.submit(keyed, None).await.unwrap();
-    assert_eq!(got.id, id);
-    in_flight_drops_to_zero(&f.engine).await;
-    let stored = f.storage.get_task(&id).await.unwrap().unwrap();
-    assert_eq!(
-        stored.state,
-        TaskState::Failed,
-        "it ran: its input is refused"
-    );
 }

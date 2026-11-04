@@ -62,7 +62,11 @@ One row per submission.
 | `id` | TEXT | Primary key (the task id). |
 | `state` | TEXT | `TaskState` token. |
 | `owner` | TEXT | Subject of the token that submitted the task (`NULL` when auth was disabled). Only that subject or an admin can read / cancel / list it. |
-| `attempts` | INTEGER | Crash‑interrupted resume count; a task is failed once this exceeds the cap (poison‑task guard). A graceful shutdown gives the attempt back, so restarts and deploys never count. |
+| `attempts` | INTEGER | Crash‑interrupted resume count; a task is failed once this exceeds the cap (poison‑task guard). A takeover counts one only when the claim it replaces was never handed back (its runner crashed); a graceful shutdown hands claims back, so restarts and deploys never count. |
+| `claim` | TEXT | The current runner's token. Its writes apply only while this is still its token. `NULL` when handed back, or for a task stored before leases. |
+| `claimed_by` | TEXT | Who holds the claim: `<node>/<process>`. |
+| `lease_until` | INTEGER | When the claim lapses unless renewed (milliseconds, on the database's clock). |
+| `pin` | TEXT | The node whose upload or local file the task reads, if any: only it may run the task. |
 | `metadata_json` | TEXT | The client's `metadata` as a JSON object (`NULL` when empty). |
 | `request_id` | TEXT | The client's idempotency key, if any. |
 | `created_at` / `updated_at` | INTEGER | UNIX seconds. |
@@ -153,12 +157,15 @@ Upgrading a 3.x server to 4.0 (see SurrealDB's [3.x to 4.x guide](https://surrea
 
 ## Resume & recovery
 
-On startup the engine loads every task still in a non‑terminal state, fully reconstructed from these tables, and re‑queues it. Recovery relies on:
+Every task is claimed by the instance that runs it, with a lease it renews every third of `[database].lease_secs`. On startup the engine takes over unfinished tasks, fully reconstructed from these tables, and re‑queues them: on SQLite (one process per file) every one; on SurrealDB the ones nobody holds (stored before leases, or handed back by a graceful stop), and, every third of the lease from then on, also the ones whose lease lapsed (their runner stopped), but only once it has itself been in touch with the database for a whole lease, and only up to its free room and for tasks whose models it has (a task whose input is local to it, it takes back whatever its room). A task cancelled while its runner was gone is taken over too, to finish its items as cancelled. A task that no instance has held for ten leases and that the instance looking at it can't run (its model or pipeline is gone) is failed, saying why. Recovery relies on:
 
 - `tasks.state` (indexed) to find incomplete work,
+- `tasks.claim` and `lease_until` to tell held tasks from lapsed ones,
 - `model_results.state` + `frames` to skip already‑finished models and frames,
-- `tasks.attempts` (bumped per resume, given back on graceful shutdown) to **fail a poison task** once it exceeds its cap instead of crash‑looping — its items are marked failed, its webhook fires, and its staged upload is removed,
+- `tasks.attempts` (bumped by a takeover of a claim never handed back) to **fail a poison task** once it exceeds its cap instead of crash‑looping — its items are marked failed, its webhook fires, and its staged upload is removed,
 - `items.webhook_delivered` to redeliver any `FINISHED` webhook event that a crash left un‑acknowledged.
+
+A runner whose lease was taken over (it lost touch with the database for longer than the lease) is fenced out: its writes no longer apply, and it stops when its next renewal finds the claim gone. A task whose input is an upload or a local file is pinned to the node that accepted it (`[app].node_id`): other instances leave it alone, and fail it with a clear message (submit it again) only once its lease has lapsed for ten leases. Cancelling one needs no input, so any instance finishes a cancelled one. The startup upload sweep removes only unreferenced files older than an hour, so a shared upload directory doesn't lose one still arriving.
 
 State writes only apply to an unfinished task or item: the first finish wins, so a late or second runner can't reopen a task, overwrite a cancel, or start an item another runner finished (one already partway through it can still overwrite its model results). An upload is read, and removed, only from the server's own upload directory (`[app].cache_dir/uploads`), whatever path a task's row holds; anything else fails the item.
 

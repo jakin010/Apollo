@@ -74,18 +74,25 @@ async fn one_request_id_through_two_instances_makes_two_tasks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until the upload sweep only removes old files"]
 async fn a_starting_instance_deletes_an_upload_in_progress() {
     fleet_test(|fleet| async move {
         // Both servers use one cache directory (e.g. shared storage for the
         // model weights).
         let shared = tempfile::tempdir().unwrap();
         let a = fleet.start_in("a", NSFW, shared.path()).await;
-        // An upload is arriving at A when B starts.
+        // An upload is arriving at A when B starts; another, two hours old,
+        // is an orphan.
         let path = a.stage(b"not an image");
+        let orphan = a.stage(b"orphan");
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
+            .unwrap();
         let b = fleet.start_in("b", NSFW, shared.path()).await;
         b.recover().await;
-        let kept = path.exists();
+        let (kept, swept) = (path.exists(), !orphan.exists());
 
         let t = a.submit(uploaded(&path)).await.id;
         a.wait_idle().await;
@@ -93,47 +100,98 @@ async fn a_starting_instance_deletes_an_upload_in_progress() {
         let error = fleet.task(&t).await.items[0].error.clone().unwrap();
 
         assert_eq!(
-            (kept, error.kind),
-            (true, ErrorKind::Decode),
-            "B's start deleted A's upload in progress: (kept, A's item error \
-             kind); A's error: {}",
+            (kept, swept, error.kind),
+            (true, true, ErrorKind::Decode),
+            "B's start deleted A's upload in progress: (kept, the old orphan \
+             swept, A's item error kind); A's error: {}",
             error.message
         );
     })
     .await;
 }
 
+/// A dead instance A with an upload task `t` and a plain one `c` (an http
+/// input, unpinned), both waiting for A's only slot when A crashed; B running.
+async fn dead_with_an_upload(
+    fleet: &Fleet,
+    origin: &Origin,
+) -> (Instance, String, String, Option<tempfile::TempDir>) {
+    let toml = format!("{SHORT_LEASE}{NSFW}");
+    let b = fleet.start("b", &toml).await;
+    b.recover().await;
+    let a = fleet
+        .start("a", &format!("[app]\nmax_concurrent = 1\n{toml}"))
+        .await;
+    let slot = a.engine.inner.gate.clone().acquire(0).await;
+    let t = a.submit(uploaded(&a.stage(b"not an image"))).await.id;
+    let c = a.submit(image_at(&origin.url("/c.png"))).await.id;
+    wait_until("a's items wait for a slot", || a.slots_waiting() == 2).await;
+    let disk = a.crash();
+    drop(slot);
+    (b, t, c, disk)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until uploads carry their instance (others leave them for a grace \
-            period, then fail them with a clear error); the lease PR expires A's lease before B \
-            starts, so that only this keeps B off the task"]
 async fn an_upload_to_a_dead_instance_fails_elsewhere_at_once() {
     fleet_test(|fleet| async move {
-        let a = fleet
-            .start("a", &format!("[app]\nmax_concurrent = 1\n{NSFW}"))
-            .await;
-        let slot = a.engine.inner.gate.clone().acquire(0).await;
-        let path = a.stage(b"not an image");
-        let t = a.submit(uploaded(&path)).await.id;
-        wait_until("a's item waits for a slot", || a.slots_waiting() == 1).await;
-        let _a_disk = a.crash();
-        drop(slot);
+        let origin = Origin::start();
+        let (b, t, c, _disk) = dead_with_an_upload(&fleet, &origin).await;
+        // Both leases lapsed, within the upload's grace.
+        fleet.db.expire_lease(&t, LEASE).await;
+        fleet.db.expire_lease(&c, LEASE).await;
 
-        // B runs on another server, which can't see A's disk.
-        let uploads = path.parent().unwrap().to_path_buf();
-        let away = uploads.with_extension("elsewhere");
-        std::fs::rename(&uploads, &away).unwrap();
-        let b = fleet.start("b", NSFW).await;
-        b.recover().await;
+        // B takes the plain task over...
+        let download = origin.next("b takes the plain task over").await;
+        assert_eq!(download.path, "/c.png");
+        download.reply(Reply::Garbage);
         b.wait_idle().await;
-        fleet.log.settled("b", &t).await;
-        std::fs::rename(&away, &uploads).unwrap();
+        fleet.log.settled("b", &c).await;
+        // ...and, a few passes on, has left the upload alone.
+        tokio::time::sleep(LEASE).await;
         let task = fleet.task(&t).await;
+        let claims = fleet
+            .log
+            .count(|who, call| who == "b" && matches!(call, Call::Claim(id, Some(_)) if *id == t));
 
         assert!(
-            !finished(task.state),
-            "B failed a task uploaded to A as soon as it started: {:?}",
+            !finished(task.state) && claims == 0,
+            "B took over a task uploaded to A within its grace: {:?}, B's claims {claims}",
             task.items[0].error
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_instances_upload_fails_after_its_grace() {
+    fleet_test(|fleet| async move {
+        let origin = Origin::start();
+        let (b, t, c, _disk) = dead_with_an_upload(&fleet, &origin).await;
+        // A has been gone longer than the grace (ten leases).
+        fleet.db.expire_lease(&t, 20 * LEASE).await;
+        fleet.db.expire_lease(&c, LEASE).await;
+        origin
+            .next("b takes the plain task over")
+            .await
+            .reply(Reply::Garbage);
+        fleet.log.delivered("b", &t).await;
+        b.wait_idle().await;
+        fleet.log.settled("b", &c).await;
+        let task = fleet.task(&t).await;
+        let error = task.items[0].error.clone().unwrap();
+
+        assert_eq!(
+            (task.state, error.kind, fleet.log.finished(&t)),
+            (
+                TaskState::Failed,
+                ErrorKind::Fetch,
+                vec![("b", TaskState::Failed)]
+            )
+        );
+        assert!(
+            error.message.contains("uploaded to node a"),
+            "{}",
+            error.message
         );
     })
     .await;
@@ -163,7 +221,7 @@ async fn a_task_row_makes_an_instance_read_and_delete_any_file() {
             )],
             None,
         );
-        fleet.store.create_task(&task).await.unwrap();
+        fleet.store.create_task(&task, None, None).await.unwrap();
 
         assert_eq!(b.recover().await, 1);
         b.wait_idle().await;
@@ -181,13 +239,16 @@ async fn a_task_row_makes_an_instance_read_and_delete_any_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until a takeover checks the task's models resolve locally; the lease \
-            PR expires A's lease before B starts, so that only this keeps B off the task"]
 async fn an_instance_without_the_model_fails_a_task_it_takes_over() {
     fleet_test(|fleet| async move {
         let origin = Origin::start();
+        // B has no `special` model.
+        let b = fleet.start("b", &format!("{SHORT_LEASE}{NSFW}")).await;
+        b.recover().await;
         let special = "[models.special]\narchitecture = \"vit\"\nrepo = \"test/special\"\n";
-        let a = fleet.start("a", &format!("{NSFW}{special}")).await;
+        let a = fleet
+            .start("a", &format!("{SHORT_LEASE}{NSFW}{special}"))
+            .await;
         let t = a
             .submit(Submission {
                 run: Run::Models(vec!["special".into()]),
@@ -195,25 +256,32 @@ async fn an_instance_without_the_model_fails_a_task_it_takes_over() {
             })
             .await
             .id;
-        let _download = origin.next("a downloads the input").await;
+        let c = a.submit(image_at(&origin.url("/c.ppm"))).await.id;
+        let _downloads = [
+            origin.next("a downloads an input").await,
+            origin.next("a downloads an input").await,
+        ];
         a.crash();
+        // Both leases lapsed.
+        fleet.db.expire_lease(&t, LEASE).await;
+        fleet.db.expire_lease(&c, LEASE).await;
 
-        // B has no `special` model.
-        let b = fleet.start("b", NSFW).await;
-        let resumed = b.recover().await;
-        if b.in_flight() > 0 {
-            origin
-                .next("b downloads the input")
-                .await
-                .reply(Reply::Bytes(ppm(16, 16, 1)));
-        }
+        // B takes over the task it can run...
+        let download = origin.next("b takes the nsfw task over").await;
+        assert_eq!(download.path, "/c.ppm");
+        download.reply(Reply::Garbage);
         b.wait_idle().await;
-        fleet.log.settled("b", &t).await;
+        fleet.log.settled("b", &c).await;
+        // ...and, a few passes on, has left the other alone.
+        tokio::time::sleep(LEASE).await;
         let task = fleet.task(&t).await;
+        let claims = fleet
+            .log
+            .count(|who, call| who == "b" && matches!(call, Call::Claim(id, Some(_)) if *id == t));
 
         assert!(
-            resumed == 0 && !finished(task.state),
-            "B finished a task for a model it doesn't have: {:?}",
+            !finished(task.state) && claims == 0 && origin.hits() == 3,
+            "B took over a task for a model it doesn't have: {:?}, B's claims {claims}",
             task.items[0].results.get("special")
         );
     })
@@ -307,6 +375,116 @@ async fn a_wait_on_another_instance_misses_the_finish() {
             finished(state) && took < Duration::from_secs(4),
             "B's wait missed A finishing the task: after {took:?} it returned {state:?}"
         );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_upload_whose_node_died_is_finished_as_cancelled() {
+    fleet_test(|fleet| async move {
+        let origin = Origin::start();
+        let (b, t, c, _disk) = dead_with_an_upload(&fleet, &origin).await;
+        // Cancelled through B; A's lease lapses, well within the upload's
+        // grace: finishing it as cancelled reads no input, so B does it.
+        b.cancel(&t).await;
+        fleet.db.expire_lease(&t, LEASE).await;
+        fleet.log.delivered("b", &t).await;
+        let task = fleet.task(&t).await;
+        fleet.db.expire_lease(&c, LEASE).await;
+        origin
+            .next("b takes the plain task over")
+            .await
+            .reply(Reply::Garbage);
+        b.wait_idle().await;
+        fleet.log.settled("b", &c).await;
+
+        assert_eq!(
+            (task.state, task.items[0].state, fleet.log.finished(&t)),
+            (
+                TaskState::Cancelled,
+                ItemState::Cancelled,
+                vec![("b", TaskState::Cancelled)]
+            )
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_no_instance_can_run_is_failed_once_stale() {
+    fleet_test(|fleet| async move {
+        let b = fleet.start("b", &format!("{SHORT_LEASE}{NSFW}")).await;
+        // A task for a model B doesn't have, whose runner stopped long ago
+        // (past the grace): nobody that looked could run it.
+        let task = Task::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![Item::new(refused().input, vec!["gone".into()], None)],
+            None,
+        );
+        let crashed = apollo_storage::Lease {
+            token: "crashed",
+            node: "gone",
+            process: "p",
+            ttl: LEASE,
+        };
+        fleet
+            .store
+            .create_task(&task, Some(&crashed), None)
+            .await
+            .unwrap();
+        fleet.db.expire_lease(&task.id, 20 * LEASE).await;
+
+        b.recover().await;
+        fleet.log.delivered("b", &task.id).await;
+        b.wait_idle().await;
+        let end = fleet.task(&task.id).await;
+        let error = end.items[0].error.clone().unwrap();
+
+        assert_eq!(
+            (end.state, error.kind),
+            (TaskState::Failed, ErrorKind::ModelUnavailable),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("gone"), "{}", error.message);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_takes_its_own_pinned_task_back_even_when_full() {
+    fleet_test(|fleet| async move {
+        let origin = Origin::start();
+        let toml = format!("[app]\nmax_concurrent = 1\nmax_pending = 1\n{SHORT_LEASE}{NSFW}");
+        let a = fleet.start("a", &toml).await;
+        let slot = a.engine.inner.gate.clone().acquire(0).await;
+        let t = a.submit(uploaded(&a.stage(b"not an image"))).await.id;
+        wait_until("a's item waits for a slot", || a.slots_waiting() == 1).await;
+        let disk = a.crash().unwrap();
+        drop(slot);
+        fleet.db.expire_lease(&t, LEASE).await;
+
+        // A comes back (same node, same disk), and is full at once: no room
+        // for new work, though a slot is free.
+        let full = format!("[app]\nmax_concurrent = 2\nmax_pending = 1\n{SHORT_LEASE}{NSFW}");
+        let back = fleet.start_in("a", &full, disk.path()).await;
+        back.submit(image_at(&origin.url("/busy.png"))).await;
+        let busy = origin.next("a downloads its new work").await;
+        let room = back
+            .on(|e| async move {
+                let probe = refused();
+                e.check_submission(&probe.input, &probe.run).is_ok()
+            })
+            .await;
+        assert!(!room, "full");
+        back.recover().await;
+        fleet.log.delivered("a", &t).await;
+        let error = fleet.task(&t).await.items[0].error.clone().unwrap();
+        busy.reply(Reply::Garbage);
+        back.wait_idle().await;
+
+        // It ran it: its upload was read (and isn't an image).
+        assert_eq!(error.kind, ErrorKind::Decode, "{}", error.message);
     })
     .await;
 }

@@ -119,6 +119,36 @@ impl SurrealScratch {
         attempts.expect("the task row and its attempts field") as u32
     }
 
+    /// End a task's lease `ago` ago, as if its holder had stopped renewing
+    /// it then (its claim stays).
+    pub async fn expire_lease(&self, task_id: &str, ago: Duration) {
+        self.admin
+            .query("UPDATE type::record('task', $tid) SET lease_until = time::now() - $ago")
+            .bind(("tid", task_id.to_string()))
+            .bind(("ago", ago))
+            .await
+            .and_then(|resp| resp.check())
+            .expect("expiring a lease");
+    }
+
+    /// Who holds a task's claim (`<node>/<process>`), if anyone, and whether
+    /// its lease is still running.
+    pub async fn lease(&self, task_id: &str) -> (Option<String>, bool) {
+        let mut resp = self
+            .admin
+            .query(
+                "SELECT VALUE claimed_by FROM ONLY type::record('task', $tid);
+                 SELECT VALUE lease_until != NONE AND lease_until > time::now()
+                    FROM ONLY type::record('task', $tid);",
+            )
+            .bind(("tid", task_id.to_string()))
+            .await
+            .expect("reading a lease");
+        let holder: Option<String> = resp.take(0).expect("reading a lease's holder");
+        let live: Option<bool> = resp.take(1).expect("reading a lease's end");
+        (holder, live.expect("the task row"))
+    }
+
     /// Drop the database.
     pub async fn remove(&self) {
         self.admin

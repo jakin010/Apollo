@@ -5,7 +5,12 @@
 use std::sync::Arc;
 
 use apollo_domain::{ItemState, ModelResult, Task, TaskState};
-use apollo_storage::{Storage, StorageError, TaskPage, TaskQuery};
+use std::time::Duration;
+
+use apollo_storage::{
+    ClaimMode, Claimable, Fence, Held, Lease, Renewal, Storage, StorageError, TaskCursor, TaskPage,
+    TaskQuery,
+};
 
 /// A store whose `create_task` waits until the test lets it go (one permit of
 /// `release` per write), and fails it when `fail` is set. Everything else goes
@@ -34,19 +39,29 @@ impl Storage for HeldCreate {
     async fn migrate(&self) -> Result<(), StorageError> {
         self.inner.migrate().await
     }
-    async fn create_task(&self, task: &Task) -> Result<(), StorageError> {
+    async fn create_task(
+        &self,
+        task: &Task,
+        lease: Option<&Lease<'_>>,
+        pin: Option<&str>,
+    ) -> Result<(), StorageError> {
         // One permit per write: consumed, not returned.
         self.release.acquire().await.unwrap().forget();
         if self.fail {
             return Err(StorageError::Surreal("create failed".into()));
         }
-        self.inner.create_task(task).await
+        self.inner.create_task(task, lease, pin).await
     }
     async fn get_task(&self, id: &str) -> Result<Option<Task>, StorageError> {
         self.inner.get_task(id).await
     }
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<bool, StorageError> {
-        self.inner.set_task_state(id, state).await
+    async fn set_task_state(
+        &self,
+        id: &str,
+        state: TaskState,
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
+        self.inner.set_task_state(id, state, fence).await
     }
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool, StorageError> {
         self.inner.cancel_task_if_active(id).await
@@ -57,8 +72,11 @@ impl Storage for HeldCreate {
         item: usize,
         state: ItemState,
         error: Option<&apollo_domain::TaskError>,
+        fence: Fence<'_>,
     ) -> Result<bool, StorageError> {
-        self.inner.set_item_state(task_id, item, state, error).await
+        self.inner
+            .set_item_state(task_id, item, state, error, fence)
+            .await
     }
     async fn set_item_failed(
         &self,
@@ -66,9 +84,10 @@ impl Storage for HeldCreate {
         item: usize,
         error: &apollo_domain::TaskError,
         models: &[String],
+        fence: Fence<'_>,
     ) -> Result<bool, StorageError> {
         self.inner
-            .set_item_failed(task_id, item, error, models)
+            .set_item_failed(task_id, item, error, models, fence)
             .await
     }
     async fn find_task_by_request(
@@ -87,9 +106,10 @@ impl Storage for HeldCreate {
         item: usize,
         label: &str,
         result: &ModelResult,
-    ) -> Result<(), StorageError> {
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
         self.inner
-            .upsert_model_result(task_id, item, label, result)
+            .upsert_model_result(task_id, item, label, result, fence)
             .await
     }
     async fn append_samples(
@@ -139,8 +159,44 @@ impl Storage for HeldCreate {
     async fn increment_attempts(&self, id: &str) -> Result<u32, StorageError> {
         self.inner.increment_attempts(id).await
     }
-    async fn release_resume_attempts(&self) -> Result<u64, StorageError> {
-        self.inner.release_resume_attempts().await
+    fn shared(&self) -> bool {
+        self.inner.shared()
+    }
+
+    async fn claimable_tasks(
+        &self,
+        mode: ClaimMode,
+        node: &str,
+        skip: &[String],
+        grace: Duration,
+        after: Option<&TaskCursor>,
+        limit: usize,
+    ) -> Result<Vec<Claimable>, StorageError> {
+        self.inner
+            .claimable_tasks(mode, node, skip, grace, after, limit)
+            .await
+    }
+
+    async fn claim_task(
+        &self,
+        id: &str,
+        lease: &Lease<'_>,
+        mode: ClaimMode,
+        grace: Duration,
+    ) -> Result<Option<u32>, StorageError> {
+        self.inner.claim_task(id, lease, mode, grace).await
+    }
+
+    async fn renew_claims(
+        &self,
+        held: &[Held],
+        ttl: Duration,
+    ) -> Result<Vec<Renewal>, StorageError> {
+        self.inner.renew_claims(held, ttl).await
+    }
+
+    async fn release_claims(&self, held: &[Held]) -> Result<u64, StorageError> {
+        self.inner.release_claims(held).await
     }
     async fn items_pending_webhook(
         &self,
@@ -155,8 +211,11 @@ impl Storage for HeldCreate {
         task_id: &str,
         item: usize,
         retries: u32,
-    ) -> Result<(), StorageError> {
-        self.inner.set_item_retries(task_id, item, retries).await
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .set_item_retries(task_id, item, retries, fence)
+            .await
     }
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError> {
         self.inner.purge_finished_before(cutoff_unix_secs).await

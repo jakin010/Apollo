@@ -234,7 +234,7 @@ impl Engine {
         match self
             .inner
             .storage
-            .set_item_state(&task_id, idx, ItemState::Processing, None)
+            .set_item_state(&task_id, idx, ItemState::Processing, None, self.fence())
             .await
         {
             Ok(true) => {}
@@ -423,12 +423,12 @@ impl Engine {
         let _ = self
             .inner
             .storage
-            .set_item_retries(task_id, idx, item.retries)
+            .set_item_retries(task_id, idx, item.retries, self.fence())
             .await;
         if let Ok(false) = self
             .inner
             .storage
-            .set_item_state(task_id, idx, ItemState::Retrying, Some(&err))
+            .set_item_state(task_id, idx, ItemState::Retrying, Some(&err), self.fence())
             .await
         {
             return false;
@@ -459,7 +459,7 @@ impl Engine {
         !matches!(
             self.inner
                 .storage
-                .set_item_state(task_id, idx, ItemState::Processing, None)
+                .set_item_state(task_id, idx, ItemState::Processing, None, self.fence())
                 .await,
             Ok(false)
         )
@@ -505,7 +505,7 @@ impl Engine {
                     let _ = self
                         .inner
                         .storage
-                        .upsert_model_result(task_id, idx, label, &done)
+                        .upsert_model_result(task_id, idx, label, &done, self.fence())
                         .await;
                     if let Some(uh) = url_hash {
                         let _ = self
@@ -531,7 +531,13 @@ impl Engine {
         let _ = self
             .inner
             .storage
-            .upsert_model_result(task_id, idx, label, &ModelResult::processing())
+            .upsert_model_result(
+                task_id,
+                idx,
+                label,
+                &ModelResult::processing(),
+                self.fence(),
+            )
             .await;
 
         tracing::debug!(task = %task_id, item = idx, model = %label, "running model");
@@ -564,7 +570,7 @@ impl Engine {
         let _ = self
             .inner
             .storage
-            .upsert_model_result(task_id, idx, label, result)
+            .upsert_model_result(task_id, idx, label, result, self.fence())
             .await;
         outcome
     }
@@ -746,7 +752,13 @@ impl Engine {
                     let _ = self
                         .inner
                         .storage
-                        .upsert_model_result(task_id, idx, model, &ModelResult::skipped())
+                        .upsert_model_result(
+                            task_id,
+                            idx,
+                            model,
+                            &ModelResult::skipped(),
+                            self.fence(),
+                        )
                         .await;
                 }
             }
@@ -794,10 +806,14 @@ impl Engine {
         state: ItemState,
         error: Option<&TaskError>,
     ) -> bool {
+        // A run that lost its claim writes nothing more.
+        if self.lost() {
+            return false;
+        }
         match self
             .inner
             .storage
-            .set_item_state(task_id, idx, state, error)
+            .set_item_state(task_id, idx, state, error, self.fence())
             .await
         {
             Ok(written) => {
@@ -809,12 +825,15 @@ impl Engine {
                 }
                 written
             }
+            // Nothing was stored (each write is one atomic statement), so
+            // nothing is reported; the run's final rollup, or the next run,
+            // picks it up.
             Err(e) => {
                 tracing::error!(
                     task = %task_id, item = idx, state = state.as_str(), error = %e,
                     "could not store the item's final state"
                 );
-                true
+                false
             }
         }
     }
@@ -877,7 +896,13 @@ impl Engine {
             let _ = self
                 .inner
                 .storage
-                .upsert_model_result(task_id, idx, &label, &ModelResult::done(output))
+                .upsert_model_result(
+                    task_id,
+                    idx,
+                    &label,
+                    &ModelResult::done(output),
+                    self.fence(),
+                )
                 .await;
         }
         true
@@ -903,6 +928,9 @@ impl Engine {
     /// a prior run, and the errors of models that already failed. If the item
     /// finished meanwhile (elsewhere), nothing is written or reported.
     pub(crate) async fn fail_item(&self, task_id: &str, idx: usize, item: &Item, err: TaskError) {
+        if self.lost() {
+            return;
+        }
         let models: Vec<String> = item
             .models
             .iter()
@@ -918,7 +946,7 @@ impl Engine {
         match self
             .inner
             .storage
-            .set_item_failed(task_id, idx, &err, &models)
+            .set_item_failed(task_id, idx, &err, &models, self.fence())
             .await
         {
             Ok(true) => {}
@@ -926,8 +954,10 @@ impl Engine {
                 tracing::info!(task = %task_id, item = idx, "item already finished; not failing it");
                 return;
             }
+            // Nothing was stored, so nothing is reported (see finish_item).
             Err(e) => {
-                tracing::error!(task = %task_id, item = idx, error = %e, "could not store the item's failure")
+                tracing::error!(task = %task_id, item = idx, error = %e, "could not store the item's failure");
+                return;
             }
         }
         self.inner.metrics.item_finished(ItemState::Failed);
@@ -941,6 +971,9 @@ impl Engine {
     /// carries the correct task state). A task already in a terminal state
     /// (cancelled, failed) keeps it.
     pub async fn rollup_task_state(&self, task_id: &str) {
+        if self.lost() {
+            return;
+        }
         let task = match self.inner.storage.get_task(task_id).await {
             Ok(Some(t)) => t,
             _ => return,
@@ -950,7 +983,11 @@ impl Engine {
         } else {
             let desired = aggregate::task_state_for(&task);
             if desired != task.state
-                && let Err(e) = self.inner.storage.set_task_state(task_id, desired).await
+                && let Err(e) = self
+                    .inner
+                    .storage
+                    .set_task_state(task_id, desired, self.fence())
+                    .await
             {
                 tracing::error!(task = %task_id, error = %e, "failed to roll up task state");
             }

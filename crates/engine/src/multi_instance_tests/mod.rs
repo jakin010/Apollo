@@ -32,18 +32,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use apollo_config::{Backend, DatabaseConfig, DevicePreference};
+use apollo_config::{Backend, DevicePreference};
 use apollo_domain::{
     Input, ItemState, MediaKind, ModelOutput, ModelResult, ModelState, Sample, Task, TaskState, Url,
 };
 use apollo_storage::testing::SurrealScratch;
-use apollo_storage::{PendingWebhook, Storage, StorageError, SurrealStorage, TaskPage, TaskQuery};
+use apollo_storage::{
+    ClaimMode, Claimable, Fence, Held, Lease, PendingWebhook, Renewal, Storage, StorageError,
+    SurrealStorage, TaskCursor, TaskPage, TaskQuery,
+};
 use tokio::sync::Semaphore;
 
 use crate::{Engine, EventKind, Run, Submission, Submitted, TaskEvent, WebhookError, WebhookSink};
 
 /// The longest any one wait may take before the test fails.
 const WAIT: Duration = Duration::from_secs(20);
+
+/// A one-second lease: renewed every third of a second, taken over a second
+/// after it lapses, and an instance is settled (may take lapsed ones over) a
+/// second after it starts.
+const SHORT_LEASE: &str = "[database]\nlease_secs = 1\n";
+
+/// [`SHORT_LEASE`], in time.
+const LEASE: Duration = Duration::from_secs(1);
 
 /// An image model that is never loaded: an item fails before reaching it.
 const NSFW: &str = "[models.nsfw]\narchitecture = \"vit\"\nrepo = \"test/nsfw\"\n";
@@ -129,11 +140,9 @@ impl Fleet {
         // The test origin listens on 127.0.0.1.
         config.limits.block_private_ips = false;
         config.validate().unwrap();
-        config.database = DatabaseConfig {
-            backend: Backend::Surrealdb,
-            surrealdb: Some(self.db.config()),
-            ..Default::default()
-        };
+        // The shared database; the test's other `[database]` settings stay.
+        config.database.backend = Backend::Surrealdb;
+        config.database.surrealdb = Some(self.db.config());
         config.app.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -160,7 +169,12 @@ impl Fleet {
                     log,
                     holds: Holds::default(),
                 });
-                let engine = Engine::new(Arc::new(config), probe.clone(), Some(sink.clone()));
+                let engine = Engine::with_node(
+                    Arc::new(config),
+                    probe.clone(),
+                    Some(sink.clone()),
+                    who.to_string(),
+                );
                 (engine, probe, sink)
             })
             .await
@@ -255,6 +269,39 @@ impl Instance {
         self.engine.inner.in_flight.load(Ordering::SeqCst)
     }
 
+    /// Claim `id` now, in `mode`, and start running it, as a takeover of it
+    /// would (whether or not this instance would take it). Whether it won.
+    async fn take(&self, id: &str, mode: apollo_storage::ClaimMode) -> bool {
+        let id = id.to_string();
+        self.on(move |e| async move {
+            let token = uuid::Uuid::new_v4().to_string();
+            let claimed = e
+                .inner
+                .storage
+                .claim_task(&id, &e.lease(&token), mode, Duration::ZERO)
+                .await
+                .unwrap();
+            if claimed.is_none() {
+                return false;
+            }
+            let task = e.get_task(&id).await.unwrap().unwrap();
+            let run = e.register(&id, token).unwrap();
+            let reservations = task
+                .items
+                .iter()
+                .map(|item| e.reserve_resumed(&item.models))
+                .collect();
+            tokio::spawn(async move { e.run_task(task, run, reservations).await });
+            true
+        })
+        .await
+    }
+
+    /// Tasks this instance runs now.
+    fn runs(&self) -> usize {
+        self.engine.inner.runs.lock().unwrap().len()
+    }
+
     /// Items waiting for one of this instance's slots.
     fn slots_waiting(&self) -> usize {
         self.engine.inner.gate.snapshot().2
@@ -332,8 +379,12 @@ enum Call {
     ModelResult(String, usize, String, ModelState),
     /// With the new count.
     IncrementAttempts(String, u32),
-    /// With the number of tasks released.
-    ReleaseAttempts(u64),
+    /// A claim of the task, with its attempts if it won.
+    Claim(String, Option<u32>),
+    /// Claims handed back (a graceful stop), with how many were still held.
+    Release(u64),
+    /// A renewal of this many claims (holdable; not logged).
+    Renew(usize),
     WebhookDelivered(String, usize),
     /// A webhook event the sink received.
     Webhook(String, EventKind, TaskState),
@@ -504,9 +555,14 @@ impl Storage for Probe {
     async fn migrate(&self) -> Result<(), StorageError> {
         self.inner.migrate().await
     }
-    async fn create_task(&self, task: &Task) -> Result<(), StorageError> {
+    async fn create_task(
+        &self,
+        task: &Task,
+        lease: Option<&Lease<'_>>,
+        pin: Option<&str>,
+    ) -> Result<(), StorageError> {
         let call = self.pass(Call::CreateTask(task.id.clone())).await;
-        let r = self.inner.create_task(task).await;
+        let r = self.inner.create_task(task, lease, pin).await;
         self.done(call);
         r
     }
@@ -515,9 +571,14 @@ impl Storage for Probe {
         self.done(Call::GetTask(id.into()));
         r
     }
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<bool, StorageError> {
+    async fn set_task_state(
+        &self,
+        id: &str,
+        state: TaskState,
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
         self.pass(Call::SetTaskState(id.into(), state, false)).await;
-        let r = self.inner.set_task_state(id, state).await;
+        let r = self.inner.set_task_state(id, state, fence).await;
         if let Ok(written) = &r {
             self.done(Call::SetTaskState(id.into(), state, *written));
         }
@@ -537,10 +598,14 @@ impl Storage for Probe {
         item: usize,
         state: ItemState,
         error: Option<&apollo_domain::TaskError>,
+        fence: Fence<'_>,
     ) -> Result<bool, StorageError> {
         self.pass(Call::SetItemState(task_id.into(), item, state, false))
             .await;
-        let r = self.inner.set_item_state(task_id, item, state, error).await;
+        let r = self
+            .inner
+            .set_item_state(task_id, item, state, error, fence)
+            .await;
         if let Ok(written) = &r {
             self.done(Call::SetItemState(task_id.into(), item, state, *written));
         }
@@ -552,12 +617,13 @@ impl Storage for Probe {
         item: usize,
         error: &apollo_domain::TaskError,
         models: &[String],
+        fence: Fence<'_>,
     ) -> Result<bool, StorageError> {
         let call = |written| Call::SetItemState(task_id.into(), item, ItemState::Failed, written);
         self.pass(call(false)).await;
         let r = self
             .inner
-            .set_item_failed(task_id, item, error, models)
+            .set_item_failed(task_id, item, error, models, fence)
             .await;
         if let Ok(written) = &r {
             self.done(call(*written));
@@ -580,7 +646,8 @@ impl Storage for Probe {
         item: usize,
         label: &str,
         result: &ModelResult,
-    ) -> Result<(), StorageError> {
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
         let call = self
             .pass(Call::ModelResult(
                 task_id.into(),
@@ -591,7 +658,7 @@ impl Storage for Probe {
             .await;
         let r = self
             .inner
-            .upsert_model_result(task_id, item, label, result)
+            .upsert_model_result(task_id, item, label, result, fence)
             .await;
         self.done(call);
         r
@@ -648,10 +715,48 @@ impl Storage for Probe {
         }
         r
     }
-    async fn release_resume_attempts(&self) -> Result<u64, StorageError> {
-        let r = self.inner.release_resume_attempts().await;
+    fn shared(&self) -> bool {
+        self.inner.shared()
+    }
+    async fn claimable_tasks(
+        &self,
+        mode: ClaimMode,
+        node: &str,
+        skip: &[String],
+        grace: Duration,
+        after: Option<&TaskCursor>,
+        limit: usize,
+    ) -> Result<Vec<Claimable>, StorageError> {
+        self.inner
+            .claimable_tasks(mode, node, skip, grace, after, limit)
+            .await
+    }
+    async fn claim_task(
+        &self,
+        id: &str,
+        lease: &Lease<'_>,
+        mode: ClaimMode,
+        grace: Duration,
+    ) -> Result<Option<u32>, StorageError> {
+        self.pass(Call::Claim(id.into(), None)).await;
+        let r = self.inner.claim_task(id, lease, mode, grace).await;
+        if let Ok(attempts) = &r {
+            self.done(Call::Claim(id.into(), *attempts));
+        }
+        r
+    }
+    async fn renew_claims(
+        &self,
+        held: &[Held],
+        ttl: Duration,
+    ) -> Result<Vec<Renewal>, StorageError> {
+        self.pass(Call::Renew(held.len())).await;
+        self.inner.renew_claims(held, ttl).await
+    }
+    async fn release_claims(&self, held: &[Held]) -> Result<u64, StorageError> {
+        let r = self.inner.release_claims(held).await;
         if let Ok(n) = &r {
-            self.done(Call::ReleaseAttempts(*n));
+            self.done(Call::Release(*n));
         }
         r
     }
@@ -671,8 +776,11 @@ impl Storage for Probe {
         task_id: &str,
         item: usize,
         retries: u32,
-    ) -> Result<(), StorageError> {
-        self.inner.set_item_retries(task_id, item, retries).await
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .set_item_retries(task_id, item, retries, fence)
+            .await
     }
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError> {
         self.inner.purge_finished_before(cutoff_unix_secs).await
@@ -752,18 +860,20 @@ struct Origin {
 }
 
 /// A download waiting for its answer.
-struct Arrival(std::sync::mpsc::Sender<Reply>);
+struct Arrival {
+    /// The path it asked for.
+    path: String,
+    reply: std::sync::mpsc::Sender<Reply>,
+}
 
 enum Reply {
     /// 200 with bytes that aren't an image: the item fails, permanently.
     Garbage,
-    /// 200 with these bytes.
-    Bytes(Vec<u8>),
 }
 
 impl Arrival {
     fn reply(self, reply: Reply) {
-        let _ = self.0.send(reply);
+        let _ = self.reply.send(reply);
     }
 }
 
@@ -838,17 +948,26 @@ fn serve(
     let mut reader = BufReader::new(&stream);
     // The request head; the body (none for a GET) is ignored.
     let mut line = String::new();
+    let mut path = None;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => return,
             Ok(_) if line == "\r\n" || line == "\n" => break,
+            // The request line: `GET /path HTTP/1.1`.
+            Ok(_) if path.is_none() => {
+                path = line.split_whitespace().nth(1).map(str::to_string);
+            }
             Ok(_) => {}
         }
     }
     hits.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = std::sync::mpsc::channel();
-    if arrivals.send(Arrival(tx)).is_err() {
+    let arrival = Arrival {
+        path: path.unwrap_or_default(),
+        reply: tx,
+    };
+    if arrivals.send(arrival).is_err() {
         return;
     }
     // A dropped arrival (the test ended) closes the connection.
@@ -857,7 +976,6 @@ fn serve(
     };
     let body = match reply {
         Reply::Garbage => b"not an image".to_vec(),
-        Reply::Bytes(bytes) => bytes,
     };
     let mut stream = &stream;
     let _ = write!(

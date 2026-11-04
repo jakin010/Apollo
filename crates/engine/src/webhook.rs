@@ -117,7 +117,7 @@ impl Engine {
     /// processing). Spawned so a slow or unreachable receiver never blocks the
     /// scheduler; not tracked for redelivery (only terminal states are).
     pub(crate) async fn notify_item_change(&self, task_id: &str, item_index: usize) {
-        if self.live().webhook.is_none() {
+        if self.live().webhook.is_none() || self.lost() {
             return;
         }
         // The current webhook, also for a task pinned to an older config.
@@ -135,7 +135,7 @@ impl Engine {
     /// success, otherwise leaving it pending for the periodic redelivery loop (and,
     /// ultimately, restart recovery).
     pub(crate) async fn deliver_webhook(&self, task_id: &str, item_index: usize) {
-        if self.live().webhook.is_none() {
+        if self.live().webhook.is_none() || self.lost() {
             return;
         }
         // The current webhook, also for a task pinned to an older config.

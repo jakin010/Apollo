@@ -10,6 +10,7 @@ max_memory     = "4gb"                          # soft process-memory cap (incl.
 max_pending    = 1024                           # max queued/in-flight items before backpressure (0 = off)
 max_retries    = 3                              # times a failed item is retried before it is marked failed (0 = off)
 device         = "auto"                         # auto (CUDA → Metal → CPU), or pin one: cpu / metal / cuda
+# node_id      = "apollo-1"                     # this instance's name when several share one database (default: kept in the state dir)
 
 [webhook]
 url = "https://hooks.example.com:443"          # optional; omit the section to disable and let clients poll
@@ -55,6 +56,7 @@ url = "https://hooks.example.com:443"          # optional; omit the section to d
 [database]
 backend   = "sqlite"            # sqlite | postgres | surrealdb  (postgres: future)
 # retention = "30d"             # how long to keep finished tasks; omit = keep forever
+# lease_secs = 30               # with instances sharing one SurrealDB: a task's claim lasts this long unless renewed
 
 [database.sqlite]
 path            = "/var/lib/apollo/classifications.db"

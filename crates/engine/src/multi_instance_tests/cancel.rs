@@ -3,6 +3,8 @@
 
 use super::*;
 
+use apollo_storage::ClaimMode;
+
 use apollo_domain::Classification;
 
 /// `[app] max_concurrent = 1`, so a test can take the only slot.
@@ -11,11 +13,12 @@ fn one_slot(models: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until cross-instance cancel (the runner sees a cancel written elsewhere, \
-            at its next lease renewal; the lease PR gives this test a short lease)"]
 async fn a_cancel_through_another_instance_doesnt_stop_the_task() {
     fleet_test(|fleet| async move {
-        let a = fleet.start("a", &one_slot(NSFW)).await;
+        // A renews its lease every third of a second: that's how it learns.
+        let a = fleet
+            .start("a", &one_slot(&format!("{SHORT_LEASE}{NSFW}")))
+            .await;
         let b = fleet.start("b", NSFW).await;
         // A's item waits for A's only slot.
         let slot = a.engine.inner.gate.clone().acquire(0).await;
@@ -27,7 +30,7 @@ async fn a_cancel_through_another_instance_doesnt_stop_the_task() {
         // a_cancelled_item_waiting_for_a_slot_gives_back_its_place). From B, A
         // can only learn of it when it next renews its lease.
         let stopped = wait_within(WAIT, || a.in_flight() == 0).await;
-        let b_tokens = b.engine.inner.cancels.lock().unwrap().len();
+        let b_tokens = b.runs();
 
         drop(slot);
         a.wait_idle().await;
@@ -105,16 +108,8 @@ async fn a_second_runner_overwrites_a_finished_result() {
             )
             .await
             .unwrap();
-        let copy = fleet.task(&t).await;
-        b.on(move |e| async move {
-            let reservations: Vec<_> = copy
-                .items
-                .iter()
-                .map(|item| e.reserve_resumed(&item.models))
-                .collect();
-            e.run_task(copy, reservations).await;
-        })
-        .await;
+        fleet.db.expire_lease(&t, Duration::from_secs(1)).await;
+        assert!(b.take(&t, ClaimMode::Expired).await);
         fleet.log.delivered("b", &t).await;
         let by_b = fleet.task(&t).await;
         assert_eq!(

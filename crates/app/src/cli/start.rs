@@ -106,9 +106,10 @@ async fn serve(
 
     let webhook = webhook_sink(&config)?;
 
-    // Engine::new spawns background tasks, so it must run inside the runtime.
+    // Engine::with_node spawns background tasks, so it must run inside the runtime.
+    let node = node_id(&config).context("reading the node id")?;
     let config = Arc::new(config);
-    let engine = Engine::new(config.clone(), storage, webhook);
+    let engine = Engine::with_node(config.clone(), storage, webhook, node);
     let reloader = Reloader {
         engine: engine.clone(),
         source,
@@ -117,17 +118,33 @@ async fn serve(
     reload_on_hangup(reloader.clone());
     let _metrics = start_metrics(&config.metrics, engine.clone()).await?;
 
-    let resumed = engine.recover().await.context("recovering tasks")?;
-    if resumed > 0 {
-        tracing::info!(resumed, "re-queued in-flight tasks from a previous run");
-    }
-
     // Owns the PID file for this process; removed on graceful shutdown.
     let _pidfile = crate::daemon::PidFile::create()?;
 
     let auth = configure_auth(&config.auth)?;
     auth.watch_revocations(REVOCATION_POLL);
     let tls = load_tls(config.tls.as_ref())?;
+
+    // Take the port before any task: a second start on the same database
+    // (and port) must fail before it claims anything.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+
+    // Take tasks over only once nothing above can fail the start: a failed
+    // start would leave its claims to lapse, which the next start counts as a
+    // crash of each task.
+    let resumed = match engine.recover().await {
+        Ok(n) => n,
+        Err(e) => {
+            // Hand back whatever it took before failing.
+            engine.shutdown().await;
+            return Err(e).context("recovering tasks");
+        }
+    };
+    if resumed > 0 {
+        tracing::info!(resumed, "re-queued in-flight tasks from a previous run");
+    }
     if tls.is_none() && !addr.ip().is_loopback() {
         tracing::warn!(
             %addr,
@@ -144,28 +161,84 @@ async fn serve(
         mutual_tls: tls.as_ref().is_some_and(|t| t.client_ca_pem.is_some()),
         auth: auth.is_enabled(),
         config_file: config_file.map(|p| p.display().to_string()),
-        database: describe_database(&config.database),
+        database: match config.database.backend {
+            // Instances sharing the database tell each other apart by node.
+            apollo_config::Backend::Surrealdb => format!(
+                "{} (node {})",
+                describe_database(&config.database),
+                engine.node()
+            ),
+            _ => describe_database(&config.database),
+        },
         log_file: std::env::var(DAEMON_LOG_ENV).ok(),
     };
     let _status_socket = start_status_socket(engine.clone(), info, reloader);
 
     tracing::info!(%addr, models = config.model_count(), "apollo listening");
-    apollo_server::serve_with_shutdown(
+    let served = apollo_server::serve_on(
         engine.clone(),
-        addr,
+        listener,
         crate::daemon::shutdown_signal(),
         auth,
         tls,
     )
-    .await
-    .context("gRPC server error")?;
+    .await;
 
-    // A clean stop must not count toward the poison-task cap for whatever was
-    // still in flight; those tasks resume on the next start.
+    // Hand unfinished tasks back, also when serving failed: a clean stop must
+    // not count toward the poison-task cap for whatever was still in flight,
+    // and the next start (or another instance) takes them at once.
     engine.shutdown().await;
+    served.context("gRPC server error")?;
 
     tracing::info!("apollo shut down cleanly");
     Ok(())
+}
+
+/// This instance's node id: `[app].node_id`, or one kept in the state directory
+/// for its upload directory (two instances on one machine with their own cache
+/// directories are two nodes), made on first use.
+fn node_id(config: &Config) -> anyhow::Result<String> {
+    if let Some(node) = &config.app.node_id {
+        return Ok(node.clone());
+    }
+    let uploads = match &config.app.cache_dir {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("apollo"),
+    };
+    // The same string whether or not the directory exists yet (it's made by
+    // the first upload), so the id doesn't change once it does.
+    let uploads = std::path::absolute(&uploads).unwrap_or(uploads);
+    let uploads = uploads
+        .to_string_lossy()
+        .trim_end_matches(std::path::MAIN_SEPARATOR)
+        .to_string();
+    // FNV-1a: a stable name for the directory, not a security boundary.
+    let key = uploads.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let path = crate::daemon::state_dir()?.join(format!("node-{key:016x}"));
+    let read = |path: &std::path::Path| -> Option<String> {
+        let id = std::fs::read_to_string(path).ok()?.trim().to_string();
+        (!id.is_empty()).then_some(id)
+    };
+    if let Some(id) = read(&path) {
+        return Ok(id);
+    }
+    // Written aside, then linked into place: two starts racing agree on one.
+    let id = format!("n-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, &id).with_context(|| format!("writing {}", tmp.display()))?;
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(id),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            read(&path).ok_or_else(|| anyhow!("{} is empty", path.display()))
+        }
+        Err(e) => Err(e).with_context(|| format!("writing {}", path.display())),
+    }
 }
 
 /// Set by `start --daemon` for the detached child: the log file it writes to.

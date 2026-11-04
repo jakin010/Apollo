@@ -162,10 +162,12 @@ fn keep_restart_only(running: &Config, mut new: Config) -> (Config, Vec<String>)
     keep!(app.device, "app.device");
     keep!(app.cache_dir, "app.cache_dir");
     keep!(app.max_concurrent, "app.max_concurrent");
+    keep!(app.node_id, "app.node_id");
     keep!(app.config_file, "app.config_file");
     keep!(tls, "tls");
     keep!(auth, "auth");
     keep!(database.backend, "database.backend");
+    keep!(database.lease_secs, "database.lease_secs");
     keep!(database.sqlite, "database.sqlite");
     keep!(database.surrealdb, "database.surrealdb");
     keep!(database.postgres, "database.postgres");

@@ -1,27 +1,33 @@
 //! Task submission lifecycle, startup recovery, and the maintenance timer.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime};
 
 use apollo_domain::{Input, Task, TaskError, TaskState};
+use apollo_storage::Renewal;
 
 use crate::aggregate;
 use crate::error::EngineError;
+use crate::lease::{MAX_RESUME_ATTEMPTS, Running};
 use crate::{Engine, Reservation};
 
-/// Resume attempts before a task is declared poison and failed.
-const MAX_RESUME_ATTEMPTS: u32 = 3;
+/// Upload files younger than this are never swept: one may still be arriving
+/// (a `ClassifyStream`), here or at another instance sharing the directory.
+const UPLOAD_SWEEP_AGE: Duration = Duration::from_secs(3600);
 
 impl Engine {
     /// Startup recovery, run once before serving:
     /// 1. re-fire webhooks stranded by a crash between terminal-state and delivery;
-    /// 2. re-queue every incomplete task, bumping its attempt count and failing it
-    ///    if it has exceeded [`MAX_RESUME_ATTEMPTS`] (poison-task guard). Only
-    ///    crashes count: a graceful shutdown releases the attempt again (see
+    /// 2. take over the unfinished tasks this instance may: on SQLite (one
+    ///    process per database) every one; on a shared database the ones nobody
+    ///    holds, and, from then on, every third of the lease, also the ones
+    ///    whose holder stopped renewing its lease. A takeover of a claim that
+    ///    was never handed back counts a resume attempt, failing the task once
+    ///    it exceeds [`MAX_RESUME_ATTEMPTS`] (poison-task guard): only crashes
+    ///    count, since a graceful shutdown hands claims back (see
     ///    [`Engine::shutdown`]).
     ///
-    /// Returns the number of tasks resumed.
+    /// Returns the number of tasks taken over now.
     pub async fn recover(&self) -> Result<usize, EngineError> {
         match self.inner.storage.items_pending_webhook().await {
             Ok(pending) => {
@@ -32,43 +38,28 @@ impl Engine {
             Err(e) => tracing::warn!(error = %e, "recover: could not list pending webhooks"),
         }
 
+        // Remove orphaned upload files: left by a task that finished but
+        // crashed before its upload was deleted. Every unfinished task in the
+        // database keeps its file, and young files are kept anyway.
         let tasks = self.inner.storage.load_incomplete_tasks().await?;
-
-        // Remove orphaned ClassifyStream uploads (files left by a task that
-        // finished but crashed before its upload was deleted). Safe here because
-        // recovery runs before the server accepts new uploads.
         self.sweep_uploads(&tasks);
 
-        let mut resumed = 0usize;
-        for task in tasks {
-            let attempts = self.inner.storage.increment_attempts(&task.id).await?;
-            if attempts > MAX_RESUME_ATTEMPTS {
-                tracing::warn!(task = %task.id, attempts, "exceeded resume cap; failing task");
-                self.fail_poison_task(&task).await?;
-                continue;
-            }
-            tracing::info!(task = %task.id, attempts, "resuming task");
-            // Count resumed items toward the in-flight backpressure gauge.
-            let reservations = task
-                .items
-                .iter()
-                .map(|item| self.reserve_resumed(&item.models))
-                .collect();
-            let engine = self.clone();
-            tokio::spawn(async move { engine.run_task(task, reservations).await });
-            resumed += 1;
+        let resumed = self.take_over().await?;
+        if self.inner.storage.shared() {
+            self.spawn_takeover();
         }
         Ok(resumed)
     }
 
     /// Fail a task that keeps crashing the process: mark it failed, fail each
     /// unfinished item (so the wire reports an error and the webhook fires), and
-    /// let the rollup remove its staged upload.
-    async fn fail_poison_task(&self, task: &Task) -> Result<(), EngineError> {
+    /// let the rollup remove its staged upload. Called on the claim's run
+    /// handle, so its writes are fenced.
+    pub(crate) async fn fail_poison_task(&self, task: &Task) -> Result<(), EngineError> {
         if !self
             .inner
             .storage
-            .set_task_state(&task.id, TaskState::Failed)
+            .set_task_state(&task.id, TaskState::Failed, self.fence())
             .await?
         {
             // It finished meanwhile (elsewhere). If it was cancelled, its
@@ -97,19 +88,9 @@ impl Engine {
         Ok(())
     }
 
-    /// The task's stored state, if it can be read.
-    async fn stored_state(&self, task_id: &str) -> Option<TaskState> {
-        match self.inner.storage.get_task(task_id).await {
-            Ok(task) => task.map(|t| t.state),
-            Err(e) => {
-                tracing::warn!(task = %task_id, error = %e, "could not read the task");
-                None
-            }
-        }
-    }
-
-    /// Remove `ClassifyStream` upload files no longer referenced by any incomplete
-    /// task. Runs once at startup, so there is no race with in-flight uploads.
+    /// Remove upload files no longer referenced by any incomplete task and
+    /// older than [`UPLOAD_SWEEP_AGE`] (a shared upload directory may have one
+    /// arriving at another instance). Runs at startup.
     fn sweep_uploads(&self, keep_tasks: &[Task]) {
         let dir = self.upload_dir();
         let entries = match std::fs::read_dir(&dir) {
@@ -134,6 +115,14 @@ impl Engine {
             if keep.contains(&path) {
                 continue;
             }
+            // Only old plain files; one we can't date stays.
+            let old = entry.metadata().ok().filter(|m| m.is_file()).and_then(|m| {
+                let age = SystemTime::now().duration_since(m.modified().ok()?).ok()?;
+                Some(age >= UPLOAD_SWEEP_AGE)
+            });
+            if old != Some(true) {
+                continue;
+            }
             match std::fs::remove_file(&path) {
                 Ok(()) => removed += 1,
                 Err(e) => {
@@ -146,61 +135,47 @@ impl Engine {
         }
     }
 
-    /// Drive one task to completion: mark it processing, run every item
-    /// concurrently (each bounded by the global semaphore), then mark it completed
-    /// once all items are terminal. `reservations` holds one per item, in item
-    /// order; each item gives its own back when it ends.
-    pub(crate) async fn run_task(&self, task: Task, reservations: Vec<Reservation>) {
+    /// Drive one task to completion under the claim `run` holds: mark it
+    /// processing, run every item concurrently (each bounded by the global
+    /// semaphore), then mark it completed once all items are terminal.
+    /// `reservations` holds one per item, in item order; each item gives its
+    /// own back when it ends. Every write is fenced by the claim.
+    pub(crate) async fn run_task(&self, task: Task, run: Running, reservations: Vec<Reservation>) {
         let task_id = task.id.clone();
         let n_items = task.items.len();
+        // The items run on the config in effect now, even if it is reloaded
+        // while they run, and write only while the claim holds.
+        let runner = self.running(&run);
+        let cancel = run.ctl.cancel.clone();
 
-        // Adopt the cancellation token cancel() may have already created for this
-        // task, otherwise register a fresh one.
-        let cancel = {
-            let mut map = self.inner.cancels.lock().unwrap();
-            map.entry(task_id.clone())
-                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                .clone()
-        };
-
-        // Mark it processing, unless it has finished meanwhile (cancelled, or
-        // finished by another instance sharing the database): then there is
-        // nothing left to run. A cancel through this instance that lands
-        // meanwhile is still recorded, by the items at their first checkpoint.
+        // Mark it processing, unless it has finished meanwhile or isn't ours
+        // any more: then there is nothing left to run. One cancelled while we
+        // still hold it (through another instance, or before this run
+        // registered) still has its items finish, as cancelled.
         if !cancel.load(Ordering::SeqCst) {
             let started = self
                 .inner
                 .storage
-                .set_task_state(&task_id, TaskState::Processing)
+                .set_task_state(&task_id, TaskState::Processing, runner.fence())
                 .await;
-            let stop = match started {
-                Ok(true) => false,
-                Ok(false) if cancel.load(Ordering::SeqCst) => false,
-                // Cancelled through the database only (from another
-                // instance): the items still finish, as cancelled.
-                Ok(false) if self.stored_state(&task_id).await == Some(TaskState::Cancelled) => {
-                    cancel.store(true, Ordering::SeqCst);
-                    false
-                }
-                Ok(false) => {
-                    tracing::info!(task = %task_id, "task already finished; not running it");
-                    true
-                }
+            match started {
+                Ok(true) => {}
+                Ok(false) => match self.renew_one(&run.ctl).await {
+                    Renewal::Held(TaskState::Cancelled) => cancel.store(true, Ordering::SeqCst),
+                    _ => {
+                        tracing::info!(task = %task_id, "task already finished, or not this instance's; not running it");
+                        // Dropping `reservations` gives every item's back.
+                        return;
+                    }
+                },
                 Err(e) => {
                     tracing::error!(task = %task_id, error = %e, "failed to mark task processing");
-                    true
+                    return;
                 }
-            };
-            if stop {
-                // Dropping `reservations` gives every item's back.
-                self.inner.cancels.lock().unwrap().remove(&task_id);
-                return;
             }
         }
 
-        // The items run on the config in effect now, even if it is reloaded
-        // while they run.
-        let pinned = self.pinned();
+        let pinned = runner;
         let mut handles = Vec::with_capacity(n_items);
         debug_assert_eq!(reservations.len(), n_items);
         for ((idx, item), reservation) in task.items.into_iter().enumerate().zip(reservations) {
@@ -217,17 +192,12 @@ impl Engine {
             }
         }
 
-        // Cancellation wins over the item rollup — unless the task finished first
-        // (the write is conditional). Then reflect the items: a backstop in case an
-        // item task panicked before it could roll up, and the point where a
-        // cancelled task's uploads are removed.
-        if cancel.load(Ordering::SeqCst)
-            && let Err(e) = self.inner.storage.cancel_task_if_active(&task_id).await
-        {
-            tracing::error!(task = %task_id, error = %e, "failed to mark task cancelled");
-        }
-        self.rollup_task_state(&task_id).await;
-        self.inner.cancels.lock().unwrap().remove(&task_id);
+        // Reflect the items: a backstop in case an item task panicked before it
+        // could roll up, and the point where a cancelled task's uploads are
+        // removed. (A cancel wrote the task's state before signalling.) A run
+        // that lost its claim writes nothing.
+        pinned.rollup_task_state(&task_id).await;
+        drop(run);
     }
 
     /// Start the hourly maintenance loop: purge finished tasks older than

@@ -16,7 +16,11 @@ use apollo_domain::{
     Classification, Input, Item, ItemState, ModelOutput, ModelResult, ModelState, Prediction,
     Sample, Task, TaskError, TaskState, Url,
 };
-use apollo_storage::{SqliteStorage, Storage, StorageError, SurrealStorage, TaskQuery};
+use apollo_storage::{
+    ClaimMode, Fence, Held, Lease, Renewal, SqliteStorage, Storage, StorageError, SurrealStorage,
+    TaskCursor, TaskQuery,
+};
+use std::time::Duration;
 
 /// Real task ids are hyphenated UUIDs; one test task uses that shape.
 const UUID_ID: &str = "3f2a8c1e-9b4d-4e1a-8f00-0123456789ab";
@@ -67,7 +71,7 @@ async fn exercise(store: &dyn Storage) {
     let mut t1 = sample_task("t1");
     t1.metadata.insert("record".into(), "42".into());
     t1.request_id = Some("req-1".into());
-    store.create_task(&t1).await.unwrap();
+    store.create_task(&t1, None, None).await.unwrap();
     let t = store.get_task("t1").await.unwrap().unwrap();
     assert_eq!(t.state, TaskState::Queued);
     assert_eq!(t.metadata.get("record").map(String::as_str), Some("42"));
@@ -80,10 +84,14 @@ async fn exercise(store: &dyn Storage) {
     assert!(store.get_task("missing").await.unwrap().is_none());
     // Ownerless tasks (submitted with auth disabled) round-trip as None.
     store
-        .create_task(&Task {
-            owner: None,
-            ..sample_task("anon")
-        })
+        .create_task(
+            &Task {
+                owner: None,
+                ..sample_task("anon")
+            },
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(store.get_task("anon").await.unwrap().unwrap().owner, None);
@@ -114,7 +122,7 @@ async fn exercise(store: &dyn Storage) {
     let mut anon2 = sample_task("anon2");
     anon2.owner = None;
     anon2.request_id = Some("req-1".into());
-    store.create_task(&anon2).await.unwrap();
+    store.create_task(&anon2, None, None).await.unwrap();
     assert_eq!(
         store
             .find_task_by_request(None, "req-1")
@@ -139,7 +147,13 @@ async fn exercise(store: &dyn Storage) {
         predictions: vec![Prediction::new(7, "seven", 0.99)],
     });
     store
-        .upsert_model_result("t1", 0, "general", &ModelResult::done(out.clone()))
+        .upsert_model_result(
+            "t1",
+            0,
+            "general",
+            &ModelResult::done(out.clone()),
+            Fence::Unchecked,
+        )
         .await
         .unwrap();
     // A result write keeps the steps marker, and a marker write keeps the result.
@@ -153,7 +167,13 @@ async fn exercise(store: &dyn Storage) {
     assert_eq!(t.items[0].results["general"].state, ModelState::Done);
     assert_eq!(t.items[0].results["general"].output, Some(out.clone()));
     store
-        .upsert_model_result("t1", 0, "nsfw", &ModelResult::processing())
+        .upsert_model_result(
+            "t1",
+            0,
+            "nsfw",
+            &ModelResult::processing(),
+            Fence::Unchecked,
+        )
         .await
         .unwrap();
     let first: Vec<Sample> = (0..3u32)
@@ -186,18 +206,19 @@ async fn exercise(store: &dyn Storage) {
     assert_eq!(t.items[0].results["general"].output, Some(out.clone()));
     assert_eq!(t.items[0].results["nsfw"].state, ModelState::Processing);
 
-    // --- resume bookkeeping: attempts, and their release on graceful shutdown
+    // --- resume bookkeeping: attempts
     store
-        .set_task_state("t1", TaskState::Processing)
+        .set_task_state("t1", TaskState::Processing, Fence::Unchecked)
         .await
         .unwrap();
     let incomplete = store.load_incomplete_tasks().await.unwrap();
     assert!(incomplete.iter().any(|t| t.id == "t1"));
     assert_eq!(store.increment_attempts("t1").await.unwrap(), 1);
     assert_eq!(store.increment_attempts("t1").await.unwrap(), 2);
-    assert_eq!(store.release_resume_attempts().await.unwrap(), 1);
-    assert_eq!(store.increment_attempts("t1").await.unwrap(), 2);
-    store.set_item_retries("t1", 0, 2).await.unwrap();
+    store
+        .set_item_retries("t1", 0, 2, Fence::Unchecked)
+        .await
+        .unwrap();
     assert_eq!(
         store.get_task("t1").await.unwrap().unwrap().items[0].retries,
         2
@@ -212,14 +233,17 @@ async fn exercise(store: &dyn Storage) {
     );
 
     // --- conditional cancel: active -> cancelled; finished stays finished
-    store.create_task(&sample_task(UUID_ID)).await.unwrap();
+    store
+        .create_task(&sample_task(UUID_ID), None, None)
+        .await
+        .unwrap();
     assert!(store.cancel_task_if_active(UUID_ID).await.unwrap());
     let t2 = store.get_task(UUID_ID).await.unwrap().unwrap();
     assert_eq!(t2.state, TaskState::Cancelled);
     assert!(t2.finished_at.is_some(), "a cancelled task is finished");
     assert!(!store.cancel_task_if_active(UUID_ID).await.unwrap());
     store
-        .set_task_state("t1", TaskState::Completed)
+        .set_task_state("t1", TaskState::Completed, Fence::Unchecked)
         .await
         .unwrap();
     assert!(!store.cancel_task_if_active("t1").await.unwrap());
@@ -236,7 +260,10 @@ async fn exercise(store: &dyn Storage) {
         TaskState::Processing,
     ] {
         assert!(
-            !store.set_task_state("t1", state).await.unwrap(),
+            !store
+                .set_task_state("t1", state, Fence::Unchecked)
+                .await
+                .unwrap(),
             "{state:?} over a finished task"
         );
     }
@@ -248,13 +275,13 @@ async fn exercise(store: &dyn Storage) {
     assert!(!store.cancel_task_if_active("missing").await.unwrap());
     assert!(
         !store
-            .set_task_state("missing", TaskState::Failed)
+            .set_task_state("missing", TaskState::Failed, Fence::Unchecked)
             .await
             .unwrap()
     );
 
     // A second task with a stored id is refused, and the first is kept.
-    match store.create_task(&sample_task("t1")).await {
+    match store.create_task(&sample_task("t1"), None, None).await {
         Err(StorageError::TaskExists(id)) => assert_eq!(id, "t1"),
         other => panic!("a duplicate create: {other:?}"),
     }
@@ -262,7 +289,7 @@ async fn exercise(store: &dyn Storage) {
 
     // --- webhook delivery flag
     store
-        .set_item_state("t1", 0, ItemState::Completed, None)
+        .set_item_state("t1", 0, ItemState::Completed, None, Fence::Unchecked)
         .await
         .unwrap();
     // Only t1's item is terminal; the others (anon, anon2, the UUID task) are
@@ -281,7 +308,10 @@ async fn exercise(store: &dyn Storage) {
     // A finished item keeps its state.
     for state in [ItemState::Processing, ItemState::Failed] {
         assert!(
-            !store.set_item_state("t1", 0, state, None).await.unwrap(),
+            !store
+                .set_item_state("t1", 0, state, None, Fence::Unchecked)
+                .await
+                .unwrap(),
             "{state:?} over a finished item"
         );
     }
@@ -291,7 +321,7 @@ async fn exercise(store: &dyn Storage) {
     );
     assert!(
         !store
-            .set_item_state("t1", 7, ItemState::Failed, None)
+            .set_item_state("t1", 7, ItemState::Failed, None, Fence::Unchecked)
             .await
             .unwrap(),
         "no such item"
@@ -301,15 +331,15 @@ async fn exercise(store: &dyn Storage) {
     // A kind other than the fallback's, so storing the message alone would fail.
     let err = TaskError::fetch("fetch failed");
     store
-        .set_item_state("anon", 0, ItemState::Failed, Some(&err))
+        .set_item_state("anon", 0, ItemState::Failed, Some(&err), Fence::Unchecked)
         .await
         .unwrap();
     store
-        .set_item_state("anon2", 0, ItemState::Cancelled, None)
+        .set_item_state("anon2", 0, ItemState::Cancelled, None, Fence::Unchecked)
         .await
         .unwrap();
     store
-        .set_item_state(UUID_ID, 0, ItemState::Processing, None)
+        .set_item_state(UUID_ID, 0, ItemState::Processing, None, Fence::Unchecked)
         .await
         .unwrap();
     let mut pending: Vec<(String, usize)> = store
@@ -385,9 +415,12 @@ async fn exercise(store: &dyn Storage) {
     for i in 1..=5 {
         let mut t = sample_task(&format!("p{i}"));
         t.owner = Some("lister".into());
-        store.create_task(&t).await.unwrap();
+        store.create_task(&t, None, None).await.unwrap();
     }
-    store.set_task_state("p2", TaskState::Failed).await.unwrap();
+    store
+        .set_task_state("p2", TaskState::Failed, Fence::Unchecked)
+        .await
+        .unwrap();
     let mine = TaskQuery {
         owner: Some(Some("lister".into())),
         limit: 2,
@@ -454,7 +487,7 @@ async fn exercise(store: &dyn Storage) {
 
     // --- retention: finished tasks (and their children) are purged
     store
-        .set_task_state("anon", TaskState::Completed)
+        .set_task_state("anon", TaskState::Completed, Fence::Unchecked)
         .await
         .unwrap();
     // t1, the UUID task, anon and p2 are finished.
@@ -469,7 +502,10 @@ async fn exercise(store: &dyn Storage) {
             .is_empty()
     );
     // No children were left behind: the id can be used again from scratch.
-    store.create_task(&sample_task("t1")).await.unwrap();
+    store
+        .create_task(&sample_task("t1"), None, None)
+        .await
+        .unwrap();
     let again = store.get_task("t1").await.unwrap().unwrap();
     assert_eq!(again.items.len(), 1);
     assert_eq!(again.items[0].results["general"].state, ModelState::Queued);
@@ -481,12 +517,15 @@ async fn exercise(store: &dyn Storage) {
     assert_eq!(store.purge_finished_before(now() + 10).await.unwrap(), 0);
 
     // --- failing an item: the item and the listed models, in one write
-    store.create_task(&sample_task("f1")).await.unwrap();
+    store
+        .create_task(&sample_task("f1"), None, None)
+        .await
+        .unwrap();
     let err = TaskError::fetch("unreachable");
     let general = ["general".to_string()];
     assert!(
         store
-            .set_item_failed("f1", 0, &err, &general)
+            .set_item_failed("f1", 0, &err, &general, Fence::Unchecked)
             .await
             .unwrap()
     );
@@ -498,12 +537,25 @@ async fn exercise(store: &dyn Storage) {
     assert_ne!(f1.items[0].results["nsfw"].state, ModelState::Failed);
     // Once finished, nothing more is written.
     let nsfw = ["nsfw".to_string()];
-    assert!(!store.set_item_failed("f1", 0, &err, &nsfw).await.unwrap());
+    assert!(
+        !store
+            .set_item_failed("f1", 0, &err, &nsfw, Fence::Unchecked)
+            .await
+            .unwrap()
+    );
     assert_eq!(store.get_task("f1").await.unwrap().unwrap(), f1);
-    assert!(!store.set_item_failed("f1", 7, &err, &nsfw).await.unwrap());
+    assert!(
+        !store
+            .set_item_failed("f1", 7, &err, &nsfw, Fence::Unchecked)
+            .await
+            .unwrap()
+    );
 
     // --- a retried item goes on, and finishes
-    store.create_task(&sample_task("r1")).await.unwrap();
+    store
+        .create_task(&sample_task("r1"), None, None)
+        .await
+        .unwrap();
     for state in [
         ItemState::Processing,
         ItemState::Retrying,
@@ -512,7 +564,10 @@ async fn exercise(store: &dyn Storage) {
         ItemState::Completed,
     ] {
         assert!(
-            store.set_item_state("r1", 0, state, None).await.unwrap(),
+            store
+                .set_item_state("r1", 0, state, None, Fence::Unchecked)
+                .await
+                .unwrap(),
             "{state:?}"
         );
     }
@@ -522,7 +577,10 @@ async fn exercise(store: &dyn Storage) {
     for round in 0..5 {
         let id = format!("dup{round}");
         let task = sample_task(&id);
-        let (first, second) = tokio::join!(store.create_task(&task), store.create_task(&task));
+        let (first, second) = tokio::join!(
+            store.create_task(&task, None, None),
+            store.create_task(&task, None, None)
+        );
         let outcome = |r: Result<(), StorageError>| match r {
             Ok(()) => "stored",
             Err(StorageError::TaskExists(_)) => "exists",
@@ -532,6 +590,459 @@ async fn exercise(store: &dyn Storage) {
         outcomes.sort();
         assert_eq!(outcomes, ["exists", "stored"], "{id}");
     }
+}
+
+/// A lease for `token`, held by node `node`, for `ttl`.
+fn lease<'a>(token: &'a str, node: &'a str, ttl: Duration) -> Lease<'a> {
+    Lease {
+        token,
+        node,
+        process: "p",
+        ttl,
+    }
+}
+
+/// How claimable `id` is for `node`, per mode: (Force, Open, Expired), each
+/// `None` (not claimable) or `Some(abandoned pin)`.
+async fn claimable(
+    store: &dyn Storage,
+    id: &str,
+    node: &str,
+    grace: Duration,
+) -> [Option<Option<String>>; 3] {
+    let mut out = [None, None, None];
+    for (i, mode) in [ClaimMode::Force, ClaimMode::Open, ClaimMode::Expired]
+        .into_iter()
+        .enumerate()
+    {
+        let rows = store
+            .claimable_tasks(mode, node, &[], grace, None, 100)
+            .await
+            .unwrap();
+        out[i] = rows
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(|c| c.abandoned_pin);
+    }
+    out
+}
+
+/// The lease contract: claims on the database clock, fences, renewals,
+/// releases, attempts, pins.
+async fn exercise_leases(store: &dyn Storage) {
+    const SHORT: Duration = Duration::from_millis(300);
+    const PAST_SHORT: Duration = Duration::from_millis(450);
+    const LONG: Duration = Duration::from_secs(60);
+    let none = Duration::ZERO;
+    let held = |id: &str, token: &str| Held {
+        task_id: id.into(),
+        token: token.into(),
+    };
+
+    // A claimed task: claimable by nobody while its lease lives, except by
+    // force; its runner's writes need its token.
+    store
+        .create_task(&sample_task("L1"), Some(&lease("a1", "A", LONG)), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        claimable(store, "L1", "B", none).await,
+        [Some(None), None, None]
+    );
+    assert_eq!(
+        store
+            .claim_task("L1", &lease("b1", "B", LONG), ClaimMode::Expired, none)
+            .await
+            .unwrap(),
+        None,
+        "a live lease isn't taken over"
+    );
+    assert!(
+        !store
+            .set_task_state("L1", TaskState::Processing, Fence::Claim("b1"))
+            .await
+            .unwrap(),
+        "fenced out"
+    );
+    assert!(
+        store
+            .set_task_state("L1", TaskState::Processing, Fence::Claim("a1"))
+            .await
+            .unwrap()
+    );
+    let err = TaskError::fetch("x");
+    let general = ["general".to_string()];
+    let done = ModelResult::done(ModelOutput::Classification(Classification::default()));
+    for fence in [Fence::Claim("b1"), Fence::Claim("a1")] {
+        let ours = fence == Fence::Claim("a1");
+        assert_eq!(
+            store
+                .set_item_state("L1", 0, ItemState::Processing, None, fence)
+                .await
+                .unwrap(),
+            ours,
+            "{fence:?}"
+        );
+        assert_eq!(
+            store
+                .upsert_model_result("L1", 0, "general", &done, fence)
+                .await
+                .unwrap(),
+            ours,
+            "{fence:?}"
+        );
+        assert_eq!(
+            store.set_item_retries("L1", 0, 1, fence).await.unwrap(),
+            ours,
+            "{fence:?}"
+        );
+    }
+    assert!(
+        !store
+            .set_item_failed("L1", 0, &err, &general, Fence::Claim("b1"))
+            .await
+            .unwrap()
+    );
+    let l1 = store.get_task("L1").await.unwrap().unwrap();
+    assert_eq!(l1.items[0].state, ItemState::Processing);
+    assert_eq!(l1.items[0].results["general"].state, ModelState::Done);
+    assert_eq!(l1.items[0].retries, 1);
+
+    // Renewing: by id and token only, and not a change to the task. Times
+    // are whole seconds: wait for the next one, so a touched `updated_at`
+    // would show.
+    let second = now();
+    while now() == second {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        store
+            .renew_claims(
+                &[held("L1", "a1"), held("L1", "b1"), held("nope", "a1")],
+                LONG
+            )
+            .await
+            .unwrap(),
+        [
+            Renewal::Held(TaskState::Processing),
+            Renewal::Lost,
+            Renewal::Lost
+        ]
+    );
+    let renewed = store.get_task("L1").await.unwrap().unwrap();
+    assert_eq!(renewed.updated_at, l1.updated_at);
+    assert_eq!(renewed, l1);
+
+    // An expired lease: taken over, counting an attempt, and the old runner
+    // is fenced out.
+    store
+        .create_task(&sample_task("L2"), Some(&lease("a2", "A", SHORT)), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        claimable(store, "L2", "B", none).await,
+        [Some(None), None, None]
+    );
+    tokio::time::sleep(PAST_SHORT).await;
+    assert_eq!(
+        claimable(store, "L2", "B", none).await,
+        [Some(None), None, Some(None)]
+    );
+    assert_eq!(
+        store
+            .claim_task("L2", &lease("b2", "B", LONG), ClaimMode::Open, none)
+            .await
+            .unwrap(),
+        None,
+        "an expired claim isn't open"
+    );
+    assert_eq!(
+        store
+            .claim_task("L2", &lease("b2", "B", LONG), ClaimMode::Expired, none)
+            .await
+            .unwrap(),
+        Some(1),
+        "a takeover of a lapsed claim counts an attempt"
+    );
+    assert_eq!(
+        store
+            .renew_claims(&[held("L2", "a2"), held("L2", "b2")], LONG)
+            .await
+            .unwrap(),
+        [Renewal::Lost, Renewal::Held(TaskState::Queued)]
+    );
+    assert!(
+        !store
+            .set_task_state("L2", TaskState::Failed, Fence::Claim("a2"))
+            .await
+            .unwrap()
+    );
+
+    // Released: open at once, and the next claim counts nothing.
+    assert_eq!(
+        store
+            .release_claims(&[held("L2", "b2"), held("L2", "a2")])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        claimable(store, "L2", "C", none).await,
+        [Some(None), Some(None), Some(None)]
+    );
+    assert_eq!(
+        store
+            .claim_task("L2", &lease("c2", "C", LONG), ClaimMode::Open, none)
+            .await
+            .unwrap(),
+        Some(1),
+        "no attempt for a handed-back claim"
+    );
+    // Force takes even a live lease, and counts the claim it replaces.
+    assert_eq!(
+        store
+            .claim_task("L2", &lease("d2", "D", LONG), ClaimMode::Force, none)
+            .await
+            .unwrap(),
+        Some(2)
+    );
+
+    // Never claimed (stored before leases): open, and no attempt.
+    store
+        .create_task(&sample_task("L3"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        claimable(store, "L3", "B", none).await,
+        [Some(None), Some(None), Some(None)]
+    );
+    assert_eq!(
+        store
+            .claim_task("L3", &lease("b3", "B", LONG), ClaimMode::Open, none)
+            .await
+            .unwrap(),
+        Some(0)
+    );
+
+    // Pinned to node A: others leave it until A's lease ended more than the
+    // grace ago, then may only fail it; A itself may run it.
+    store
+        .create_task(
+            &sample_task("L4"),
+            Some(&lease("a4", "A", SHORT)),
+            Some("A"),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(PAST_SHORT).await;
+    assert_eq!(
+        claimable(store, "L4", "B", LONG).await,
+        [Some(Some("A".into())), None, None],
+        "within the grace"
+    );
+    assert_eq!(
+        claimable(store, "L4", "A", LONG).await,
+        [Some(None), None, Some(None)],
+        "its own node"
+    );
+    assert_eq!(
+        store
+            .claim_task("L4", &lease("b4", "B", LONG), ClaimMode::Expired, LONG)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        claimable(store, "L4", "B", none).await,
+        [Some(Some("A".into())), None, Some(Some("A".into()))],
+        "past the grace"
+    );
+    let row = |rows: Vec<apollo_storage::Claimable>, id: &str| {
+        rows.into_iter().find(|c| c.id == id).expect("listed")
+    };
+    let own = row(
+        store
+            .claimable_tasks(ClaimMode::Force, "A", &[], LONG, None, 100)
+            .await
+            .unwrap(),
+        "L4",
+    );
+    assert_eq!(
+        (own.pinned_here, own.stale),
+        (true, false),
+        "its own, within the grace"
+    );
+    let other = row(
+        store
+            .claimable_tasks(ClaimMode::Force, "B", &[], none, None, 100)
+            .await
+            .unwrap(),
+        "L4",
+    );
+    assert_eq!(
+        (other.pinned_here, other.stale),
+        (false, true),
+        "another's, past the grace"
+    );
+    assert!(
+        store
+            .claim_task("L4", &lease("b4", "B", LONG), ClaimMode::Expired, none)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Pinned and cancelled: finishing it reads no input, so the pin doesn't
+    // hold it back, and it isn't reported abandoned.
+    store
+        .create_task(
+            &sample_task("L7"),
+            Some(&lease("a7", "A", SHORT)),
+            Some("A"),
+        )
+        .await
+        .unwrap();
+    assert!(store.cancel_task_if_active("L7").await.unwrap());
+    tokio::time::sleep(PAST_SHORT).await;
+    assert_eq!(
+        claimable(store, "L7", "B", LONG).await,
+        [Some(None), None, Some(None)]
+    );
+    assert!(
+        store
+            .claim_task("L7", &lease("b7", "B", LONG), ClaimMode::Expired, LONG)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .set_item_state("L7", 0, ItemState::Cancelled, None, Fence::Claim("b7"))
+            .await
+            .unwrap()
+    );
+
+    // Stored before leases: stale (nobody has held it since).
+    store
+        .create_task(&sample_task("L8"), None, None)
+        .await
+        .unwrap();
+    let legacy = row(
+        store
+            .claimable_tasks(ClaimMode::Force, "B", &[], LONG, None, 100)
+            .await
+            .unwrap(),
+        "L8",
+    );
+    assert_eq!((legacy.pinned_here, legacy.stale), (false, true));
+
+    // A cancelled task is claimable while it has unfinished items (to finish
+    // them), and not once they are.
+    store
+        .create_task(&sample_task("L5"), Some(&lease("a5", "A", SHORT)), None)
+        .await
+        .unwrap();
+    assert!(store.cancel_task_if_active("L5").await.unwrap());
+    tokio::time::sleep(PAST_SHORT).await;
+    assert_eq!(
+        claimable(store, "L5", "B", none).await,
+        [Some(None), None, Some(None)]
+    );
+    let rows = store
+        .claimable_tasks(ClaimMode::Expired, "B", &[], none, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter().find(|c| c.id == "L5").map(|c| c.state),
+        Some(TaskState::Cancelled)
+    );
+    assert!(
+        store
+            .set_item_state("L5", 0, ItemState::Cancelled, None, Fence::Claim("a5"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(claimable(store, "L5", "B", none).await, [None, None, None]);
+    assert_eq!(
+        store
+            .claim_task("L5", &lease("b5", "B", LONG), ClaimMode::Expired, none)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Skipped ids, oldest first, and paging.
+    let all = store
+        .claimable_tasks(ClaimMode::Force, "B", &[], none, None, 100)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = all.iter().map(|c| c.id.as_str()).collect();
+    assert!(ids.windows(2).all(|w| {
+        let (a, b) = (
+            &all[ids.iter().position(|x| x == &w[0]).unwrap()],
+            &all[ids.iter().position(|x| x == &w[1]).unwrap()],
+        );
+        (a.created_at, &a.id) < (b.created_at, &b.id)
+    }));
+    let skipped = store
+        .claimable_tasks(ClaimMode::Force, "B", &["L1".to_string()], none, None, 100)
+        .await
+        .unwrap();
+    assert!(!skipped.iter().any(|c| c.id == "L1"));
+    assert_eq!(skipped.len() + 1, all.len());
+    let first = store
+        .claimable_tasks(ClaimMode::Force, "B", &[], none, None, 1)
+        .await
+        .unwrap();
+    let cursor = TaskCursor {
+        created_at: first[0].created_at,
+        id: first[0].id.clone(),
+    };
+    let rest = store
+        .claimable_tasks(ClaimMode::Force, "B", &[], none, Some(&cursor), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::iter::once(first[0].id.clone())
+            .chain(rest.iter().map(|c| c.id.clone()))
+            .collect::<Vec<_>>(),
+        all.iter().map(|c| c.id.clone()).collect::<Vec<_>>()
+    );
+
+    // Racing claimers: exactly one wins.
+    store
+        .create_task(&sample_task("L6"), Some(&lease("a6", "A", SHORT)), None)
+        .await
+        .unwrap();
+    tokio::time::sleep(PAST_SHORT).await;
+    let tokens: Vec<String> = (0..6).map(|i| format!("r{i}")).collect();
+    let claims = futures_lite_join(store, &tokens).await;
+    assert_eq!(
+        claims.iter().filter(|c| c.is_some()).count(),
+        1,
+        "{claims:?}"
+    );
+}
+
+/// Each token tries to claim L6 at the same moment.
+async fn futures_lite_join(store: &dyn Storage, tokens: &[String]) -> Vec<Option<u32>> {
+    let leases: Vec<Lease<'_>> = tokens
+        .iter()
+        .map(|t| lease(t, "R", Duration::from_secs(60)))
+        .collect();
+    let mut claims = Vec::new();
+    for chunk in leases.chunks(3) {
+        let (x, y, z) = tokio::join!(
+            store.claim_task("L6", &chunk[0], ClaimMode::Expired, Duration::ZERO),
+            store.claim_task("L6", &chunk[1], ClaimMode::Expired, Duration::ZERO),
+            store.claim_task("L6", &chunk[2], ClaimMode::Expired, Duration::ZERO),
+        );
+        for r in [x, y, z] {
+            // A conflicting claim may fail outright: it didn't take the task.
+            claims.push(r.ok().flatten());
+        }
+    }
+    claims
 }
 
 #[tokio::test]
@@ -544,6 +1055,7 @@ async fn sqlite_backend_contract() {
     .await
     .unwrap();
     exercise(&store).await;
+    exercise_leases(&store).await;
 }
 
 #[tokio::test]
@@ -577,7 +1089,11 @@ async fn surreal_backend_contract() {
     let store = SurrealStorage::connect(&cfg).await.unwrap();
 
     // Run the contract, then always drop the throwaway database.
-    let outcome = tokio::spawn(async move { exercise(&store).await }).await;
+    let outcome = tokio::spawn(async move {
+        exercise(&store).await;
+        exercise_leases(&store).await;
+    })
+    .await;
 
     let admin = surrealdb::engine::any::connect(url).await.unwrap();
     if let (Some(username), Some(password)) = (user, password) {

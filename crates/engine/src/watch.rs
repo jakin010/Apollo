@@ -13,7 +13,10 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use apollo_domain::{ItemState, ModelOutput, ModelResult, Sample, Task, TaskError, TaskState};
-use apollo_storage::{PendingWebhook, Storage, StorageError, TaskPage, TaskQuery};
+use apollo_storage::{
+    ClaimMode, Claimable, Fence, Held, Lease, PendingWebhook, Renewal, Storage, StorageError,
+    TaskCursor, TaskPage, TaskQuery,
+};
 
 use crate::Engine;
 use crate::aggregate;
@@ -46,8 +49,13 @@ impl Storage for Notifying {
         self.inner.migrate().await
     }
 
-    async fn create_task(&self, task: &Task) -> Result<(), StorageError> {
-        self.inner.create_task(task).await?;
+    async fn create_task(
+        &self,
+        task: &Task,
+        lease: Option<&Lease<'_>>,
+        pin: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.inner.create_task(task, lease, pin).await?;
         self.changed(&task.id);
         Ok(())
     }
@@ -56,8 +64,13 @@ impl Storage for Notifying {
         self.inner.get_task(id).await
     }
 
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<bool, StorageError> {
-        let written = self.inner.set_task_state(id, state).await?;
+    async fn set_task_state(
+        &self,
+        id: &str,
+        state: TaskState,
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
+        let written = self.inner.set_task_state(id, state, fence).await?;
         if written {
             self.changed(id);
         }
@@ -78,10 +91,11 @@ impl Storage for Notifying {
         item: usize,
         state: ItemState,
         error: Option<&TaskError>,
+        fence: Fence<'_>,
     ) -> Result<bool, StorageError> {
         let written = self
             .inner
-            .set_item_state(task_id, item, state, error)
+            .set_item_state(task_id, item, state, error, fence)
             .await?;
         if written {
             self.changed(task_id);
@@ -95,10 +109,11 @@ impl Storage for Notifying {
         item: usize,
         error: &TaskError,
         models: &[String],
+        fence: Fence<'_>,
     ) -> Result<bool, StorageError> {
         let written = self
             .inner
-            .set_item_failed(task_id, item, error, models)
+            .set_item_failed(task_id, item, error, models, fence)
             .await?;
         if written {
             self.changed(task_id);
@@ -124,12 +139,16 @@ impl Storage for Notifying {
         item: usize,
         label: &str,
         result: &ModelResult,
-    ) -> Result<(), StorageError> {
-        self.inner
-            .upsert_model_result(task_id, item, label, result)
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
+        let written = self
+            .inner
+            .upsert_model_result(task_id, item, label, result, fence)
             .await?;
-        self.changed(task_id);
-        Ok(())
+        if written {
+            self.changed(task_id);
+        }
+        Ok(written)
     }
 
     // Scan checkpoints are not part of a task until its model finishes, so
@@ -188,8 +207,45 @@ impl Storage for Notifying {
         self.inner.increment_attempts(id).await
     }
 
-    async fn release_resume_attempts(&self) -> Result<u64, StorageError> {
-        self.inner.release_resume_attempts().await
+    // Claims, renewals and releases change nothing a watcher sees.
+    fn shared(&self) -> bool {
+        self.inner.shared()
+    }
+
+    async fn claimable_tasks(
+        &self,
+        mode: ClaimMode,
+        node: &str,
+        skip: &[String],
+        grace: Duration,
+        after: Option<&TaskCursor>,
+        limit: usize,
+    ) -> Result<Vec<Claimable>, StorageError> {
+        self.inner
+            .claimable_tasks(mode, node, skip, grace, after, limit)
+            .await
+    }
+
+    async fn claim_task(
+        &self,
+        id: &str,
+        lease: &Lease<'_>,
+        mode: ClaimMode,
+        grace: Duration,
+    ) -> Result<Option<u32>, StorageError> {
+        self.inner.claim_task(id, lease, mode, grace).await
+    }
+
+    async fn renew_claims(
+        &self,
+        held: &[Held],
+        ttl: Duration,
+    ) -> Result<Vec<Renewal>, StorageError> {
+        self.inner.renew_claims(held, ttl).await
+    }
+
+    async fn release_claims(&self, held: &[Held]) -> Result<u64, StorageError> {
+        self.inner.release_claims(held).await
     }
 
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError> {
@@ -205,10 +261,16 @@ impl Storage for Notifying {
         task_id: &str,
         item: usize,
         retries: u32,
-    ) -> Result<(), StorageError> {
-        self.inner.set_item_retries(task_id, item, retries).await?;
-        self.changed(task_id);
-        Ok(())
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
+        let written = self
+            .inner
+            .set_item_retries(task_id, item, retries, fence)
+            .await?;
+        if written {
+            self.changed(task_id);
+        }
+        Ok(written)
     }
 
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError> {

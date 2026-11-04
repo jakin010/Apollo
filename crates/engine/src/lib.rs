@@ -2,6 +2,7 @@
 //! into a runnable pipeline.
 //!
 //! - `queue`     — submission, startup recovery, maintenance timer
+//! - `lease`     — which tasks this process runs; takeover and hand-back
 //! - `scheduler` — per-task dispatch: fetch-once, fan-out, global concurrency cap
 //! - `worker`    — per-model dedicated-thread batching worker (idle-unload)
 //! - `registry`  — loaded-model registry + submission validation
@@ -22,6 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use apollo_config::Config;
 use apollo_domain::{Input, Item, Task};
@@ -32,6 +34,7 @@ mod aggregate;
 mod catalog;
 mod error;
 mod gate;
+mod lease;
 mod live;
 mod memory;
 mod metrics;
@@ -102,6 +105,9 @@ pub struct Engine {
     /// A snapshot this handle is pinned to (see [`Engine::pinned`]); `None`
     /// reads the current one.
     pinned: Option<Arc<Live>>,
+    /// The run this handle works for: its claim fences the handle's writes
+    /// (see [`Engine::running`]).
+    run: Option<Arc<lease::RunCtl>>,
 }
 
 struct Inner {
@@ -126,10 +132,23 @@ struct Inner {
     /// Of those, how many run each model (by label), for the models'
     /// `max_pending`. Labels with none are absent.
     admitted: Mutex<HashMap<String, usize>>,
-    /// Per-task cooperative cancellation signals, keyed by task id.
-    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// The tasks this process runs, by id: each run's claim and its
+    /// cooperative cancel signal.
+    runs: Mutex<HashMap<String, Arc<lease::RunCtl>>>,
     /// Woken on every cancel, so items waiting for a slot can check theirs.
     cancelled: tokio::sync::Notify,
+    /// This instance's node id, and this process's id (one per start).
+    node: String,
+    process: String,
+    /// How long a claim lasts unless renewed (`[database].lease_secs`).
+    lease_ttl: Duration,
+    /// Since when the database has answered without a break (for taking over
+    /// lapsed leases).
+    connected_since: Mutex<Option<Instant>>,
+    /// Serializes takeover passes, and what they remember between passes.
+    takeover: tokio::sync::Mutex<lease::Takeover>,
+    /// Shutting down: no new runs, no takeovers.
+    closing: AtomicBool,
     /// Ids of changed tasks, announced by the storage wrapper.
     changes: broadcast::Sender<Arc<str>>,
     /// One lock per `(owner, request_id)` in use: serializes submissions with
@@ -175,11 +194,24 @@ impl Engine {
     /// model, and start the maintenance timer.
     ///
     /// Must be called within a Tokio runtime (it spawns background tasks). Loading
-    /// of model weights is lazy — workers load on first use, not here.
+    /// of model weights is lazy — workers load on first use, not here. Its node
+    /// id is new each time (see [`Engine::with_node`]).
     pub fn new(
         config: Arc<Config>,
         storage: Arc<dyn Storage>,
         webhook: Option<Arc<dyn WebhookSink>>,
+    ) -> Engine {
+        Self::with_node(config, storage, webhook, uuid::Uuid::new_v4().to_string())
+    }
+
+    /// [`Engine::new`], as node `node`: the name its node-local inputs
+    /// (uploads, local files) stay with among instances sharing a database,
+    /// the same across restarts.
+    pub fn with_node(
+        config: Arc<Config>,
+        storage: Arc<dyn Storage>,
+        webhook: Option<Arc<dyn WebhookSink>>,
+        node: String,
     ) -> Engine {
         let (_probe, kind) = apollo_inference::select_device(config.app.device);
         tracing::info!(device = %kind, "selected compute device");
@@ -194,6 +226,8 @@ impl Engine {
             metrics: &metrics,
         };
         let (registry, _) = Registry::build(&config, &env, None);
+        let lease_ttl = Duration::from_secs(config.database.lease_secs.max(1).into());
+        let shared = storage.shared();
         let gate = Arc::new(PriorityGate::new(config.app.max_concurrent.max(1) as usize));
         let (changes, _) = broadcast::channel(watch::CHANGE_BUFFER);
         let storage: Arc<dyn Storage> = Arc::new(watch::Notifying {
@@ -213,15 +247,25 @@ impl Engine {
                 gate,
                 in_flight: AtomicUsize::new(0),
                 admitted: Mutex::new(HashMap::new()),
-                cancels: Mutex::new(HashMap::new()),
+                runs: Mutex::new(HashMap::new()),
                 cancelled: tokio::sync::Notify::new(),
                 changes,
                 idempotency: Mutex::new(HashMap::new()),
+                node,
+                process: uuid::Uuid::new_v4().to_string(),
+                lease_ttl,
+                connected_since: Mutex::new(Some(Instant::now())),
+                takeover: tokio::sync::Mutex::new(lease::Takeover::default()),
+                closing: AtomicBool::new(false),
             }),
             pinned: None,
+            run: None,
         };
         engine.spawn_maintenance();
         engine.spawn_redelivery();
+        if shared {
+            engine.spawn_renewal();
+        }
         engine
     }
 
@@ -243,6 +287,7 @@ impl Engine {
         Engine {
             inner: Arc::clone(&self.inner),
             pinned: None,
+            run: None,
         }
     }
 
@@ -253,6 +298,7 @@ impl Engine {
         Engine {
             inner: Arc::clone(&self.inner),
             pinned: Some(self.live()),
+            run: self.run.clone(),
         }
     }
 
@@ -387,14 +433,15 @@ impl Engine {
         let engine = self.clone();
         let stored = tokio::spawn(async move {
             let _serialized = serialized;
-            if task.request_id.is_some() {
-                // A keyed id comes back once retention has removed its task. A
-                // cancel signal this instance kept for that earlier task (one
-                // it didn't run) mustn't stop this one: nothing can cancel this
-                // one before it's stored.
-                engine.inner.cancels.lock().unwrap().remove(&task.id);
-            }
-            match engine.inner.storage.create_task(&task).await {
+            let token = uuid::Uuid::new_v4().to_string();
+            // Node-local input stays with this node.
+            let pin = lease::pinned_input(&task).then(|| engine.inner.node.as_str());
+            match engine
+                .inner
+                .storage
+                .create_task(&task, Some(&engine.lease(&token)), pin)
+                .await
+            {
                 Ok(()) => {}
                 // Another instance stored this key's task after this one
                 // looked for it: that's the task.
@@ -404,8 +451,16 @@ impl Engine {
                 Err(e) => return Err(e.into()),
             }
             tracing::info!(task = %task.id, "task submitted");
-            let runner = engine.clone();
-            tokio::spawn(async move { runner.run_task(task, vec![reservation]).await });
+            match engine.register(&task.id, token.clone()) {
+                Some(run) => {
+                    let runner = engine.clone();
+                    tokio::spawn(
+                        async move { runner.run_task(task, run, vec![reservation]).await },
+                    );
+                }
+                // Stopping: the next start (or another instance) runs it.
+                None => engine.release(&task.id, &token).await,
+            }
             Ok::<bool, EngineError>(false)
         });
         match stored.await {
@@ -613,15 +668,11 @@ impl Engine {
     }
 
     /// Graceful-shutdown hook, called once the server has stopped accepting
-    /// requests. Releases this run's resume attempt for every incomplete task, so
-    /// a clean restart (e.g. a deploy) never counts toward the poison-task cap —
-    /// only crashes do.
+    /// requests. Stops this process's runs and hands their tasks back, so a
+    /// clean restart (e.g. a deploy) never counts toward the poison-task cap —
+    /// only crashes do — and another instance may take them at once.
     pub async fn shutdown(&self) {
-        match self.inner.storage.release_resume_attempts().await {
-            Ok(n) if n > 0 => tracing::info!(tasks = n, "released resume attempts on shutdown"),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "could not release resume attempts"),
-        }
+        self.hand_back_all().await;
     }
 
     /// Fetch a task by id (backs the `GetTask` RPC).
@@ -642,23 +693,25 @@ impl Engine {
         if aggregate::task_terminal(task.state) {
             return Ok(());
         }
-        // The token, created if run_task hasn't registered one yet, so a run
-        // that starts meanwhile shares it (its start write then sees the
-        // cancel, and sets it).
-        let token = {
-            let mut map = self.inner.cancels.lock().unwrap();
-            map.entry(task_id.to_string())
-                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                .clone()
-        };
         // The stored state first, so an item that stops on the signal rolls
         // the task up as cancelled. Conditional: if the task finished in the
         // meantime it stays finished rather than being relabelled as cancelled.
         if !self.inner.storage.cancel_task_if_active(task_id).await? {
-            self.inner.cancels.lock().unwrap().remove(task_id);
             return Ok(());
         }
-        token.store(true, Ordering::SeqCst);
+        // Then the run's signal, if it runs here; a run elsewhere learns of the
+        // cancel when it next renews its lease, and one that hasn't started yet
+        // when its start write finds the task cancelled.
+        let run = self
+            .inner
+            .runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+            .cloned();
+        if let Some(run) = run {
+            run.cancel.store(true, Ordering::SeqCst);
+        }
         // Items waiting for a slot stop waiting (and give back their place).
         self.inner.cancelled.notify_waiters();
         tracing::info!(task = %task_id, "task cancellation requested");

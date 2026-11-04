@@ -66,7 +66,7 @@ With authentication on, a caller lists only its own tasks; [admin subjects](./co
 
 ### `CancelTask(CancelTaskRequest) → Task`
 
-Requests cooperative cancellation and returns the task **after** the request: `CANCELLED`, unless it had already finished. Running work stops at the next checkpoint: between models, or between sampled video frames. Results of models that finished before are kept; models that had not finished are reported `CANCELLED`. Returns `NOT_FOUND` for an unknown id.
+Requests cooperative cancellation and returns the task **after** the request: `CANCELLED`, unless it had already finished. Running work stops at the next checkpoint: between models, or between sampled video frames. With instances sharing one database, a cancel through another instance than the one running the task reaches it when that one next renews its lease (within a third of `[database].lease_secs`). Results of models that finished before are kept; models that had not finished are reported `CANCELLED`. Returns `NOT_FOUND` for an unknown id.
 
 ### `ListModels(ListModelsRequest) → ListModelsResponse`
 
