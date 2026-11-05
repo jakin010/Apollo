@@ -59,10 +59,11 @@ A running server picks up an edited file with `apollo reload` (or `SIGHUP`), wit
 
 ## `[webhook]` — outbound delivery
 
-Optional. Omit the whole section to disable delivery and let clients poll. See [webhooks.md](./webhooks.md) for semantics.
+Optional. Omit the whole section, or set `enabled = false`, to disable delivery and let clients poll. See [webhooks.md](./webhooks.md) for semantics.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
+| `enabled` | bool | `true` | Send webhooks. `false` turns delivery off but keeps the settings: nothing is sent, nor kept to send once it's on again. `--webhook-url` turns it on for a run. |
 | `url` | string | *(required if section present)* | gRPC receiver target. Scheme selects transport: `https` = TLS, `http` = plaintext. Path is ignored. |
 | `secret` | string | *(none)* | Shared secret. When set, each delivery is signed: `x-apollo-webhook-signature` = `v1=` + hex HMAC‑SHA256 over the delivery timestamp and the exact payload bytes (see [webhooks.md → Signing](./webhooks.md#signing-and-authenticity)). |
 | `redelivery_secs` | u32 | `60` | Background retry interval for failed deliveries. `0` disables periodic retry (still retried on restart). |
@@ -608,7 +609,7 @@ apollo token --subject NAME [--expires 30d] [--secret-key-file PATH]
 apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
 ```
 
-- **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url`, or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
+- **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url` and turns delivery on (also over `enabled = false`), or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
 - **`status`** reports whether the server is running and its live state:
   - version, PID, uptime, listen address, TLS/auth, config file (with its generation and when it was reloaded, after a reload), database, and log file;
   - memory in use against `max_memory` (measured as for `max_memory`: physical footprint on macOS, resident set size elsewhere);

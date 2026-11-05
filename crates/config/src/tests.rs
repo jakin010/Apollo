@@ -99,6 +99,22 @@ fn database_timeout_defaults_to_30_seconds() {
 }
 
 #[test]
+fn webhooks_turn_off_and_the_url_flag_turns_them_back_on() {
+    let section = "[webhook]\nurl = \"http://hooks:1\"\n";
+    assert!(load::from_str(section).unwrap().webhook.unwrap().enabled);
+    let off = format!("{section}enabled = false\n");
+    let mut cfg = load::from_str(&off).unwrap();
+    assert!(!cfg.webhook.as_ref().unwrap().enabled);
+    cfg.apply_overrides(&load::Overrides {
+        endpoint: None,
+        port: None,
+        webhook_url: Some("http://other:2".into()),
+    });
+    let w = cfg.webhook.unwrap();
+    assert_eq!((w.enabled, w.url.as_str()), (true, "http://other:2"));
+}
+
+#[test]
 fn rejects_unknown_strategy_reference() {
     let cfg = load::from_str(
         r#"
