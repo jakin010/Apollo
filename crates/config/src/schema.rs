@@ -304,6 +304,11 @@ pub struct DatabaseConfig {
     pub postgres: Option<PostgresConfig>,
     #[serde(default)]
     pub surrealdb: Option<SurrealdbConfig>,
+    /// Seconds a client's call waits for the database before it fails as
+    /// unavailable, and that connecting to SurrealDB may take at startup. 0
+    /// waits as long as it takes. Background work always waits.
+    #[serde(default = "crate::defaults::database_timeout")]
+    pub timeout: u32,
 }
 
 impl Default for DatabaseConfig {
@@ -314,6 +319,7 @@ impl Default for DatabaseConfig {
             sqlite: None,
             postgres: None,
             surrealdb: None,
+            timeout: defaults::database_timeout(),
         }
     }
 }

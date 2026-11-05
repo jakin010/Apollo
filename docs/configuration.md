@@ -193,6 +193,7 @@ See [database.md](./database.md) for the full picture.
 |-------|------|---------|---------|
 | `backend` | enum | `sqlite` | `sqlite` \| `postgres` \| `surrealdb`. (`postgres` is a future seam and currently fails at startup.) |
 | `retention` | duration | *(none)* | How long to keep finished tasks (e.g. `"30d"`). Omit to keep forever. |
+| `timeout` | u32 (s) | `30` | How long a client's call waits for the database before it fails with `UNAVAILABLE`, and how long connecting to SurrealDB may take at startup (the schema migration after it has no limit). Background work (running tasks, webhooks) always waits, so none of its writes is dropped. A Classify told `UNAVAILABLE` may still have its task stored and run once the database answers: retry it with the same `request_id` to get that task. `0` waits as long as it takes. |
 
 Each backend has its own sub‑table; the one matching `backend` is required (except `sqlite`, which has defaults).
 

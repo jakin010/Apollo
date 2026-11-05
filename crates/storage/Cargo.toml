@@ -12,12 +12,14 @@ serde_json = "1"
 thiserror = "2"
 # SurrealDB backend (remote server over ws(s)/http(s)).
 surrealdb = { version = "4.0", default-features = false, features = ["protocol-ws", "protocol-http", "rustls"] }
+# The time limit on connecting to SurrealDB.
+tokio = { workspace = true, features = ["time"] }
 # For `testing` (the `test-util` feature) only.
-tokio = { workspace = true, features = ["time"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"], optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# `net`, `io-util` and `sync` for the outage test's proxy.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util", "sync"] }
 tempfile = "3"
 # The workspace links two rustls backends, so the SurrealDB test picks one before
 # a wss:// URL needs it (the binary does this in main).
@@ -26,4 +28,4 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 [features]
 # `apollo_storage::testing` (a throwaway SurrealDB database), for other
 # crates' tests only.
-test-util = ["dep:tokio", "dep:rustls"]
+test-util = ["dep:rustls"]

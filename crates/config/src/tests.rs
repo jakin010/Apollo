@@ -92,6 +92,13 @@ fn device_defaults_to_auto_and_parses_overrides() {
 }
 
 #[test]
+fn database_timeout_defaults_to_30_seconds() {
+    assert_eq!(load::from_str("").unwrap().database.timeout, 30);
+    let off = load::from_str("[database]\ntimeout = 0\n").unwrap();
+    assert_eq!(off.database.timeout, 0);
+}
+
+#[test]
 fn rejects_unknown_strategy_reference() {
     let cfg = load::from_str(
         r#"

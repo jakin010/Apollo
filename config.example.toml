@@ -55,6 +55,7 @@ url = "https://hooks.example.com:443"          # optional; omit the section to d
 [database]
 backend   = "sqlite"            # sqlite | postgres | surrealdb  (postgres: future)
 # retention = "30d"             # how long to keep finished tasks; omit = keep forever
+# timeout   = 30                # s a client's call waits for the database (and SurrealDB's connect at start); 0 = no limit
 
 [database.sqlite]
 path            = "/var/lib/apollo/classifications.db"
