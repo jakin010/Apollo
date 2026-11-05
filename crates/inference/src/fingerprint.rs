@@ -35,7 +35,7 @@ pub fn output_fingerprint(
         revision,
         enabled: _,
         keep_in_memory: _,
-        max_concurrent: _,
+        max_concurrent,
         timeout: _,
         max_pending: _,
         priority: _,
@@ -84,6 +84,9 @@ pub fn output_fingerprint(
         "max_pixels": max_pixels,
         "min_confidence": min_confidence,
         "strategy": strategy,
+        // A scan that confirms its triggers classifies whole batches before it
+        // looks, so which frames it samples depends on the batch size.
+        "batch": strategy.filter(|s| s.confirm > 0).map(|_| max_concurrent),
         "numerics": numerics(*architecture, device),
     });
     // Unset settings leave no trace, so one added later keeps every
@@ -95,8 +98,9 @@ pub fn output_fingerprint(
 }
 
 /// What computes the numbers: the device, and on the CPU its architecture
-/// and the speed features compiled in (they move scores in the last digits).
-/// `None` for `pdq`, plain integer code whatever it runs on.
+/// and the speed features in use (they move scores in the last digits): those
+/// compiled in, where they apply at run time. `None` for `pdq`, plain integer
+/// code whatever it runs on.
 fn numerics(architecture: Architecture, device: DeviceKind) -> Option<String> {
     if architecture == Architecture::Pdq {
         return None;
@@ -105,17 +109,49 @@ fn numerics(architecture: Architecture, device: DeviceKind) -> Option<String> {
         return Some(device.to_string());
     };
     let mut cpu = format!("cpu-{}", std::env::consts::ARCH);
+    let avx512 = cfg!(feature = "avx512") && x86_has("avx512f");
     for (on, name) in [
+        // The matmul kernels without FMA are other code (old x86 CPUs).
+        (cfg!(target_arch = "x86_64") && !x86_has("fma"), "no-fma"),
         (cfg!(feature = "accelerate"), "accelerate"),
-        (cfg!(feature = "avx512"), "avx512"),
-        (cfg!(feature = "fast-gelu"), "fast-gelu"),
+        // Its kernels are picked only on CPUs that have AVX-512.
+        (avx512, "avx512"),
+        // `CANDLE_FAST_GELU=0` (or `false`) turns it off, as candle reads it.
+        (
+            cfg!(feature = "fast-gelu")
+                && !std::env::var("CANDLE_FAST_GELU")
+                    .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false")),
+            "fast-gelu",
+        ),
     ] {
         if on {
             cpu.push('+');
             cpu.push_str(name);
         }
     }
+    // Which matmuls the AVX-512 kernels take (the fork's switch).
+    if avx512 && let Ok(factor) = std::env::var("GEMM_X86_V4_FACTOR") {
+        cpu.push_str(&format!("+v4-factor={}", factor.trim()));
+    }
     Some(cpu)
+}
+
+/// Whether this x86-64 CPU has `feature` (as the matmul kernels check):
+/// `avx512f` or `fma`. False elsewhere.
+fn x86_has(feature: &str) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match feature {
+            "avx512f" => std::arch::is_x86_feature_detected!("avx512f"),
+            "fma" => std::arch::is_x86_feature_detected!("fma"),
+            _ => false,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = feature;
+        false
+    }
 }
 
 /// Drop object members that are null, or empty arrays or objects, at any
@@ -315,6 +351,34 @@ mod tests {
             );
         }
 
+        // The batch size, for a scan that confirms its triggers.
+        let confirming = strategy(&format!("confirm = 1\n{SAMPLING}"));
+        assert_ne!(
+            fp(
+                &model(&format!("{VIT}max_concurrent = 1\n")),
+                &ModelFiles::default(),
+                Some(&confirming)
+            ),
+            fp(
+                &model(&format!("{VIT}max_concurrent = 8\n")),
+                &ModelFiles::default(),
+                Some(&confirming)
+            ),
+        );
+        assert_eq!(
+            fp(
+                &model(&format!("{VIT}max_concurrent = 1\n")),
+                &ModelFiles::default(),
+                Some(&s)
+            ),
+            fp(
+                &model(&format!("{VIT}max_concurrent = 8\n")),
+                &ModelFiles::default(),
+                Some(&s)
+            ),
+            "without confirmation"
+        );
+
         // The device, for a model the device computes.
         assert_ne!(
             output_fingerprint(&model(VIT), &ModelFiles::default(), None, DeviceKind::Cuda),
@@ -328,6 +392,7 @@ mod tests {
         for change in [
             "enabled = true\n",
             "keep_in_memory = true\n",
+            // No scan confirms anything: the batch size changes nothing.
             "max_concurrent = 7\n",
             "timeout = 5\n",
             "max_pending = 3\n",

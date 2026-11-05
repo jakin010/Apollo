@@ -582,6 +582,79 @@ async fn a_database_outage_for_everyone_hands_runs_back_uncounted() {
     .await;
 }
 
+/// Not ignored: a look for tasks to take over that hangs for less than a lease
+/// and then finds a lease lapsed (the database was out of reach for everyone)
+/// looks again half a lease later instead of taking it: by then the lease's
+/// holder has handed it back, and it runs again uncounted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_look_for_lapsed_leases_takes_none() {
+    fleet_test(|fleet| async move {
+        let origin = Origin::start();
+        let toml = format!("{SHORT_LEASE}{NSFW}");
+        let b = fleet.start("b", &toml).await;
+        b.recover().await;
+        let a = fleet.start("a", &toml).await;
+        a.recover().await;
+        let t = a.submit(image_at(&origin.url("/t.png"))).await.id;
+        let download_a = origin.next("a downloads the input").await;
+        assert!(
+            wait_within(2 * LEASE, || b.engine.settled()).await,
+            "B settled"
+        );
+
+        // The database is out of reach: A stops, and B's next look hangs.
+        let hold_a = a.hold_storage(usize::MAX, |c| {
+            matches!(c, Call::Renew(n) if *n > 0)
+                || matches!(c, Call::Release(_) | Call::Claimable | Call::Claim(..))
+        });
+        let read_b = b.hold_storage(1, |c| matches!(c, Call::Claimable));
+        read_b.entered("b looks for tasks to take over").await;
+        let hung = Instant::now();
+        assert!(
+            wait_within(LEASE, || a.run_lost(&t) == Some(true)).await,
+            "A stopped within its lease"
+        );
+        download_a.reply(Reply::Garbage);
+        a.wait_idle().await;
+        // A's lease lapses on the database's clock.
+        let deadline = Instant::now() + 2 * LEASE;
+        while fleet.db.lease(&t).await.1 {
+            assert!(Instant::now() < deadline, "A's lease never lapsed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if let Some(rest) = (LEASE / 2).checked_sub(hung.elapsed()) {
+            tokio::time::sleep(rest).await;
+        }
+
+        // The database is back for both: B's look answers, with A's lapsed
+        // lease; A hands its task back.
+        read_b.release();
+        hold_a.open();
+        tokio::time::sleep(LEASE / 4).await;
+        let taken = fleet
+            .log
+            .count(|who, c| who == "b" && matches!(c, Call::Claim(id, Some(_)) if *id == t));
+
+        let download = origin.next("the task runs again").await;
+        download.reply(Reply::Garbage);
+        fleet
+            .log
+            .wait_for(
+                "the finished webhook is delivered",
+                |_, c| matches!(c, Call::WebhookDelivered(id, _) if *id == t),
+            )
+            .await;
+        a.wait_idle().await;
+        b.wait_idle().await;
+        assert_eq!(
+            (taken, fleet.db.attempts(&t).await),
+            (0, 0),
+            "(B's claims right after its slow look, attempts)"
+        );
+    })
+    .await;
+}
+
 /// Not ignored: renewals a stopped run sent, applied late (the database
 /// client queued them), and its hand-back, in whatever order they land, count
 /// no attempt: the task runs again once, as if handed back at once.

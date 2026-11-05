@@ -441,6 +441,7 @@ enum Call {
     Renew(usize),
     /// A takeover's read of candidates (holdable; not logged).
     Claimable,
+    /// A finished webhook marked delivered (by its delivery claim's holder).
     WebhookDelivered(String, usize),
     /// Finished webhooks claimed for delivery by a redelivery pass (logged
     /// when any were).
@@ -875,10 +876,11 @@ impl Storage for Probe {
         target: Option<&str>,
         mode: apollo_storage::ClaimMode,
         ttl: Duration,
+        limit: usize,
     ) -> Result<Vec<PendingWebhook>, StorageError> {
         let r = self
             .inner
-            .claim_pending_webhooks(holder, target, mode, ttl)
+            .claim_pending_webhooks(holder, target, mode, ttl, limit)
             .await;
         if let Ok(claimed) = &r
             && !claimed.is_empty()
@@ -958,7 +960,10 @@ impl Storage for Probe {
             .inner
             .mark_webhook_delivered(task_id, item, holder)
             .await;
-        self.done(call);
+        // Only a mark that took (the holder's).
+        if let Ok(true) = &r {
+            self.done(call);
+        }
         r
     }
     async fn set_item_retries(

@@ -1086,7 +1086,7 @@ async fn exercise_webhook_claims(store: &dyn Storage) {
     let ttl = Duration::from_secs(30);
     // Settle what the other exercises left pending (a Force claim takes any).
     for p in store
-        .claim_pending_webhooks("sweep", None, ClaimMode::Force, ttl)
+        .claim_pending_webhooks("sweep", None, ClaimMode::Force, ttl, 1000)
         .await
         .unwrap()
     {
@@ -1125,13 +1125,13 @@ async fn exercise_webhook_claims(store: &dyn Storage) {
     assert!(has(&store.items_pending_webhook().await.unwrap(), "W1"));
     for mode in [ClaimMode::Open, ClaimMode::Expired] {
         let got = store
-            .claim_pending_webhooks("n2/p2", Some("t://x"), mode, ttl)
+            .claim_pending_webhooks("n2/p2", Some("t://x"), mode, ttl, 1000)
             .await
             .unwrap();
         assert!(!has(&got, "W1"), "{mode:?} took a live claim");
     }
     let got = store
-        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Force, ttl)
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Force, ttl, 1000)
         .await
         .unwrap();
     assert!(has(&got, "W1"));
@@ -1145,12 +1145,12 @@ async fn exercise_webhook_claims(store: &dyn Storage) {
     finish("W2", short).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     let got = store
-        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Open, ttl)
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Open, ttl, 1000)
         .await
         .unwrap();
     assert!(!has(&got, "W2"), "Open took a lapsed claim");
     let got = store
-        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Expired, ttl)
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Expired, ttl, 1000)
         .await
         .unwrap();
     assert!(has(&got, "W2"), "Expired left a lapsed claim");
@@ -1161,13 +1161,13 @@ async fn exercise_webhook_claims(store: &dyn Storage) {
     finish("W3b", OPEN).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     let got = store
-        .claim_pending_webhooks("n2/p2", Some("t://y"), ClaimMode::Expired, ttl)
+        .claim_pending_webhooks("n2/p2", Some("t://y"), ClaimMode::Expired, ttl, 1000)
         .await
         .unwrap();
     assert!(!has(&got, "W3"), "another receiver's event");
     assert!(has(&got, "W3b"), "an event for any receiver");
     let got = store
-        .claim_pending_webhooks("n2/p2", None, ClaimMode::Expired, ttl)
+        .claim_pending_webhooks("n2/p2", None, ClaimMode::Expired, ttl, 1000)
         .await
         .unwrap();
     assert!(has(&got, "W3"), "a claim for any receiver");
@@ -1201,7 +1201,7 @@ async fn exercise_webhook_claims(store: &dyn Storage) {
     assert!(!store.release_webhook_claim("W5", 0, "n2/p2").await.unwrap());
     assert!(store.release_webhook_claim("W5", 0, "n1/p1").await.unwrap());
     let got = store
-        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Open, ttl)
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Open, ttl, 1000)
         .await
         .unwrap();
     assert!(has(&got, "W5"), "a handed-back claim");
@@ -1217,7 +1217,7 @@ async fn exercise_webhook_claims(store: &dyn Storage) {
         [true]
     );
     let got = store
-        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Force, ttl)
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Force, ttl, 1000)
         .await
         .unwrap();
     assert!(has(&got, "W6"));
@@ -1234,12 +1234,13 @@ async fn exercise_webhook_claims(store: &dyn Storage) {
     finish("W7", Delivery::Off).await;
     assert!(!has(&store.items_pending_webhook().await.unwrap(), "W7"));
     let got = store
-        .claim_pending_webhooks("n2/p2", None, ClaimMode::Force, ttl)
+        .claim_pending_webhooks("n2/p2", None, ClaimMode::Force, ttl, 1000)
         .await
         .unwrap();
     assert!(!has(&got, "W7"));
 
-    // (8) A write that doesn't finish the item records no delivery.
+    // (8) A write that doesn't finish the item lists nothing pending, and the
+    // finishing write's delivery is what counts.
     store
         .create_task(&sample_task("W8"), None, None)
         .await
@@ -1274,7 +1275,7 @@ async fn exercise_webhook_claims(store: &dyn Storage) {
             .unwrap()
     );
     let got = store
-        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Open, ttl)
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Open, ttl, 1000)
         .await
         .unwrap();
     assert!(
@@ -1295,7 +1296,7 @@ async fn exercise_webhook_claims(store: &dyn Storage) {
             .unwrap()
     );
     let got = store
-        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Expired, ttl)
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Expired, ttl, 1000)
         .await
         .unwrap();
     assert!(!has(&got, "W8b"), "a failed item's live claim");
@@ -1306,12 +1307,29 @@ async fn exercise_webhook_claims(store: &dyn Storage) {
             .unwrap()
     );
 
+    // (10) At most `limit` at a time.
+    finish("W10a", OPEN).await;
+    finish("W10b", OPEN).await;
+    let got = store
+        .claim_pending_webhooks("n3/p3", None, ClaimMode::Open, ttl, 1)
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1, "{got:?}");
+    let more = store
+        .claim_pending_webhooks("n3/p3", None, ClaimMode::Open, ttl, 1000)
+        .await
+        .unwrap();
+    assert!(
+        has(&more, "W10a") != has(&got, "W10a"),
+        "the other one, next"
+    );
+
     // (9) Concurrent claimers: at most one gets it (a conflict is not a claim).
     finish("W9", OPEN).await;
     let (x, y, z) = tokio::join!(
-        store.claim_pending_webhooks("c1", None, ClaimMode::Open, ttl),
-        store.claim_pending_webhooks("c2", None, ClaimMode::Open, ttl),
-        store.claim_pending_webhooks("c3", None, ClaimMode::Open, ttl),
+        store.claim_pending_webhooks("c1", None, ClaimMode::Open, ttl, 1000),
+        store.claim_pending_webhooks("c2", None, ClaimMode::Open, ttl, 1000),
+        store.claim_pending_webhooks("c3", None, ClaimMode::Open, ttl, 1000),
     );
     let winners = [x, y, z]
         .into_iter()
@@ -1455,6 +1473,12 @@ async fn surreal_backend_contract() {
     };
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let store = SurrealStorage::connect(&cfg).await.unwrap();
+    let (raw_url, raw_user, raw_password, raw_db) = (
+        url.clone(),
+        user.clone(),
+        password.clone(),
+        database.clone(),
+    );
 
     // Run the contract, then always drop the throwaway database.
     let outcome = tokio::spawn(async move {
@@ -1462,6 +1486,21 @@ async fn surreal_backend_contract() {
         exercise_leases(&store).await;
         exercise_webhook_claims(&store).await;
         exercise_auth(&store).await;
+        // A revocation row of the wrong shape (written by hand) is left out,
+        // not a failure of every read.
+        let raw = surrealdb::engine::any::connect(raw_url).await.unwrap();
+        if let (Some(username), Some(password)) = (raw_user, raw_password) {
+            raw.signin(surrealdb::opt::auth::Root { username, password })
+                .await
+                .unwrap();
+        }
+        raw.use_ns("apollo_test").use_db(raw_db).await.unwrap();
+        raw.query("CREATE revocation:['id', 'bad'] CONTENT { kind: 'id', value: 42 }")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        assert_eq!(store.revocations().await.unwrap().len(), 2);
     })
     .await;
 

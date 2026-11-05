@@ -1029,13 +1029,16 @@ impl Storage for SqliteStorage {
         target: Option<&str>,
         mode: ClaimMode,
         ttl: Duration,
+        limit: usize,
     ) -> Result<Vec<PendingWebhook>> {
         let open = delivery_clause(mode);
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE items SET webhook_claim = ?, webhook_claim_until = {} + ?
-             WHERE webhook_delivered = 0 AND state IN ('completed', 'failed', 'cancelled')
-               AND (? IS NULL OR webhook_target IS NULL OR webhook_target = ?)
-               AND {open}
+             WHERE rowid IN (SELECT rowid FROM items
+                 WHERE webhook_delivered = 0 AND state IN ('completed', 'failed', 'cancelled')
+                   AND (? IS NULL OR webhook_target IS NULL OR webhook_target = ?)
+                   AND {open}
+                 ORDER BY random() LIMIT ?)
              RETURNING task_id, idx",
             now_ms!()
         )))
@@ -1043,6 +1046,7 @@ impl Storage for SqliteStorage {
         .bind(ttl.as_millis() as i64)
         .bind(target)
         .bind(target)
+        .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -1540,7 +1544,7 @@ mod tests {
         // Its pending event is for any receiver, and nobody's to deliver.
         let ttl = Duration::from_secs(30);
         let claimed = store
-            .claim_pending_webhooks("n/p", Some("t://x"), ClaimMode::Open, ttl)
+            .claim_pending_webhooks("n/p", Some("t://x"), ClaimMode::Open, ttl, 1000)
             .await
             .unwrap();
         assert_eq!(

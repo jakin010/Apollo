@@ -151,88 +151,192 @@ pub fn run_revoke(args: RevokeArgs) -> Result<()> {
         _ => unreachable!("clap requires one target"),
     };
     let config = load_config(args.config.as_deref())?;
+    if config.is_none() {
+        eprintln!(
+            "note: no config at {}: only this host's revocation file is changed, not a database \
+             instances share (pass --config with the servers' config)",
+            apollo_config::load::default_path().display()
+        );
+    }
     let auth = config.as_ref().map(|c| c.auth.clone()).unwrap_or_default();
     let path = revocation_file(&auth)?;
 
-    if args.undo {
-        unrevoke_in_file(&path, &entry)?;
-    } else {
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+    // Revokes and undos on this host take turns, the database write included,
+    // so the file and the database agree.
+    let _lock = lock_revocations(&path)?;
+    let in_file = {
+        if args.undo {
+            unrevoke_in_file(&path, &entry)?
+        } else {
+            append_revocation(&path, &entry)?;
+            true
         }
-        let mut file = options
-            .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        writeln!(file, "{entry}").with_context(|| format!("writing {}", path.display()))?;
-    }
-    let done = if args.undo { "un-revoked" } else { "revoked" };
+    };
     let in_db = match &config {
         Some(config) => {
             let entry = entry.clone();
             let undo = args.undo;
             with_shared_db(config, move |db| async move {
                 if undo {
-                    db.remove_revocation(&entry).await?;
+                    Ok(db.remove_revocation(&entry).await?)
                 } else {
                     db.add_revocation(&entry).await?;
+                    Ok(true)
                 }
-                Ok(())
             })
         }
         None => Ok(None),
     };
-    match in_db {
-        Ok(Some(())) => println!(
-            "{done} {entry} in {} and in the database (every instance sharing it applies it \
-             within ~10s)",
-            path.display()
-        ),
-        Ok(None) => println!(
-            "{done} {entry} in {} (running servers apply it within ~10s)",
-            path.display()
-        ),
-        Err(e) => {
-            return Err(anyhow!(
-                "{done} {entry} in {} but NOT in the database: {e:#}; other instances sharing \
-                 it don't see it — run again",
-                path.display()
-            ));
+    let file = path.display();
+    match (args.undo, in_db) {
+        (_, Err(e)) => Err(anyhow!(
+            "{} {entry} in {file} but NOT in the database: {e:#}; other instances sharing it \
+             don't see it — run again",
+            if args.undo { "un-revoked" } else { "revoked" }
+        )),
+        (false, Ok(Some(_))) => {
+            println!(
+                "revoked {entry} in {file} and in the database (every instance sharing it \
+                 applies it within ~10s)"
+            );
+            Ok(())
+        }
+        (false, Ok(None)) => {
+            println!("revoked {entry} in {file} (running servers apply it within ~10s)");
+            Ok(())
+        }
+        (true, Ok(None)) if !in_file => {
+            println!("{entry} was not revoked in {file}: nothing to undo");
+            Ok(())
+        }
+        (true, Ok(None)) => {
+            println!("un-revoked {entry} in {file} (running servers apply it within ~10s)");
+            Ok(())
+        }
+        (true, Ok(Some(in_db))) => {
+            if !in_file && !in_db {
+                println!("{entry} was not revoked in {file} or in the database: nothing to undo");
+            } else {
+                println!(
+                    "un-revoked {entry} in {file} and in the database (applied within ~10s); \
+                     an instance whose own revocation file lists it still refuses it"
+                );
+            }
+            Ok(())
         }
     }
-    Ok(())
 }
 
-/// Remove `entry`'s lines from the revocation file at `path` (keeping
-/// everything else), through a new file put in its place.
-fn unrevoke_in_file(path: &Path, entry: &Revocation) -> Result<()> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
-    };
-    let kept = without_entry(&text, entry);
-    if kept == text {
-        return Ok(());
-    }
-    let tmp = path.with_extension("tmp");
+/// Add `entry` to the revocation file at `path` (made owner-only if new), on
+/// a line of its own, also after a last line with no newline. The caller
+/// holds [`lock_revocations`].
+fn append_revocation(path: &Path, entry: &Revocation) -> Result<()> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let mut file = options
-        .open(&tmp)
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    file.write_all(kept.as_bytes())
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    drop(file);
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let ends_open = std::fs::read(path)
+        .ok()
+        .is_some_and(|text| text.last().is_some_and(|&b| b != b'\n'));
+    let line = if ends_open {
+        format!("\n{entry}\n")
+    } else {
+        format!("{entry}\n")
+    };
+    file.write_all(line.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Hold a lock on the revocation file's directory while the returned handle
+/// is open, so revokes and undos on this host take turns. (The directory,
+/// not a file of its own: that needs no right to create files there, and
+/// leaves nothing owned by whoever ran it.)
+fn lock_revocations(path: &Path) -> Result<std::fs::File> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let lock = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: flock on a file descriptor this function owns.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(anyhow::Error::new(std::io::Error::last_os_error())
+                .context(format!("locking {}", dir.display())));
+        }
+    }
+    Ok(lock)
+}
+
+/// Remove `entry`'s lines from the revocation file at `path` (keeping
+/// everything else, and the file's owner and mode, through a symlink),
+/// through a new file put in its place, so a server never reads half of it.
+/// Returns whether the file listed it. The caller holds [`lock_revocations`].
+fn unrevoke_in_file(path: &Path, entry: &Revocation) -> Result<bool> {
+    let target = match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("resolving {}", path.display())));
+        }
+    };
+    let text = std::fs::read_to_string(&target)
+        .with_context(|| format!("reading {}", target.display()))?;
+    let listed = text
+        .lines()
+        .any(|line| Revocation::parse_line(line).ok().flatten().as_ref() == Some(entry));
+    if !listed {
+        return Ok(false);
+    }
+    let kept = without_entry(&text, entry);
+    let meta =
+        std::fs::metadata(&target).with_context(|| format!("reading {}", target.display()))?;
+    let tmp = target.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = (|| -> std::io::Result<()> {
+        let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // The servers read it as its owner did: keep owner and mode.
+            if (meta.uid(), meta.gid()) != current_owner(&file)? {
+                std::os::unix::fs::fchown(&file, Some(meta.uid()), Some(meta.gid()))?;
+            }
+        }
+        file.set_permissions(meta.permissions())?;
+        file.write_all(kept.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &target)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e).context(format!(
+            "rewriting {} (run this as its owner)",
+            target.display()
+        )));
+    }
+    Ok(true)
+}
+
+/// The owner and group of an open file.
+#[cfg(unix)]
+fn current_owner(file: &std::fs::File) -> std::io::Result<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    Ok((meta.uid(), meta.gid()))
 }
 
 /// `text` without the lines that revoke `entry`.
@@ -411,7 +515,11 @@ pub(crate) async fn resolve_public_key(
         .context("reading the shared public key")?
     {
         parse_public(&stored.public_key).map_err(|_| invalid_stored(&stored))?;
-        let local = local_public_key_at(local_path)?;
+        // Only compared with the shared key: one that can't be read is none.
+        let local = local_public_key_at(local_path).unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "this host's local keypair can't be read; ignored");
+            None
+        });
         if local
             .as_deref()
             .is_some_and(|l| same_key(l, &stored.public_key))
@@ -496,10 +604,12 @@ where
         .context("starting a runtime")?;
     let secs = config.database.timeout;
     runtime.block_on(async {
-        let Some(db) = apollo_storage::connect_shared(&config.database)
-            .await
-            .context("connecting to the database")?
-        else {
+        let connect = async {
+            apollo_storage::connect_shared(&config.database)
+                .await
+                .context("connecting to the database")
+        };
+        let Some(db) = within_db_timeout(secs, connect).await? else {
             return Ok(None);
         };
         within_db_timeout(secs, work(db)).await.map(Some)
@@ -523,15 +633,27 @@ pub(crate) async fn within_db_timeout<T>(
     }
 }
 
-/// The config at `path`, which must load, or at the standard path, if there
-/// is one.
+/// The config at `path`, or at the standard path if there is a file there;
+/// either must load.
 fn load_config(path: Option<&Path>) -> Result<Option<Config>> {
-    match path {
-        Some(path) => apollo_config::load::load(Some(path))
-            .map(Some)
-            .with_context(|| format!("loading {}", path.display())),
-        None => Ok(apollo_config::load::load(None).ok()),
-    }
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let path = apollo_config::load::default_path();
+            match std::fs::metadata(&path) {
+                Ok(_) => path,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::new(e).context(format!("reading {}", path.display()))
+                    );
+                }
+            }
+        }
+    };
+    apollo_config::load::load(Some(&path))
+        .map(Some)
+        .with_context(|| format!("loading {}", path.display()))
 }
 
 /// The secret key `apollo token` signs with: from `file`, else
@@ -1024,6 +1146,66 @@ mod tests {
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic.into_panic());
         }
+    }
+
+    #[test]
+    fn undo_says_whether_the_file_listed_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revoked_tokens");
+        let id = Revocation::Id("a".into());
+        assert!(!unrevoke_in_file(&path, &id).unwrap(), "no file");
+        std::fs::write(&path, "# note\nid a\nid b\n").unwrap();
+        let _lock = lock_revocations(&path).unwrap();
+        assert!(unrevoke_in_file(&path, &id).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# note\nid b\n");
+        assert!(!unrevoke_in_file(&path, &id).unwrap(), "already gone");
+        // Nothing left behind but the file and its lock.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["revoked_tokens"]);
+    }
+
+    #[test]
+    fn appending_keeps_entries_on_lines_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revoked_tokens");
+        std::fs::write(&path, "id a").unwrap();
+        append_revocation(&path, &Revocation::Id("b".into())).unwrap();
+        append_revocation(&path, &Revocation::Subject("c".into())).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "id a\nid b\nsubject c\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_keeps_the_files_mode_and_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real_revocations");
+        std::fs::write(&real, "id a\nid b\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.path().join("revoked_tokens");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(unrevoke_in_file(&link, &Revocation::Id("a".into())).unwrap());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "id b\n");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        // A file without the entry is left alone, without a trailing newline too.
+        std::fs::write(&real, "id b").unwrap();
+        assert!(!unrevoke_in_file(&link, &Revocation::Id("a".into())).unwrap());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "id b");
     }
 
     #[tokio::test]

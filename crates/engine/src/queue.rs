@@ -34,10 +34,28 @@ impl Engine {
     pub async fn recover(&self) -> Result<usize, EngineError> {
         self.redeliver_pending().await;
         if self.inner.storage.shared() {
+            // Once settled, also those whose claim lapsed, until none is left
+            // (a pass takes a limited number), whatever `redelivery_secs` is.
             let engine = self.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(engine.inner.lease_ttl).await;
-                engine.redeliver_pending().await;
+                let mut tick = tokio::time::interval(engine.renew_every());
+                tick.tick().await;
+                let mut tries = 0;
+                loop {
+                    tick.tick().await;
+                    if !engine.settled() {
+                        tries += 1;
+                        // Out of touch for long: the redelivery loop (or
+                        // the next start) takes over.
+                        if tries > 30 {
+                            return;
+                        }
+                        continue;
+                    }
+                    if !engine.redeliver_pending().await {
+                        return;
+                    }
+                }
             });
         }
 
@@ -47,7 +65,12 @@ impl Engine {
         let tasks = self.inner.storage.load_incomplete_tasks().await?;
         self.sweep_uploads(&tasks);
 
-        let resumed = self.take_over().await?;
+        // As long as `[database].timeout` says, like opening the database.
+        let limit = match self.config().database.timeout {
+            0 => None,
+            secs => Some(Duration::from_secs(secs.into())),
+        };
+        let resumed = self.take_over(limit).await?;
         if self.inner.storage.shared() {
             self.spawn_takeover();
         }
@@ -165,14 +188,20 @@ impl Engine {
                 Ok(true) => {}
                 Ok(false) => match self.renew_one(&run.ctl).await {
                     Renewal::Held(TaskState::Cancelled) => cancel.store(true, Ordering::SeqCst),
-                    _ => {
+                    renewal => {
                         tracing::info!(task = %task_id, "task already finished, or not this instance's; not running it");
+                        // Perhaps still ours: hand it back (fenced by token).
+                        if renewal != Renewal::Lost {
+                            self.unrelease_later(&run.ctl);
+                        }
                         // Dropping `reservations` gives every item's back.
                         return;
                     }
                 },
                 Err(e) => {
                     tracing::error!(task = %task_id, error = %e, "failed to mark task processing");
+                    // Still ours: hand it back once the database answers.
+                    self.unrelease_later(&run.ctl);
                     return;
                 }
             }

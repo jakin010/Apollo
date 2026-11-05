@@ -63,6 +63,10 @@ pub trait WebhookSink: Send + Sync {
     fn target(&self) -> String;
 }
 
+/// The most finished webhooks this process delivers at once: their claims
+/// are renewed in one go, which must fit in a renewal period.
+const MAX_DELIVERING: usize = 512;
+
 /// What became of one [`Engine::push_webhook`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pushed {
@@ -266,14 +270,36 @@ impl Engine {
     /// receiver that nobody holds, and once this instance is settled those
     /// whose claim lapsed (their holder stopped). With webhooks off on a shared
     /// database it takes nothing: other instances' events are theirs to send.
-    pub(crate) async fn redeliver_pending(&self) {
+    /// Returns whether more may be left (it took as many as it may at once).
+    pub(crate) async fn redeliver_pending(&self) -> bool {
+        // A stopping instance takes nothing new: its claims would lapse with
+        // the delivery perhaps sent, and be sent again.
+        if self.inner.closing.load(Ordering::SeqCst) {
+            return false;
+        }
         let engine = self.current();
         let live = engine.live();
         let storage = &engine.inner.storage;
         let shared = storage.shared();
+        // On a shared database no more than one renewal can keep up with;
+        // SQLite renews nothing.
+        let room = if shared {
+            MAX_DELIVERING.saturating_sub(
+                self.inner
+                    .deliveries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len(),
+            )
+        } else {
+            i64::MAX as usize
+        };
+        if room == 0 {
+            return true;
+        }
         let (target, mode) = if shared {
             let Some(target) = live.webhook_target.as_deref() else {
-                return;
+                return false;
             };
             let mode = if engine.settled() {
                 ClaimMode::Expired
@@ -284,28 +310,47 @@ impl Engine {
         } else {
             (None, ClaimMode::Force)
         };
-        match storage
-            .claim_pending_webhooks(&engine.inner.holder, target, mode, engine.inner.lease_ttl)
+        let pending = match storage
+            .claim_pending_webhooks(
+                &engine.inner.holder,
+                target,
+                mode,
+                engine.inner.lease_ttl,
+                room,
+            )
             .await
         {
             Ok(pending) => {
                 if shared {
                     engine.connected(true);
                 }
-                if !pending.is_empty() {
-                    tracing::debug!(count = pending.len(), "redelivering pending webhooks");
-                }
-                for p in pending {
-                    engine.deliver_webhook(&p.task_id, p.item_index).await;
-                }
+                pending
             }
             Err(e) => {
                 if shared {
                     engine.connected(false);
                 }
                 tracing::warn!(error = %e, "redelivery: could not claim pending webhooks");
+                return false;
             }
+        };
+        let more = pending.len() >= room;
+        // Stopping meanwhile: give them back rather than leave them to lapse.
+        if self.inner.closing.load(Ordering::SeqCst) {
+            for p in &pending {
+                let _ = storage
+                    .release_webhook_claim(&p.task_id, p.item_index, &engine.inner.holder)
+                    .await;
+            }
+            return false;
         }
+        if !pending.is_empty() {
+            tracing::debug!(count = pending.len(), "redelivering pending webhooks");
+        }
+        for p in pending {
+            engine.deliver_webhook(&p.task_id, p.item_index).await;
+        }
+        more
     }
 
     /// Renew the delivery claims of the webhooks this process is delivering,
@@ -377,7 +422,10 @@ impl Engine {
                     continue;
                 }
                 tokio::time::sleep(Duration::from_secs(secs.into())).await;
-                engine.redeliver_pending().await;
+                // A backlog is taken a bounded batch at a time.
+                while engine.redeliver_pending().await {
+                    tokio::time::sleep(engine.renew_every()).await;
+                }
             }
         });
     }
@@ -397,6 +445,8 @@ impl Delivering {
         let key = (task_id.to_string(), item_index);
         let lost = Arc::new(AtomicBool::new(false));
         let mut deliveries = inner.deliveries.lock().unwrap_or_else(|e| e.into_inner());
+        // Already being delivered here (a claim taken meanwhile waits for its
+        // claim to lapse, a delay rather than a second send).
         if deliveries.contains_key(&key) {
             return None;
         }

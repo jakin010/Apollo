@@ -1136,32 +1136,50 @@ impl Storage for SurrealStorage {
     }
 
     async fn release_claims(&self, held: &[Held]) -> Result<u64> {
+        // One statement per claim. One that fails (a write conflict with a
+        // late renewal of the same task, say) is tried again; any still
+        // failing makes the whole call fail, so the caller keeps them.
         let mut released = 0;
-        for chunk in held.chunks(64) {
-            let sql: String = (0..chunk.len())
-                .map(|i| {
-                    format!(
-                        "UPDATE type::record('task', $id{i})
-                         SET claim = NONE, claimed_by = NONE, lease_until = time::now()
-                         WHERE claim = $tok{i} RETURN VALUE key;"
-                    )
-                })
-                .collect();
-            let mut q = self.db.query(sql);
-            for (i, h) in chunk.iter().enumerate() {
-                q = q
-                    .bind((format!("id{i}"), h.task_id.clone()))
-                    .bind((format!("tok{i}"), h.token.clone()));
-            }
-            let mut resp = q.await?;
-            for i in 0..chunk.len() {
-                if resp
-                    .take::<Vec<String>>(i)
-                    .is_ok_and(|keys| !keys.is_empty())
-                {
-                    released += 1;
+        let mut pending: Vec<&Held> = held.iter().collect();
+        for tries in 1u64.. {
+            let mut failed = Vec::new();
+            for chunk in pending.chunks(64) {
+                let sql: String = (0..chunk.len())
+                    .map(|i| {
+                        format!(
+                            "UPDATE type::record('task', $id{i})
+                             SET claim = NONE, claimed_by = NONE, lease_until = time::now()
+                             WHERE claim = $tok{i} RETURN VALUE key;"
+                        )
+                    })
+                    .collect();
+                let mut q = self.db.query(sql);
+                for (i, h) in chunk.iter().enumerate() {
+                    q = q
+                        .bind((format!("id{i}"), h.task_id.clone()))
+                        .bind((format!("tok{i}"), h.token.clone()));
+                }
+                let mut resp = q.await?;
+                for (i, h) in chunk.iter().enumerate() {
+                    match resp.take::<Vec<String>>(i) {
+                        Ok(keys) if !keys.is_empty() => released += 1,
+                        Ok(_) => {}
+                        Err(_) => failed.push(*h),
+                    }
                 }
             }
+            if failed.is_empty() {
+                break;
+            }
+            if tries == 5 {
+                return Err(StorageError::Surreal(format!(
+                    "handing back {} of {} claims kept failing",
+                    failed.len(),
+                    held.len()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20 * tries + jitter_ms())).await;
+            pending = failed;
         }
         Ok(released)
     }
@@ -1191,6 +1209,7 @@ impl Storage for SurrealStorage {
         target: Option<&str>,
         mode: ClaimMode,
         ttl: Duration,
+        limit: usize,
     ) -> Result<Vec<PendingWebhook>> {
         let open = delivery_open(mode);
         let mut resp = self
@@ -1200,13 +1219,17 @@ impl Storage for SurrealStorage {
                  WHERE webhook_delivered = false
                    AND state IN ['completed', 'failed', 'cancelled']
                    AND ($target = NONE OR webhook_target = NONE OR webhook_target = $target)
-                   AND {open}"
+                   AND {open}
+                 ORDER BY rand() LIMIT $limit"
             ))
             .bind(("target", target.map(str::to_string)))
+            .bind(("limit", limit as i64))
             .await?;
         let rows: Vec<PendingRow> = resp.take(0)?;
-        // One statement per item: each runs (and may conflict with another
-        // claimer) on its own, and a conflict only means not claimed.
+        // In no particular order, so events that keep failing don't keep the
+        // rest waiting. One statement per item: each runs (and may conflict
+        // with another claimer) on its own, and a conflict only means not
+        // claimed.
         let mut claimed = Vec::new();
         for chunk in rows.chunks(64) {
             let sql: String = (0..chunk.len())
@@ -1228,7 +1251,13 @@ impl Storage for SurrealStorage {
                     .bind((format!("t{i}"), r.task_id.clone()))
                     .bind((format!("x{i}"), r.idx));
             }
-            let mut resp = q.await?;
+            // A chunk that fails is not claimed; those claimed before it are
+            // still returned.
+            let mut resp = match q.await {
+                Ok(resp) => resp,
+                Err(e) if claimed.is_empty() => return Err(e.into()),
+                Err(_) => break,
+            };
             for (i, r) in chunk.iter().enumerate() {
                 if resp.take::<Vec<i64>>(i).is_ok_and(|won| !won.is_empty()) {
                     claimed.push(PendingWebhook {
@@ -1288,18 +1317,21 @@ impl Storage for SurrealStorage {
         item: usize,
         holder: &str,
     ) -> Result<bool> {
-        let mut resp = self
-            .db
-            .query(
-                "UPDATE type::record('item', [$tid, $idx])
-                 SET webhook_claim = NONE, webhook_claim_until = NONE
-                 WHERE webhook_delivered = false AND webhook_claim = $holder RETURN VALUE idx",
-            )
-            .bind(("tid", task_id.to_string()))
-            .bind(("idx", item as i64))
-            .bind(("holder", holder.to_string()))
-            .await?;
-        let released: Vec<i64> = resp.take(0)?;
+        // Retried on a conflict (with this process's renewal of it, say).
+        let released: Vec<i64> = retry_conflicts(|| async {
+            self.db
+                .query(
+                    "UPDATE type::record('item', [$tid, $idx])
+                     SET webhook_claim = NONE, webhook_claim_until = NONE
+                     WHERE webhook_delivered = false AND webhook_claim = $holder RETURN VALUE idx",
+                )
+                .bind(("tid", task_id.to_string()))
+                .bind(("idx", item as i64))
+                .bind(("holder", holder.to_string()))
+                .await?
+                .take(0)
+        })
+        .await?;
         Ok(!released.is_empty())
     }
 
@@ -1309,18 +1341,22 @@ impl Storage for SurrealStorage {
         item: usize,
         holder: &str,
     ) -> Result<bool> {
-        let mut resp = self
-            .db
-            .query(
-                "UPDATE type::record('item', [$tid, $idx])
-                 SET webhook_delivered = true, webhook_claim = NONE, webhook_claim_until = NONE
-                 WHERE webhook_delivered = false AND webhook_claim = $holder RETURN VALUE idx",
-            )
-            .bind(("tid", task_id.to_string()))
-            .bind(("idx", item as i64))
-            .bind(("holder", holder.to_string()))
-            .await?;
-        let marked: Vec<i64> = resp.take(0)?;
+        // Retried on a conflict (with this process's renewal of it, say): a
+        // mark that fails leaves the event to be sent again.
+        let marked: Vec<i64> = retry_conflicts(|| async {
+            self.db
+                .query(
+                    "UPDATE type::record('item', [$tid, $idx])
+                     SET webhook_delivered = true, webhook_claim = NONE, webhook_claim_until = NONE
+                     WHERE webhook_delivered = false AND webhook_claim = $holder RETURN VALUE idx",
+                )
+                .bind(("tid", task_id.to_string()))
+                .bind(("idx", item as i64))
+                .bind(("holder", holder.to_string()))
+                .await?
+                .take(0)
+        })
+        .await?;
         Ok(!marked.is_empty())
     }
 
@@ -1588,7 +1624,15 @@ impl Storage for SurrealStorage {
     }
 
     async fn revocations(&self) -> Result<Vec<Revocation>> {
-        let mut resp = self.db.query("SELECT kind, value FROM revocation").await?;
+        // A row of the wrong shape (written by hand) is left out, not a
+        // failure of every read.
+        let mut resp = self
+            .db
+            .query(
+                "SELECT kind, value FROM revocation
+                 WHERE type::is_string(kind) AND type::is_string(value)",
+            )
+            .await?;
         let rows: Vec<RevocationRow> = resp.take(0)?;
         Ok(rows
             .into_iter()

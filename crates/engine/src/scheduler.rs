@@ -513,17 +513,18 @@ impl Engine {
             Some(_) => (text_hash.as_deref(), None),
             None => (ctx.content_hash, ctx.url_hash),
         };
+        let key = self.item_cache_key(label, ctx.text_input.is_none().then_some(&ctx.item.input));
 
         // Content-cache fast path: identical bytes already classified by a
         // model with this one's output settings -> reuse the stored output,
         // skip inference.
         if let Some(ch) = content_hash
-            && let Some(rev) = self.cache_key(label)
+            && let Some(rev) = key.as_deref()
         {
             match self
                 .inner
                 .storage
-                .cache_lookup(ch, label, &rev, ctx.fresh_after)
+                .cache_lookup(ch, label, rev, ctx.fresh_after)
                 .await
             {
                 // A label repointed at another kind of model (a classifier
@@ -540,11 +541,7 @@ impl Engine {
                         .upsert_model_result(task_id, idx, label, &done, self.fence())
                         .await;
                     if let Some(uh) = url_hash {
-                        let _ = self
-                            .inner
-                            .storage
-                            .url_cache_store(uh, label, &rev, ch)
-                            .await;
+                        let _ = self.inner.storage.url_cache_store(uh, label, rev, ch).await;
                     }
                     tracing::debug!(task = %task_id, item = idx, model = %label, "cache hit");
                     self.inner
@@ -572,6 +569,16 @@ impl Engine {
             )
             .await;
 
+        // A video scan resuming from frames a previous run saved may mix in
+        // frames of another config (they carry no key): its result isn't
+        // cached. (Before the run: its own frames are saved as it goes.)
+        let resumed = ctx.text_input.is_none()
+            && ctx.item.input.modality() == Modality::Video
+            && !matches!(
+                self.inner.storage.load_samples(task_id, idx, label).await,
+                Ok(saved) if saved.is_empty()
+            );
+
         tracing::debug!(task = %task_id, item = idx, model = %label, "running model");
         // The model's `timeout` bounds each individual classification — a single
         // image, or *each frame* of a video scan — not the whole video, and not
@@ -585,8 +592,17 @@ impl Engine {
         };
         let outcome = match run {
             Ok(output) => {
-                self.store_in_cache(task_id, label, content_hash, url_hash, &output)
+                if !resumed {
+                    self.store_in_cache(
+                        task_id,
+                        label,
+                        key.as_deref(),
+                        content_hash,
+                        url_hash,
+                        &output,
+                    )
                     .await;
+                }
                 SetOutcome::Finished(ModelResult::done(output))
             }
             Err(EngineError::Cancelled) => return SetOutcome::Cancelled,
@@ -613,27 +629,19 @@ impl Engine {
         &self,
         task_id: &str,
         label: &str,
+        key: Option<&str>,
         content_hash: Option<&str>,
         url_hash: Option<&str>,
         output: &ModelOutput,
     ) {
-        let (Some(ch), Some(rev)) = (content_hash, self.cache_key(label)) else {
+        let (Some(ch), Some(rev)) = (content_hash, key) else {
             return;
         };
-        if let Err(e) = self
-            .inner
-            .storage
-            .cache_store(ch, label, &rev, output)
-            .await
-        {
+        if let Err(e) = self.inner.storage.cache_store(ch, label, rev, output).await {
             tracing::warn!(task = %task_id, model = %label, error = %e, "cache store failed");
         }
         if let Some(uh) = url_hash {
-            let _ = self
-                .inner
-                .storage
-                .url_cache_store(uh, label, &rev, ch)
-                .await;
+            let _ = self.inner.storage.url_cache_store(uh, label, rev, ch).await;
         }
     }
 
@@ -826,32 +834,40 @@ impl Engine {
         self.live().registry.fingerprint(label)
     }
 
-    /// Persist an item's final `state`. `false` when it had already finished
+    /// [`Engine::cache_key`] for `label` run on `input` (`None`: on text read
+    /// from it), kept apart per kind of media: the same bytes sent as an
+    /// image and as a video give a classification and a scan.
+    pub(crate) fn item_cache_key(&self, label: &str, input: Option<&Input>) -> Option<String> {
+        let key = self.cache_key(label)?;
+        Some(match input.map(Input::modality) {
+            Some(Modality::Video) => format!("{key}:video"),
+            Some(Modality::Audio) => format!("{key}:audio"),
+            _ => key.to_string(),
+        })
+    }
+
+    /// Persist an item's final `state`. `None` when it had already finished
     /// (another runner finished it): its runner reports it, this one doesn't.
+    /// Otherwise whether its finished webhook is this process's to deliver
+    /// (with webhooks off it was stored as delivered).
     async fn finish_item(
         &self,
         task_id: &str,
         idx: usize,
         state: ItemState,
         error: Option<&TaskError>,
-    ) -> bool {
+    ) -> Option<bool> {
         // A run that lost its claim writes nothing more.
         if self.lost() {
-            return false;
+            return None;
         }
         // The current webhook's, also for a task pinned to an older config.
         let live = self.current().live();
+        let delivery = self.delivery(&live);
         match self
             .inner
             .storage
-            .set_item_state(
-                task_id,
-                idx,
-                state,
-                error,
-                self.fence(),
-                self.delivery(&live),
-            )
+            .set_item_state(task_id, idx, state, error, self.fence(), delivery)
             .await
         {
             Ok(written) => {
@@ -861,7 +877,7 @@ impl Engine {
                         "item already finished; not finishing it again"
                     );
                 }
-                written
+                written.then_some(delivery != Delivery::Off)
             }
             // Nothing was stored (each write is one atomic statement), so
             // nothing is reported; the run's final rollup, or the next run,
@@ -871,7 +887,7 @@ impl Engine {
                     task = %task_id, item = idx, state = state.as_str(), error = %e,
                     "could not store the item's final state"
                 );
-                false
+                None
             }
         }
     }
@@ -879,13 +895,13 @@ impl Engine {
     /// Finalize an item as completed: persist the state, roll up the task, and
     /// fire the terminal webhook.
     async fn complete_item(&self, task_id: &str, idx: usize) {
-        if !self
+        let Some(claimed) = self
             .finish_item(task_id, idx, ItemState::Completed, None)
             .await
-        {
+        else {
             return;
-        }
-        let delivering = self.start_delivery(task_id, idx);
+        };
+        let delivering = claimed.then(|| self.start_delivery(task_id, idx)).flatten();
         self.inner.metrics.item_finished(ItemState::Completed);
         self.rollup_task_state(task_id).await;
         if let Some(delivering) = delivering {
@@ -909,7 +925,7 @@ impl Engine {
             if model_done(item, label) {
                 continue;
             }
-            let Some(rev) = self.cache_key(label) else {
+            let Some(rev) = self.item_cache_key(label, Some(&item.input)) else {
                 return false;
             };
             let content_hash = match self
@@ -959,13 +975,13 @@ impl Engine {
     /// task state up, and fire the terminal webhook.
     pub(crate) async fn cancel_item(&self, task_id: &str, idx: usize) {
         let cancelled = TaskError::cancelled("cancelled");
-        if !self
+        let Some(claimed) = self
             .finish_item(task_id, idx, ItemState::Cancelled, Some(&cancelled))
             .await
-        {
+        else {
             return;
-        }
-        let delivering = self.start_delivery(task_id, idx);
+        };
+        let delivering = claimed.then(|| self.start_delivery(task_id, idx)).flatten();
         self.inner.metrics.item_finished(ItemState::Cancelled);
         self.rollup_task_state(task_id).await;
         if let Some(delivering) = delivering {
@@ -994,17 +1010,11 @@ impl Engine {
             .cloned()
             .collect();
         let live = self.current().live();
+        let delivery = self.delivery(&live);
         match self
             .inner
             .storage
-            .set_item_failed(
-                task_id,
-                idx,
-                &err,
-                &models,
-                self.fence(),
-                self.delivery(&live),
-            )
+            .set_item_failed(task_id, idx, &err, &models, self.fence(), delivery)
             .await
         {
             Ok(true) => {}
@@ -1018,7 +1028,10 @@ impl Engine {
                 return;
             }
         }
-        let delivering = self.start_delivery(task_id, idx);
+        // With webhooks off it was stored as delivered.
+        let delivering = (delivery != Delivery::Off)
+            .then(|| self.start_delivery(task_id, idx))
+            .flatten();
         self.inner.metrics.item_finished(ItemState::Failed);
         self.rollup_task_state(task_id).await;
         if let Some(delivering) = delivering {

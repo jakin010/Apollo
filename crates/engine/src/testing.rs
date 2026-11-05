@@ -207,9 +207,10 @@ impl Storage for HeldCreate {
         target: Option<&str>,
         mode: apollo_storage::ClaimMode,
         ttl: std::time::Duration,
+        limit: usize,
     ) -> Result<Vec<apollo_storage::PendingWebhook>, StorageError> {
         self.inner
-            .claim_pending_webhooks(holder, target, mode, ttl)
+            .claim_pending_webhooks(holder, target, mode, ttl, limit)
             .await
     }
     async fn renew_webhook_claims(
@@ -575,10 +576,11 @@ impl Storage for Stalled {
         target: Option<&str>,
         mode: apollo_storage::ClaimMode,
         ttl: std::time::Duration,
+        limit: usize,
     ) -> Result<Vec<apollo_storage::PendingWebhook>, StorageError> {
         self.pass().await;
         self.inner
-            .claim_pending_webhooks(holder, target, mode, ttl)
+            .claim_pending_webhooks(holder, target, mode, ttl, limit)
             .await
     }
     async fn renew_webhook_claims(
@@ -917,9 +919,10 @@ impl Storage for FailFinish {
         target: Option<&str>,
         mode: apollo_storage::ClaimMode,
         ttl: std::time::Duration,
+        limit: usize,
     ) -> Result<Vec<apollo_storage::PendingWebhook>, StorageError> {
         self.inner
-            .claim_pending_webhooks(holder, target, mode, ttl)
+            .claim_pending_webhooks(holder, target, mode, ttl, limit)
             .await
     }
     async fn renew_webhook_claims(

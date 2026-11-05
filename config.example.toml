@@ -63,7 +63,8 @@ url = "https://hooks.example.com:443"          # optional; omit the section to d
 backend   = "sqlite"            # sqlite | postgres | surrealdb  (postgres: future)
 # retention = "30d"             # how long to keep finished tasks; omit = keep forever
 # lease_secs = 30               # with instances sharing one SurrealDB: a task's claim lasts this long unless renewed
-#                               # (every third); a runner that can't renew for 25 s stops and hands its tasks back
+#                               # (every third); a runner whose last confirmed renewal is 25 s old stops and hands its
+#                               # tasks back (a database outage of 10-25 s can cause this)
 # timeout   = 30                # s a client's call waits for the database (and SurrealDB's connect at start); 0 = no limit
 
 [database.sqlite]

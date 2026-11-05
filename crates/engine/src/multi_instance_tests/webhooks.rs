@@ -178,3 +178,25 @@ async fn an_instance_with_webhooks_off_settles_only_its_own_items() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_sends_a_crashed_instances_event_without_a_redelivery_loop() {
+    fleet_test(|fleet| async move {
+        let a = fleet.start("a", &format!("{SHORT_LEASE}{NSFW}")).await;
+        let hold = a.hold_webhook(1, |c| matches!(c, Call::Webhook(_, EventKind::Finished, _)));
+        let t = a.submit(refused()).await.id;
+        hold.entered("a delivers the finished webhook").await;
+        a.crash();
+
+        // B has no redelivery loop: its start sends what lapsed once it has
+        // settled.
+        let no_loop = "[webhook]\nurl = \"http://127.0.0.1:9\"\nredelivery_secs = 0\n";
+        let b = fleet
+            .start("b", &format!("{no_loop}{SHORT_LEASE}{NSFW}"))
+            .await;
+        b.recover().await;
+        fleet.log.delivered("b", &t).await;
+        assert_eq!(fleet.log.finished(&t), [("b", TaskState::Failed)]);
+    })
+    .await;
+}

@@ -165,6 +165,8 @@ impl Engine {
             }
             runs.insert(task_id.to_string(), ctl.clone())
         };
+        // Its deadline may be the earliest (a slow claim write).
+        self.inner.registered.notify_one();
         // Claims leave out tasks this process runs, so there's no earlier run;
         // if there were, it would be fenced out anyway: stop it.
         if let Some(old) = old {
@@ -238,20 +240,36 @@ impl Engine {
         self.inner.lease_ttl * 5 / 6
     }
 
-    /// How long one renewal of `runs` may take: a renewal period, but no longer
-    /// than their earliest deadline (so a run is stopped on time), and at least
-    /// a sixth of the lease (so a run whose claim write was slow still gets a
-    /// try).
-    pub(crate) fn renewal_cap(&self, runs: &[Arc<RunCtl>]) -> Duration {
-        let ttl = self.inner.lease_ttl;
-        runs.iter()
+    /// How long until the earliest deadline of a run still going (see
+    /// [`Engine::unconfirmed_limit`]); a renewal period when none is.
+    pub(crate) fn next_deadline(&self) -> Duration {
+        self.runs()
+            .iter()
+            .filter(|r| !r.lost())
             .map(|r| {
                 self.unconfirmed_limit()
                     .saturating_sub(r.confirmed().elapsed())
             })
             .min()
-            .unwrap_or(ttl / 3)
-            .clamp(ttl / 6, ttl / 3)
+            .unwrap_or_else(|| self.renew_every())
+    }
+
+    /// Start watching the runs' deadlines (with a shared database): each run
+    /// is stopped once no renewal has been confirmed for
+    /// [`Engine::unconfirmed_limit`], however long a renewal takes.
+    pub(crate) fn spawn_deadlines(&self) {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let wait = engine.next_deadline().max(Duration::from_millis(1));
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    // A new run, whose deadline may come first.
+                    _ = engine.inner.registered.notified() => {}
+                }
+                engine.stop_unconfirmed(&engine.runs());
+            }
+        });
     }
 
     /// Start renewing this process's claims (its tasks' and its webhook
@@ -284,8 +302,9 @@ impl Engine {
         tokio::join!(self.renew_live(&live), self.release_unreleased(pending));
     }
 
-    /// Renew `runs`' claims, act on what the renewal found, and stop the runs
-    /// whose lease may lapse before another renewal is confirmed.
+    /// Renew `runs`' claims, waiting a renewal period at most, and act on what
+    /// the renewal found. (Runs whose renewals aren't confirmed in time are
+    /// stopped by [`Engine::spawn_deadlines`].)
     async fn renew_live(&self, runs: &[Arc<RunCtl>]) {
         // No round trip, so nothing to tell about the connection.
         if runs.is_empty() {
@@ -293,9 +312,9 @@ impl Engine {
         }
         let held: Vec<Held> = runs.iter().map(|r| r.held()).collect();
         let sent = Instant::now();
-        let cap = self.renewal_cap(runs);
+        let limit = self.renew_every();
         let renewal = self.inner.storage.renew_claims(&held, self.inner.lease_ttl);
-        match tokio::time::timeout(cap, renewal).await {
+        match tokio::time::timeout(limit, renewal).await {
             Ok(Ok(renewals)) => {
                 self.connected(true);
                 for (run, renewal) in runs.iter().zip(renewals) {
@@ -329,11 +348,21 @@ impl Engine {
                 self.connected(false);
             }
             Err(_) => {
-                tracing::warn!(after = ?cap, "renewing task leases timed out");
+                tracing::warn!(after = ?limit, "renewing task leases timed out");
                 self.connected(false);
             }
         }
-        self.stop_unconfirmed(runs);
+    }
+
+    /// Hand `run`'s claim back with the stopped runs' (by the renewal loop,
+    /// fenced by token), as it ends without finishing.
+    pub(crate) fn unrelease_later(&self, run: &RunCtl) {
+        self.lose(run);
+        self.inner
+            .unreleased
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(run.held());
     }
 
     /// Stop the runs with no renewal confirmed for most of the lease: past
@@ -430,7 +459,7 @@ impl Engine {
                 if engine.inner.closing.load(Ordering::SeqCst) {
                     return;
                 }
-                if let Err(e) = engine.take_over().await {
+                if let Err(e) = engine.take_over(Some(engine.inner.lease_ttl)).await {
                     tracing::warn!(error = %e, "could not look for tasks to take over");
                 }
             }
@@ -441,7 +470,11 @@ impl Engine {
     /// up to its free room. On a database only this process uses (SQLite), at
     /// startup, that is every unfinished task, as before leases existed.
     /// Returns how many were taken.
-    pub(crate) async fn take_over(&self) -> Result<usize, EngineError> {
+    ///
+    /// On a shared database each read of candidates waits `limit` at most
+    /// (`None`: as long as it takes); one that times out leaves this instance
+    /// unsettled, as one that fails does.
+    pub(crate) async fn take_over(&self, limit: Option<Duration>) -> Result<usize, EngineError> {
         let mut memo = self.inner.takeover.lock().await;
         if self.inner.closing.load(Ordering::SeqCst) {
             return Ok(0);
@@ -459,6 +492,7 @@ impl Engine {
         memo.unrunnable.retain(|_, at| at.elapsed() < forget_after);
         let mut taken = 0;
         let mut after: Option<TaskCursor> = None;
+        let mut looked_again = false;
         for page_no in 0.. {
             if !force && page_no == PASS_PAGES {
                 break;
@@ -473,22 +507,35 @@ impl Engine {
                 after.as_ref(),
                 PAGE,
             );
-            // On a shared database a lease at most: one that hangs leaves this
-            // instance unsettled, as one that fails does.
-            let read = if force {
-                read.await
-            } else {
-                match tokio::time::timeout(self.inner.lease_ttl, read).await {
+            let sent = Instant::now();
+            let read = match limit.filter(|_| !force) {
+                None => read.await,
+                Some(limit) => match tokio::time::timeout(limit, read).await {
                     Ok(read) => read,
                     Err(_) => {
                         self.connected(false);
-                        return Err(StorageError::Timeout(self.inner.lease_ttl).into());
+                        return Err(StorageError::Timeout(limit).into());
                     }
-                }
+                },
             };
             let page = match read {
                 Ok(page) => {
                     self.connected(true);
+                    // A read that took this long may have waited out an
+                    // outage, and a lease it found lapsed may have lapsed for
+                    // want of the database: its holder hands it back once the
+                    // database answers. Look again once such hand-backs have
+                    // landed (half a lease; holders retry every third), and
+                    // take what has lapsed then.
+                    if mode == ClaimMode::Expired
+                        && !looked_again
+                        && sent.elapsed() > self.renew_every()
+                    {
+                        tracing::warn!(took = ?sent.elapsed(), "looking for tasks to take over was slow; looking again in half a lease");
+                        looked_again = true;
+                        tokio::time::sleep(self.inner.lease_ttl / 2).await;
+                        continue;
+                    }
                     page
                 }
                 Err(e) => {

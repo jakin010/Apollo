@@ -321,16 +321,18 @@ pub trait Storage: Send + Sync {
     /// delivering it (for status and metrics).
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError>;
 
-    /// Claim the finished items whose webhook is pending for `holder` to
-    /// deliver, for `ttl` on the database's clock: those whose delivery claim
-    /// `mode` may take, for receiver `target` (or any, with `None`; items
-    /// stored for any receiver go to every one). Returns the items claimed.
+    /// Claim up to `limit` of the finished items whose webhook is pending, for
+    /// `holder` to deliver, for `ttl` on the database's clock: those whose
+    /// delivery claim `mode` may take, for receiver `target` (or any, with
+    /// `None`; items stored for any receiver go to every one). Returns the
+    /// items claimed.
     async fn claim_pending_webhooks(
         &self,
         holder: &str,
         target: Option<&str>,
         mode: ClaimMode,
         ttl: std::time::Duration,
+        limit: usize,
     ) -> Result<Vec<PendingWebhook>, StorageError>;
 
     /// Renew `holder`'s delivery claims on `items` for `ttl`, saying for each

@@ -1572,6 +1572,10 @@ async fn with_webhooks_off_nothing_is_kept_to_send_later() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert_eq!(
+        f.storage.get_task(&id).await.unwrap().unwrap().state,
+        TaskState::Failed
+    );
     // The item's finish is recorded as handled (in the write that finished
     // it), so turning webhooks on later doesn't send events for tasks that
     // finished while they were off.
@@ -1734,6 +1738,7 @@ async fn a_failed_delivery_hands_its_claim_back() {
                 None,
                 apollo_storage::ClaimMode::Open,
                 Duration::from_secs(60),
+                100,
             )
             .await
             .unwrap();
@@ -1981,13 +1986,12 @@ async fn sqlite_runs_have_no_renewal_limit() {
 }
 
 #[tokio::test]
-async fn renewal_cap_keeps_to_the_deadline() {
+async fn deadlines_come_five_sixths_into_the_lease() {
     let ms = Duration::from_millis;
     let ns = Duration::from_nanos;
-    // (lease, renewal period, how long a run goes unconfirmed, the floor)
-    for (lease_secs, period, limit, floor) in [
-        (30, ms(10_000), ms(25_000), ms(5_000)),
-        (1, ns(333_333_333), ns(833_333_333), ns(166_666_666)),
+    for (lease_secs, period, limit) in [
+        (30, ms(10_000), ms(25_000)),
+        (1, ns(333_333_333), ns(833_333_333)),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_in(&dir, "");
@@ -1995,44 +1999,72 @@ async fn renewal_cap_keeps_to_the_deadline() {
         let storage = apollo_storage::open(&config.database).await.unwrap();
         let engine = Engine::new(Arc::new(config), storage, None);
         let ttl = Duration::from_secs(lease_secs.into());
-        let mut n = 0;
-        // A run whose last confirmed renewal was sent `ago`.
-        let mut run = |ago: Duration| {
-            n += 1;
-            engine
-                .register(&n.to_string(), "t".into(), Instant::now() - ago)
-                .unwrap()
-        };
-        let cap = |runs: &[&crate::lease::Running]| {
-            let ctls: Vec<_> = runs.iter().map(|r| r.ctl.clone()).collect();
-            engine.renewal_cap(&ctls)
-        };
-
         assert_eq!(engine.unconfirmed_limit(), limit);
-        // A renewal period, but no further than the deadline, and at least
-        // the floor.
-        let fresh = run(Duration::ZERO);
-        assert_eq!(cap(&[&fresh]), period);
-        let late = run(ttl * 2 / 3);
-        assert_eq!(cap(&[&late]), floor);
-        let lapsed = run(ttl * 4 / 3);
-        assert_eq!(cap(&[&lapsed]), floor);
-        // 8/30 of the lease left until the deadline.
-        let between = run(ttl * 17 / 30);
-        let left = cap(&[&between]);
+        // No run: a renewal period.
+        assert_eq!(engine.next_deadline(), period);
+
+        // The earliest deadline among the runs going.
+        let fresh = engine.register("1", "t".into(), Instant::now()).unwrap();
+        let left = engine.next_deadline();
+        assert!(
+            left <= limit && left > limit * 9 / 10,
+            "{left:?} of {ttl:?}"
+        );
+        let late = engine
+            .register("2", "t".into(), Instant::now() - ttl * 17 / 30)
+            .unwrap();
+        let left = engine.next_deadline();
         assert!(
             left <= ttl * 8 / 30 && left > ttl * 7 / 30,
             "{left:?} of {ttl:?}"
         );
-        // The earliest deadline among them.
-        let both = cap(&[&fresh, &between]);
-        assert!(both <= left && both > ttl * 7 / 30, "{both:?} of {ttl:?}");
-        // A confirmation moves the deadline on, never back.
+        // Past it: due now.
+        let lapsed = engine
+            .register("3", "t".into(), Instant::now() - ttl * 4 / 3)
+            .unwrap();
+        assert_eq!(engine.next_deadline(), Duration::ZERO);
+        // A confirmation moves a deadline on, never back.
         lapsed.ctl.confirm(Instant::now());
-        assert_eq!(cap(&[&lapsed]), period);
+        late.ctl.confirm(Instant::now());
+        assert!(engine.next_deadline() > limit * 9 / 10);
         lapsed.ctl.confirm(Instant::now() - ttl);
-        assert_eq!(cap(&[&lapsed]), period);
+        assert!(engine.next_deadline() > limit * 9 / 10);
+        drop((fresh, late, lapsed));
     }
+}
+
+#[tokio::test]
+async fn a_run_claimed_late_stops_at_its_deadline() {
+    // A one-second lease: the deadline is 5/6 of a second after the claim.
+    let (engine, _sqlite, gate, _dir) = stalled_engine(true).await;
+    gate.shut();
+    // Its claim's write was slow: sent 700 ms ago.
+    let run = engine
+        .register(
+            "slow",
+            "t".into(),
+            Instant::now() - Duration::from_millis(700),
+        )
+        .unwrap();
+    let start = Instant::now();
+    assert!(wait_within(Duration::from_millis(400), || run.ctl.lost()).await);
+    let took = start.elapsed();
+    // About 133 ms on: at its deadline, not a renewal (and its limit) later.
+    assert!(
+        took >= Duration::from_millis(100) && took < Duration::from_millis(300),
+        "stopped {took:?} after registering"
+    );
+    assert!(
+        engine
+            .inner
+            .unreleased
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.task_id == "slow"),
+        "kept to hand back"
+    );
+    gate.open();
 }
 
 /// A `pdq` model `hash` whose block list (in `dir`) lists `ab…ab` as
@@ -2217,4 +2249,98 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+#[tokio::test]
+async fn an_image_and_a_video_of_the_same_bytes_are_cached_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(&dir, &pdq_config(dir.path(), 1));
+    let storage = apollo_storage::open(&config.database).await.unwrap();
+    let engine = Engine::new(Arc::new(config), storage, None);
+    let url = |main: &str| apollo_domain::Url {
+        main: main.into(),
+        fallback: None,
+    };
+    let image = engine.item_cache_key("hash", Some(&Input::Image(url("http://h/a.gif"))));
+    let video = engine.item_cache_key("hash", Some(&Input::Video(url("http://h/a.gif"))));
+    let plain = engine.cache_key("hash").map(|k| k.to_string());
+    assert_eq!(image, plain, "an image: the model's key");
+    assert_ne!(video, image, "a video: a key of its own");
+    assert_eq!(
+        engine.item_cache_key("hash", None),
+        plain,
+        "text read from either"
+    );
+}
+
+#[tokio::test]
+async fn a_stopping_engine_takes_no_deliveries() {
+    let sink = Arc::new(Recorder::default());
+    let (engine, storage, _dir) = engine_with_sink("", sink.clone()).await;
+    storage
+        .create_task(
+            &task("t", TaskState::Processing, ItemState::Processing, None),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .set_item_state(
+                "t",
+                0,
+                ItemState::Completed,
+                None,
+                Fence::Unchecked,
+                PLANTED
+            )
+            .await
+            .unwrap()
+    );
+    engine.shutdown().await;
+    engine.redeliver_pending().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(sink.finished("t").is_empty());
+    let pending = storage.items_pending_webhook().await.unwrap();
+    assert_eq!(pending.len(), 1, "left pending: {pending:?}");
+}
+
+#[tokio::test]
+async fn a_restart_sends_every_pending_event() {
+    // More than a shared database's batch: SQLite sends them all at once.
+    let sink = Arc::new(Recorder::default());
+    let (engine, storage, _dir) = engine_with_sink("", sink.clone()).await;
+    let n = 600;
+    for i in 0..n {
+        let id = format!("t{i}");
+        storage
+            .create_task(
+                &task(&id, TaskState::Processing, ItemState::Processing, None),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .set_item_state(
+                    &id,
+                    0,
+                    ItemState::Completed,
+                    None,
+                    Fence::Unchecked,
+                    PLANTED
+                )
+                .await
+                .unwrap()
+        );
+    }
+    engine.recover().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !storage.items_pending_webhook().await.unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "still pending after the restart");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(sink.finished("t0").len(), 1);
 }

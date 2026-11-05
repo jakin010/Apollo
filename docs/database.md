@@ -134,13 +134,26 @@ The optional result cache (see below).
 - SQLite: `DELETE FROM cache WHERE revision NOT LIKE 'fp1:%'; DELETE FROM url_cache WHERE revision NOT LIKE 'fp1:%';`
 - SurrealDB: `DELETE cache WHERE !string::starts_with(revision, 'fp1:'); DELETE url_cache WHERE !string::starts_with(revision, 'fp1:');`
 
+### `auth_key` and `revocations`
+
+Where instances share the database (SurrealDB), the public key they all verify tokens with and the token revocations they all apply (see [configuration.md → `[auth]`](./configuration.md#auth--authentication)). SQLite has the tables too, but a single instance never uses them: it keeps its key and revocations in files.
+
+| `auth_key` column | Type | | `revocations` column | Type |
+|-------------------|------|---|----------------------|------|
+| `slot` | TEXT | | `kind` | TEXT (`id` \| `subject`) |
+| `public_key` | TEXT | | `value` | TEXT |
+| `created_by` | TEXT | | `revoked_at` | INTEGER |
+| `created_at` | INTEGER | | | |
+
+`auth_key` holds one row (`slot = 'current'`); `revocations` is keyed by `(kind, value)`.
+
 ---
 
 ## SurrealDB schema
 
 The SurrealDB backend models the same data with `SCHEMALESS` tables and explicit indexes:
 
-- **Tables:** `task`, `item`, `model_result`, `frame`, `cache`, `url_cache`.
+- **Tables:** `task`, `item`, `model_result`, `frame`, `cache`, `url_cache`, `auth_key` (one record, `auth_key:current`), `revocation` (records `revocation:[kind, value]`).
 - **Indexes:** `task(state)`, `task(created_at)`, `task(request_id)`, `item(task_id)`, `item(webhook_delivered, state)`, `model_result(task_id, item_idx)`, `frame(task_id, item_idx, label)`.
 
 Records use composite record ids (e.g. `item:[task_id, idx]`, `model_result:[task_id, item_idx, label]`) mirroring the SQLite primary keys, so the same lifecycle, checkpointing, and cache semantics apply. Item records carry the same delivery-claim fields (`webhook_target`, `webhook_claim`, `webhook_claim_until`, the last a datetime).
@@ -171,7 +184,7 @@ Every task is claimed by the instance that runs it, with a lease it renews every
 - `tasks.attempts` (bumped by a takeover of a claim never handed back) to **fail a poison task** once it exceeds its cap instead of crash‑looping — its items are marked failed, its webhook fires, and its staged upload is removed,
 - `items.webhook_delivered` to redeliver any `FINISHED` webhook event that a crash left un‑acknowledged, and `webhook_claim` / `webhook_claim_until` so only one instance at a time delivers it (the one that finished the item, until its claim lapses or it gives up).
 
-A runner whose lease was taken over (it lost touch with the database for longer than the lease) is fenced out: its writes no longer apply, and it stops when its next renewal finds the claim gone. A runner that can't get a renewal through for five sixths of its lease (the database is out of reach, or answers no renewal within a third of the lease) stops its tasks at their next checkpoint and writes nothing more. It hands them back as soon as the database answers, and they resume, here or elsewhere, with no attempt counted. A shorter outage changes nothing. A task whose input is an upload or a local file is pinned to the node that accepted it (`[app].node_id`): other instances leave it alone, and fail it with a clear message (submit it again) only once its lease has lapsed for ten leases. Cancelling one needs no input, so any instance finishes a cancelled one. The startup upload sweep removes only unreferenced files older than an hour, so a shared upload directory doesn't lose one still arriving.
+A runner whose lease was taken over (it lost touch with the database for longer than the lease) is fenced out: its writes no longer apply, and it stops when its next renewal finds the claim gone. A runner whose last confirmed renewal was sent five sixths of a lease ago (the database is out of reach, or answers no renewal within a third of the lease) stops its tasks at their next checkpoint and writes nothing more. It hands them back as soon as the database answers, and they resume, here or elsewhere, with no attempt counted. Renewals go out every third of the lease, so an outage shorter than a third changes nothing, one longer than five sixths always stops tasks, and one in between may, depending on when it starts. A task whose input is an upload or a local file is pinned to the node that accepted it (`[app].node_id`): other instances leave it alone, and fail it with a clear message (submit it again) only once its lease has lapsed for ten leases. Cancelling one needs no input, so any instance finishes a cancelled one. The startup upload sweep removes only unreferenced files older than an hour, so a shared upload directory doesn't lose one still arriving.
 
 State writes only apply to an unfinished task or item: the first finish wins, so a late or second runner can't reopen a task, overwrite a cancel, or start an item another runner finished (one already partway through it can still overwrite its model results). An upload is read, and removed, only from the server's own upload directory (`[app].cache_dir/uploads`), whatever path a task's row holds; anything else fails the item.
 
@@ -190,6 +203,6 @@ When `[cache]` is enabled, model outputs are cached so identical inputs skip inf
 - **Content cache** (`cache` table): keyed by the input's **content hash** + model + the model's **output fingerprint**. A hit returns the stored `ModelOutput` directly, unless it is not the kind of output the model gives now (its label was repointed at a model that reads text, or back). A pipeline step with an `input` is keyed by the text it classifies instead, and not cached when that text is empty.
 - **URL→content hint** (`url_cache` table): maps a URL's hash to the content hash it last resolved to, so a repeated URL can reach the content cache without re‑downloading. Local files (`file://` or a bare path) get no hint: they are read each time, so a file replaced at the same path gets its own result.
 
-The **output fingerprint** covers what a model's output depends on: its output settings (`architecture`, `repo`, `revision`, `labels`, `prompt_template`, thresholds, `max_results`, the pdq and text and OCR settings, `early_exit`), the contents of its `taxonomy_file` and `hash_list` (not their paths), the contents of its `video_strategy`, the device and the CPU speed features it runs with (except for `pdq`), and the version of Apollo's own output code. Scheduling settings (`timeout`, `priority`, `max_pending`, `max_concurrent`, `keep_in_memory`), paths, `[limits]` and pipelines are left out. Changing any of the covered settings starts new entries; a restart with the same config keeps hitting the old ones. Instances sharing a database share results only where these match, and each logs its models' fingerprints (`result cache key`) at startup and on reload, for comparing them. A `revision` such as `main` can move between downloads without the cache noticing: pin a commit for instances that share a database.
+The **output fingerprint** covers what a model's output depends on: its output settings (`architecture`, `repo`, `revision`, `labels`, `prompt_template`, thresholds, `max_results`, the pdq and text and OCR settings, `early_exit`), the contents of its `taxonomy_file` and `hash_list` (not their paths), the contents of its `video_strategy` (and its `max_concurrent` when the strategy confirms triggers, which then depends on the batch size), the device and the CPU speed features in use (except for `pdq`), and the version of Apollo's own output code. Scheduling settings (`timeout`, `priority`, `max_pending`, `max_concurrent` otherwise, `keep_in_memory`), paths, `[limits]` and pipelines are left out. Results for videos are kept apart from those for images of the same bytes (an animated image sent both ways), and a video scan that resumed from frames an earlier run saved isn't cached (those frames may come from another config). Changing any of the covered settings starts new entries; a restart with the same config keeps hitting the old ones. Instances sharing a database share results only where these match, and each logs its models' fingerprints (`result cache key`) at startup and on reload, for comparing them. A `revision` such as `main` can move between downloads without the cache noticing: pin a commit for instances that share a database.
 
 Freshness is controlled by `[cache].ttl_secs`: a lookup passes a lower bound on `created_at`, so entries older than the TTL are ignored, and an hourly job deletes them. Omit `ttl_secs` for entries that never expire.

@@ -142,6 +142,8 @@ struct Inner {
     unreleased: Mutex<Vec<apollo_storage::Held>>,
     /// Woken on every cancel, so items waiting for a slot can check theirs.
     cancelled: tokio::sync::Notify,
+    /// Woken as a run registers, for the deadline watch.
+    registered: tokio::sync::Notify,
     /// This instance's node id, and this process's id (one per start).
     node: String,
     process: String,
@@ -262,6 +264,7 @@ impl Engine {
                 runs: Mutex::new(HashMap::new()),
                 unreleased: Mutex::new(Vec::new()),
                 cancelled: tokio::sync::Notify::new(),
+                registered: tokio::sync::Notify::new(),
                 changes,
                 idempotency: Mutex::new(HashMap::new()),
                 node,
@@ -280,6 +283,7 @@ impl Engine {
         engine.spawn_redelivery();
         if shared {
             engine.spawn_renewal();
+            engine.spawn_deadlines();
         }
         engine
     }

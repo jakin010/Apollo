@@ -105,7 +105,7 @@ apollo token --subject ci-runner --expires 30d
 **Rotating the shared key.**
 
 ```bash
-apollo keygen > new.key                                  # keep new.key safe
+(umask 077; apollo keygen > new.key)                     # owner-only; keep new.key safe
 apollo publish-key --replace --secret-key-file new.key   # store its public key as the shared one
 apollo token --secret-key-file new.key --subject …       # mint tokens with it
 ```
@@ -124,7 +124,7 @@ apollo revoke --token "v4.public.…"  # one token, reading its id from the toke
 apollo revoke --subject ci-runner    # every token of a subject (incl. tokens minted before ids existed)
 ```
 
-Each command appends a line (`id <id>` or `subject <name>`) to the revocation file; running servers pick it up within about 10 seconds. On a database instances share, it also stores the revocation there, so every instance applies it. `apollo revoke --undo …` takes a revocation back (from the file and the database). The file is plain text: deleting a line also un‑revokes, unless the database revokes it too. Run `apollo revoke` as the server's OS user (or pass `--config` when `revocation_file` is set there). If the file becomes unreadable, the server keeps the last list it loaded.
+Each command appends a line (`id <id>` or `subject <name>`) to the revocation file; running servers pick it up within about 10 seconds. On a database instances share, it also stores the revocation there, so every instance applies it. `apollo revoke --undo …` takes a revocation back, from this host's file and the database (an instance whose own revocation file lists it keeps refusing it). The file is plain text: deleting a line also un‑revokes, unless the database revokes it too. Run `apollo revoke` as the server's OS user, with `--config <the servers' config>` whenever the servers don't use the standard config path: that config's `[database]` is where instances sharing a database read revocations, and its `revocation_file` the file it writes. Without a config it changes only this host's file, and says so. If the file becomes unreadable, the server keeps the last list it loaded.
 
 Clients send the token in the **`authorization`** metadata header (with or without a `Bearer ` prefix). See [grpc-api.md → Authentication](./grpc-api.md#authentication).
 
@@ -207,7 +207,7 @@ See [database.md](./database.md) for the full picture.
 |-------|------|---------|---------|
 | `backend` | enum | `sqlite` | `sqlite` \| `postgres` \| `surrealdb`. (`postgres` is a future seam and currently fails at startup.) |
 | `retention` | duration | *(none)* | How long to keep finished tasks (e.g. `"30d"`). Omit to keep forever. |
-| `lease_secs` | u32 | `30` | Seconds a task's claim lasts unless its runner renews it (every third of this); 1 to 3600. With instances sharing one database (SurrealDB), another instance takes a task over once its lease has lapsed this long. A runner that gets no renewal through for 5/6 of this stops its tasks and hands them back once the database answers. Also how long a finished webhook's delivery claim lasts unless renewed. Keep it the same on every instance. Restart-only. |
+| `lease_secs` | u32 | `30` | Seconds a task's claim lasts unless its runner renews it (every third of this); 1 to 3600. With instances sharing one database (SurrealDB), another instance takes a task over once its lease has lapsed this long. A runner whose last confirmed renewal was sent 5/6 of this ago stops its tasks and hands them back once the database answers: a database outage of a third to 5/6 of this can stop them, depending on when it starts. Also how long a finished webhook's delivery claim lasts unless renewed. Keep it the same on every instance. Restart-only. |
 | `timeout` | u32 (s) | `30` | How long a client's call waits for the database before it fails with `UNAVAILABLE`, and how long connecting to SurrealDB may take at startup (the schema migration after it has no limit). Background work (running tasks, webhooks) always waits, so none of its writes is dropped. A Classify told `UNAVAILABLE` may still have its task stored and run once the database answers: retry it with the same `request_id` to get that task. `0` waits as long as it takes. Lease renewals have their own limit (a third of `lease_secs`), whatever this is. |
 
 Each backend has its own sub‑table; the one matching `backend` is required (except `sqlite`, which has defaults).
