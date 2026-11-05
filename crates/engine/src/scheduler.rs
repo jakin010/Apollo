@@ -18,6 +18,8 @@ use apollo_media::{
     Confirm, FrameRef, FrameRequest, LocalMedia, MediaError, VideoInfo, VideoShare,
 };
 
+use apollo_storage::Delivery;
+
 use crate::Engine;
 use crate::aggregate;
 use crate::error::EngineError;
@@ -234,7 +236,15 @@ impl Engine {
         match self
             .inner
             .storage
-            .set_item_state(&task_id, idx, ItemState::Processing, None, self.fence())
+            // Not a finish: no delivery to record.
+            .set_item_state(
+                &task_id,
+                idx,
+                ItemState::Processing,
+                None,
+                self.fence(),
+                Delivery::Off,
+            )
             .await
         {
             Ok(true) => {}
@@ -428,7 +438,15 @@ impl Engine {
         if let Ok(false) = self
             .inner
             .storage
-            .set_item_state(task_id, idx, ItemState::Retrying, Some(&err), self.fence())
+            // Not a finish: no delivery to record.
+            .set_item_state(
+                task_id,
+                idx,
+                ItemState::Retrying,
+                Some(&err),
+                self.fence(),
+                Delivery::Off,
+            )
             .await
         {
             return false;
@@ -459,7 +477,15 @@ impl Engine {
         !matches!(
             self.inner
                 .storage
-                .set_item_state(task_id, idx, ItemState::Processing, None, self.fence())
+                // Not a finish: no delivery to record.
+                .set_item_state(
+                    task_id,
+                    idx,
+                    ItemState::Processing,
+                    None,
+                    self.fence(),
+                    Delivery::Off
+                )
                 .await,
             Ok(false)
         )
@@ -810,10 +836,19 @@ impl Engine {
         if self.lost() {
             return false;
         }
+        // The current webhook's, also for a task pinned to an older config.
+        let live = self.current().live();
         match self
             .inner
             .storage
-            .set_item_state(task_id, idx, state, error, self.fence())
+            .set_item_state(
+                task_id,
+                idx,
+                state,
+                error,
+                self.fence(),
+                self.delivery(&live),
+            )
             .await
         {
             Ok(written) => {
@@ -847,9 +882,12 @@ impl Engine {
         {
             return;
         }
+        let delivering = self.start_delivery(task_id, idx);
         self.inner.metrics.item_finished(ItemState::Completed);
         self.rollup_task_state(task_id).await;
-        self.deliver_webhook(task_id, idx).await;
+        if let Some(delivering) = delivering {
+            self.send_webhook(delivering).await;
+        }
     }
 
     /// All-or-nothing URL fast path. If every not-yet-done model for this item
@@ -918,9 +956,12 @@ impl Engine {
         {
             return;
         }
+        let delivering = self.start_delivery(task_id, idx);
         self.inner.metrics.item_finished(ItemState::Cancelled);
         self.rollup_task_state(task_id).await;
-        self.deliver_webhook(task_id, idx).await;
+        if let Some(delivering) = delivering {
+            self.send_webhook(delivering).await;
+        }
     }
 
     /// Mark the item (and its not-yet-done models) failed, in one write, then
@@ -943,10 +984,18 @@ impl Engine {
             })
             .cloned()
             .collect();
+        let live = self.current().live();
         match self
             .inner
             .storage
-            .set_item_failed(task_id, idx, &err, &models, self.fence())
+            .set_item_failed(
+                task_id,
+                idx,
+                &err,
+                &models,
+                self.fence(),
+                self.delivery(&live),
+            )
             .await
         {
             Ok(true) => {}
@@ -960,9 +1009,12 @@ impl Engine {
                 return;
             }
         }
+        let delivering = self.start_delivery(task_id, idx);
         self.inner.metrics.item_finished(ItemState::Failed);
         self.rollup_task_state(task_id).await;
-        self.deliver_webhook(task_id, idx).await;
+        if let Some(delivering) = delivering {
+            self.send_webhook(delivering).await;
+        }
     }
 
     /// Recompute the task's lifecycle state from its items and persist it when it

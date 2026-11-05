@@ -177,8 +177,9 @@ async fn nobody_takes_over_a_dead_instances_task() {
     .await;
 }
 
+/// Not ignored: an instance starting while another delivers a finished
+/// webhook leaves it alone (the delivery claim is the other's).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until webhook delivery claims (a start resends only unclaimed events)"]
 async fn a_starting_instance_resends_a_webhook_being_delivered() {
     fleet_test(|fleet| async move {
         let a = fleet.start("a", NSFW).await;
@@ -209,8 +210,9 @@ async fn a_starting_instance_resends_a_webhook_being_delivered() {
     .await;
 }
 
+/// Not ignored: another instance's redelivery leaves a finished webhook
+/// alone while its deliverer renews the claim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until webhook delivery claims (redelivery skips events being delivered)"]
 async fn a_running_instance_resends_a_webhook_being_delivered() {
     fleet_test(|fleet| async move {
         let a = fleet.start("a", NSFW).await;

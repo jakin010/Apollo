@@ -14,6 +14,10 @@ use apollo_storage::{Fence, Storage, TaskQuery};
 
 use crate::{Engine, EngineError, Run, Submission};
 
+/// What a planted terminal write records about the finished webhook:
+/// pending, for any receiver, nobody's to deliver.
+const PLANTED: apollo_storage::Delivery<'static> = apollo_storage::Delivery::Open { target: None };
+
 struct Fixture {
     engine: Engine,
     storage: Arc<dyn Storage>,
@@ -171,7 +175,14 @@ async fn cancelled_task_upload_is_removed_once_its_item_stops() {
 
     // The item reaches its cancellation checkpoint (what cancel_item persists).
     f.storage
-        .set_item_state("t", 0, ItemState::Cancelled, None, Fence::Unchecked)
+        .set_item_state(
+            "t",
+            0,
+            ItemState::Cancelled,
+            None,
+            Fence::Unchecked,
+            PLANTED,
+        )
         .await
         .unwrap();
     f.engine.rollup_task_state("t").await;
@@ -508,7 +519,14 @@ async fn a_watch_follows_a_task_until_it_finishes() {
     let writer = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         storage
-            .set_item_state("w", 0, ItemState::Processing, None, Fence::Unchecked)
+            .set_item_state(
+                "w",
+                0,
+                ItemState::Processing,
+                None,
+                Fence::Unchecked,
+                PLANTED,
+            )
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -518,7 +536,14 @@ async fn a_watch_follows_a_task_until_it_finishes() {
             .await
             .unwrap();
         storage
-            .set_item_state("w", 0, ItemState::Completed, None, Fence::Unchecked)
+            .set_item_state(
+                "w",
+                0,
+                ItemState::Completed,
+                None,
+                Fence::Unchecked,
+                PLANTED,
+            )
             .await
             .unwrap();
         storage
@@ -1322,7 +1347,14 @@ async fn a_late_runner_leaves_a_finished_item_alone() {
     f.storage.create_task(&late, None, None).await.unwrap();
     assert!(
         f.storage
-            .set_item_state("t", 0, ItemState::Completed, None, Fence::Unchecked)
+            .set_item_state(
+                "t",
+                0,
+                ItemState::Completed,
+                None,
+                Fence::Unchecked,
+                PLANTED
+            )
             .await
             .unwrap()
     );
@@ -1437,7 +1469,14 @@ async fn a_watch_sees_changes_nobody_announced() {
     );
     // Written past this engine, as another instance would: not announced.
     f.storage
-        .set_item_state("t", 0, ItemState::Completed, None, Fence::Unchecked)
+        .set_item_state(
+            "t",
+            0,
+            ItemState::Completed,
+            None,
+            Fence::Unchecked,
+            PLANTED,
+        )
         .await
         .unwrap();
     f.storage
@@ -1462,6 +1501,10 @@ impl crate::WebhookSink for Recorder {
         let mut events = self.0.lock().unwrap();
         events.push((event.kind, event.task.id.clone(), event.task.state));
         Ok(())
+    }
+
+    fn target(&self) -> String {
+        "test://recorder".into()
     }
 }
 
@@ -1529,20 +1572,203 @@ async fn with_webhooks_off_nothing_is_kept_to_send_later() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // The item's finish is recorded as handled, so turning webhooks on later
-    // doesn't send events for tasks that finished while they were off.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let pending = f.storage.items_pending_webhook().await.unwrap();
-        if pending.is_empty() {
-            break;
+    // The item's finish is recorded as handled (in the write that finished
+    // it), so turning webhooks on later doesn't send events for tasks that
+    // finished while they were off.
+    let pending = f.storage.items_pending_webhook().await.unwrap();
+    assert!(
+        pending.is_empty(),
+        "left pending with webhooks off: {pending:?}"
+    );
+}
+
+/// A webhook receiver for the delivery tests: records events as [`Recorder`]
+/// does, and of the finished ones holds the first for `hold_first` and
+/// refuses the next `fail`.
+#[derive(Default)]
+struct Flaky {
+    recorder: Recorder,
+    hold_first: Duration,
+    fail: std::sync::atomic::AtomicUsize,
+    /// Finished events it was sent.
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::WebhookSink for Flaky {
+    async fn deliver(&self, event: &crate::TaskEvent) -> Result<(), crate::WebhookError> {
+        use std::sync::atomic::Ordering;
+        if event.kind != crate::EventKind::Finished {
+            return self.recorder.deliver(event).await;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "left pending with webhooks off: {pending:?}"
-        );
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            tokio::time::sleep(self.hold_first).await;
+        }
+        if self
+            .fail
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(crate::WebhookError("refused".into()));
+        }
+        self.recorder.deliver(event).await
+    }
+
+    fn target(&self) -> String {
+        "test://recorder".into()
+    }
+}
+
+impl Flaky {
+    fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// An engine on SQLite with webhook `sink`, and `toml` besides the nsfw model.
+async fn engine_with_sink(
+    toml: &str,
+    sink: Arc<dyn crate::WebhookSink>,
+) -> (Engine, Arc<dyn Storage>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(&dir, &format!("{toml}{NSFW}"));
+    let storage = apollo_storage::open(&config.database).await.unwrap();
+    let engine = Engine::new(Arc::new(config), storage.clone(), Some(sink));
+    (engine, storage, dir)
+}
+
+/// Wait until `id`'s item has finished, and its finished webhook is no longer
+/// pending.
+async fn wait_delivered(storage: &Arc<dyn Storage>, id: &str, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    loop {
+        let task = storage.get_task(id).await.unwrap().unwrap();
+        let pending = storage.items_pending_webhook().await.unwrap();
+        if crate::aggregate::item_terminal(task.items[0].state)
+            && !pending.iter().any(|p| p.task_id == id)
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "still pending: {pending:?}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test]
+async fn redelivery_skips_an_item_being_delivered_here() {
+    let sink = Arc::new(Flaky {
+        hold_first: Duration::from_millis(2500),
+        ..Default::default()
+    });
+    let webhook = "[webhook]\nurl = \"http://127.0.0.1:1\"\nredelivery_secs = 1\n";
+    let (engine, storage, _dir) = engine_with_sink(webhook, sink.clone()).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    // The first delivery takes 2.5 s, through two rounds of redelivery.
+    wait_delivered(&storage, &id, Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(sink.recorder.finished(&id), [TaskState::Failed]);
+    assert_eq!(sink.attempts(), 1, "delivered again while being delivered");
+}
+
+#[tokio::test]
+async fn a_restart_delivers_what_the_last_process_had_claimed() {
+    let sink = Arc::new(Recorder::default());
+    let (engine, storage, _dir) = engine_with_sink("", sink.clone()).await;
+    // Finished by the last process, which was delivering its webhook (for an
+    // hour yet) when it stopped.
+    storage
+        .create_task(
+            &task("t", TaskState::Processing, ItemState::Processing, None),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let claim = apollo_storage::Delivery::Claim {
+        holder: "old/proc",
+        target: "test://recorder",
+        ttl: Duration::from_secs(3600),
+    };
+    assert!(
+        storage
+            .set_item_state("t", 0, ItemState::Completed, None, Fence::Unchecked, claim)
+            .await
+            .unwrap()
+    );
+    assert!(
+        storage
+            .set_task_state("t", TaskState::Completed, Fence::Unchecked)
+            .await
+            .unwrap()
+    );
+
+    // One process per SQLite database: its start sends it at once.
+    engine.recover().await.unwrap();
+    wait_delivered(&storage, "t", Duration::from_secs(5)).await;
+    assert_eq!(sink.finished("t"), [TaskState::Completed]);
+}
+
+#[tokio::test]
+async fn a_failed_delivery_hands_its_claim_back() {
+    let sink = Arc::new(Flaky {
+        fail: 3.into(),
+        ..Default::default()
+    });
+    let (engine, storage, _dir) = engine_with_sink("", sink.clone()).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    // Three attempts, over about 4 s, then the claim is handed back: anyone
+    // may take it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let taken = storage
+            .claim_pending_webhooks(
+                "other/proc",
+                None,
+                apollo_storage::ClaimMode::Open,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        if taken.iter().any(|p| p.task_id == id) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the claim wasn't handed back");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(sink.attempts(), 3);
+    assert!(sink.recorder.finished(&id).is_empty());
+}
+
+#[tokio::test]
+async fn turning_webhooks_off_settles_this_instances_deliveries() {
+    let sink = Arc::new(Flaky {
+        fail: 1.into(),
+        ..Default::default()
+    });
+    let (engine, storage, dir) = engine_with_sink("", sink.clone()).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    // The first attempt fails; before the next, webhooks are turned off.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sink.attempts() == 0 {
+        assert!(Instant::now() < deadline, "never delivered");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    engine.reload(config_in(&dir, NSFW), None).await.unwrap();
+    // The next attempt finds them off, and marks the item: nothing is kept.
+    wait_delivered(&storage, &id, Duration::from_secs(5)).await;
+    assert_eq!(sink.attempts(), 1);
 }
 
 #[tokio::test]

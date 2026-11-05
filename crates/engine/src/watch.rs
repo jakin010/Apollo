@@ -92,10 +92,11 @@ impl Storage for Notifying {
         state: ItemState,
         error: Option<&TaskError>,
         fence: Fence<'_>,
+        delivery: apollo_storage::Delivery<'_>,
     ) -> Result<bool, StorageError> {
         let written = self
             .inner
-            .set_item_state(task_id, item, state, error, fence)
+            .set_item_state(task_id, item, state, error, fence, delivery)
             .await?;
         if written {
             self.changed(task_id);
@@ -110,10 +111,11 @@ impl Storage for Notifying {
         error: &TaskError,
         models: &[String],
         fence: Fence<'_>,
+        delivery: apollo_storage::Delivery<'_>,
     ) -> Result<bool, StorageError> {
         let written = self
             .inner
-            .set_item_failed(task_id, item, error, models, fence)
+            .set_item_failed(task_id, item, error, models, fence, delivery)
             .await?;
         if written {
             self.changed(task_id);
@@ -248,12 +250,51 @@ impl Storage for Notifying {
         self.inner.release_claims(held).await
     }
 
+    async fn claim_pending_webhooks(
+        &self,
+        holder: &str,
+        target: Option<&str>,
+        mode: apollo_storage::ClaimMode,
+        ttl: std::time::Duration,
+    ) -> Result<Vec<apollo_storage::PendingWebhook>, StorageError> {
+        self.inner
+            .claim_pending_webhooks(holder, target, mode, ttl)
+            .await
+    }
+
+    async fn renew_webhook_claims(
+        &self,
+        holder: &str,
+        items: &[apollo_storage::PendingWebhook],
+        ttl: std::time::Duration,
+    ) -> Result<Vec<bool>, StorageError> {
+        self.inner.renew_webhook_claims(holder, items, ttl).await
+    }
+
+    async fn release_webhook_claim(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .release_webhook_claim(task_id, item, holder)
+            .await
+    }
+
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError> {
         self.inner.items_pending_webhook().await
     }
 
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError> {
-        self.inner.mark_webhook_delivered(task_id, item).await
+    async fn mark_webhook_delivered(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .mark_webhook_delivered(task_id, item, holder)
+            .await
     }
 
     async fn set_item_retries(

@@ -149,6 +149,41 @@ impl SurrealScratch {
         (holder, live.expect("the task row"))
     }
 
+    /// Who holds an item's finished-webhook delivery claim, if anyone, and
+    /// whether it is still running.
+    pub async fn delivery_claim(&self, task_id: &str, item: usize) -> (Option<String>, bool) {
+        let mut resp = self
+            .admin
+            .query(
+                "SELECT VALUE webhook_claim FROM ONLY type::record('item', [$tid, $idx]);
+                 SELECT VALUE webhook_claim_until != NONE AND webhook_claim_until > time::now()
+                    FROM ONLY type::record('item', [$tid, $idx]);",
+            )
+            .bind(("tid", task_id.to_string()))
+            .bind(("idx", item as i64))
+            .await
+            .expect("reading a delivery claim");
+        let holder: Option<String> = resp.take(0).expect("reading a delivery claim's holder");
+        let live: Option<bool> = resp.take(1).expect("reading a delivery claim's end");
+        (holder, live.expect("the item row"))
+    }
+
+    /// End an item's delivery claim `ago` ago, as if its holder had stopped
+    /// renewing it then (the claim stays).
+    pub async fn expire_delivery_claim(&self, task_id: &str, item: usize, ago: Duration) {
+        self.admin
+            .query(
+                "UPDATE type::record('item', [$tid, $idx])
+                 SET webhook_claim_until = time::now() - $ago",
+            )
+            .bind(("tid", task_id.to_string()))
+            .bind(("idx", item as i64))
+            .bind(("ago", ago))
+            .await
+            .and_then(|resp| resp.check())
+            .expect("expiring a delivery claim");
+    }
+
     /// Drop the database.
     pub async fn remove(&self) {
         self.admin

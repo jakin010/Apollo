@@ -45,16 +45,50 @@ impl<'a> Fence<'a> {
     }
 }
 
-/// Which tasks a claim may take.
+/// What a write that finishes an item records about its finished webhook
+/// (ignored by a write to a state that isn't finished).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery<'a> {
+    /// Webhooks are off: stored as delivered, nothing is kept to send.
+    Off,
+    /// Pending, and nobody's to deliver (planted rows, tests). A `target` of
+    /// `None` is any receiver, as for rows stored before delivery claims.
+    Open { target: Option<&'a str> },
+    /// Pending for receiver `target`, and `holder`'s to deliver: claimed for
+    /// `ttl` on the database's clock.
+    Claim {
+        holder: &'a str,
+        target: &'a str,
+        ttl: Duration,
+    },
+}
+
+impl<'a> Delivery<'a> {
+    /// What a finishing write stores: (delivered, target, holder, ttl).
+    pub fn parts(self) -> (bool, Option<&'a str>, Option<&'a str>, Duration) {
+        match self {
+            Delivery::Off => (true, None, None, Duration::ZERO),
+            Delivery::Open { target } => (false, target, None, Duration::ZERO),
+            Delivery::Claim {
+                holder,
+                target,
+                ttl,
+            } => (false, Some(target), Some(holder), ttl),
+        }
+    }
+}
+
+/// Which claims a claim may take: of a task (its lease), or of an item's
+/// finished webhook (its delivery).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimMode {
-    /// Any unfinished task, whoever holds it: a database only this process
-    /// uses (SQLite, at startup).
+    /// Any, whoever holds it: a database only this process uses (SQLite).
     Force,
-    /// Only tasks nobody holds: stored before leases existed, or handed back
-    /// by a graceful stop.
+    /// Only those nobody holds: stored before claims existed, or handed back
+    /// (a graceful stop, a failed delivery).
     Open,
-    /// Those, and tasks whose lease expired (their holder stopped renewing it).
+    /// Those, and those whose claim expired (their holder stopped renewing
+    /// it).
     Expired,
 }
 

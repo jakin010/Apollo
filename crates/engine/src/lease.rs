@@ -227,7 +227,7 @@ impl Engine {
     }
 
     /// How often claims are renewed, and how long one renewal may take at most.
-    fn renew_every(&self) -> Duration {
+    pub(crate) fn renew_every(&self) -> Duration {
         self.inner.lease_ttl / 3
     }
 
@@ -254,9 +254,10 @@ impl Engine {
             .clamp(ttl / 6, ttl / 3)
     }
 
-    /// Start renewing this process's claims every third of the lease (with a
-    /// shared database; on SQLite nobody takes a task over). It goes on while
-    /// the engine stops, until its claims are handed back.
+    /// Start renewing this process's claims (its tasks' and its webhook
+    /// deliveries') every third of the lease (with a shared database; on
+    /// SQLite nobody takes a claim over). It goes on while the engine stops,
+    /// until its claims are handed back.
     pub(crate) fn spawn_renewal(&self) {
         let engine = self.clone();
         tokio::spawn(async move {
@@ -265,7 +266,7 @@ impl Engine {
             tick.tick().await;
             loop {
                 tick.tick().await;
-                engine.renew_runs().await;
+                tokio::join!(engine.renew_runs(), engine.renew_deliveries());
             }
         });
     }
@@ -387,7 +388,7 @@ impl Engine {
     }
 
     /// Note whether the database answered, for [`Engine::settled`].
-    fn connected(&self, ok: bool) {
+    pub(crate) fn connected(&self, ok: bool) {
         let mut since = self
             .inner
             .connected_since

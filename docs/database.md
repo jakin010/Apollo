@@ -88,6 +88,9 @@ One row per input within a task. `PRIMARY KEY (task_id, idx)`.
 | `state` | TEXT | `ItemState` token. |
 | `error` | TEXT | Item‑level error as JSON, if failed. |
 | `webhook_delivered` | INTEGER | 0/1 — whether the `FINISHED` webhook event was delivered. |
+| `webhook_target` | TEXT | The receiver its finishing instance's webhook sends to (`scheme://host:port`); `NULL` = any. |
+| `webhook_claim` | TEXT | Who is delivering the `FINISHED` event (`<node>/<process>`), if anyone. |
+| `webhook_claim_until` | INTEGER | Until when (ms, on the database clock) that delivery claim lasts unless renewed. |
 | `retries` | INTEGER | Retry count, compared against `[app].max_retries`. |
 
 ### `model_results`
@@ -137,7 +140,7 @@ The SurrealDB backend models the same data with `SCHEMALESS` tables and explicit
 - **Tables:** `task`, `item`, `model_result`, `frame`, `cache`, `url_cache`.
 - **Indexes:** `task(state)`, `task(created_at)`, `task(request_id)`, `item(task_id)`, `item(webhook_delivered, state)`, `model_result(task_id, item_idx)`, `frame(task_id, item_idx, label)`.
 
-Records use composite record ids (e.g. `item:[task_id, idx]`, `model_result:[task_id, item_idx, label]`) mirroring the SQLite primary keys, so the same lifecycle, checkpointing, and cache semantics apply.
+Records use composite record ids (e.g. `item:[task_id, idx]`, `model_result:[task_id, item_idx, label]`) mirroring the SQLite primary keys, so the same lifecycle, checkpointing, and cache semantics apply. Item records carry the same delivery-claim fields (`webhook_target`, `webhook_claim`, `webhook_claim_until`, the last a datetime).
 
 ### SurrealDB versions and upgrades
 
@@ -163,7 +166,7 @@ Every task is claimed by the instance that runs it, with a lease it renews every
 - `tasks.claim` and `lease_until` to tell held tasks from lapsed ones,
 - `model_results.state` + `frames` to skip already‑finished models and frames,
 - `tasks.attempts` (bumped by a takeover of a claim never handed back) to **fail a poison task** once it exceeds its cap instead of crash‑looping — its items are marked failed, its webhook fires, and its staged upload is removed,
-- `items.webhook_delivered` to redeliver any `FINISHED` webhook event that a crash left un‑acknowledged.
+- `items.webhook_delivered` to redeliver any `FINISHED` webhook event that a crash left un‑acknowledged, and `webhook_claim` / `webhook_claim_until` so only one instance at a time delivers it (the one that finished the item, until its claim lapses or it gives up).
 
 A runner whose lease was taken over (it lost touch with the database for longer than the lease) is fenced out: its writes no longer apply, and it stops when its next renewal finds the claim gone. A runner that can't get a renewal through for five sixths of its lease (the database is out of reach, or answers no renewal within a third of the lease) stops its tasks at their next checkpoint and writes nothing more. It hands them back as soon as the database answers, and they resume, here or elsewhere, with no attempt counted. A shorter outage changes nothing. A task whose input is an upload or a local file is pinned to the node that accepted it (`[app].node_id`): other instances leave it alone, and fail it with a clear message (submit it again) only once its lease has lapsed for ten leases. Cancelling one needs no input, so any instance finishes a cancelled one. The startup upload sweep removes only unreferenced files older than an hour, so a shared upload directory doesn't lose one still arriving.
 

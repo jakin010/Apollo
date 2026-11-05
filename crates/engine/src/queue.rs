@@ -17,7 +17,10 @@ const UPLOAD_SWEEP_AGE: Duration = Duration::from_secs(3600);
 
 impl Engine {
     /// Startup recovery, run once before serving:
-    /// 1. re-fire webhooks stranded by a crash between terminal-state and delivery;
+    /// 1. re-fire webhooks stranded by a crash between terminal-state and
+    ///    delivery: on a shared database the ones nobody is delivering, and
+    ///    one lease later (settled by then) also those whose claim lapsed, so
+    ///    a crash's events are sent even with `redelivery_secs = 0`;
     /// 2. take over the unfinished tasks this instance may: on SQLite (one
     ///    process per database) every one; on a shared database the ones nobody
     ///    holds, and, from then on, every third of the lease, also the ones
@@ -29,13 +32,13 @@ impl Engine {
     ///
     /// Returns the number of tasks taken over now.
     pub async fn recover(&self) -> Result<usize, EngineError> {
-        match self.inner.storage.items_pending_webhook().await {
-            Ok(pending) => {
-                for p in pending {
-                    self.deliver_webhook(&p.task_id, p.item_index).await;
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "recover: could not list pending webhooks"),
+        self.redeliver_pending().await;
+        if self.inner.storage.shared() {
+            let engine = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(engine.inner.lease_ttl).await;
+                engine.redeliver_pending().await;
+            });
         }
 
         // Remove orphaned upload files: left by a task that finished but

@@ -22,6 +22,7 @@
 mod cancel;
 mod data;
 mod recovery;
+mod webhooks;
 
 use std::fmt::Display;
 use std::future::Future;
@@ -123,15 +124,31 @@ impl Fleet {
     /// migrated once, up front; and with no `[webhook]` in `toml` (the sink is
     /// always there), the instance's redelivery loop stays off.
     async fn start(&self, who: &'static str, toml: &str) -> Instance {
+        self.start_with(who, toml, SinkKind::Fleet).await
+    }
+
+    /// Like [`Fleet::start`], with the webhook sink `kind` says.
+    async fn start_with(&self, who: &'static str, toml: &str, kind: SinkKind) -> Instance {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
-        let mut instance = self.start_in(who, toml, &path).await;
+        let mut instance = self.start_in_with(who, toml, &path, kind).await;
         instance._dir = Some(dir);
         instance
     }
 
     /// Like [`Fleet::start`], with `cache_dir` as the cache directory.
     async fn start_in(&self, who: &'static str, toml: &str, cache_dir: &Path) -> Instance {
+        self.start_in_with(who, toml, cache_dir, SinkKind::Fleet)
+            .await
+    }
+
+    async fn start_in_with(
+        &self,
+        who: &'static str,
+        toml: &str,
+        cache_dir: &Path,
+        kind: SinkKind,
+    ) -> Instance {
         let mut config = apollo_config::load::from_str(toml).unwrap();
         config.app.device = DevicePreference::Cpu;
         // The tests share one process, whose memory isn't any instance's.
@@ -169,13 +186,18 @@ impl Fleet {
                     who,
                     log,
                     holds: Holds::default(),
+                    target: match kind {
+                        SinkKind::Target(target) => target,
+                        SinkKind::Fleet | SinkKind::Off => FLEET_TARGET,
+                    },
+                    fail: AtomicUsize::new(0),
                 });
-                let engine = Engine::with_node(
-                    Arc::new(config),
-                    probe.clone(),
-                    Some(sink.clone()),
-                    who.to_string(),
-                );
+                let webhook: Option<Arc<dyn WebhookSink>> = match kind {
+                    SinkKind::Off => None,
+                    _ => Some(sink.clone()),
+                };
+                let engine =
+                    Engine::with_node(Arc::new(config), probe.clone(), webhook, who.to_string());
                 (engine, probe, sink)
             })
             .await
@@ -373,6 +395,11 @@ impl Instance {
         self.sink.holds.add(times, matches)
     }
 
+    /// Fail this instance's next `n` finished-webhook deliveries.
+    fn fail_webhooks(&self, n: usize) {
+        self.sink.fail.store(n, Ordering::SeqCst);
+    }
+
     /// Stop the instance as a crash would: everything it was doing stops where
     /// it is, and its connections close. Returns its cache directory, which a
     /// crash leaves on disk.
@@ -415,6 +442,11 @@ enum Call {
     /// A takeover's read of candidates (holdable; not logged).
     Claimable,
     WebhookDelivered(String, usize),
+    /// Finished webhooks claimed for delivery by a redelivery pass (logged
+    /// when any were).
+    ClaimWebhooks(Vec<(String, usize)>),
+    /// A delivery claim handed back (the delivery failed).
+    ReleaseWebhook(String, usize),
     /// A webhook event the sink received.
     Webhook(String, EventKind, TaskState),
 }
@@ -645,12 +677,13 @@ impl Storage for Probe {
         state: ItemState,
         error: Option<&apollo_domain::TaskError>,
         fence: Fence<'_>,
+        delivery: apollo_storage::Delivery<'_>,
     ) -> Result<bool, StorageError> {
         self.pass(Call::SetItemState(task_id.into(), item, state, false))
             .await;
         let r = self
             .inner
-            .set_item_state(task_id, item, state, error, fence)
+            .set_item_state(task_id, item, state, error, fence, delivery)
             .await;
         if let Ok(written) = &r {
             self.done(Call::SetItemState(task_id.into(), item, state, *written));
@@ -664,12 +697,13 @@ impl Storage for Probe {
         error: &apollo_domain::TaskError,
         models: &[String],
         fence: Fence<'_>,
+        delivery: apollo_storage::Delivery<'_>,
     ) -> Result<bool, StorageError> {
         let call = |written| Call::SetItemState(task_id.into(), item, ItemState::Failed, written);
         self.pass(call(false)).await;
         let r = self
             .inner
-            .set_item_failed(task_id, item, error, models, fence)
+            .set_item_failed(task_id, item, error, models, fence, delivery)
             .await;
         if let Ok(written) = &r {
             self.done(call(*written));
@@ -835,14 +869,67 @@ impl Storage for Probe {
             release.await
         }
     }
+    async fn claim_pending_webhooks(
+        &self,
+        holder: &str,
+        target: Option<&str>,
+        mode: apollo_storage::ClaimMode,
+        ttl: Duration,
+    ) -> Result<Vec<PendingWebhook>, StorageError> {
+        let r = self
+            .inner
+            .claim_pending_webhooks(holder, target, mode, ttl)
+            .await;
+        if let Ok(claimed) = &r
+            && !claimed.is_empty()
+        {
+            let items = claimed
+                .iter()
+                .map(|p| (p.task_id.clone(), p.item_index))
+                .collect();
+            self.done(Call::ClaimWebhooks(items));
+        }
+        r
+    }
+    async fn renew_webhook_claims(
+        &self,
+        holder: &str,
+        items: &[PendingWebhook],
+        ttl: Duration,
+    ) -> Result<Vec<bool>, StorageError> {
+        self.inner.renew_webhook_claims(holder, items, ttl).await
+    }
+    async fn release_webhook_claim(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError> {
+        let r = self
+            .inner
+            .release_webhook_claim(task_id, item, holder)
+            .await;
+        if let Ok(true) = &r {
+            self.done(Call::ReleaseWebhook(task_id.into(), item));
+        }
+        r
+    }
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError> {
         self.inner.items_pending_webhook().await
     }
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError> {
+    async fn mark_webhook_delivered(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError> {
         let call = self
             .pass(Call::WebhookDelivered(task_id.into(), item))
             .await;
-        let r = self.inner.mark_webhook_delivered(task_id, item).await;
+        let r = self
+            .inner
+            .mark_webhook_delivered(task_id, item, holder)
+            .await;
         self.done(call);
         r
     }
@@ -914,6 +1001,26 @@ struct Sink {
     who: &'static str,
     log: Arc<Log>,
     holds: Holds,
+    /// The receiver it says it delivers to.
+    target: &'static str,
+    /// Fail this many more finished-event deliveries (not logged as
+    /// received).
+    fail: AtomicUsize,
+}
+
+/// The receiver every instance's sink delivers to, unless a test says
+/// otherwise: the same for all, whatever their `[webhook]` url.
+const FLEET_TARGET: &str = "test://fleet";
+
+/// Which webhook sink an instance gets.
+#[derive(Clone, Copy)]
+enum SinkKind {
+    /// The fleet's ([`FLEET_TARGET`]).
+    Fleet,
+    /// One that says it delivers to another receiver.
+    Target(&'static str),
+    /// None: webhooks off.
+    Off,
 }
 
 #[async_trait::async_trait]
@@ -921,8 +1028,20 @@ impl WebhookSink for Sink {
     async fn deliver(&self, event: &TaskEvent) -> Result<(), WebhookError> {
         let call = Call::Webhook(event.task.id.clone(), event.kind, event.task.state);
         self.holds.pass(&call).await;
+        if event.kind == EventKind::Finished
+            && self
+                .fail
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Err(WebhookError("the receiver refused it".into()));
+        }
         self.log.push(self.who, call);
         Ok(())
+    }
+
+    fn target(&self) -> String {
+        self.target.into()
     }
 }
 

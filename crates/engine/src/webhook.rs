@@ -7,14 +7,17 @@
 //! gRPC call) is injected as a [`WebhookSink`] by the server/app layer, so this
 //! crate stays free of the protobuf types.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 
 use apollo_domain::Task;
+use apollo_storage::{ClaimMode, Delivery, PendingWebhook};
 
-use crate::Engine;
-use crate::aggregate;
+use crate::live::Live;
+use crate::{Engine, Inner, aggregate};
 
 /// An error from a webhook delivery attempt.
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +57,10 @@ pub struct TaskEvent {
 #[async_trait]
 pub trait WebhookSink: Send + Sync {
     async fn deliver(&self, event: &TaskEvent) -> Result<(), WebhookError>;
+
+    /// The receiver this sink delivers to. Instances sharing a database send
+    /// each other's pending events only when their sinks' targets are equal.
+    fn target(&self) -> String;
 }
 
 /// What became of one [`Engine::push_webhook`].
@@ -155,50 +162,197 @@ impl Engine {
         });
     }
 
-    /// Fire the finished event for a terminal item. Spawned so it never blocks the
-    /// scheduler; retries a few times with backoff and marks the item delivered on
-    /// success, otherwise leaving it pending for the periodic redelivery loop (and,
-    /// ultimately, restart recovery). With webhooks off the item is marked
-    /// delivered at once: nothing is kept to send once they're on again.
-    pub(crate) async fn deliver_webhook(&self, task_id: &str, item_index: usize) {
-        // A run that lost its lease leaves the task to its new runner.
-        if self.lost() {
-            return;
+    /// What a write that finishes an item records about its finished webhook:
+    /// with webhooks on, this process's claim to deliver it, for the current
+    /// webhook's receiver; otherwise delivered (nothing is kept to send).
+    pub(crate) fn delivery<'a>(&'a self, live: &'a Live) -> Delivery<'a> {
+        match &live.webhook_target {
+            Some(target) => Delivery::Claim {
+                holder: &self.inner.holder,
+                target,
+                ttl: self.inner.lease_ttl,
+            },
+            None => Delivery::Off,
         }
+    }
+
+    /// Fire the finished event for a terminal item, whose delivery claim this
+    /// process holds (its finishing write stamped it, or a redelivery pass
+    /// took it). Spawned so it never blocks the scheduler; retries a few times
+    /// with backoff and marks the item delivered on success. Otherwise it
+    /// hands the claim back, leaving the item to the redelivery loop of any
+    /// instance with the same receiver (and, ultimately, restart recovery).
+    /// It stops once another instance has taken the claim over. With webhooks
+    /// off the item is marked delivered at once: nothing is kept to send once
+    /// they're on again.
+    pub(crate) async fn deliver_webhook(&self, task_id: &str, item_index: usize) {
+        if let Some(delivering) = self.start_delivery(task_id, item_index) {
+            self.send_webhook(delivering).await;
+        }
+    }
+
+    /// Register the delivery of an item's finished webhook, as soon as its
+    /// finishing write won: from then on its claim is renewed, also while the
+    /// task is rolled up. `None` if this process is delivering it already.
+    pub(crate) fn start_delivery(&self, task_id: &str, item_index: usize) -> Option<Delivering> {
+        Delivering::start(&self.inner, task_id, item_index)
+    }
+
+    /// Send the finished webhook `delivering` registered (see
+    /// [`Engine::deliver_webhook`]).
+    pub(crate) async fn send_webhook(&self, delivering: Delivering) {
         // The current webhook, also for a task pinned to an older config.
         let engine = self.current();
+        let (task_id, item_index) = delivering.key.clone();
         if engine.live().webhook.is_none() {
-            let _ = engine
-                .inner
-                .storage
-                .mark_webhook_delivered(task_id, item_index)
-                .await;
+            engine.mark_delivered(&task_id, item_index).await;
             return;
         }
-        let task_id = task_id.to_string();
         tokio::spawn(async move {
             for (attempt, delay) in (1..).zip([0u64, 1, 3]) {
                 if delay > 0 {
                     tokio::time::sleep(Duration::from_secs(delay)).await;
+                }
+                if delivering.lost() {
+                    tracing::info!(task = %task_id, item = item_index, "another instance took the webhook delivery over");
+                    return;
                 }
                 let pushed = engine
                     .push_webhook(&task_id, item_index, EventKind::Finished, attempt)
                     .await;
                 // Sent, or webhooks were turned off meanwhile.
                 if pushed != Pushed::Failed {
-                    let _ = engine
-                        .inner
-                        .storage
-                        .mark_webhook_delivered(&task_id, item_index)
-                        .await;
+                    engine.mark_delivered(&task_id, item_index).await;
                     return;
                 }
+            }
+            if let Err(e) = engine
+                .inner
+                .storage
+                .release_webhook_claim(&task_id, item_index, &engine.inner.holder)
+                .await
+            {
+                tracing::warn!(task = %task_id, item = item_index, error = %e, "could not hand back a webhook delivery");
             }
             tracing::warn!(
                 task = %task_id, item = item_index,
                 "webhook undelivered after retries; left pending for redelivery"
             );
         });
+    }
+
+    /// Mark an item's webhook delivered, if this process still holds its
+    /// delivery claim.
+    async fn mark_delivered(&self, task_id: &str, item_index: usize) {
+        match self
+            .inner
+            .storage
+            .mark_webhook_delivered(task_id, item_index, &self.inner.holder)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(task = %task_id, item = item_index, "webhook already marked, or another instance had taken its delivery over")
+            }
+            Err(e) => {
+                tracing::warn!(task = %task_id, item = item_index, error = %e, "could not mark a webhook delivered")
+            }
+        }
+    }
+
+    /// Take the delivery of the finished webhooks still pending that this
+    /// instance may send, and send them. On a database only this process uses
+    /// (SQLite) that is every one; on a shared one, those for this instance's
+    /// receiver that nobody holds, and once this instance is settled those
+    /// whose claim lapsed (their holder stopped). With webhooks off on a shared
+    /// database it takes nothing: other instances' events are theirs to send.
+    pub(crate) async fn redeliver_pending(&self) {
+        let engine = self.current();
+        let live = engine.live();
+        let storage = &engine.inner.storage;
+        let shared = storage.shared();
+        let (target, mode) = if shared {
+            let Some(target) = live.webhook_target.as_deref() else {
+                return;
+            };
+            let mode = if engine.settled() {
+                ClaimMode::Expired
+            } else {
+                ClaimMode::Open
+            };
+            (Some(target), mode)
+        } else {
+            (None, ClaimMode::Force)
+        };
+        match storage
+            .claim_pending_webhooks(&engine.inner.holder, target, mode, engine.inner.lease_ttl)
+            .await
+        {
+            Ok(pending) => {
+                if shared {
+                    engine.connected(true);
+                }
+                if !pending.is_empty() {
+                    tracing::debug!(count = pending.len(), "redelivering pending webhooks");
+                }
+                for p in pending {
+                    engine.deliver_webhook(&p.task_id, p.item_index).await;
+                }
+            }
+            Err(e) => {
+                if shared {
+                    engine.connected(false);
+                }
+                tracing::warn!(error = %e, "redelivery: could not claim pending webhooks");
+            }
+        }
+    }
+
+    /// Renew the delivery claims of the webhooks this process is delivering,
+    /// waiting a renewal period at most, and stop the deliveries whose claim
+    /// another instance has taken over.
+    pub(crate) async fn renew_deliveries(&self) {
+        let delivering: Vec<(PendingWebhook, Arc<AtomicBool>)> = self
+            .inner
+            .deliveries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|((task_id, item_index), lost)| {
+                let item = PendingWebhook {
+                    task_id: task_id.clone(),
+                    item_index: *item_index,
+                };
+                (item, lost.clone())
+            })
+            .collect();
+        if delivering.is_empty() {
+            return;
+        }
+        let items: Vec<PendingWebhook> = delivering.iter().map(|(p, _)| p.clone()).collect();
+        let limit = self.renew_every();
+        let renewal = self.inner.storage.renew_webhook_claims(
+            &self.inner.holder,
+            &items,
+            self.inner.lease_ttl,
+        );
+        match tokio::time::timeout(limit, renewal).await {
+            Ok(Ok(kept)) => {
+                for ((p, lost), kept) in delivering.iter().zip(kept) {
+                    if !kept && !lost.swap(true, Ordering::SeqCst) {
+                        tracing::info!(task = %p.task_id, item = p.item_index, "lost a webhook delivery claim; leaving the delivery to its new holder");
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "could not renew webhook delivery claims");
+                self.connected(false);
+            }
+            Err(_) => {
+                tracing::warn!(after = ?limit, "renewing webhook delivery claims timed out");
+                self.connected(false);
+            }
+        }
     }
 
     /// Start the periodic redelivery loop: every `[webhook].redelivery_secs`,
@@ -223,19 +377,55 @@ impl Engine {
                     continue;
                 }
                 tokio::time::sleep(Duration::from_secs(secs.into())).await;
-                match engine.inner.storage.items_pending_webhook().await {
-                    Ok(pending) if !pending.is_empty() => {
-                        tracing::debug!(count = pending.len(), "redelivering pending webhooks");
-                        for p in pending {
-                            engine.deliver_webhook(&p.task_id, p.item_index).await;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!(error = %e, "redelivery: could not list pending webhooks")
-                    }
-                }
+                engine.redeliver_pending().await;
             }
         });
+    }
+}
+
+/// A delivery this process is making, in [`Inner::deliveries`] until dropped.
+pub(crate) struct Delivering {
+    inner: Arc<Inner>,
+    key: (String, usize),
+    lost: Arc<AtomicBool>,
+}
+
+impl Delivering {
+    /// Register the delivery of `task_id`'s item; `None` if this process is
+    /// delivering it already.
+    fn start(inner: &Arc<Inner>, task_id: &str, item_index: usize) -> Option<Self> {
+        let key = (task_id.to_string(), item_index);
+        let lost = Arc::new(AtomicBool::new(false));
+        let mut deliveries = inner.deliveries.lock().unwrap_or_else(|e| e.into_inner());
+        if deliveries.contains_key(&key) {
+            return None;
+        }
+        deliveries.insert(key.clone(), lost.clone());
+        Some(Self {
+            inner: inner.clone(),
+            key,
+            lost,
+        })
+    }
+
+    /// Another instance has taken the delivery claim over.
+    fn lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Delivering {
+    fn drop(&mut self) {
+        let mut deliveries = self
+            .inner
+            .deliveries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if deliveries
+            .get(&self.key)
+            .is_some_and(|lost| Arc::ptr_eq(lost, &self.lost))
+        {
+            deliveries.remove(&self.key);
+        }
     }
 }

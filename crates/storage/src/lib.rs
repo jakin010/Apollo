@@ -22,7 +22,7 @@ pub mod testing;
 
 pub use backends::{SqliteStorage, SurrealStorage};
 pub use error::StorageError;
-pub use lease::{ClaimMode, Claimable, Fence, Held, Lease, Renewal};
+pub use lease::{ClaimMode, Claimable, Delivery, Fence, Held, Lease, Renewal};
 
 /// Serialize a task error to the JSON stored in an `error` column.
 fn error_to_json(error: Option<&TaskError>) -> Result<Option<String>, StorageError> {
@@ -88,6 +88,14 @@ pub(crate) fn is_terminal(state: TaskState) -> bool {
     )
 }
 
+/// Whether an item in `state` is finished (its finished webhook is due).
+pub(crate) fn item_terminal(state: ItemState) -> bool {
+    matches!(
+        state,
+        ItemState::Completed | ItemState::Failed | ItemState::Cancelled
+    )
+}
+
 /// The stored form of a task's metadata (`None` when empty).
 pub(crate) fn metadata_to_json(
     metadata: &std::collections::BTreeMap<String, String>,
@@ -144,7 +152,8 @@ pub trait Storage: Send + Sync {
 
     /// Set the state (and error) of an item that hasn't finished, while its
     /// task is claimed as `fence` says. A completed, failed or cancelled item
-    /// keeps its state. Returns whether it was written.
+    /// keeps its state. A write that finishes the item also records its
+    /// finished webhook as `delivery` says. Returns whether it was written.
     async fn set_item_state(
         &self,
         task_id: &str,
@@ -152,11 +161,13 @@ pub trait Storage: Send + Sync {
         state: ItemState,
         error: Option<&TaskError>,
         fence: Fence<'_>,
+        delivery: Delivery<'_>,
     ) -> Result<bool, StorageError>;
 
     /// Fail an item that hasn't finished with `error`, and each of `models`
-    /// with it, in one transaction, while its task is claimed as `fence` says.
-    /// Nothing is written otherwise. Returns whether it was written.
+    /// with it, in one transaction, while its task is claimed as `fence` says,
+    /// recording its finished webhook as `delivery` says. Nothing is written
+    /// otherwise. Returns whether it was written.
     async fn set_item_failed(
         &self,
         task_id: &str,
@@ -164,6 +175,7 @@ pub trait Storage: Send + Sync {
         error: &TaskError,
         models: &[String],
         fence: Fence<'_>,
+        delivery: Delivery<'_>,
     ) -> Result<bool, StorageError>;
 
     /// The id of the task `owner` created with idempotency key `request_id`, if
@@ -294,11 +306,48 @@ pub trait Storage: Send + Sync {
 
     // -------------------------- webhook delivery -------------------------
 
-    /// Terminal items whose webhook has not been delivered (recovers a crash
-    /// between reaching a terminal state and delivering).
+    /// Every finished item whose webhook has not been delivered, whoever is
+    /// delivering it (for status and metrics).
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError>;
 
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError>;
+    /// Claim the finished items whose webhook is pending for `holder` to
+    /// deliver, for `ttl` on the database's clock: those whose delivery claim
+    /// `mode` may take, for receiver `target` (or any, with `None`; items
+    /// stored for any receiver go to every one). Returns the items claimed.
+    async fn claim_pending_webhooks(
+        &self,
+        holder: &str,
+        target: Option<&str>,
+        mode: ClaimMode,
+        ttl: std::time::Duration,
+    ) -> Result<Vec<PendingWebhook>, StorageError>;
+
+    /// Renew `holder`'s delivery claims on `items` for `ttl`, saying for each
+    /// (in order) whether `holder` still holds it.
+    async fn renew_webhook_claims(
+        &self,
+        holder: &str,
+        items: &[PendingWebhook],
+        ttl: std::time::Duration,
+    ) -> Result<Vec<bool>, StorageError>;
+
+    /// Hand back `holder`'s delivery claim on an item (its delivery failed),
+    /// so any instance may deliver it. Returns whether `holder` held it.
+    async fn release_webhook_claim(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError>;
+
+    /// Mark an item's webhook delivered, only while `holder` holds its delivery
+    /// claim. Returns whether it did.
+    async fn mark_webhook_delivered(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError>;
 
     /// Persist an item's retry count (compared against `[app].max_retries`),
     /// while its task is claimed as `fence` says. Returns whether it was

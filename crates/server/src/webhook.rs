@@ -32,6 +32,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct GrpcWebhookSink {
     channel: Channel,
     secret: Option<String>,
+    /// The receiver, as `scheme://host:port` (see [`receiver`]).
+    target: String,
 }
 
 impl GrpcWebhookSink {
@@ -46,9 +48,11 @@ impl GrpcWebhookSink {
         if endpoint.uri().scheme_str() == Some("https") {
             endpoint = endpoint.tls_config(ClientTlsConfig::new().with_enabled_roots())?;
         }
+        let target = receiver(endpoint.uri());
         Ok(Self {
             channel: endpoint.connect_lazy(),
             secret,
+            target,
         })
     }
 
@@ -102,6 +106,22 @@ impl WebhookSink for GrpcWebhookSink {
             .map_err(|status| WebhookError(status.to_string()))?;
         Ok(())
     }
+
+    fn target(&self) -> String {
+        self.target.clone()
+    }
+}
+
+/// The receiver `uri` names, the same however the url is written:
+/// `scheme://host:port`, lowercase, with the scheme's default port filled in
+/// and any path, query or user info left out. Not secret.
+fn receiver(uri: &tonic::codegen::http::Uri) -> String {
+    let scheme = uri.scheme_str().unwrap_or("http").to_ascii_lowercase();
+    let host = uri.host().unwrap_or_default().to_ascii_lowercase();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    format!("{scheme}://{host}:{port}")
 }
 
 fn unix_now() -> i64 {
@@ -120,6 +140,26 @@ mod tests {
     use apollo_domain::{Task, TaskState};
     use tokio::sync::{mpsc, oneshot};
     use tonic::{Response, Status};
+
+    #[tokio::test]
+    async fn target_ignores_path_case_and_default_port() {
+        let target = |url: &str| GrpcWebhookSink::new(url, None).unwrap().target();
+        assert_eq!(
+            target("https://Hooks.Example.com/x?y=1"),
+            "https://hooks.example.com:443"
+        );
+        assert_eq!(
+            target("https://hooks.example.com:443"),
+            "https://hooks.example.com:443"
+        );
+        assert_eq!(target("http://h"), "http://h:80");
+        assert_eq!(target("http://h:80/"), "http://h:80");
+        assert_ne!(target("http://h:81"), target("http://h"));
+        assert_ne!(target("https://h"), target("http://h"));
+        // The secret isn't part of it.
+        let signed = GrpcWebhookSink::new("http://h", Some("s".into())).unwrap();
+        assert_eq!(signed.target(), "http://h:80");
+    }
 
     fn task(id: &str) -> TaskEvent {
         let mut task = Task::new(id, vec![], None);

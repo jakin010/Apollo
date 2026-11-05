@@ -40,7 +40,8 @@ use crate::error::StorageError;
 use crate::now;
 use crate::resume::PendingWebhook;
 use crate::{
-    ClaimMode, Claimable, Fence, Held, Lease, Renewal, Storage, TaskCursor, TaskPage, TaskQuery,
+    ClaimMode, Claimable, Delivery, Fence, Held, Lease, Renewal, Storage, TaskCursor, TaskPage,
+    TaskQuery,
 };
 
 /// Who holds a claim, for operators: `<node>/<process>`.
@@ -101,13 +102,40 @@ const SET_ITEM_STATE: &str = concat!(
     } ELSE { false }"
 );
 
+/// The finished-webhook fields a finishing write sets (see
+/// [`Delivery`](crate::Delivery)). Binds: `$delivered`, `$target`, `$holder`,
+/// `$ttl`.
+macro_rules! delivery_fields {
+    () => {
+        "webhook_delivered = $delivered, webhook_target = $target, webhook_claim = $holder,
+            webhook_claim_until = IF $holder = NONE THEN NONE ELSE time::now() + $ttl END"
+    };
+}
+
+/// Finish an unfinished item while the fence holds, recording its finished
+/// webhook; returns whether it did.
+const FINISH_ITEM_STATE: &str = concat!(
+    "IF ",
+    held!(),
+    " {
+        LET $won = (UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error, ",
+    delivery_fields!(),
+    "
+            WHERE state IN ['queued', 'processing', 'retrying'] RETURN VALUE state);
+        IF array::len($won) > 0 { UPDATE type::record('task', $tid) SET updated_at = $ts; };
+        array::len($won) > 0
+    } ELSE { false }"
+);
+
 /// Fail an unfinished item, and the listed models with it, while the fence
 /// holds; returns whether it did.
 const FAIL_ITEM: &str = concat!(
     "IF ",
     held!(),
     " {
-        LET $won = (UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error
+        LET $won = (UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error, ",
+    delivery_fields!(),
+    "
             WHERE state IN ['queued', 'processing', 'retrying'] RETURN VALUE state);
         IF array::len($won) > 0 {
             FOR $label IN $models {
@@ -157,6 +185,32 @@ const CLAIMABLE_STATE: &str = "(state IN ['queued', 'processing']
 /// ago: not claimable, unless it's cancelled (finishing it reads no input).
 const PIN_OPEN: &str = "(state = 'cancelled' OR pin = NONE OR pin = $node
     OR (lease_until != NONE AND lease_until < time::now() - $grace))";
+
+/// The delivery-claim condition for `mode`, on an item. A missing
+/// `webhook_claim_until` is guarded explicitly: `NONE < time::now()` is true.
+fn delivery_open(mode: ClaimMode) -> &'static str {
+    match mode {
+        ClaimMode::Force => "true",
+        ClaimMode::Open => "webhook_claim = NONE",
+        ClaimMode::Expired => {
+            "(webhook_claim = NONE
+              OR (webhook_claim_until != NONE AND webhook_claim_until < time::now()))"
+        }
+    }
+}
+
+/// The bound values of a [`Delivery`]: `$delivered`, `$target`, `$holder`,
+/// `$ttl`.
+fn bind_delivery<'q>(
+    q: surrealdb::method::Query<'q, Any>,
+    delivery: Delivery<'_>,
+) -> surrealdb::method::Query<'q, Any> {
+    let (delivered, target, holder, ttl) = delivery.parts();
+    q.bind(("delivered", delivered))
+        .bind(("target", target.map(str::to_string)))
+        .bind(("holder", holder.map(str::to_string)))
+        .bind(("ttl", ttl))
+}
 
 /// The lease condition for `mode`. A missing `lease_until` is guarded
 /// explicitly: `NONE < time::now()` is true.
@@ -577,17 +631,28 @@ impl Storage for SurrealStorage {
         state: ItemState,
         error: Option<&TaskError>,
         fence: Fence<'_>,
+        delivery: Delivery<'_>,
     ) -> Result<bool> {
-        let mut resp = self
+        let finish = crate::item_terminal(state);
+        let q = self
             .db
-            .query(SET_ITEM_STATE)
+            .query(if finish {
+                FINISH_ITEM_STATE
+            } else {
+                SET_ITEM_STATE
+            })
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
             .bind(("state", state.as_str().to_string()))
             .bind(("error", crate::error_to_json(error)?))
             .bind(("fence", fence.token().map(str::to_string)))
-            .bind(("ts", now()))
-            .await?;
+            .bind(("ts", now()));
+        let q = if finish {
+            bind_delivery(q, delivery)
+        } else {
+            q
+        };
+        let mut resp = q.await?;
         let written: Option<bool> = resp.take(0)?;
         Ok(written == Some(true))
     }
@@ -599,8 +664,9 @@ impl Storage for SurrealStorage {
         error: &TaskError,
         models: &[String],
         fence: Fence<'_>,
+        delivery: Delivery<'_>,
     ) -> Result<bool> {
-        let mut resp = self
+        let q = self
             .db
             .query(FAIL_ITEM)
             .bind(("tid", task_id.to_string()))
@@ -610,8 +676,8 @@ impl Storage for SurrealStorage {
             .bind(("error", crate::error_to_json(Some(error))?))
             .bind(("models", models.to_vec()))
             .bind(("fence", fence.token().map(str::to_string)))
-            .bind(("ts", now()))
-            .await?;
+            .bind(("ts", now()));
+        let mut resp = bind_delivery(q, delivery).await?;
         let written: Option<bool> = resp.take(0)?;
         Ok(written == Some(true))
     }
@@ -1071,14 +1137,143 @@ impl Storage for SurrealStorage {
             .collect())
     }
 
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<()> {
-        self.db
-            .query("UPDATE type::record('item', [$tid, $idx]) SET webhook_delivered = true")
+    async fn claim_pending_webhooks(
+        &self,
+        holder: &str,
+        target: Option<&str>,
+        mode: ClaimMode,
+        ttl: Duration,
+    ) -> Result<Vec<PendingWebhook>> {
+        let open = delivery_open(mode);
+        let mut resp = self
+            .db
+            .query(format!(
+                "SELECT task_id, idx FROM item
+                 WHERE webhook_delivered = false
+                   AND state IN ['completed', 'failed', 'cancelled']
+                   AND ($target = NONE OR webhook_target = NONE OR webhook_target = $target)
+                   AND {open}"
+            ))
+            .bind(("target", target.map(str::to_string)))
+            .await?;
+        let rows: Vec<PendingRow> = resp.take(0)?;
+        // One statement per item: each runs (and may conflict with another
+        // claimer) on its own, and a conflict only means not claimed.
+        let mut claimed = Vec::new();
+        for chunk in rows.chunks(64) {
+            let sql: String = (0..chunk.len())
+                .map(|i| {
+                    format!(
+                        "UPDATE type::record('item', [$t{i}, $x{i}])
+                         SET webhook_claim = $holder, webhook_claim_until = time::now() + $ttl
+                         WHERE webhook_delivered = false AND {open} RETURN VALUE idx;"
+                    )
+                })
+                .collect();
+            let mut q = self
+                .db
+                .query(sql)
+                .bind(("holder", holder.to_string()))
+                .bind(("ttl", ttl));
+            for (i, r) in chunk.iter().enumerate() {
+                q = q
+                    .bind((format!("t{i}"), r.task_id.clone()))
+                    .bind((format!("x{i}"), r.idx));
+            }
+            let mut resp = q.await?;
+            for (i, r) in chunk.iter().enumerate() {
+                if resp.take::<Vec<i64>>(i).is_ok_and(|won| !won.is_empty()) {
+                    claimed.push(PendingWebhook {
+                        task_id: r.task_id.clone(),
+                        item_index: r.idx as usize,
+                    });
+                }
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn renew_webhook_claims(
+        &self,
+        holder: &str,
+        items: &[PendingWebhook],
+        ttl: Duration,
+    ) -> Result<Vec<bool>> {
+        let mut out = Vec::with_capacity(items.len());
+        for chunk in items.chunks(64) {
+            let sql: String = (0..chunk.len())
+                .map(|i| {
+                    format!(
+                        "UPDATE type::record('item', [$t{i}, $x{i}])
+                         SET webhook_claim_until = time::now() + $ttl
+                         WHERE webhook_delivered = false AND webhook_claim = $holder
+                         RETURN VALUE idx;"
+                    )
+                })
+                .collect();
+            let mut q = self
+                .db
+                .query(sql)
+                .bind(("holder", holder.to_string()))
+                .bind(("ttl", ttl));
+            for (i, p) in chunk.iter().enumerate() {
+                q = q
+                    .bind((format!("t{i}"), p.task_id.clone()))
+                    .bind((format!("x{i}"), p.item_index as i64));
+            }
+            let mut resp = q.await?;
+            for i in 0..chunk.len() {
+                // A statement that failed (a conflict) says nothing: the claim
+                // is taken as held, and lapses by itself if it isn't.
+                out.push(
+                    resp.take::<Vec<i64>>(i)
+                        .map_or(true, |kept| !kept.is_empty()),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn release_webhook_claim(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool> {
+        let mut resp = self
+            .db
+            .query(
+                "UPDATE type::record('item', [$tid, $idx])
+                 SET webhook_claim = NONE, webhook_claim_until = NONE
+                 WHERE webhook_delivered = false AND webhook_claim = $holder RETURN VALUE idx",
+            )
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
-            .await?
-            .check()?;
-        Ok(())
+            .bind(("holder", holder.to_string()))
+            .await?;
+        let released: Vec<i64> = resp.take(0)?;
+        Ok(!released.is_empty())
+    }
+
+    async fn mark_webhook_delivered(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool> {
+        let mut resp = self
+            .db
+            .query(
+                "UPDATE type::record('item', [$tid, $idx])
+                 SET webhook_delivered = true, webhook_claim = NONE, webhook_claim_until = NONE
+                 WHERE webhook_delivered = false AND webhook_claim = $holder RETURN VALUE idx",
+            )
+            .bind(("tid", task_id.to_string()))
+            .bind(("idx", item as i64))
+            .bind(("holder", holder.to_string()))
+            .await?;
+        let marked: Vec<i64> = resp.take(0)?;
+        Ok(!marked.is_empty())
     }
 
     async fn set_item_retries(

@@ -145,6 +145,11 @@ struct Inner {
     /// This instance's node id, and this process's id (one per start).
     node: String,
     process: String,
+    /// Who holds this process's claims: `<node>/<process>`.
+    holder: String,
+    /// The finished webhooks this process is delivering, by (task, item):
+    /// each one's lost flag, set once its delivery claim is found taken.
+    deliveries: Mutex<HashMap<(String, usize), Arc<AtomicBool>>>,
     /// How long a claim lasts unless renewed (`[database].lease_secs`).
     lease_ttl: Duration,
     /// Since when the database has answered without a break (for taking over
@@ -240,6 +245,8 @@ impl Engine {
             changes: changes.clone(),
         });
 
+        let process = uuid::Uuid::new_v4().to_string();
+        let holder = format!("{node}/{process}");
         let engine = Engine {
             inner: Arc::new(Inner {
                 storage,
@@ -258,7 +265,9 @@ impl Engine {
                 changes,
                 idempotency: Mutex::new(HashMap::new()),
                 node,
-                process: uuid::Uuid::new_v4().to_string(),
+                process,
+                holder,
+                deliveries: Mutex::new(HashMap::new()),
                 lease_ttl,
                 connected_since: Mutex::new(Some(Instant::now())),
                 takeover: tokio::sync::Mutex::new(lease::Takeover::default()),

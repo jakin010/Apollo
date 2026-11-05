@@ -17,10 +17,20 @@ use apollo_domain::{
     Sample, Task, TaskError, TaskState, Url,
 };
 use apollo_storage::{
-    ClaimMode, Fence, Held, Lease, Renewal, SqliteStorage, Storage, StorageError, SurrealStorage,
-    TaskCursor, TaskQuery,
+    ClaimMode, Delivery, Fence, Held, Lease, PendingWebhook, Renewal, SqliteStorage, Storage,
+    StorageError, SurrealStorage, TaskCursor, TaskQuery,
 };
 use std::time::Duration;
+
+/// A finishing write's delivery for planted rows: pending, any receiver.
+const OPEN: Delivery<'static> = Delivery::Open { target: None };
+
+/// A finishing write's delivery claimed by `n1/p1`, for `t://x`.
+const CLAIM: Delivery<'static> = Delivery::Claim {
+    holder: "n1/p1",
+    target: "t://x",
+    ttl: Duration::from_secs(30),
+};
 
 /// Real task ids are hyphenated UUIDs; one test task uses that shape.
 const UUID_ID: &str = "3f2a8c1e-9b4d-4e1a-8f00-0123456789ab";
@@ -289,7 +299,7 @@ async fn exercise(store: &dyn Storage) {
 
     // --- webhook delivery flag
     store
-        .set_item_state("t1", 0, ItemState::Completed, None, Fence::Unchecked)
+        .set_item_state("t1", 0, ItemState::Completed, None, Fence::Unchecked, CLAIM)
         .await
         .unwrap();
     // Only t1's item is terminal; the others (anon, anon2, the UUID task) are
@@ -302,14 +312,19 @@ async fn exercise(store: &dyn Storage) {
             .collect::<Vec<_>>(),
         [("t1", 0)]
     );
-    store.mark_webhook_delivered("t1", 0).await.unwrap();
+    assert!(
+        store
+            .mark_webhook_delivered("t1", 0, "n1/p1")
+            .await
+            .unwrap()
+    );
     let pending = store.items_pending_webhook().await.unwrap();
     assert!(!pending.iter().any(|p| p.task_id == "t1"));
     // A finished item keeps its state.
     for state in [ItemState::Processing, ItemState::Failed] {
         assert!(
             !store
-                .set_item_state("t1", 0, state, None, Fence::Unchecked)
+                .set_item_state("t1", 0, state, None, Fence::Unchecked, OPEN)
                 .await
                 .unwrap(),
             "{state:?} over a finished item"
@@ -321,7 +336,7 @@ async fn exercise(store: &dyn Storage) {
     );
     assert!(
         !store
-            .set_item_state("t1", 7, ItemState::Failed, None, Fence::Unchecked)
+            .set_item_state("t1", 7, ItemState::Failed, None, Fence::Unchecked, OPEN)
             .await
             .unwrap(),
         "no such item"
@@ -331,15 +346,36 @@ async fn exercise(store: &dyn Storage) {
     // A kind other than the fallback's, so storing the message alone would fail.
     let err = TaskError::fetch("fetch failed");
     store
-        .set_item_state("anon", 0, ItemState::Failed, Some(&err), Fence::Unchecked)
+        .set_item_state(
+            "anon",
+            0,
+            ItemState::Failed,
+            Some(&err),
+            Fence::Unchecked,
+            OPEN,
+        )
         .await
         .unwrap();
     store
-        .set_item_state("anon2", 0, ItemState::Cancelled, None, Fence::Unchecked)
+        .set_item_state(
+            "anon2",
+            0,
+            ItemState::Cancelled,
+            None,
+            Fence::Unchecked,
+            OPEN,
+        )
         .await
         .unwrap();
     store
-        .set_item_state(UUID_ID, 0, ItemState::Processing, None, Fence::Unchecked)
+        .set_item_state(
+            UUID_ID,
+            0,
+            ItemState::Processing,
+            None,
+            Fence::Unchecked,
+            OPEN,
+        )
         .await
         .unwrap();
     let mut pending: Vec<(String, usize)> = store
@@ -525,7 +561,7 @@ async fn exercise(store: &dyn Storage) {
     let general = ["general".to_string()];
     assert!(
         store
-            .set_item_failed("f1", 0, &err, &general, Fence::Unchecked)
+            .set_item_failed("f1", 0, &err, &general, Fence::Unchecked, OPEN)
             .await
             .unwrap()
     );
@@ -539,14 +575,14 @@ async fn exercise(store: &dyn Storage) {
     let nsfw = ["nsfw".to_string()];
     assert!(
         !store
-            .set_item_failed("f1", 0, &err, &nsfw, Fence::Unchecked)
+            .set_item_failed("f1", 0, &err, &nsfw, Fence::Unchecked, OPEN)
             .await
             .unwrap()
     );
     assert_eq!(store.get_task("f1").await.unwrap().unwrap(), f1);
     assert!(
         !store
-            .set_item_failed("f1", 7, &err, &nsfw, Fence::Unchecked)
+            .set_item_failed("f1", 7, &err, &nsfw, Fence::Unchecked, OPEN)
             .await
             .unwrap()
     );
@@ -565,7 +601,7 @@ async fn exercise(store: &dyn Storage) {
     ] {
         assert!(
             store
-                .set_item_state("r1", 0, state, None, Fence::Unchecked)
+                .set_item_state("r1", 0, state, None, Fence::Unchecked, OPEN)
                 .await
                 .unwrap(),
             "{state:?}"
@@ -677,7 +713,7 @@ async fn exercise_leases(store: &dyn Storage) {
         let ours = fence == Fence::Claim("a1");
         assert_eq!(
             store
-                .set_item_state("L1", 0, ItemState::Processing, None, fence)
+                .set_item_state("L1", 0, ItemState::Processing, None, fence, OPEN)
                 .await
                 .unwrap(),
             ours,
@@ -699,7 +735,7 @@ async fn exercise_leases(store: &dyn Storage) {
     }
     assert!(
         !store
-            .set_item_failed("L1", 0, &err, &general, Fence::Claim("b1"))
+            .set_item_failed("L1", 0, &err, &general, Fence::Claim("b1"), OPEN)
             .await
             .unwrap()
     );
@@ -917,7 +953,14 @@ async fn exercise_leases(store: &dyn Storage) {
     );
     assert!(
         store
-            .set_item_state("L7", 0, ItemState::Cancelled, None, Fence::Claim("b7"))
+            .set_item_state(
+                "L7",
+                0,
+                ItemState::Cancelled,
+                None,
+                Fence::Claim("b7"),
+                OPEN
+            )
             .await
             .unwrap()
     );
@@ -958,7 +1001,14 @@ async fn exercise_leases(store: &dyn Storage) {
     );
     assert!(
         store
-            .set_item_state("L5", 0, ItemState::Cancelled, None, Fence::Claim("a5"))
+            .set_item_state(
+                "L5",
+                0,
+                ItemState::Cancelled,
+                None,
+                Fence::Claim("a5"),
+                OPEN
+            )
             .await
             .unwrap()
     );
@@ -1024,6 +1074,252 @@ async fn exercise_leases(store: &dyn Storage) {
     );
 }
 
+/// Whether `items` has `task_id`'s item 0.
+fn has(items: &[PendingWebhook], task_id: &str) -> bool {
+    items
+        .iter()
+        .any(|p| p.task_id == task_id && p.item_index == 0)
+}
+
+/// Finished-webhook delivery claims.
+async fn exercise_webhook_claims(store: &dyn Storage) {
+    let ttl = Duration::from_secs(30);
+    // Settle what the other exercises left pending (a Force claim takes any).
+    for p in store
+        .claim_pending_webhooks("sweep", None, ClaimMode::Force, ttl)
+        .await
+        .unwrap()
+    {
+        assert!(
+            store
+                .mark_webhook_delivered(&p.task_id, p.item_index, "sweep")
+                .await
+                .unwrap()
+        );
+    }
+    assert!(store.items_pending_webhook().await.unwrap().is_empty());
+
+    let finish = |id: &'static str, delivery: Delivery<'static>| async move {
+        store
+            .create_task(&sample_task(id), None, None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .set_item_state(
+                    id,
+                    0,
+                    ItemState::Completed,
+                    None,
+                    Fence::Unchecked,
+                    delivery
+                )
+                .await
+                .unwrap()
+        );
+    };
+
+    // (1) A finishing write's claim: listed as pending, but others take it
+    // only by force.
+    finish("W1", CLAIM).await;
+    assert!(has(&store.items_pending_webhook().await.unwrap(), "W1"));
+    for mode in [ClaimMode::Open, ClaimMode::Expired] {
+        let got = store
+            .claim_pending_webhooks("n2/p2", Some("t://x"), mode, ttl)
+            .await
+            .unwrap();
+        assert!(!has(&got, "W1"), "{mode:?} took a live claim");
+    }
+    let got = store
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Force, ttl)
+        .await
+        .unwrap();
+    assert!(has(&got, "W1"));
+
+    // (2) A lapsed claim: Expired takes it, Open doesn't.
+    let short = Delivery::Claim {
+        holder: "n1/p1",
+        target: "t://x",
+        ttl: Duration::from_millis(50),
+    };
+    finish("W2", short).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let got = store
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Open, ttl)
+        .await
+        .unwrap();
+    assert!(!has(&got, "W2"), "Open took a lapsed claim");
+    let got = store
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Expired, ttl)
+        .await
+        .unwrap();
+    assert!(has(&got, "W2"), "Expired left a lapsed claim");
+
+    // (3) Only for its receiver, or for any; a row for any receiver goes to
+    // every one.
+    finish("W3", short).await;
+    finish("W3b", OPEN).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let got = store
+        .claim_pending_webhooks("n2/p2", Some("t://y"), ClaimMode::Expired, ttl)
+        .await
+        .unwrap();
+    assert!(!has(&got, "W3"), "another receiver's event");
+    assert!(has(&got, "W3b"), "an event for any receiver");
+    let got = store
+        .claim_pending_webhooks("n2/p2", None, ClaimMode::Expired, ttl)
+        .await
+        .unwrap();
+    assert!(has(&got, "W3"), "a claim for any receiver");
+
+    // (4) Only the holder marks it delivered.
+    finish("W4", CLAIM).await;
+    assert!(
+        !store
+            .mark_webhook_delivered("W4", 0, "n2/p2")
+            .await
+            .unwrap()
+    );
+    assert!(has(&store.items_pending_webhook().await.unwrap(), "W4"));
+    assert!(
+        store
+            .mark_webhook_delivered("W4", 0, "n1/p1")
+            .await
+            .unwrap()
+    );
+    assert!(!has(&store.items_pending_webhook().await.unwrap(), "W4"));
+    assert!(
+        !store
+            .mark_webhook_delivered("W4", 0, "n1/p1")
+            .await
+            .unwrap(),
+        "marked twice"
+    );
+
+    // (5) A claim handed back is anyone's.
+    finish("W5", CLAIM).await;
+    assert!(!store.release_webhook_claim("W5", 0, "n2/p2").await.unwrap());
+    assert!(store.release_webhook_claim("W5", 0, "n1/p1").await.unwrap());
+    let got = store
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Open, ttl)
+        .await
+        .unwrap();
+    assert!(has(&got, "W5"), "a handed-back claim");
+
+    // (6) Renewing says whether the claim is still held.
+    finish("W6", CLAIM).await;
+    let w6 = [PendingWebhook {
+        task_id: "W6".into(),
+        item_index: 0,
+    }];
+    assert_eq!(
+        store.renew_webhook_claims("n1/p1", &w6, ttl).await.unwrap(),
+        [true]
+    );
+    let got = store
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Force, ttl)
+        .await
+        .unwrap();
+    assert!(has(&got, "W6"));
+    assert_eq!(
+        store.renew_webhook_claims("n1/p1", &w6, ttl).await.unwrap(),
+        [false]
+    );
+    assert_eq!(
+        store.renew_webhook_claims("n2/p2", &w6, ttl).await.unwrap(),
+        [true]
+    );
+
+    // (7) Webhooks off: nothing is kept to send.
+    finish("W7", Delivery::Off).await;
+    assert!(!has(&store.items_pending_webhook().await.unwrap(), "W7"));
+    let got = store
+        .claim_pending_webhooks("n2/p2", None, ClaimMode::Force, ttl)
+        .await
+        .unwrap();
+    assert!(!has(&got, "W7"));
+
+    // (8) A write that doesn't finish the item records no delivery.
+    store
+        .create_task(&sample_task("W8"), None, None)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .set_item_state(
+                "W8",
+                0,
+                ItemState::Processing,
+                None,
+                Fence::Unchecked,
+                CLAIM
+            )
+            .await
+            .unwrap()
+    );
+    assert!(!has(&store.items_pending_webhook().await.unwrap(), "W8"));
+    assert!(
+        store
+            .set_item_state(
+                "W8",
+                0,
+                ItemState::Failed,
+                None,
+                Fence::Unchecked,
+                Delivery::Open {
+                    target: Some("t://x")
+                }
+            )
+            .await
+            .unwrap()
+    );
+    let got = store
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Open, ttl)
+        .await
+        .unwrap();
+    assert!(
+        has(&got, "W8"),
+        "unclaimed: the earlier write claimed nothing"
+    );
+
+    // set_item_failed records it too.
+    store
+        .create_task(&sample_task("W8b"), None, None)
+        .await
+        .unwrap();
+    let err = TaskError::fetch("fetch failed");
+    assert!(
+        store
+            .set_item_failed("W8b", 0, &err, &[], Fence::Unchecked, CLAIM)
+            .await
+            .unwrap()
+    );
+    let got = store
+        .claim_pending_webhooks("n2/p2", Some("t://x"), ClaimMode::Expired, ttl)
+        .await
+        .unwrap();
+    assert!(!has(&got, "W8b"), "a failed item's live claim");
+    assert!(
+        store
+            .mark_webhook_delivered("W8b", 0, "n1/p1")
+            .await
+            .unwrap()
+    );
+
+    // (9) Concurrent claimers: at most one gets it (a conflict is not a claim).
+    finish("W9", OPEN).await;
+    let (x, y, z) = tokio::join!(
+        store.claim_pending_webhooks("c1", None, ClaimMode::Open, ttl),
+        store.claim_pending_webhooks("c2", None, ClaimMode::Open, ttl),
+        store.claim_pending_webhooks("c3", None, ClaimMode::Open, ttl),
+    );
+    let winners = [x, y, z]
+        .into_iter()
+        .filter(|r| r.as_ref().is_ok_and(|got| has(got, "W9")))
+        .count();
+    assert!(winners <= 1, "{winners} claimers got W9");
+}
+
 /// Each token tries to claim L6 at the same moment.
 async fn futures_lite_join(store: &dyn Storage, tokens: &[String]) -> Vec<Option<u32>> {
     let leases: Vec<Lease<'_>> = tokens
@@ -1056,6 +1352,7 @@ async fn sqlite_backend_contract() {
     .unwrap();
     exercise(&store).await;
     exercise_leases(&store).await;
+    exercise_webhook_claims(&store).await;
 }
 
 #[tokio::test]
@@ -1092,6 +1389,7 @@ async fn surreal_backend_contract() {
     let outcome = tokio::spawn(async move {
         exercise(&store).await;
         exercise_leases(&store).await;
+        exercise_webhook_claims(&store).await;
     })
     .await;
 

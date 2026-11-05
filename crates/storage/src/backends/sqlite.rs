@@ -22,7 +22,8 @@ use crate::error::StorageError;
 use crate::now;
 use crate::resume::PendingWebhook;
 use crate::{
-    ClaimMode, Claimable, Fence, Held, Lease, Renewal, Storage, TaskCursor, TaskPage, TaskQuery,
+    ClaimMode, Claimable, Delivery, Fence, Held, Lease, Renewal, Storage, TaskCursor, TaskPage,
+    TaskQuery,
 };
 
 type Result<T> = std::result::Result<T, StorageError>;
@@ -51,6 +52,28 @@ const ITEM_FENCE: &str =
 const CLAIMABLE_STATE: &str = "(state IN ('queued', 'processing')
      OR (state = 'cancelled' AND EXISTS (SELECT 1 FROM items
          WHERE items.task_id = tasks.id AND items.state IN ('queued', 'processing', 'retrying'))))";
+
+/// The finished-webhook columns a finishing write sets. Binds: delivered,
+/// target, holder, holder, ttl (ms).
+const DELIVERY_SET: &str = concat!(
+    "webhook_delivered = ?, webhook_target = ?, webhook_claim = ?,
+     webhook_claim_until = CASE WHEN ? IS NULL THEN NULL ELSE ",
+    now_ms!(),
+    " + ? END"
+);
+
+/// The delivery-claim condition for `mode`, on an item.
+fn delivery_clause(mode: ClaimMode) -> &'static str {
+    match mode {
+        ClaimMode::Force => "1 = 1",
+        ClaimMode::Open => "webhook_claim IS NULL",
+        ClaimMode::Expired => concat!(
+            "(webhook_claim IS NULL OR webhook_claim_until < ",
+            now_ms!(),
+            ")"
+        ),
+    }
+}
 
 /// The lease condition for `mode`.
 fn lease_clause(mode: ClaimMode) -> &'static str {
@@ -311,6 +334,19 @@ async fn add_column_if_missing(
     Ok(())
 }
 
+/// Bind a [`Delivery`] for [`DELIVERY_SET`].
+fn bind_delivery<'q>(
+    q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
+    delivery: Delivery<'_>,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
+    let (delivered, target, holder, ttl) = delivery.parts();
+    q.bind(delivered)
+        .bind(target.map(str::to_string))
+        .bind(holder.map(str::to_string))
+        .bind(holder.map(str::to_string))
+        .bind(ttl.as_millis() as i64)
+}
+
 /// Who holds a claim, for operators: `<node>/<process>`.
 fn holder(lease: &Lease<'_>) -> String {
     format!("{}/{}", lease.node, lease.process)
@@ -341,6 +377,15 @@ impl Storage for SqliteStorage {
             ("pin", "TEXT"),
         ] {
             add_column_if_missing(&mut tx, "tasks", column, decl).await?;
+        }
+        // Finished-webhook delivery claims: the receiver it is for (`NULL` =
+        // any), who delivers it, until when (ms on the database clock).
+        for (column, decl) in [
+            ("webhook_target", "TEXT"),
+            ("webhook_claim", "TEXT"),
+            ("webhook_claim_until", "INTEGER"),
+        ] {
+            add_column_if_missing(&mut tx, "items", column, decl).await?;
         }
         for stmt in [
             "CREATE INDEX IF NOT EXISTS idx_tasks_request ON tasks(request_id)",
@@ -555,21 +600,34 @@ impl Storage for SqliteStorage {
         state: ItemState,
         error: Option<&TaskError>,
         fence: Fence<'_>,
+        delivery: Delivery<'_>,
     ) -> Result<bool> {
-        let res = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE items SET state = ?, error = ?
+        let finish = crate::item_terminal(state);
+        let set = if finish {
+            format!(", {DELIVERY_SET}")
+        } else {
+            String::new()
+        };
+        let q = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE items SET state = ?, error = ?{set}
              WHERE task_id = ? AND idx = ? AND state IN ('queued', 'processing', 'retrying')
                AND {ITEM_FENCE}"
         )))
         .bind(state.as_str())
-        .bind(crate::error_to_json(error)?)
-        .bind(task_id)
-        .bind(item as i64)
-        .bind(fence.token())
-        .bind(task_id)
-        .bind(fence.token())
-        .execute(&self.pool)
-        .await?;
+        .bind(crate::error_to_json(error)?);
+        let q = if finish {
+            bind_delivery(q, delivery)
+        } else {
+            q
+        };
+        let res = q
+            .bind(task_id)
+            .bind(item as i64)
+            .bind(fence.token())
+            .bind(task_id)
+            .bind(fence.token())
+            .execute(&self.pool)
+            .await?;
         if res.rows_affected() == 0 {
             return Ok(false);
         }
@@ -584,23 +642,25 @@ impl Storage for SqliteStorage {
         error: &TaskError,
         models: &[String],
         fence: Fence<'_>,
+        delivery: Delivery<'_>,
     ) -> Result<bool> {
         let error_json = crate::error_to_json(Some(error))?;
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE items SET state = ?, error = ?
+        let q = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE items SET state = ?, error = ?, {DELIVERY_SET}
              WHERE task_id = ? AND idx = ? AND state IN ('queued', 'processing', 'retrying')
                AND {ITEM_FENCE}"
         )))
         .bind(ItemState::Failed.as_str())
-        .bind(&error_json)
-        .bind(task_id)
-        .bind(item as i64)
-        .bind(fence.token())
-        .bind(task_id)
-        .bind(fence.token())
-        .execute(&mut *tx)
-        .await?;
+        .bind(&error_json);
+        let res = bind_delivery(q, delivery)
+            .bind(task_id)
+            .bind(item as i64)
+            .bind(fence.token())
+            .bind(task_id)
+            .bind(fence.token())
+            .execute(&mut *tx)
+            .await?;
         if res.rows_affected() == 0 {
             return Ok(false); // dropping `tx` rolls it back
         }
@@ -949,13 +1009,98 @@ impl Storage for SqliteStorage {
         Ok(out)
     }
 
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<()> {
-        sqlx::query("UPDATE items SET webhook_delivered = 1 WHERE task_id = ? AND idx = ?")
-            .bind(task_id)
-            .bind(item as i64)
+    async fn claim_pending_webhooks(
+        &self,
+        holder: &str,
+        target: Option<&str>,
+        mode: ClaimMode,
+        ttl: Duration,
+    ) -> Result<Vec<PendingWebhook>> {
+        let open = delivery_clause(mode);
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE items SET webhook_claim = ?, webhook_claim_until = {} + ?
+             WHERE webhook_delivered = 0 AND state IN ('completed', 'failed', 'cancelled')
+               AND (? IS NULL OR webhook_target IS NULL OR webhook_target = ?)
+               AND {open}
+             RETURNING task_id, idx",
+            now_ms!()
+        )))
+        .bind(holder)
+        .bind(ttl.as_millis() as i64)
+        .bind(target)
+        .bind(target)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let task_id: String = r.try_get("task_id")?;
+            let idx: i64 = r.try_get("idx")?;
+            out.push(PendingWebhook {
+                task_id,
+                item_index: idx as usize,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn renew_webhook_claims(
+        &self,
+        holder: &str,
+        items: &[PendingWebhook],
+        ttl: Duration,
+    ) -> Result<Vec<bool>> {
+        let mut out = Vec::with_capacity(items.len());
+        for p in items {
+            let res = sqlx::query(concat!(
+                "UPDATE items SET webhook_claim_until = ",
+                now_ms!(),
+                " + ? WHERE task_id = ? AND idx = ? AND webhook_delivered = 0 AND webhook_claim = ?"
+            ))
+            .bind(ttl.as_millis() as i64)
+            .bind(&p.task_id)
+            .bind(p.item_index as i64)
+            .bind(holder)
             .execute(&self.pool)
             .await?;
-        Ok(())
+            out.push(res.rows_affected() > 0);
+        }
+        Ok(out)
+    }
+
+    async fn release_webhook_claim(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE items SET webhook_claim = NULL, webhook_claim_until = NULL
+             WHERE task_id = ? AND idx = ? AND webhook_delivered = 0 AND webhook_claim = ?",
+        )
+        .bind(task_id)
+        .bind(item as i64)
+        .bind(holder)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn mark_webhook_delivered(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE items SET webhook_delivered = 1, webhook_claim = NULL, webhook_claim_until = NULL
+             WHERE task_id = ? AND idx = ? AND webhook_delivered = 0 AND webhook_claim = ?",
+        )
+        .bind(task_id)
+        .bind(item as i64)
+        .bind(holder)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn set_item_retries(
@@ -1223,12 +1368,29 @@ mod tests {
         assert_eq!(store.increment_attempts("task-1").await.unwrap(), 2);
 
         // Webhook delivery bookkeeping.
+        let claim = Delivery::Claim {
+            holder: "n/p",
+            target: "t://x",
+            ttl: Duration::from_secs(30),
+        };
         store
-            .set_item_state("task-1", 0, ItemState::Completed, None, Fence::Unchecked)
+            .set_item_state(
+                "task-1",
+                0,
+                ItemState::Completed,
+                None,
+                Fence::Unchecked,
+                claim,
+            )
             .await
             .unwrap();
         assert_eq!(store.items_pending_webhook().await.unwrap().len(), 1);
-        store.mark_webhook_delivered("task-1", 0).await.unwrap();
+        assert!(
+            store
+                .mark_webhook_delivered("task-1", 0, "n/p")
+                .await
+                .unwrap()
+        );
         assert!(store.items_pending_webhook().await.unwrap().is_empty());
 
         // Retention purges finished tasks (and cascades).
@@ -1260,6 +1422,24 @@ mod tests {
                 .execute(&store.pool)
                 .await
                 .unwrap();
+            // And items from before delivery claims, one finished and pending.
+            sqlx::query(
+                "CREATE TABLE items (task_id TEXT NOT NULL, idx INTEGER NOT NULL,
+                 input_json TEXT NOT NULL, models_json TEXT NOT NULL, pipeline TEXT,
+                 state TEXT NOT NULL, error TEXT,
+                 webhook_delivered INTEGER NOT NULL DEFAULT 0,
+                 retries INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (task_id, idx))",
+            )
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO items VALUES ('old', 0, '{\"Text\":\"x\"}', '[]', NULL, 'completed',
+                 NULL, 0, 0)",
+            )
+            .execute(&store.pool)
+            .await
+            .unwrap();
         }
         let store = SqliteStorage::connect(&cfg).await.unwrap();
         store.migrate().await.unwrap();
@@ -1268,6 +1448,19 @@ mod tests {
         assert_eq!(old.owner, None);
         assert!(old.metadata.is_empty());
         assert_eq!((old.request_id, old.finished_at), (None, None));
+        // Its pending event is for any receiver, and nobody's to deliver.
+        let ttl = Duration::from_secs(30);
+        let claimed = store
+            .claim_pending_webhooks("n/p", Some("t://x"), ClaimMode::Open, ttl)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed,
+            [PendingWebhook {
+                task_id: "old".into(),
+                item_index: 0
+            }]
+        );
 
         let mut t = sample_task();
         t.owner = Some("alice".into());
