@@ -6,6 +6,7 @@
 pub mod image;
 pub mod model;
 pub mod result;
+pub mod revocation;
 pub mod task;
 
 pub use image::DecodedImage;
@@ -14,6 +15,7 @@ pub use result::{
     Classification, Label, ModelOutput, Prediction, Sample, Scan, Segment, TextOutput, TimedText,
     select_top,
 };
+pub use revocation::Revocation;
 pub use task::{
     ErrorKind, Input, Item, ItemState, MediaKind, ModelResult, ModelState, ParseStateError, Task,
     TaskError, TaskState, Url,

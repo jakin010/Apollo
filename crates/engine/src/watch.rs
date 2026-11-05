@@ -13,7 +13,10 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use apollo_domain::{ItemState, ModelOutput, ModelResult, Sample, Task, TaskError, TaskState};
-use apollo_storage::{PendingWebhook, Storage, StorageError, TaskPage, TaskQuery};
+use apollo_storage::{
+    ClaimMode, Claimable, Fence, Held, Lease, PendingWebhook, Renewal, Storage, StorageError,
+    TaskCursor, TaskPage, TaskQuery,
+};
 
 use crate::Engine;
 use crate::aggregate;
@@ -22,6 +25,9 @@ use crate::error::EngineError;
 /// Queued change announcements per subscriber before it lags (a lagging
 /// watcher just reloads its task).
 pub(crate) const CHANGE_BUFFER: usize = 1024;
+
+/// How long a watch waits for an announcement before reading the task again.
+const REREAD: Duration = Duration::from_secs(2);
 
 /// A [`Storage`] that announces each changed task id on `changes`.
 pub(crate) struct Notifying {
@@ -43,8 +49,13 @@ impl Storage for Notifying {
         self.inner.migrate().await
     }
 
-    async fn create_task(&self, task: &Task) -> Result<(), StorageError> {
-        self.inner.create_task(task).await?;
+    async fn create_task(
+        &self,
+        task: &Task,
+        lease: Option<&Lease<'_>>,
+        pin: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.inner.create_task(task, lease, pin).await?;
         self.changed(&task.id);
         Ok(())
     }
@@ -53,10 +64,17 @@ impl Storage for Notifying {
         self.inner.get_task(id).await
     }
 
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<(), StorageError> {
-        self.inner.set_task_state(id, state).await?;
-        self.changed(id);
-        Ok(())
+    async fn set_task_state(
+        &self,
+        id: &str,
+        state: TaskState,
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
+        let written = self.inner.set_task_state(id, state, fence).await?;
+        if written {
+            self.changed(id);
+        }
+        Ok(written)
     }
 
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool, StorageError> {
@@ -73,12 +91,36 @@ impl Storage for Notifying {
         item: usize,
         state: ItemState,
         error: Option<&TaskError>,
-    ) -> Result<(), StorageError> {
-        self.inner
-            .set_item_state(task_id, item, state, error)
+        fence: Fence<'_>,
+        delivery: apollo_storage::Delivery<'_>,
+    ) -> Result<bool, StorageError> {
+        let written = self
+            .inner
+            .set_item_state(task_id, item, state, error, fence, delivery)
             .await?;
-        self.changed(task_id);
-        Ok(())
+        if written {
+            self.changed(task_id);
+        }
+        Ok(written)
+    }
+
+    async fn set_item_failed(
+        &self,
+        task_id: &str,
+        item: usize,
+        error: &TaskError,
+        models: &[String],
+        fence: Fence<'_>,
+        delivery: apollo_storage::Delivery<'_>,
+    ) -> Result<bool, StorageError> {
+        let written = self
+            .inner
+            .set_item_failed(task_id, item, error, models, fence, delivery)
+            .await?;
+        if written {
+            self.changed(task_id);
+        }
+        Ok(written)
     }
 
     async fn find_task_by_request(
@@ -99,12 +141,16 @@ impl Storage for Notifying {
         item: usize,
         label: &str,
         result: &ModelResult,
-    ) -> Result<(), StorageError> {
-        self.inner
-            .upsert_model_result(task_id, item, label, result)
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
+        let written = self
+            .inner
+            .upsert_model_result(task_id, item, label, result, fence)
             .await?;
-        self.changed(task_id);
-        Ok(())
+        if written {
+            self.changed(task_id);
+        }
+        Ok(written)
     }
 
     // Scan checkpoints are not part of a task until its model finishes, so
@@ -163,16 +209,121 @@ impl Storage for Notifying {
         self.inner.increment_attempts(id).await
     }
 
-    async fn release_resume_attempts(&self) -> Result<u64, StorageError> {
-        self.inner.release_resume_attempts().await
+    // Claims, renewals and releases change nothing a watcher sees.
+    fn shared(&self) -> bool {
+        self.inner.shared()
     }
 
+    async fn claimable_tasks(
+        &self,
+        mode: ClaimMode,
+        node: &str,
+        skip: &[String],
+        grace: Duration,
+        after: Option<&TaskCursor>,
+        limit: usize,
+    ) -> Result<Vec<Claimable>, StorageError> {
+        self.inner
+            .claimable_tasks(mode, node, skip, grace, after, limit)
+            .await
+    }
+
+    async fn claim_task(
+        &self,
+        id: &str,
+        lease: &Lease<'_>,
+        mode: ClaimMode,
+        grace: Duration,
+    ) -> Result<Option<u32>, StorageError> {
+        self.inner.claim_task(id, lease, mode, grace).await
+    }
+
+    async fn renew_claims(
+        &self,
+        held: &[Held],
+        ttl: Duration,
+    ) -> Result<Vec<Renewal>, StorageError> {
+        self.inner.renew_claims(held, ttl).await
+    }
+
+    async fn release_claims(&self, held: &[Held]) -> Result<u64, StorageError> {
+        self.inner.release_claims(held).await
+    }
+
+    async fn claim_pending_webhooks(
+        &self,
+        holder: &str,
+        target: Option<&str>,
+        mode: apollo_storage::ClaimMode,
+        ttl: std::time::Duration,
+        limit: usize,
+    ) -> Result<Vec<apollo_storage::PendingWebhook>, StorageError> {
+        self.inner
+            .claim_pending_webhooks(holder, target, mode, ttl, limit)
+            .await
+    }
+
+    async fn renew_webhook_claims(
+        &self,
+        holder: &str,
+        items: &[apollo_storage::PendingWebhook],
+        ttl: std::time::Duration,
+    ) -> Result<Vec<bool>, StorageError> {
+        self.inner.renew_webhook_claims(holder, items, ttl).await
+    }
+
+    async fn release_webhook_claim(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .release_webhook_claim(task_id, item, holder)
+            .await
+    }
+
+    async fn auth_key(&self) -> Result<Option<apollo_storage::SharedKey>, StorageError> {
+        self.inner.auth_key().await
+    }
+    async fn publish_auth_key(
+        &self,
+        public_key: &str,
+        node: &str,
+    ) -> Result<apollo_storage::SharedKey, StorageError> {
+        self.inner.publish_auth_key(public_key, node).await
+    }
+    async fn replace_auth_key(&self, public_key: &str, node: &str) -> Result<(), StorageError> {
+        self.inner.replace_auth_key(public_key, node).await
+    }
+    async fn add_revocation(
+        &self,
+        revocation: &apollo_domain::Revocation,
+    ) -> Result<(), StorageError> {
+        self.inner.add_revocation(revocation).await
+    }
+    async fn remove_revocation(
+        &self,
+        revocation: &apollo_domain::Revocation,
+    ) -> Result<bool, StorageError> {
+        self.inner.remove_revocation(revocation).await
+    }
+    async fn revocations(&self) -> Result<Vec<apollo_domain::Revocation>, StorageError> {
+        self.inner.revocations().await
+    }
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError> {
         self.inner.items_pending_webhook().await
     }
 
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError> {
-        self.inner.mark_webhook_delivered(task_id, item).await
+    async fn mark_webhook_delivered(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .mark_webhook_delivered(task_id, item, holder)
+            .await
     }
 
     async fn set_item_retries(
@@ -180,10 +331,16 @@ impl Storage for Notifying {
         task_id: &str,
         item: usize,
         retries: u32,
-    ) -> Result<(), StorageError> {
-        self.inner.set_item_retries(task_id, item, retries).await?;
-        self.changed(task_id);
-        Ok(())
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
+        let written = self
+            .inner
+            .set_item_retries(task_id, item, retries, fence)
+            .await?;
+        if written {
+            self.changed(task_id);
+        }
+        Ok(written)
     }
 
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError> {
@@ -282,17 +439,20 @@ impl TaskWatch {
         }
     }
 
-    /// Wait until the task may have changed: its id is announced, or
-    /// announcements were missed.
+    /// Wait until the task may have changed: its id is announced,
+    /// announcements were missed, or [`REREAD`] has passed (another instance
+    /// sharing the database changes tasks without announcing it here).
     async fn changed(&mut self) {
+        let deadline = tokio::time::Instant::now() + REREAD;
         loop {
-            match self.changes.recv().await {
-                Ok(id) if *id == *self.id => return,
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(_)) => return,
+            match tokio::time::timeout_at(deadline, self.changes.recv()).await {
+                Err(_) => return,
+                Ok(Ok(id)) if *id == *self.id => return,
+                Ok(Ok(_)) => {}
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => return,
                 // No more announcements (cannot happen while the engine
                 // lives, since the watch holds it): reload once more, then end.
-                Err(broadcast::error::RecvError::Closed) => {
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
                     self.closed = true;
                     return;
                 }

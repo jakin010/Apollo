@@ -22,6 +22,7 @@
 mod cancel;
 mod data;
 mod recovery;
+mod webhooks;
 
 use std::fmt::Display;
 use std::future::Future;
@@ -32,18 +33,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use apollo_config::{Backend, DatabaseConfig, DevicePreference};
+use apollo_config::{Backend, DevicePreference};
 use apollo_domain::{
     Input, ItemState, MediaKind, ModelOutput, ModelResult, ModelState, Sample, Task, TaskState, Url,
 };
 use apollo_storage::testing::SurrealScratch;
-use apollo_storage::{PendingWebhook, Storage, StorageError, SurrealStorage, TaskPage, TaskQuery};
+use apollo_storage::{
+    ClaimMode, Claimable, Fence, Held, Lease, PendingWebhook, Renewal, Storage, StorageError,
+    SurrealStorage, TaskCursor, TaskPage, TaskQuery,
+};
 use tokio::sync::Semaphore;
 
 use crate::{Engine, EventKind, Run, Submission, Submitted, TaskEvent, WebhookError, WebhookSink};
 
 /// The longest any one wait may take before the test fails.
 const WAIT: Duration = Duration::from_secs(20);
+
+/// A one-second lease: renewed every third of a second, taken over a second
+/// after it lapses, and an instance is settled (may take lapsed ones over) a
+/// second after it starts.
+const SHORT_LEASE: &str = "[database]\nlease_secs = 1\n";
+
+/// [`SHORT_LEASE`], in time.
+const LEASE: Duration = Duration::from_secs(1);
 
 /// An image model that is never loaded: an item fails before reaching it.
 const NSFW: &str = "[models.nsfw]\narchitecture = \"vit\"\nrepo = \"test/nsfw\"\n";
@@ -112,15 +124,31 @@ impl Fleet {
     /// migrated once, up front; and with no `[webhook]` in `toml` (the sink is
     /// always there), the instance's redelivery loop stays off.
     async fn start(&self, who: &'static str, toml: &str) -> Instance {
+        self.start_with(who, toml, SinkKind::Fleet).await
+    }
+
+    /// Like [`Fleet::start`], with the webhook sink `kind` says.
+    async fn start_with(&self, who: &'static str, toml: &str, kind: SinkKind) -> Instance {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
-        let mut instance = self.start_in(who, toml, &path).await;
+        let mut instance = self.start_in_with(who, toml, &path, kind).await;
         instance._dir = Some(dir);
         instance
     }
 
     /// Like [`Fleet::start`], with `cache_dir` as the cache directory.
     async fn start_in(&self, who: &'static str, toml: &str, cache_dir: &Path) -> Instance {
+        self.start_in_with(who, toml, cache_dir, SinkKind::Fleet)
+            .await
+    }
+
+    async fn start_in_with(
+        &self,
+        who: &'static str,
+        toml: &str,
+        cache_dir: &Path,
+        kind: SinkKind,
+    ) -> Instance {
         let mut config = apollo_config::load::from_str(toml).unwrap();
         config.app.device = DevicePreference::Cpu;
         // The tests share one process, whose memory isn't any instance's.
@@ -129,11 +157,9 @@ impl Fleet {
         // The test origin listens on 127.0.0.1.
         config.limits.block_private_ips = false;
         config.validate().unwrap();
-        config.database = DatabaseConfig {
-            backend: Backend::Surrealdb,
-            surrealdb: Some(self.db.config()),
-            ..Default::default()
-        };
+        // The shared database; the test's other `[database]` settings stay.
+        config.database.backend = Backend::Surrealdb;
+        config.database.surrealdb = Some(self.db.config());
         config.app.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -154,13 +180,24 @@ impl Fleet {
                     inner: Arc::new(store),
                     log: log.clone(),
                     holds: Holds::default(),
+                    detached: Holds::default(),
                 });
                 let sink = Arc::new(Sink {
                     who,
                     log,
                     holds: Holds::default(),
+                    target: match kind {
+                        SinkKind::Target(target) => target,
+                        SinkKind::Fleet | SinkKind::Off => FLEET_TARGET,
+                    },
+                    fail: AtomicUsize::new(0),
                 });
-                let engine = Engine::new(Arc::new(config), probe.clone(), Some(sink.clone()));
+                let webhook: Option<Arc<dyn WebhookSink>> = match kind {
+                    SinkKind::Off => None,
+                    _ => Some(sink.clone()),
+                };
+                let engine =
+                    Engine::with_node(Arc::new(config), probe.clone(), webhook, who.to_string());
                 (engine, probe, sink)
             })
             .await
@@ -255,6 +292,53 @@ impl Instance {
         self.engine.inner.in_flight.load(Ordering::SeqCst)
     }
 
+    /// Claim `id` now, in `mode`, and start running it, as a takeover of it
+    /// would (whether or not this instance would take it). Whether it won.
+    async fn take(&self, id: &str, mode: apollo_storage::ClaimMode) -> bool {
+        let id = id.to_string();
+        self.on(move |e| async move {
+            let token = uuid::Uuid::new_v4().to_string();
+            let sent = Instant::now();
+            let claimed = e
+                .inner
+                .storage
+                .claim_task(&id, &e.lease(&token), mode, Duration::ZERO)
+                .await
+                .unwrap();
+            if claimed.is_none() {
+                return false;
+            }
+            let task = e.get_task(&id).await.unwrap().unwrap();
+            let run = e.register(&id, token, sent).unwrap();
+            let reservations = task
+                .items
+                .iter()
+                .map(|item| e.reserve_resumed(&item.models))
+                .collect();
+            tokio::spawn(async move { e.run_task(task, run, reservations).await });
+            true
+        })
+        .await
+    }
+
+    /// Tasks this instance runs now.
+    fn runs(&self) -> usize {
+        self.engine.inner.runs.lock().unwrap().len()
+    }
+
+    /// Whether this instance's run of `id` has stopped writing (lost its
+    /// claim, or stopped for want of a renewal); `None` when it has no run of
+    /// `id`.
+    fn run_lost(&self, id: &str) -> Option<bool> {
+        self.engine
+            .inner
+            .runs
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|r| r.lost())
+    }
+
     /// Items waiting for one of this instance's slots.
     fn slots_waiting(&self) -> usize {
         self.engine.inner.gate.snapshot().2
@@ -290,6 +374,17 @@ impl Instance {
         self.probe.holds.add(times, matches)
     }
 
+    /// Like [`Instance::hold_storage`], for renewals and hand-backs only, but
+    /// a held call goes on in a task of its own: a caller that stops waiting
+    /// doesn't cancel it, as a database client's queue wouldn't.
+    fn hold_storage_detached(
+        &self,
+        times: usize,
+        matches: impl Fn(&Call) -> bool + Send + Sync + 'static,
+    ) -> Hold {
+        self.probe.detached.add(times, matches)
+    }
+
     /// Hold this instance's next `times` webhook deliveries that `matches`
     /// picks.
     fn hold_webhook(
@@ -298,6 +393,11 @@ impl Instance {
         matches: impl Fn(&Call) -> bool + Send + Sync + 'static,
     ) -> Hold {
         self.sink.holds.add(times, matches)
+    }
+
+    /// Fail this instance's next `n` finished-webhook deliveries.
+    fn fail_webhooks(&self, n: usize) {
+        self.sink.fail.store(n, Ordering::SeqCst);
     }
 
     /// Stop the instance as a crash would: everything it was doing stops where
@@ -323,16 +423,31 @@ impl Drop for Instance {
 enum Call {
     CreateTask(String),
     GetTask(String),
-    SetTaskState(String, TaskState),
+    /// With whether it was written.
+    SetTaskState(String, TaskState, bool),
     /// With whether the task was still active.
     CancelIfActive(String, bool),
-    SetItemState(String, usize, ItemState),
+    /// With whether it was written.
+    SetItemState(String, usize, ItemState, bool),
     ModelResult(String, usize, String, ModelState),
     /// With the new count.
     IncrementAttempts(String, u32),
-    /// With the number of tasks released.
-    ReleaseAttempts(u64),
+    /// A claim of the task, with its attempts if it won.
+    Claim(String, Option<u32>),
+    /// Claims handed back (a graceful stop, or a run stopped for want of a
+    /// renewal), with how many were still held.
+    Release(u64),
+    /// A renewal of this many claims (holdable; not logged).
+    Renew(usize),
+    /// A takeover's read of candidates (holdable; not logged).
+    Claimable,
+    /// A finished webhook marked delivered (by its delivery claim's holder).
     WebhookDelivered(String, usize),
+    /// Finished webhooks claimed for delivery by a redelivery pass (logged
+    /// when any were).
+    ClaimWebhooks(Vec<(String, usize)>),
+    /// A delivery claim handed back (the delivery failed).
+    ReleaseWebhook(String, usize),
     /// A webhook event the sink received.
     Webhook(String, EventKind, TaskState),
 }
@@ -370,6 +485,20 @@ impl Log {
     /// Wait for a matching entry.
     async fn wait_for(&self, what: &str, f: impl Fn(&str, &Call) -> bool) {
         wait_until(what, || self.count(&f) > 0).await;
+    }
+
+    /// Once `who` has no item of `task` in flight: wait for the finished
+    /// webhook it owes, if it finished an item of `task` (another runner may
+    /// have finished them first).
+    async fn settled(&self, who: &'static str, task: &str) {
+        let finished_one = self.count(|w, c| {
+            w == who
+                && matches!(c, Call::SetItemState(id, _, state, true)
+                    if id == task && crate::aggregate::item_terminal(*state))
+        }) > 0;
+        if finished_one {
+            self.delivered(who, task).await;
+        }
     }
 
     /// Wait for `who`'s finished webhook for `task` to be marked delivered:
@@ -415,7 +544,9 @@ struct HoldSlot {
 }
 
 /// A hold on some calls: [`Hold::entered`] waits for one to arrive,
-/// [`Hold::release`] lets one go.
+/// [`Hold::release`] lets one go, [`Hold::open`] all of them. A held call whose
+/// caller stops waiting (a timeout) is dropped, and never runs, unless the hold
+/// is detached ([`Instance::hold_storage_detached`]).
 #[derive(Clone)]
 struct Hold(Arc<(Semaphore, Semaphore)>);
 
@@ -431,6 +562,16 @@ impl Hold {
     fn release(&self) {
         self.0.1.add_permits(1);
     }
+
+    /// Wait until the test lets this call go.
+    async fn wait(&self) {
+        self.0.1.acquire().await.unwrap().forget();
+    }
+
+    /// Let every held call go, and every later one it picks.
+    fn open(&self) {
+        self.0.1.add_permits(1 << 20);
+    }
 }
 
 impl Holds {
@@ -444,22 +585,25 @@ impl Holds {
         hold
     }
 
-    /// Wait here if a hold picks `call` (which carries default results: it
-    /// hasn't run yet).
+    /// The hold that picks `call` (which carries default results: it hasn't
+    /// run yet), if any, told the call has arrived.
+    fn pick(&self, call: &Call) -> Option<Hold> {
+        let mut slots = self.0.lock().unwrap();
+        let hold = slots
+            .iter_mut()
+            .find(|s| s.left > 0 && (s.matches)(call))
+            .map(|s| {
+                s.left -= 1;
+                s.hold.clone()
+            })?;
+        hold.0.0.add_permits(1);
+        Some(hold)
+    }
+
+    /// Wait here if a hold picks `call`.
     async fn pass(&self, call: &Call) {
-        let hold = {
-            let mut slots = self.0.lock().unwrap();
-            slots
-                .iter_mut()
-                .find(|s| s.left > 0 && (s.matches)(call))
-                .map(|s| {
-                    s.left -= 1;
-                    s.hold.clone()
-                })
-        };
-        if let Some(hold) = hold {
-            hold.0.0.add_permits(1);
-            hold.0.1.acquire().await.unwrap().forget();
+        if let Some(hold) = self.pick(call) {
+            hold.wait().await;
         }
     }
 }
@@ -470,6 +614,8 @@ struct Probe {
     inner: Arc<dyn Storage>,
     log: Arc<Log>,
     holds: Holds,
+    /// Holds whose calls wait in a task of their own (renewals and hand-backs).
+    detached: Holds,
 }
 
 impl Probe {
@@ -488,9 +634,14 @@ impl Storage for Probe {
     async fn migrate(&self) -> Result<(), StorageError> {
         self.inner.migrate().await
     }
-    async fn create_task(&self, task: &Task) -> Result<(), StorageError> {
+    async fn create_task(
+        &self,
+        task: &Task,
+        lease: Option<&Lease<'_>>,
+        pin: Option<&str>,
+    ) -> Result<(), StorageError> {
         let call = self.pass(Call::CreateTask(task.id.clone())).await;
-        let r = self.inner.create_task(task).await;
+        let r = self.inner.create_task(task, lease, pin).await;
         self.done(call);
         r
     }
@@ -499,10 +650,17 @@ impl Storage for Probe {
         self.done(Call::GetTask(id.into()));
         r
     }
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<(), StorageError> {
-        let call = self.pass(Call::SetTaskState(id.into(), state)).await;
-        let r = self.inner.set_task_state(id, state).await;
-        self.done(call);
+    async fn set_task_state(
+        &self,
+        id: &str,
+        state: TaskState,
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
+        self.pass(Call::SetTaskState(id.into(), state, false)).await;
+        let r = self.inner.set_task_state(id, state, fence).await;
+        if let Ok(written) = &r {
+            self.done(Call::SetTaskState(id.into(), state, *written));
+        }
         r
     }
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool, StorageError> {
@@ -519,12 +677,38 @@ impl Storage for Probe {
         item: usize,
         state: ItemState,
         error: Option<&apollo_domain::TaskError>,
-    ) -> Result<(), StorageError> {
-        let call = self
-            .pass(Call::SetItemState(task_id.into(), item, state))
+        fence: Fence<'_>,
+        delivery: apollo_storage::Delivery<'_>,
+    ) -> Result<bool, StorageError> {
+        self.pass(Call::SetItemState(task_id.into(), item, state, false))
             .await;
-        let r = self.inner.set_item_state(task_id, item, state, error).await;
-        self.done(call);
+        let r = self
+            .inner
+            .set_item_state(task_id, item, state, error, fence, delivery)
+            .await;
+        if let Ok(written) = &r {
+            self.done(Call::SetItemState(task_id.into(), item, state, *written));
+        }
+        r
+    }
+    async fn set_item_failed(
+        &self,
+        task_id: &str,
+        item: usize,
+        error: &apollo_domain::TaskError,
+        models: &[String],
+        fence: Fence<'_>,
+        delivery: apollo_storage::Delivery<'_>,
+    ) -> Result<bool, StorageError> {
+        let call = |written| Call::SetItemState(task_id.into(), item, ItemState::Failed, written);
+        self.pass(call(false)).await;
+        let r = self
+            .inner
+            .set_item_failed(task_id, item, error, models, fence, delivery)
+            .await;
+        if let Ok(written) = &r {
+            self.done(call(*written));
+        }
         r
     }
     async fn find_task_by_request(
@@ -543,7 +727,8 @@ impl Storage for Probe {
         item: usize,
         label: &str,
         result: &ModelResult,
-    ) -> Result<(), StorageError> {
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
         let call = self
             .pass(Call::ModelResult(
                 task_id.into(),
@@ -554,7 +739,7 @@ impl Storage for Probe {
             .await;
         let r = self
             .inner
-            .upsert_model_result(task_id, item, label, result)
+            .upsert_model_result(task_id, item, label, result, fence)
             .await;
         self.done(call);
         r
@@ -611,22 +796,174 @@ impl Storage for Probe {
         }
         r
     }
-    async fn release_resume_attempts(&self) -> Result<u64, StorageError> {
-        let r = self.inner.release_resume_attempts().await;
-        if let Ok(n) = &r {
-            self.done(Call::ReleaseAttempts(*n));
+    fn shared(&self) -> bool {
+        self.inner.shared()
+    }
+    async fn claimable_tasks(
+        &self,
+        mode: ClaimMode,
+        node: &str,
+        skip: &[String],
+        grace: Duration,
+        after: Option<&TaskCursor>,
+        limit: usize,
+    ) -> Result<Vec<Claimable>, StorageError> {
+        self.pass(Call::Claimable).await;
+        self.inner
+            .claimable_tasks(mode, node, skip, grace, after, limit)
+            .await
+    }
+    async fn claim_task(
+        &self,
+        id: &str,
+        lease: &Lease<'_>,
+        mode: ClaimMode,
+        grace: Duration,
+    ) -> Result<Option<u32>, StorageError> {
+        self.pass(Call::Claim(id.into(), None)).await;
+        let r = self.inner.claim_task(id, lease, mode, grace).await;
+        if let Ok(attempts) = &r {
+            self.done(Call::Claim(id.into(), *attempts));
         }
         r
+    }
+    async fn renew_claims(
+        &self,
+        held: &[Held],
+        ttl: Duration,
+    ) -> Result<Vec<Renewal>, StorageError> {
+        let call = self.pass(Call::Renew(held.len())).await;
+        let Some(hold) = self.detached.pick(&call) else {
+            return self.inner.renew_claims(held, ttl).await;
+        };
+        let (inner, held) = (self.inner.clone(), held.to_vec());
+        tokio::spawn(async move {
+            hold.wait().await;
+            inner.renew_claims(&held, ttl).await
+        })
+        .await
+        .unwrap()
+    }
+    async fn release_claims(&self, held: &[Held]) -> Result<u64, StorageError> {
+        let call = self.pass(Call::Release(0)).await;
+        let hold = self.detached.pick(&call);
+        let detached = hold.is_some();
+        let (inner, log, who, held) = (
+            self.inner.clone(),
+            self.log.clone(),
+            self.who,
+            held.to_vec(),
+        );
+        let release = async move {
+            if let Some(hold) = hold {
+                hold.wait().await;
+            }
+            let r = inner.release_claims(&held).await;
+            if let Ok(n) = &r {
+                log.push(who, Call::Release(*n));
+            }
+            r
+        };
+        if detached {
+            tokio::spawn(release).await.unwrap()
+        } else {
+            release.await
+        }
+    }
+    async fn claim_pending_webhooks(
+        &self,
+        holder: &str,
+        target: Option<&str>,
+        mode: apollo_storage::ClaimMode,
+        ttl: Duration,
+        limit: usize,
+    ) -> Result<Vec<PendingWebhook>, StorageError> {
+        let r = self
+            .inner
+            .claim_pending_webhooks(holder, target, mode, ttl, limit)
+            .await;
+        if let Ok(claimed) = &r
+            && !claimed.is_empty()
+        {
+            let items = claimed
+                .iter()
+                .map(|p| (p.task_id.clone(), p.item_index))
+                .collect();
+            self.done(Call::ClaimWebhooks(items));
+        }
+        r
+    }
+    async fn renew_webhook_claims(
+        &self,
+        holder: &str,
+        items: &[PendingWebhook],
+        ttl: Duration,
+    ) -> Result<Vec<bool>, StorageError> {
+        self.inner.renew_webhook_claims(holder, items, ttl).await
+    }
+    async fn release_webhook_claim(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError> {
+        let r = self
+            .inner
+            .release_webhook_claim(task_id, item, holder)
+            .await;
+        if let Ok(true) = &r {
+            self.done(Call::ReleaseWebhook(task_id.into(), item));
+        }
+        r
+    }
+    async fn auth_key(&self) -> Result<Option<apollo_storage::SharedKey>, StorageError> {
+        self.inner.auth_key().await
+    }
+    async fn publish_auth_key(
+        &self,
+        public_key: &str,
+        node: &str,
+    ) -> Result<apollo_storage::SharedKey, StorageError> {
+        self.inner.publish_auth_key(public_key, node).await
+    }
+    async fn replace_auth_key(&self, public_key: &str, node: &str) -> Result<(), StorageError> {
+        self.inner.replace_auth_key(public_key, node).await
+    }
+    async fn add_revocation(
+        &self,
+        revocation: &apollo_domain::Revocation,
+    ) -> Result<(), StorageError> {
+        self.inner.add_revocation(revocation).await
+    }
+    async fn remove_revocation(
+        &self,
+        revocation: &apollo_domain::Revocation,
+    ) -> Result<bool, StorageError> {
+        self.inner.remove_revocation(revocation).await
+    }
+    async fn revocations(&self) -> Result<Vec<apollo_domain::Revocation>, StorageError> {
+        self.inner.revocations().await
     }
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError> {
         self.inner.items_pending_webhook().await
     }
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError> {
+    async fn mark_webhook_delivered(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError> {
         let call = self
             .pass(Call::WebhookDelivered(task_id.into(), item))
             .await;
-        let r = self.inner.mark_webhook_delivered(task_id, item).await;
-        self.done(call);
+        let r = self
+            .inner
+            .mark_webhook_delivered(task_id, item, holder)
+            .await;
+        // Only a mark that took (the holder's).
+        if let Ok(true) = &r {
+            self.done(call);
+        }
         r
     }
     async fn set_item_retries(
@@ -634,8 +971,11 @@ impl Storage for Probe {
         task_id: &str,
         item: usize,
         retries: u32,
-    ) -> Result<(), StorageError> {
-        self.inner.set_item_retries(task_id, item, retries).await
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .set_item_retries(task_id, item, retries, fence)
+            .await
     }
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError> {
         self.inner.purge_finished_before(cutoff_unix_secs).await
@@ -694,6 +1034,26 @@ struct Sink {
     who: &'static str,
     log: Arc<Log>,
     holds: Holds,
+    /// The receiver it says it delivers to.
+    target: &'static str,
+    /// Fail this many more finished-event deliveries (not logged as
+    /// received).
+    fail: AtomicUsize,
+}
+
+/// The receiver every instance's sink delivers to, unless a test says
+/// otherwise: the same for all, whatever their `[webhook]` url.
+const FLEET_TARGET: &str = "test://fleet";
+
+/// Which webhook sink an instance gets.
+#[derive(Clone, Copy)]
+enum SinkKind {
+    /// The fleet's ([`FLEET_TARGET`]).
+    Fleet,
+    /// One that says it delivers to another receiver.
+    Target(&'static str),
+    /// None: webhooks off.
+    Off,
 }
 
 #[async_trait::async_trait]
@@ -701,8 +1061,20 @@ impl WebhookSink for Sink {
     async fn deliver(&self, event: &TaskEvent) -> Result<(), WebhookError> {
         let call = Call::Webhook(event.task.id.clone(), event.kind, event.task.state);
         self.holds.pass(&call).await;
+        if event.kind == EventKind::Finished
+            && self
+                .fail
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Err(WebhookError("the receiver refused it".into()));
+        }
         self.log.push(self.who, call);
         Ok(())
+    }
+
+    fn target(&self) -> String {
+        self.target.into()
     }
 }
 
@@ -715,18 +1087,20 @@ struct Origin {
 }
 
 /// A download waiting for its answer.
-struct Arrival(std::sync::mpsc::Sender<Reply>);
+struct Arrival {
+    /// The path it asked for.
+    path: String,
+    reply: std::sync::mpsc::Sender<Reply>,
+}
 
 enum Reply {
     /// 200 with bytes that aren't an image: the item fails, permanently.
     Garbage,
-    /// 200 with these bytes.
-    Bytes(Vec<u8>),
 }
 
 impl Arrival {
     fn reply(self, reply: Reply) {
-        let _ = self.0.send(reply);
+        let _ = self.reply.send(reply);
     }
 }
 
@@ -801,17 +1175,26 @@ fn serve(
     let mut reader = BufReader::new(&stream);
     // The request head; the body (none for a GET) is ignored.
     let mut line = String::new();
+    let mut path = None;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => return,
             Ok(_) if line == "\r\n" || line == "\n" => break,
+            // The request line: `GET /path HTTP/1.1`.
+            Ok(_) if path.is_none() => {
+                path = line.split_whitespace().nth(1).map(str::to_string);
+            }
             Ok(_) => {}
         }
     }
     hits.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = std::sync::mpsc::channel();
-    if arrivals.send(Arrival(tx)).is_err() {
+    let arrival = Arrival {
+        path: path.unwrap_or_default(),
+        reply: tx,
+    };
+    if arrivals.send(arrival).is_err() {
         return;
     }
     // A dropped arrival (the test ended) closes the connection.
@@ -820,7 +1203,6 @@ fn serve(
     };
     let body = match reply {
         Reply::Garbage => b"not an image".to_vec(),
-        Reply::Bytes(bytes) => bytes,
     };
     let mut stream = &stream;
     let _ = write!(
@@ -977,4 +1359,34 @@ async fn instances_share_only_the_database() {
         assert_eq!(fleet.task(&t).await.state, TaskState::Processing);
     })
     .await;
+}
+
+/// Instances starting together on a new database all set its schema up:
+/// SurrealDB refuses some of their racing schema writes, which are retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn instances_starting_together_on_a_new_database_all_start() {
+    // A race, so it takes a few rounds to show.
+    for _ in 0..20 {
+        let Some(db) = SurrealScratch::create_empty().await else {
+            return;
+        };
+        let starts: Vec<_> = (0..8)
+            .map(|_| {
+                let config = db.config();
+                tokio::spawn(async move { SurrealStorage::connect(&config).await?.migrate().await })
+            })
+            .collect();
+        let mut failed = Vec::new();
+        for start in starts {
+            if let Err(e) = start.await.unwrap() {
+                failed.push(e.to_string());
+            }
+        }
+        db.remove().await;
+        assert!(
+            failed.is_empty(),
+            "{} of 8 instances failed to start: {failed:?}",
+            failed.len()
+        );
+    }
 }

@@ -305,6 +305,24 @@ impl Config {
             }
         }
 
+        if !(1..=3600).contains(&self.database.lease_secs) {
+            errs.push(format!(
+                "database.lease_secs must be from 1 to 3600 (got {})",
+                self.database.lease_secs
+            ));
+        }
+        if let Some(node) = &self.app.node_id
+            && (node.is_empty()
+                || node.len() > 64
+                || !node
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        {
+            errs.push(format!(
+                "app.node_id `{node}`: use 1 to 64 letters, digits, `.`, `_` or `-`"
+            ));
+        }
+
         match self.database.backend {
             Backend::Postgres if self.database.postgres.is_none() => {
                 errs.push("database.backend = 'postgres' but [database.postgres] is missing".into())

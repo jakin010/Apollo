@@ -13,14 +13,19 @@
 //!
 //! Individual tokens are revoked without rotating the keypair through a
 //! revocation file (see [`Revocation`]): one entry per line, either a token id
-//! (`jti`, printed by `apollo token`) or a whole subject. Running servers re-read
-//! the file when it changes ([`AuthInterceptor::watch_revocations`]).
+//! (`jti`, printed by `apollo token`) or a whole subject. On a database
+//! instances share, revocations are also stored there
+//! ([`AuthSettings::shared_revocations`]), and a token is refused when either
+//! list revokes it. Running servers re-read both every few seconds
+//! ([`AuthInterceptor::watch_revocations`]).
 
 use std::collections::HashSet;
-use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
+
+use async_trait::async_trait;
 
 use pasetors::Public;
 use pasetors::claims::ClaimsValidationRules;
@@ -46,43 +51,7 @@ pub struct Caller {
     pub admin: bool,
 }
 
-/// One entry of the revocation file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Revocation {
-    /// A single token, by its id (`jti` claim).
-    Id(String),
-    /// Every token issued to a subject (`sub` claim), including tokens minted
-    /// before token ids existed.
-    Subject(String),
-}
-
-impl fmt::Display for Revocation {
-    /// The line written to the revocation file.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Revocation::Id(id) => write!(f, "id {id}"),
-            Revocation::Subject(subject) => write!(f, "subject {subject}"),
-        }
-    }
-}
-
-impl Revocation {
-    /// Parse one line (`id <jti>` or `subject <name>`). Blank lines and `#`
-    /// comments yield `Ok(None)`.
-    pub fn parse_line(line: &str) -> Result<Option<Self>, String> {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            return Ok(None);
-        }
-        match line.split_once(char::is_whitespace) {
-            Some(("id", v)) if !v.trim().is_empty() => Ok(Some(Revocation::Id(v.trim().into()))),
-            Some(("subject", v)) if !v.trim().is_empty() => {
-                Ok(Some(Revocation::Subject(v.trim().into())))
-            }
-            _ => Err(format!("unrecognized revocation entry {line:?}")),
-        }
-    }
-}
+pub use apollo_domain::Revocation;
 
 /// The revoked token ids and subjects currently in force.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -113,6 +82,38 @@ impl Revocations {
     fn revokes(&self, subject: &str, token_id: Option<&str>) -> bool {
         self.subjects.contains(subject) || token_id.is_some_and(|id| self.ids.contains(id))
     }
+
+    fn from_list(list: Vec<Revocation>) -> Self {
+        let mut out = Revocations::default();
+        for r in list {
+            match r {
+                Revocation::Id(id) => out.ids.insert(id),
+                Revocation::Subject(s) => out.subjects.insert(s),
+            };
+        }
+        out
+    }
+
+    fn union(&self, other: &Revocations) -> Self {
+        Revocations {
+            ids: self.ids.union(&other.ids).cloned().collect(),
+            subjects: self.subjects.union(&other.subjects).cloned().collect(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len() + self.subjects.len()
+    }
+}
+
+/// Where the revocations of instances sharing a database are read from.
+// `async_trait` marks the boxed-future methods `#[must_use]`; clippy >= 1.99
+// reports that as `double_must_use`.
+#[allow(clippy::double_must_use)]
+#[async_trait]
+pub trait RevocationSource: Send + Sync + 'static {
+    /// Every revocation stored now.
+    async fn revocations(&self) -> Result<Vec<Revocation>, String>;
 }
 
 /// Settings for an authentication-enabled server.
@@ -123,21 +124,79 @@ pub struct AuthSettings {
     pub admin_subjects: Vec<String>,
     /// Revocation file; a missing file means nothing is revoked.
     pub revocation_file: Option<PathBuf>,
+    /// The revocations of instances sharing a database, applied along with the
+    /// file's.
+    pub shared_revocations: Option<Arc<dyn RevocationSource>>,
 }
 
 struct Verifier {
     key: AsymmetricPublicKey<V4>,
     admins: HashSet<String>,
+    /// In force: the file's and the database's.
     revocations: RwLock<Revocations>,
     file: Option<PathBuf>,
     /// Modification time of the revocation file when last loaded.
     loaded_mtime: Mutex<Option<SystemTime>>,
+    from_file: Mutex<Revocations>,
+    from_db: Mutex<Revocations>,
+    shared: Option<Arc<dyn RevocationSource>>,
+    /// The last database read failed.
+    db_failing: AtomicBool,
 }
 
 impl Verifier {
+    /// Put the file's and the database's revocations in force. Returns
+    /// whether that changed what is.
+    fn apply(&self) -> bool {
+        let file = self.from_file.lock().unwrap().clone();
+        let db = self.from_db.lock().unwrap().clone();
+        let next = file.union(&db);
+        let mut current = self.revocations.write().unwrap();
+        if *current == next {
+            return false;
+        }
+        tracing::info!(
+            ids = next.ids.len(),
+            subjects = next.subjects.len(),
+            file = file.len(),
+            database = db.len(),
+            "loaded token revocations"
+        );
+        *current = next;
+        true
+    }
+
+    /// Read the database's revocations, waiting `limit` at most. One that
+    /// can't be read keeps the previous list (fail closed). Returns whether
+    /// what is in force changed.
+    async fn reload_db(&self, limit: Duration) -> bool {
+        let Some(source) = &self.shared else {
+            return false;
+        };
+        match tokio::time::timeout(limit, source.revocations()).await {
+            Ok(Ok(list)) => {
+                *self.from_db.lock().unwrap() = Revocations::from_list(list);
+                if self.db_failing.swap(false, Ordering::SeqCst) {
+                    tracing::info!("token revocations readable from the database again");
+                }
+                self.apply()
+            }
+            failed => {
+                if !self.db_failing.swap(true, Ordering::SeqCst) {
+                    let error = match failed {
+                        Ok(Err(e)) => e,
+                        _ => format!("no answer within {limit:?}"),
+                    };
+                    tracing::warn!(%error, "cannot read token revocations from the database; keeping the previous list");
+                }
+                false
+            }
+        }
+    }
+
     /// Re-read the revocation file if it changed since the last load. A file
     /// that cannot be read keeps the previous list (fail closed); a deleted file
-    /// clears it. Returns whether the list was replaced.
+    /// clears it. Returns whether what is in force changed.
     fn reload(&self) -> bool {
         let Some(path) = &self.file else {
             return false;
@@ -162,17 +221,9 @@ impl Verifier {
             }
         };
         *loaded = mtime;
-        let mut current = self.revocations.write().unwrap();
-        if *current == next {
-            return false;
-        }
-        tracing::info!(
-            ids = next.ids.len(),
-            subjects = next.subjects.len(),
-            "loaded token revocations"
-        );
-        *current = next;
-        true
+        drop(loaded);
+        *self.from_file.lock().unwrap() = next;
+        self.apply()
     }
 }
 
@@ -190,8 +241,10 @@ impl AuthInterceptor {
     }
 
     /// Enforce authentication with `settings`. Loads the revocation file now;
-    /// call [`watch_revocations`](Self::watch_revocations) to pick up later
-    /// changes.
+    /// with shared revocations, call
+    /// [`load_shared_revocations`](Self::load_shared_revocations) before
+    /// serving, and [`watch_revocations`](Self::watch_revocations) to pick up
+    /// later changes.
     pub fn new(settings: AuthSettings) -> Result<Self, KeyError> {
         let key = AsymmetricPublicKey::<V4>::try_from(settings.public_key.as_str())
             .map_err(|e| KeyError(e.to_string()))?;
@@ -201,6 +254,10 @@ impl AuthInterceptor {
             revocations: RwLock::new(Revocations::default()),
             file: settings.revocation_file,
             loaded_mtime: Mutex::new(None),
+            from_file: Mutex::new(Revocations::default()),
+            from_db: Mutex::new(Revocations::default()),
+            shared: settings.shared_revocations,
+            db_failing: AtomicBool::new(false),
         });
         verifier.reload();
         Ok(Self {
@@ -218,23 +275,58 @@ impl AuthInterceptor {
         self.verifier.as_ref()?.file.as_deref()
     }
 
-    /// Re-check the revocation file every `every` and apply changes. Must be
-    /// called within a Tokio runtime. No-op when auth is disabled or no file is
-    /// configured.
-    pub fn watch_revocations(&self, every: Duration) {
+    /// Whether revocations are also read from a shared database.
+    pub fn has_shared_revocations(&self) -> bool {
+        self.verifier.as_ref().is_some_and(|v| v.shared.is_some())
+    }
+
+    /// The first read of the shared revocations, whose failure is returned
+    /// (a server shouldn't start without them).
+    pub async fn load_shared_revocations(&self) -> Result<(), String> {
+        let Some(verifier) = &self.verifier else {
+            return Ok(());
+        };
+        let Some(source) = &verifier.shared else {
+            return Ok(());
+        };
+        let list = source.revocations().await?;
+        *verifier.from_db.lock().unwrap() = Revocations::from_list(list);
+        verifier.apply();
+        Ok(())
+    }
+
+    /// Re-read the revocation file, and the shared revocations within
+    /// `limit`, applying changes. Returns whether what is in force changed.
+    pub async fn poll_once(&self, limit: Duration) -> bool {
         let Some(verifier) = self.verifier.clone() else {
+            return false;
+        };
+        let v = Arc::clone(&verifier);
+        let file = tokio::task::spawn_blocking(move || v.reload())
+            .await
+            .unwrap_or(false);
+        let db = verifier.reload_db(limit).await;
+        file || db
+    }
+
+    /// Re-check the revocation file and the shared revocations every `every`
+    /// and apply changes. Must be called within a Tokio runtime. No-op when
+    /// auth is disabled, or there is neither a file nor shared revocations.
+    pub fn watch_revocations(&self, every: Duration) {
+        let Some(verifier) = &self.verifier else {
             return;
         };
-        if verifier.file.is_none() {
+        if verifier.file.is_none() && verifier.shared.is_none() {
             return;
         }
+        let auth = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(every);
-            tick.tick().await; // already loaded at construction
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // already loaded
             loop {
                 tick.tick().await;
-                let v = Arc::clone(&verifier);
-                let _ = tokio::task::spawn_blocking(move || v.reload()).await;
+                auth.poll_once(every).await;
             }
         });
     }
@@ -334,12 +426,116 @@ mod tests {
     }
 
     fn interceptor(keys: &Keys, file: Option<PathBuf>) -> AuthInterceptor {
+        with_source(keys, file, None)
+    }
+
+    fn with_source(
+        keys: &Keys,
+        file: Option<PathBuf>,
+        source: Option<Arc<FakeSource>>,
+    ) -> AuthInterceptor {
         AuthInterceptor::new(AuthSettings {
             public_key: keys.public.clone(),
             admin_subjects: vec!["ops".into()],
             revocation_file: file,
+            shared_revocations: source.map(|s| s as Arc<dyn RevocationSource>),
         })
         .unwrap()
+    }
+
+    /// A database's revocations: what the next read gives.
+    struct FakeSource(Mutex<Result<Vec<Revocation>, String>>);
+
+    impl FakeSource {
+        fn new(next: Result<Vec<Revocation>, String>) -> Arc<Self> {
+            Arc::new(Self(Mutex::new(next)))
+        }
+
+        fn set(&self, next: Result<Vec<Revocation>, String>) {
+            *self.0.lock().unwrap() = next;
+        }
+    }
+
+    #[async_trait]
+    impl RevocationSource for FakeSource {
+        async fn revocations(&self) -> Result<Vec<Revocation>, String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    const LIMIT: Duration = Duration::from_secs(1);
+
+    #[tokio::test]
+    async fn db_and_file_revocations_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("revoked_tokens");
+        std::fs::write(&file, "id id-1\n").unwrap();
+        let k = keys();
+        let source = FakeSource::new(Ok(vec![Revocation::Subject("bob".into())]));
+        let mut auth = with_source(&k, Some(file), Some(source));
+        auth.poll_once(LIMIT).await;
+        assert!(call(&mut auth, &token(&k, Some("alice"), Some("id-1"))).is_err());
+        assert!(call(&mut auth, &token(&k, Some("bob"), Some("id-9"))).is_err());
+        assert!(call(&mut auth, &token(&k, Some("alice"), Some("id-2"))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn db_read_failure_keeps_previous_list() {
+        let k = keys();
+        let source = FakeSource::new(Ok(vec![Revocation::Id("id-1".into())]));
+        let mut auth = with_source(&k, None, Some(source.clone()));
+        auth.load_shared_revocations().await.unwrap();
+        let t1 = token(&k, Some("alice"), Some("id-1"));
+        assert!(call(&mut auth, &t1).is_err());
+        source.set(Err("connection reset".into()));
+        assert!(!auth.poll_once(LIMIT).await);
+        assert!(call(&mut auth, &t1).is_err(), "still revoked");
+        source.set(Ok(vec![]));
+        assert!(auth.poll_once(LIMIT).await);
+        assert!(call(&mut auth, &t1).is_ok(), "un-revoked in the database");
+    }
+
+    #[tokio::test]
+    async fn deleting_the_file_keeps_db_revocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("revoked_tokens");
+        std::fs::write(&file, "subject bob\n").unwrap();
+        let k = keys();
+        let source = FakeSource::new(Ok(vec![Revocation::Subject("bob".into())]));
+        let mut auth = with_source(&k, Some(file.clone()), Some(source));
+        auth.poll_once(LIMIT).await;
+        let bob = token(&k, Some("bob"), None);
+        assert!(call(&mut auth, &bob).is_err());
+        std::fs::remove_file(&file).unwrap();
+        auth.poll_once(LIMIT).await;
+        assert!(
+            call(&mut auth, &bob).is_err(),
+            "still revoked in the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_shared_revocations_error_is_returned() {
+        let k = keys();
+        let auth = with_source(&k, None, Some(FakeSource::new(Err("down".into()))));
+        assert_eq!(auth.load_shared_revocations().await, Err("down".into()));
+    }
+
+    #[tokio::test]
+    async fn watch_polls_the_database_without_a_file() {
+        let k = keys();
+        let source = FakeSource::new(Ok(vec![]));
+        let mut auth = with_source(&k, None, Some(source.clone()));
+        auth.load_shared_revocations().await.unwrap();
+        auth.watch_revocations(Duration::from_millis(50));
+        let t1 = token(&k, Some("alice"), Some("id-1"));
+        assert!(call(&mut auth, &t1).is_ok());
+        source.set(Ok(vec![Revocation::Id("id-1".into())]));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while call(&mut auth, &t1).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "never applied");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[test]
@@ -409,19 +605,6 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         assert!(auth.verifier.as_ref().unwrap().reload());
         assert!(call(&mut auth, &t1).is_ok());
-    }
-
-    #[test]
-    fn revocation_lines_round_trip() {
-        for r in [
-            Revocation::Id("abc".into()),
-            Revocation::Subject("ci".into()),
-        ] {
-            assert_eq!(Revocation::parse_line(&r.to_string()), Ok(Some(r)));
-        }
-        assert_eq!(Revocation::parse_line("  # note"), Ok(None));
-        assert!(Revocation::parse_line("token abc").is_err());
-        assert!(Revocation::parse_line("id   ").is_err());
     }
 
     #[test]

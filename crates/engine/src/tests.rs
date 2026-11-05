@@ -4,15 +4,19 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use apollo_config::{Config, DatabaseConfig, SqliteConfig};
 use apollo_domain::{
     ErrorKind, Input, Item, ItemState, MediaKind, ModelResult, ModelState, Task, TaskState,
 };
-use apollo_storage::{Storage, TaskQuery};
+use apollo_storage::{Fence, Storage, TaskQuery};
 
 use crate::{Engine, EngineError, Run, Submission};
+
+/// What a planted terminal write records about the finished webhook:
+/// pending, for any receiver, nobody's to deliver.
+const PLANTED: apollo_storage::Delivery<'static> = apollo_storage::Delivery::Open { target: None };
 
 struct Fixture {
     engine: Engine,
@@ -86,12 +90,16 @@ async fn poison_task_is_failed_reported_and_cleaned_up() {
     let f = fixture().await;
     let upload = staged_upload(&f.engine, "poison.bin");
     f.storage
-        .create_task(&task(
-            "t",
-            TaskState::Processing,
-            ItemState::Processing,
-            Some(upload.clone()),
-        ))
+        .create_task(
+            &task(
+                "t",
+                TaskState::Processing,
+                ItemState::Processing,
+                Some(upload.clone()),
+            ),
+            Some(&crashed_claim()),
+            None,
+        )
         .await
         .unwrap();
     // Three crashes already happened; this recovery is the fourth attempt.
@@ -113,11 +121,19 @@ async fn poison_task_is_failed_reported_and_cleaned_up() {
 async fn cancel_never_overwrites_a_finished_task() {
     let f = fixture().await;
     f.storage
-        .create_task(&task("q", TaskState::Queued, ItemState::Queued, None))
+        .create_task(
+            &task("q", TaskState::Queued, ItemState::Queued, None),
+            None,
+            None,
+        )
         .await
         .unwrap();
     f.storage
-        .create_task(&task("c", TaskState::Completed, ItemState::Completed, None))
+        .create_task(
+            &task("c", TaskState::Completed, ItemState::Completed, None),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -139,12 +155,16 @@ async fn cancelled_task_upload_is_removed_once_its_item_stops() {
     let f = fixture().await;
     let upload = staged_upload(&f.engine, "cancel.bin");
     f.storage
-        .create_task(&task(
-            "t",
-            TaskState::Processing,
-            ItemState::Processing,
-            Some(upload.clone()),
-        ))
+        .create_task(
+            &task(
+                "t",
+                TaskState::Processing,
+                ItemState::Processing,
+                Some(upload.clone()),
+            ),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -155,7 +175,14 @@ async fn cancelled_task_upload_is_removed_once_its_item_stops() {
 
     // The item reaches its cancellation checkpoint (what cancel_item persists).
     f.storage
-        .set_item_state("t", 0, ItemState::Cancelled, None)
+        .set_item_state(
+            "t",
+            0,
+            ItemState::Cancelled,
+            None,
+            Fence::Unchecked,
+            PLANTED,
+        )
         .await
         .unwrap();
     f.engine.rollup_task_state("t").await;
@@ -167,25 +194,126 @@ async fn cancelled_task_upload_is_removed_once_its_item_stops() {
     assert_eq!(t.state, TaskState::Cancelled);
 }
 
+/// The claim of a run that crashed: never handed back.
+fn crashed_claim() -> apollo_storage::Lease<'static> {
+    apollo_storage::Lease {
+        token: "crashed",
+        node: "gone",
+        process: "p",
+        ttl: Duration::from_secs(60),
+    }
+}
+
 #[tokio::test]
-async fn graceful_shutdown_does_not_count_as_a_crash() {
+async fn shutdown_hands_back_only_its_own_claims() {
     let f = fixture().await;
     f.storage
-        .create_task(&task(
-            "t",
-            TaskState::Processing,
-            ItemState::Processing,
+        .create_task(
+            &task("t", TaskState::Processing, ItemState::Processing, None),
+            Some(&crashed_claim()),
             None,
-        ))
+        )
         .await
         .unwrap();
-    f.storage.increment_attempts("t").await.unwrap();
-    f.storage.increment_attempts("t").await.unwrap();
+    // And one this engine runs.
+    let mine = apollo_storage::Lease {
+        token: "mine",
+        node: f.engine.node(),
+        ..crashed_claim()
+    };
+    f.storage
+        .create_task(
+            &task("m", TaskState::Processing, ItemState::Processing, None),
+            Some(&mine),
+            None,
+        )
+        .await
+        .unwrap();
+    let _run = f
+        .engine
+        .register("m", "mine".into(), Instant::now())
+        .unwrap();
 
     f.engine.shutdown().await;
 
-    // The next resume lands on 2, not 3.
-    assert_eq!(f.storage.increment_attempts("t").await.unwrap(), 2);
+    // Its own was handed back: taking it counts no attempt.
+    let later = apollo_storage::Lease {
+        token: "later",
+        ..crashed_claim()
+    };
+    assert_eq!(
+        f.storage
+            .claim_task(
+                "m",
+                &later,
+                apollo_storage::ClaimMode::Force,
+                Duration::ZERO
+            )
+            .await
+            .unwrap(),
+        Some(0)
+    );
+
+    // Not this engine's claim: still a crash's, so taking it over counts one.
+    let next = apollo_storage::Lease {
+        token: "next",
+        ..crashed_claim()
+    };
+    let attempts = f
+        .storage
+        .claim_task("t", &next, apollo_storage::ClaimMode::Force, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(attempts, Some(1));
+}
+
+#[tokio::test]
+async fn shutdown_hands_back_claims_of_stopped_runs() {
+    let f = fixture().await;
+    let mine = apollo_storage::Lease {
+        token: "stopped",
+        node: f.engine.node(),
+        ..crashed_claim()
+    };
+    f.storage
+        .create_task(
+            &task("s", TaskState::Processing, ItemState::Processing, None),
+            Some(&mine),
+            None,
+        )
+        .await
+        .unwrap();
+    // A run stopped for want of a renewal, which has ended, its claim not
+    // handed back yet.
+    f.engine
+        .inner
+        .unreleased
+        .lock()
+        .unwrap()
+        .push(apollo_storage::Held {
+            task_id: "s".into(),
+            token: "stopped".into(),
+        });
+
+    f.engine.shutdown().await;
+
+    let later = apollo_storage::Lease {
+        token: "later",
+        ..crashed_claim()
+    };
+    assert_eq!(
+        f.storage
+            .claim_task(
+                "s",
+                &later,
+                apollo_storage::ClaimMode::Force,
+                Duration::ZERO
+            )
+            .await
+            .unwrap(),
+        Some(0),
+        "handed back at shutdown: taking it counts no attempt"
+    );
 }
 
 #[tokio::test]
@@ -205,20 +333,27 @@ async fn upload_dir_is_private() {
 async fn status_reports_tasks_queue_and_models() {
     let f = fixture().await;
     f.storage
-        .create_task(&task("q", TaskState::Queued, ItemState::Queued, None))
-        .await
-        .unwrap();
-    f.storage
-        .create_task(&task("c", TaskState::Completed, ItemState::Completed, None))
-        .await
-        .unwrap();
-    f.storage
-        .create_task(&task(
-            "c2",
-            TaskState::Completed,
-            ItemState::Completed,
+        .create_task(
+            &task("q", TaskState::Queued, ItemState::Queued, None),
             None,
-        ))
+            None,
+        )
+        .await
+        .unwrap();
+    f.storage
+        .create_task(
+            &task("c", TaskState::Completed, ItemState::Completed, None),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    f.storage
+        .create_task(
+            &task("c2", TaskState::Completed, ItemState::Completed, None),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -246,7 +381,7 @@ async fn a_repeated_request_id_returns_the_existing_task() {
     let mut earlier = task("earlier", TaskState::Completed, ItemState::Completed, None);
     earlier.request_id = Some("order-7".into());
     earlier.owner = Some("alice".into());
-    f.storage.create_task(&earlier).await.unwrap();
+    f.storage.create_task(&earlier, None, None).await.unwrap();
 
     // The lookup comes first, so even a submission that would not validate
     // (no such model) gets the earlier task back.
@@ -367,7 +502,11 @@ async fn a_watch_follows_a_task_until_it_finishes() {
     // Writes through the engine's storage are announced.
     let storage = f.engine.inner.storage.clone();
     storage
-        .create_task(&task("w", TaskState::Queued, ItemState::Queued, None))
+        .create_task(
+            &task("w", TaskState::Queued, ItemState::Queued, None),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -380,29 +519,49 @@ async fn a_watch_follows_a_task_until_it_finishes() {
     let writer = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         storage
-            .set_item_state("w", 0, ItemState::Processing, None)
+            .set_item_state(
+                "w",
+                0,
+                ItemState::Processing,
+                None,
+                Fence::Unchecked,
+                PLANTED,
+            )
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let done = ModelResult::skipped();
         storage
-            .upsert_model_result("w", 0, "m", &done)
+            .upsert_model_result("w", 0, "m", &done, Fence::Unchecked)
             .await
             .unwrap();
         storage
-            .set_item_state("w", 0, ItemState::Completed, None)
+            .set_item_state(
+                "w",
+                0,
+                ItemState::Completed,
+                None,
+                Fence::Unchecked,
+                PLANTED,
+            )
             .await
             .unwrap();
         storage
-            .set_task_state("w", TaskState::Completed)
+            .set_task_state("w", TaskState::Completed, Fence::Unchecked)
             .await
             .unwrap();
     });
 
+    // Each write is announced: the watch keeps up well within the time it
+    // would take to read the task again on its own.
     let mut states = Vec::new();
-    while let Some(t) = watch.next().await.unwrap() {
-        states.push(t.state);
-    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(t) = watch.next().await.unwrap() {
+            states.push(t.state);
+        }
+    })
+    .await
+    .expect("announced changes arrive at once");
     writer.await.unwrap();
     assert_eq!(states.last(), Some(&TaskState::Completed));
     assert!(states.len() >= 2, "{states:?}");
@@ -415,12 +574,11 @@ async fn waiting_returns_the_finished_task_or_the_latest_state() {
     let storage = f.engine.inner.storage.clone();
     for id in ["slow", "fast"] {
         storage
-            .create_task(&task(
-                id,
-                TaskState::Processing,
-                ItemState::Processing,
+            .create_task(
+                &task(id, TaskState::Processing, ItemState::Processing, None),
                 None,
-            ))
+                None,
+            )
             .await
             .unwrap();
     }
@@ -440,7 +598,9 @@ async fn waiting_returns_the_finished_task_or_the_latest_state() {
     let s = storage.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(30)).await;
-        s.set_task_state("fast", TaskState::Failed).await.unwrap();
+        s.set_task_state("fast", TaskState::Failed, Fence::Unchecked)
+            .await
+            .unwrap();
     });
     let started = std::time::Instant::now();
     let fast = f
@@ -450,7 +610,8 @@ async fn waiting_returns_the_finished_task_or_the_latest_state() {
         .unwrap()
         .unwrap();
     assert_eq!(fast.state, TaskState::Failed);
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // Announced, so well before a watch would read it again anyway.
+    assert!(started.elapsed() < Duration::from_secs(1));
 
     assert!(
         f.engine
@@ -1100,6 +1261,236 @@ async fn a_cancel_ends_a_retry_backoff_at_once() {
     );
 }
 
+const NSFW_ONLY: &str = r#"
+    [models.nsfw]
+    architecture = "vit"
+    repo = "test/nsfw"
+"#;
+
+/// Run `task` as resumed work (the way `recover` starts it), to its end: the
+/// run claims it first, if it still may (otherwise its claim is one nobody
+/// stored, and its writes are fenced out).
+async fn run_resumed(engine: &Engine, task: Task) {
+    let token = uuid::Uuid::new_v4().to_string();
+    let sent = Instant::now();
+    let _ = engine
+        .inner
+        .storage
+        .claim_task(
+            &task.id,
+            &engine.lease(&token),
+            apollo_storage::ClaimMode::Force,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    let run = engine.register(&task.id, token, sent).unwrap();
+    let reservations = task
+        .items
+        .iter()
+        .map(|item| engine.reserve_resumed(&item.models))
+        .collect();
+    engine.run_task(task, run, reservations).await;
+}
+
+#[tokio::test]
+async fn a_late_runner_leaves_a_finished_task_as_it_ended() {
+    let f = fixture_with(NSFW_ONLY).await;
+    let late = |id: &str| {
+        let mut t = task(id, TaskState::Processing, ItemState::Queued, None);
+        t.items[0].models = vec!["nsfw".into()];
+        t.items[0].input = local_file_submission().input;
+        t
+    };
+    // Each finished after this runner loaded it: one cancelled (elsewhere,
+    // so this engine has no signal for it), one completed.
+    for id in ["cancelled", "completed"] {
+        f.storage.create_task(&late(id), None, None).await.unwrap();
+    }
+    assert!(f.storage.cancel_task_if_active("cancelled").await.unwrap());
+    assert!(
+        f.storage
+            .set_task_state("completed", TaskState::Completed, Fence::Unchecked)
+            .await
+            .unwrap()
+    );
+
+    for id in ["cancelled", "completed"] {
+        run_resumed(&f.engine, late(id)).await;
+    }
+    let cancelled = f.storage.get_task("cancelled").await.unwrap().unwrap();
+    assert_eq!(
+        cancelled.state,
+        TaskState::Cancelled,
+        "the start write lost"
+    );
+    assert!(cancelled.finished_at.is_some());
+    // Its item is finished, as cancelled, without being run (its refused
+    // input would have failed it).
+    assert_eq!(cancelled.items[0].state, ItemState::Cancelled);
+    let completed = f.storage.get_task("completed").await.unwrap().unwrap();
+    assert_eq!(completed.state, TaskState::Completed);
+    assert_eq!(completed.items[0].state, ItemState::Queued, "nothing ran");
+    assert_eq!(f.engine.status().await.unwrap().items_in_flight, 0);
+}
+
+#[tokio::test]
+async fn a_late_runner_leaves_a_finished_item_alone() {
+    let f = fixture_with(NSFW_ONLY).await;
+    // This runner's copy says queued; meanwhile another runner finished it.
+    let mut late = Task::new(
+        "t",
+        vec![Item::new(image(), vec!["nsfw".into()], None)],
+        None,
+    );
+    late.items[0].input = local_file_submission().input;
+    f.storage.create_task(&late, None, None).await.unwrap();
+    assert!(
+        f.storage
+            .set_item_state(
+                "t",
+                0,
+                ItemState::Completed,
+                None,
+                Fence::Unchecked,
+                PLANTED
+            )
+            .await
+            .unwrap()
+    );
+
+    run_resumed(&f.engine, late).await;
+    let stored = f.storage.get_task("t").await.unwrap().unwrap();
+    // Had it run, its refused input would have failed it.
+    assert_eq!(stored.items[0].state, ItemState::Completed);
+    assert_eq!(stored.items[0].error, None);
+    assert!(
+        stored.items[0]
+            .results
+            .values()
+            .all(|r| r.state != ModelState::Failed),
+        "{stored:?}"
+    );
+    assert_eq!(stored.state, TaskState::Completed, "the rollup still runs");
+}
+
+#[tokio::test]
+async fn a_keyed_tasks_id_comes_from_its_owner_and_key() {
+    let id = crate::request_task_id;
+    assert_eq!(id(Some("alice"), "r"), id(Some("alice"), "r"));
+    let ids = [
+        id(Some("alice"), "r"),
+        id(Some("bob"), "r"),
+        id(Some("alice"), "s"),
+        id(None, "r"),
+        id(Some(""), "r"),
+        // Where the owner ends can't be moved into the key.
+        id(Some("al"), "icer"),
+    ];
+    let distinct: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(distinct.len(), ids.len(), "{ids:?}");
+    for i in &ids {
+        uuid::Uuid::parse_str(i).unwrap();
+    }
+
+    // A task stored under the key's id after this instance looked for the
+    // key (by another instance) is the one the submission gets.
+    let f = fixture_with(NSFW_ONLY).await;
+    let first = Task::new(
+        id(None, "k"),
+        vec![Item::new(image(), vec!["nsfw".into()], None)],
+        None,
+    );
+    f.storage.create_task(&first, None, None).await.unwrap();
+    let keyed = Submission {
+        request_id: Some("k".into()),
+        ..local_file_submission()
+    };
+    let got = f.engine.submit(keyed, None).await.unwrap();
+    assert_eq!((got.id.as_str(), got.existing), (first.id.as_str(), true));
+    assert_eq!(f.engine.status().await.unwrap().items_in_flight, 0);
+    let text = f.engine.metrics_text().await.unwrap();
+    assert!(
+        text.contains("apollo_submissions_total{outcome=\"existing\"} 1"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn only_files_directly_in_the_upload_dir_are_read_or_removed() {
+    let f = fixture_with(NSFW_ONLY).await;
+    let dir = f.engine.ensure_upload_dir().unwrap();
+    for (path, staged) in [
+        (dir.join("a.bin"), true),
+        (dir.join("sub").join("a.bin"), false),
+        (dir.join("..").join("a.bin"), false),
+        (dir.clone(), false),
+        (PathBuf::from("/etc/hosts"), false),
+    ] {
+        assert_eq!(f.engine.is_staged_upload(&path), staged, "{path:?}");
+    }
+
+    // A task row pointing elsewhere: the file is neither read nor removed.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let file = elsewhere.path().join("private.png");
+    std::fs::write(&file, b"keep me").unwrap();
+    let mut row = task(
+        "t",
+        TaskState::Queued,
+        ItemState::Queued,
+        Some(file.clone()),
+    );
+    row.items[0].models = vec!["nsfw".into()];
+    f.storage.create_task(&row, None, None).await.unwrap();
+    assert_eq!(f.engine.recover().await.unwrap(), 1);
+    in_flight_drops_to_zero(&f.engine).await;
+    let stored = f.storage.get_task("t").await.unwrap().unwrap();
+    let error = stored.items[0].error.clone().unwrap();
+    assert_eq!(error.kind, ErrorKind::Fetch, "{error:?}");
+    assert!(error.message.contains("not an upload"), "{error:?}");
+    assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
+}
+
+#[tokio::test]
+async fn a_watch_sees_changes_nobody_announced() {
+    let f = fixture().await;
+    f.storage
+        .create_task(
+            &task("t", TaskState::Processing, ItemState::Processing, None),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut watch = f.engine.watch("t");
+    assert_eq!(
+        watch.next().await.unwrap().unwrap().state,
+        TaskState::Processing
+    );
+    // Written past this engine, as another instance would: not announced.
+    f.storage
+        .set_item_state(
+            "t",
+            0,
+            ItemState::Completed,
+            None,
+            Fence::Unchecked,
+            PLANTED,
+        )
+        .await
+        .unwrap();
+    f.storage
+        .set_task_state("t", TaskState::Completed, Fence::Unchecked)
+        .await
+        .unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(10), watch.next())
+        .await
+        .expect("the watch reads the task again")
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen.state, TaskState::Completed);
+}
+
 /// A webhook receiver that records each event: its kind, task and task state.
 #[derive(Default)]
 struct Recorder(std::sync::Mutex<Vec<(crate::EventKind, String, TaskState)>>);
@@ -1110,6 +1501,10 @@ impl crate::WebhookSink for Recorder {
         let mut events = self.0.lock().unwrap();
         events.push((event.kind, event.task.id.clone(), event.task.state));
         Ok(())
+    }
+
+    fn target(&self) -> String {
+        "test://recorder".into()
     }
 }
 
@@ -1177,20 +1572,208 @@ async fn with_webhooks_off_nothing_is_kept_to_send_later() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // The item's finish is recorded as handled, so turning webhooks on later
-    // doesn't send events for tasks that finished while they were off.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let pending = f.storage.items_pending_webhook().await.unwrap();
-        if pending.is_empty() {
-            break;
+    assert_eq!(
+        f.storage.get_task(&id).await.unwrap().unwrap().state,
+        TaskState::Failed
+    );
+    // The item's finish is recorded as handled (in the write that finished
+    // it), so turning webhooks on later doesn't send events for tasks that
+    // finished while they were off.
+    let pending = f.storage.items_pending_webhook().await.unwrap();
+    assert!(
+        pending.is_empty(),
+        "left pending with webhooks off: {pending:?}"
+    );
+}
+
+/// A webhook receiver for the delivery tests: records events as [`Recorder`]
+/// does, and of the finished ones holds the first for `hold_first` and
+/// refuses the next `fail`.
+#[derive(Default)]
+struct Flaky {
+    recorder: Recorder,
+    hold_first: Duration,
+    fail: std::sync::atomic::AtomicUsize,
+    /// Finished events it was sent.
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::WebhookSink for Flaky {
+    async fn deliver(&self, event: &crate::TaskEvent) -> Result<(), crate::WebhookError> {
+        use std::sync::atomic::Ordering;
+        if event.kind != crate::EventKind::Finished {
+            return self.recorder.deliver(event).await;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "left pending with webhooks off: {pending:?}"
-        );
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            tokio::time::sleep(self.hold_first).await;
+        }
+        if self
+            .fail
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(crate::WebhookError("refused".into()));
+        }
+        self.recorder.deliver(event).await
+    }
+
+    fn target(&self) -> String {
+        "test://recorder".into()
+    }
+}
+
+impl Flaky {
+    fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// An engine on SQLite with webhook `sink`, and `toml` besides the nsfw model.
+async fn engine_with_sink(
+    toml: &str,
+    sink: Arc<dyn crate::WebhookSink>,
+) -> (Engine, Arc<dyn Storage>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(&dir, &format!("{toml}{NSFW}"));
+    let storage = apollo_storage::open(&config.database).await.unwrap();
+    let engine = Engine::new(Arc::new(config), storage.clone(), Some(sink));
+    (engine, storage, dir)
+}
+
+/// Wait until `id`'s item has finished, and its finished webhook is no longer
+/// pending.
+async fn wait_delivered(storage: &Arc<dyn Storage>, id: &str, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    loop {
+        let task = storage.get_task(id).await.unwrap().unwrap();
+        let pending = storage.items_pending_webhook().await.unwrap();
+        if crate::aggregate::item_terminal(task.items[0].state)
+            && !pending.iter().any(|p| p.task_id == id)
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "still pending: {pending:?}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test]
+async fn redelivery_skips_an_item_being_delivered_here() {
+    let sink = Arc::new(Flaky {
+        hold_first: Duration::from_millis(2500),
+        ..Default::default()
+    });
+    let webhook = "[webhook]\nurl = \"http://127.0.0.1:1\"\nredelivery_secs = 1\n";
+    let (engine, storage, _dir) = engine_with_sink(webhook, sink.clone()).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    // The first delivery takes 2.5 s, through two rounds of redelivery.
+    wait_delivered(&storage, &id, Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(sink.recorder.finished(&id), [TaskState::Failed]);
+    assert_eq!(sink.attempts(), 1, "delivered again while being delivered");
+}
+
+#[tokio::test]
+async fn a_restart_delivers_what_the_last_process_had_claimed() {
+    let sink = Arc::new(Recorder::default());
+    let (engine, storage, _dir) = engine_with_sink("", sink.clone()).await;
+    // Finished by the last process, which was delivering its webhook (for an
+    // hour yet) when it stopped.
+    storage
+        .create_task(
+            &task("t", TaskState::Processing, ItemState::Processing, None),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let claim = apollo_storage::Delivery::Claim {
+        holder: "old/proc",
+        target: "test://recorder",
+        ttl: Duration::from_secs(3600),
+    };
+    assert!(
+        storage
+            .set_item_state("t", 0, ItemState::Completed, None, Fence::Unchecked, claim)
+            .await
+            .unwrap()
+    );
+    assert!(
+        storage
+            .set_task_state("t", TaskState::Completed, Fence::Unchecked)
+            .await
+            .unwrap()
+    );
+
+    // One process per SQLite database: its start sends it at once.
+    engine.recover().await.unwrap();
+    wait_delivered(&storage, "t", Duration::from_secs(5)).await;
+    assert_eq!(sink.finished("t"), [TaskState::Completed]);
+}
+
+#[tokio::test]
+async fn a_failed_delivery_hands_its_claim_back() {
+    let sink = Arc::new(Flaky {
+        fail: 3.into(),
+        ..Default::default()
+    });
+    let (engine, storage, _dir) = engine_with_sink("", sink.clone()).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    // Three attempts, over about 4 s, then the claim is handed back: anyone
+    // may take it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let taken = storage
+            .claim_pending_webhooks(
+                "other/proc",
+                None,
+                apollo_storage::ClaimMode::Open,
+                Duration::from_secs(60),
+                100,
+            )
+            .await
+            .unwrap();
+        if taken.iter().any(|p| p.task_id == id) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the claim wasn't handed back");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(sink.attempts(), 3);
+    assert!(sink.recorder.finished(&id).is_empty());
+}
+
+#[tokio::test]
+async fn turning_webhooks_off_settles_this_instances_deliveries() {
+    let sink = Arc::new(Flaky {
+        fail: 1.into(),
+        ..Default::default()
+    });
+    let (engine, storage, dir) = engine_with_sink("", sink.clone()).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    // The first attempt fails; before the next, webhooks are turned off.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sink.attempts() == 0 {
+        assert!(Instant::now() < deadline, "never delivered");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    engine.reload(config_in(&dir, NSFW), None).await.unwrap();
+    // The next attempt finds them off, and marks the item: nothing is kept.
+    wait_delivered(&storage, &id, Duration::from_secs(5)).await;
+    assert_eq!(sink.attempts(), 1);
 }
 
 #[tokio::test]
@@ -1219,4 +1802,545 @@ async fn a_rollup_that_fails_is_tried_again() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// An engine with one slot and a one-second lease, on SQLite behind a
+/// [`Stalled`](crate::testing::Stalled) store. With `shared`, the store says
+/// it is shared, so the engine renews its leases as on SurrealDB.
+async fn stalled_engine(
+    shared: bool,
+) -> (
+    Engine,
+    Arc<dyn Storage>,
+    crate::testing::StallGate,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config_in(&dir, &format!("[app]\nmax_concurrent = 1\n{NSFW}"));
+    config.database.lease_secs = 1;
+    let sqlite = apollo_storage::open(&config.database).await.unwrap();
+    let (stalled, gate) = if shared {
+        crate::testing::Stalled::new_shared(sqlite.clone())
+    } else {
+        crate::testing::Stalled::new(sqlite.clone())
+    };
+    let engine = Engine::new(Arc::new(config), Arc::new(stalled), None);
+    (engine, sqlite, gate, dir)
+}
+
+fn in_flight(engine: &Engine) -> usize {
+    engine
+        .inner
+        .in_flight
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether the run of `id` has lost its claim; `None` when there is none.
+fn run_lost(engine: &Engine, id: &str) -> Option<bool> {
+    engine.inner.runs.lock().unwrap().get(id).map(|r| r.lost())
+}
+
+/// Whether `done` turned true within `limit`.
+async fn wait_within(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + limit;
+    while !done() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    true
+}
+
+#[tokio::test]
+async fn a_run_without_confirmed_renewals_stops_within_its_lease() {
+    let (engine, sqlite, gate, _dir) = stalled_engine(true).await;
+    // The only slot is taken, so the item waits for it.
+    let slot = engine.inner.gate.clone().acquire(0).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    assert!(wait_within(Duration::from_secs(2), || in_flight(&engine) == 1).await);
+    // Renewals that answer keep it going past its first lease.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(run_lost(&engine, &id), Some(false));
+
+    // The database stops answering: the run goes on for a while, then stops
+    // before its lease can lapse.
+    gate.shut();
+    let shut = Instant::now();
+    let stopped = wait_within(Duration::from_secs(2), || {
+        in_flight(&engine) == 0 && engine.inner.runs.lock().unwrap().is_empty()
+    })
+    .await;
+    let took = shut.elapsed();
+    assert!(stopped, "the run never stopped");
+    assert!(
+        took >= Duration::from_millis(400) && took < Duration::from_secs(1),
+        "stopped {took:?} after the database went away"
+    );
+    // It wrote nothing: the item wasn't cancelled.
+    let stored = sqlite.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(
+        (stored.state, stored.items[0].state),
+        (TaskState::Processing, ItemState::Queued)
+    );
+    // Its claim comes back once the database answers, not before.
+    let grace = Duration::from_secs(10);
+    let open = || async {
+        sqlite
+            .claimable_tasks(
+                apollo_storage::ClaimMode::Open,
+                engine.node(),
+                &[],
+                grace,
+                None,
+                10,
+            )
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.id == id)
+    };
+    assert!(!open().await, "handed back while the database was away");
+    gate.open();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !(open().await && engine.inner.unreleased.lock().unwrap().is_empty()) {
+        assert!(Instant::now() < deadline, "the claim wasn't handed back");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Handed back: the next claim counts no attempt.
+    let next = apollo_storage::Lease {
+        token: "next",
+        node: engine.node(),
+        process: "p",
+        ttl: Duration::from_secs(60),
+    };
+    assert_eq!(
+        sqlite
+            .claim_task(&id, &next, apollo_storage::ClaimMode::Open, grace)
+            .await
+            .unwrap(),
+        Some(0)
+    );
+    drop(slot);
+}
+
+#[tokio::test]
+async fn renewals_that_answer_keep_a_run_going() {
+    let (engine, sqlite, _gate, _dir) = stalled_engine(true).await;
+    let slot = engine.inner.gate.clone().acquire(0).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    // Three leases on, renewals still confirm the claim.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(run_lost(&engine, &id), Some(false));
+    assert_eq!(in_flight(&engine), 1);
+
+    // With the slot, the item runs to its end, as without leases.
+    drop(slot);
+    assert!(
+        wait_within(Duration::from_secs(5), || {
+            in_flight(&engine) == 0 && engine.inner.runs.lock().unwrap().is_empty()
+        })
+        .await
+    );
+    let stored = sqlite.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Failed, "local files are refused");
+    let pending = sqlite.items_pending_webhook().await.unwrap();
+    assert!(
+        pending.iter().all(|p| p.task_id != id),
+        "its finished webhook is left pending: {pending:?}"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_runs_have_no_renewal_limit() {
+    let (engine, sqlite, gate, _dir) = stalled_engine(false).await;
+    let slot = engine.inner.gate.clone().acquire(0).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    // Nothing renews a lease on SQLite, so an outage stops nothing.
+    gate.shut();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(run_lost(&engine, &id), Some(false));
+
+    gate.open();
+    drop(slot);
+    assert!(
+        wait_within(Duration::from_secs(5), || {
+            in_flight(&engine) == 0 && engine.inner.runs.lock().unwrap().is_empty()
+        })
+        .await
+    );
+    let stored = sqlite.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Failed);
+}
+
+#[tokio::test]
+async fn deadlines_come_five_sixths_into_the_lease() {
+    let ms = Duration::from_millis;
+    let ns = Duration::from_nanos;
+    for (lease_secs, period, limit) in [
+        (30, ms(10_000), ms(25_000)),
+        (1, ns(333_333_333), ns(833_333_333)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_in(&dir, "");
+        config.database.lease_secs = lease_secs;
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        let engine = Engine::new(Arc::new(config), storage, None);
+        let ttl = Duration::from_secs(lease_secs.into());
+        assert_eq!(engine.unconfirmed_limit(), limit);
+        // No run: a renewal period.
+        assert_eq!(engine.next_deadline(), period);
+
+        // The earliest deadline among the runs going.
+        let fresh = engine.register("1", "t".into(), Instant::now()).unwrap();
+        let left = engine.next_deadline();
+        assert!(
+            left <= limit && left > limit * 9 / 10,
+            "{left:?} of {ttl:?}"
+        );
+        let late = engine
+            .register("2", "t".into(), Instant::now() - ttl * 17 / 30)
+            .unwrap();
+        let left = engine.next_deadline();
+        assert!(
+            left <= ttl * 8 / 30 && left > ttl * 7 / 30,
+            "{left:?} of {ttl:?}"
+        );
+        // Past it: due now.
+        let lapsed = engine
+            .register("3", "t".into(), Instant::now() - ttl * 4 / 3)
+            .unwrap();
+        assert_eq!(engine.next_deadline(), Duration::ZERO);
+        // A confirmation moves a deadline on, never back.
+        lapsed.ctl.confirm(Instant::now());
+        late.ctl.confirm(Instant::now());
+        assert!(engine.next_deadline() > limit * 9 / 10);
+        lapsed.ctl.confirm(Instant::now() - ttl);
+        assert!(engine.next_deadline() > limit * 9 / 10);
+        drop((fresh, late, lapsed));
+    }
+}
+
+#[tokio::test]
+async fn a_run_claimed_late_stops_at_its_deadline() {
+    // A one-second lease: the deadline is 5/6 of a second after the claim.
+    let (engine, _sqlite, gate, _dir) = stalled_engine(true).await;
+    gate.shut();
+    // Its claim's write was slow: sent 700 ms ago.
+    let run = engine
+        .register(
+            "slow",
+            "t".into(),
+            Instant::now() - Duration::from_millis(700),
+        )
+        .unwrap();
+    let start = Instant::now();
+    assert!(wait_within(Duration::from_millis(400), || run.ctl.lost()).await);
+    let took = start.elapsed();
+    // About 133 ms on: at its deadline, not a renewal (and its limit) later.
+    assert!(
+        took >= Duration::from_millis(100) && took < Duration::from_millis(300),
+        "stopped {took:?} after registering"
+    );
+    assert!(
+        engine
+            .inner
+            .unreleased
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.task_id == "slow"),
+        "kept to hand back"
+    );
+    gate.open();
+}
+
+/// A `pdq` model `hash` whose block list (in `dir`) lists `ab…ab` as
+/// category `id`, with categories 1 = known and 2 = other; matching any image.
+fn pdq_config(dir: &std::path::Path, id: u32) -> String {
+    let list = dir.join("list.txt");
+    std::fs::write(&list, format!("{} {id}\n", "ab".repeat(32))).unwrap();
+    format!(
+        "[cache]\n[models.hash]\narchitecture = \"pdq\"\nhash_list = \"{}\"\n\
+         categories = {{ 1 = \"known\", 2 = \"other\" }}\nmax_distance = 256\nmin_quality = 0\n",
+        list.display()
+    )
+}
+
+/// A 64×64 binary PPM image, its pixels varied by `seed`.
+fn ppm(seed: u8) -> Vec<u8> {
+    let mut bytes = b"P6\n64 64\n255\n".to_vec();
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            bytes.extend([
+                (x * 4) as u8 ^ seed,
+                (y * 4) as u8,
+                ((x + y) * 2) as u8 ^ seed,
+            ]);
+        }
+    }
+    bytes
+}
+
+/// Classify `input` with `hash`, and the category names it answered.
+async fn classify_hash(engine: &Engine, storage: &Arc<dyn Storage>, input: Input) -> Vec<String> {
+    let submission = Submission {
+        input,
+        run: Run::Models(vec!["hash".into()]),
+        metadata: Default::default(),
+        request_id: None,
+    };
+    let id = engine.submit(submission, None).await.unwrap().id;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let task = loop {
+        let task = storage.get_task(&id).await.unwrap().unwrap();
+        if crate::aggregate::task_terminal(task.state) {
+            break task;
+        }
+        assert!(Instant::now() < deadline, "{id} didn't finish");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    match &task.items[0].results["hash"].output {
+        Some(apollo_domain::ModelOutput::Classification(c)) => {
+            c.predictions.iter().map(|p| p.name.clone()).collect()
+        }
+        other => panic!("no classification: {other:?} in {task:?}"),
+    }
+}
+
+/// An upload of `bytes`, staged for `engine`.
+fn upload(engine: &Engine, bytes: &[u8]) -> Input {
+    let path = engine
+        .ensure_upload_dir()
+        .unwrap()
+        .join(format!("{}.bin", uuid::Uuid::new_v4()));
+    std::fs::write(&path, bytes).unwrap();
+    Input::Bytes {
+        path,
+        kind: MediaKind::Image,
+    }
+}
+
+fn cache_hits(engine: &Engine) -> u64 {
+    engine
+        .inner
+        .metrics
+        .cache_hits
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tokio::test]
+async fn a_restart_with_the_same_config_hits_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(&dir, &pdq_config(dir.path(), 1));
+    let image = ppm(7);
+    {
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        let engine = Engine::new(Arc::new(config.clone()), storage.clone(), None);
+        let input = upload(&engine, &image);
+        assert_eq!(classify_hash(&engine, &storage, input).await, ["known"]);
+        assert_eq!(cache_hits(&engine), 0);
+    }
+    // The next process, with the same config: the key is the same.
+    let storage = apollo_storage::open(&config.database).await.unwrap();
+    let engine = Engine::new(Arc::new(config), storage.clone(), None);
+    let input = upload(&engine, &image);
+    assert_eq!(classify_hash(&engine, &storage, input).await, ["known"]);
+    assert_eq!(cache_hits(&engine), 1);
+}
+
+#[tokio::test]
+async fn a_reload_that_changes_a_list_misses_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = pdq_config(dir.path(), 1);
+    let storage;
+    let engine = {
+        let config = config_in(&dir, &toml);
+        storage = apollo_storage::open(&config.database).await.unwrap();
+        Engine::new(Arc::new(config), storage.clone(), None)
+    };
+    let image = ppm(7);
+    assert_eq!(
+        classify_hash(&engine, &storage, upload(&engine, &image)).await,
+        ["known"]
+    );
+
+    // The same config text, the list rewritten: a new key, so the image is
+    // classified again, by the new list.
+    let toml_other = pdq_config(dir.path(), 2);
+    assert_eq!(toml_other, toml, "only the list's contents changed");
+    engine.reload(config_in(&dir, &toml), None).await.unwrap();
+    assert_eq!(
+        classify_hash(&engine, &storage, upload(&engine, &image)).await,
+        ["other"]
+    );
+    assert_eq!(cache_hits(&engine), 0);
+
+    // Scheduling settings keep the key.
+    let scheduling = toml.replace(
+        "min_quality = 0\n",
+        "min_quality = 0\ntimeout = 7\npriority = 3\nmax_pending = 9\nmax_concurrent = 2\n",
+    );
+    engine
+        .reload(config_in(&dir, &scheduling), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        classify_hash(&engine, &storage, upload(&engine, &image)).await,
+        ["other"]
+    );
+    assert_eq!(cache_hits(&engine), 1);
+}
+
+#[tokio::test]
+async fn local_paths_skip_the_url_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = tempfile::tempdir().unwrap();
+    let toml = format!(
+        "[limits]\nallow_local_files = true\nlocal_roots = [\"{}\"]\n{}",
+        files.path().display(),
+        pdq_config(dir.path(), 1)
+    );
+    let config = config_in(&dir, &toml);
+    let storage = apollo_storage::open(&config.database).await.unwrap();
+    let engine = Engine::new(Arc::new(config), storage.clone(), None);
+    let path = files.path().join("a.ppm");
+    let url = format!("file://{}", path.display());
+    let input = || {
+        Input::Image(apollo_domain::Url {
+            main: url.clone(),
+            fallback: None,
+        })
+    };
+
+    std::fs::write(&path, ppm(7)).unwrap();
+    assert_eq!(classify_hash(&engine, &storage, input()).await, ["known"]);
+    let key = engine.cache_key("hash").unwrap();
+    let url_hash = sha256_hex(url.as_bytes());
+    assert_eq!(
+        storage
+            .url_cache_lookup(&url_hash, "hash", &key, 0)
+            .await
+            .unwrap(),
+        None,
+        "a local path's hint was recorded"
+    );
+    // The file at that path rewritten: read again, not taken for the old one.
+    std::fs::write(&path, ppm(99)).unwrap();
+    assert_eq!(classify_hash(&engine, &storage, input()).await, ["known"]);
+    assert_eq!(cache_hits(&engine), 0);
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn an_image_and_a_video_of_the_same_bytes_are_cached_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(&dir, &pdq_config(dir.path(), 1));
+    let storage = apollo_storage::open(&config.database).await.unwrap();
+    let engine = Engine::new(Arc::new(config), storage, None);
+    let url = |main: &str| apollo_domain::Url {
+        main: main.into(),
+        fallback: None,
+    };
+    let image = engine.item_cache_key("hash", Some(&Input::Image(url("http://h/a.gif"))));
+    let video = engine.item_cache_key("hash", Some(&Input::Video(url("http://h/a.gif"))));
+    let plain = engine.cache_key("hash").map(|k| k.to_string());
+    assert_eq!(image, plain, "an image: the model's key");
+    assert_ne!(video, image, "a video: a key of its own");
+    assert_eq!(
+        engine.item_cache_key("hash", None),
+        plain,
+        "text read from either"
+    );
+}
+
+#[tokio::test]
+async fn a_stopping_engine_takes_no_deliveries() {
+    let sink = Arc::new(Recorder::default());
+    let (engine, storage, _dir) = engine_with_sink("", sink.clone()).await;
+    storage
+        .create_task(
+            &task("t", TaskState::Processing, ItemState::Processing, None),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .set_item_state(
+                "t",
+                0,
+                ItemState::Completed,
+                None,
+                Fence::Unchecked,
+                PLANTED
+            )
+            .await
+            .unwrap()
+    );
+    engine.shutdown().await;
+    engine.redeliver_pending().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(sink.finished("t").is_empty());
+    let pending = storage.items_pending_webhook().await.unwrap();
+    assert_eq!(pending.len(), 1, "left pending: {pending:?}");
+}
+
+#[tokio::test]
+async fn a_restart_sends_every_pending_event() {
+    // More than a shared database's batch: SQLite sends them all at once.
+    let sink = Arc::new(Recorder::default());
+    let (engine, storage, _dir) = engine_with_sink("", sink.clone()).await;
+    let n = 600;
+    for i in 0..n {
+        let id = format!("t{i}");
+        storage
+            .create_task(
+                &task(&id, TaskState::Processing, ItemState::Processing, None),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .set_item_state(
+                    &id,
+                    0,
+                    ItemState::Completed,
+                    None,
+                    Fence::Unchecked,
+                    PLANTED
+                )
+                .await
+                .unwrap()
+        );
+    }
+    engine.recover().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !storage.items_pending_webhook().await.unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "still pending after the restart");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(sink.finished("t0").len(), 1);
 }

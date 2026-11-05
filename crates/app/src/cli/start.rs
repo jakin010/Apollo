@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use clap::Args;
 
-use apollo_config::{AuthConfig, Config, Overrides, TlsConfig, load};
+use apollo_config::{Config, Overrides, TlsConfig, load};
 use apollo_engine::{Engine, WebhookSink};
 
 #[derive(Args)]
@@ -107,9 +107,12 @@ async fn serve(
 
     let webhook = webhook_sink(&config)?;
 
-    // Engine::new spawns background tasks, so it must run inside the runtime.
+    // Engine::with_node spawns background tasks, so it must run inside the runtime.
+    let node = node_id(&config).context("reading the node id")?;
     let config = Arc::new(config);
-    let engine = Engine::new(config.clone(), storage, webhook);
+    // Kept for the shared auth key and revocations.
+    let db = Arc::clone(&storage);
+    let engine = Engine::with_node(config.clone(), storage, webhook, node);
     let reloader = Reloader {
         engine: engine.clone(),
         source,
@@ -118,17 +121,33 @@ async fn serve(
     reload_on_hangup(reloader.clone());
     let _metrics = start_metrics(&config.metrics, engine.clone()).await?;
 
-    let resumed = engine.recover().await.context("recovering tasks")?;
-    if resumed > 0 {
-        tracing::info!(resumed, "re-queued in-flight tasks from a previous run");
-    }
-
     // Owns the PID file for this process; removed on graceful shutdown.
     let _pidfile = crate::daemon::PidFile::create()?;
 
-    let auth = configure_auth(&config.auth)?;
+    let auth = configure_auth(&config, &db, engine.node()).await?;
     auth.watch_revocations(REVOCATION_POLL);
     let tls = load_tls(config.tls.as_ref())?;
+
+    // Take the port before any task: a second start on the same database
+    // (and port) must fail before it claims anything.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+
+    // Take tasks over only once nothing above can fail the start: a failed
+    // start would leave its claims to lapse, which the next start counts as a
+    // crash of each task.
+    let resumed = match engine.recover().await {
+        Ok(n) => n,
+        Err(e) => {
+            // Hand back whatever it took before failing.
+            engine.shutdown().await;
+            return Err(e).context("recovering tasks");
+        }
+    };
+    if resumed > 0 {
+        tracing::info!(resumed, "re-queued in-flight tasks from a previous run");
+    }
     if tls.is_none() && !addr.ip().is_loopback() {
         tracing::warn!(
             %addr,
@@ -145,28 +164,84 @@ async fn serve(
         mutual_tls: tls.as_ref().is_some_and(|t| t.client_ca_pem.is_some()),
         auth: auth.is_enabled(),
         config_file: config_file.map(|p| p.display().to_string()),
-        database: describe_database(&config.database),
+        database: match config.database.backend {
+            // Instances sharing the database tell each other apart by node.
+            apollo_config::Backend::Surrealdb => format!(
+                "{} (node {})",
+                describe_database(&config.database),
+                engine.node()
+            ),
+            _ => describe_database(&config.database),
+        },
         log_file: std::env::var(DAEMON_LOG_ENV).ok(),
     };
     let _status_socket = start_status_socket(engine.clone(), info, reloader);
 
     tracing::info!(%addr, models = config.model_count(), "apollo listening");
-    apollo_server::serve_with_shutdown(
+    let served = apollo_server::serve_on(
         engine.clone(),
-        addr,
+        listener,
         crate::daemon::shutdown_signal(),
         auth,
         tls,
     )
-    .await
-    .context("gRPC server error")?;
+    .await;
 
-    // A clean stop must not count toward the poison-task cap for whatever was
-    // still in flight; those tasks resume on the next start.
+    // Hand unfinished tasks back, also when serving failed: a clean stop must
+    // not count toward the poison-task cap for whatever was still in flight,
+    // and the next start (or another instance) takes them at once.
     engine.shutdown().await;
+    served.context("gRPC server error")?;
 
     tracing::info!("apollo shut down cleanly");
     Ok(())
+}
+
+/// This instance's node id: `[app].node_id`, or one kept in the state directory
+/// for its upload directory (two instances on one machine with their own cache
+/// directories are two nodes), made on first use.
+pub(super) fn node_id(config: &Config) -> anyhow::Result<String> {
+    if let Some(node) = &config.app.node_id {
+        return Ok(node.clone());
+    }
+    let uploads = match &config.app.cache_dir {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("apollo"),
+    };
+    // The same string whether or not the directory exists yet (it's made by
+    // the first upload), so the id doesn't change once it does.
+    let uploads = std::path::absolute(&uploads).unwrap_or(uploads);
+    let uploads = uploads
+        .to_string_lossy()
+        .trim_end_matches(std::path::MAIN_SEPARATOR)
+        .to_string();
+    // FNV-1a: a stable name for the directory, not a security boundary.
+    let key = uploads.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let path = crate::daemon::state_dir()?.join(format!("node-{key:016x}"));
+    let read = |path: &std::path::Path| -> Option<String> {
+        let id = std::fs::read_to_string(path).ok()?.trim().to_string();
+        (!id.is_empty()).then_some(id)
+    };
+    if let Some(id) = read(&path) {
+        return Ok(id);
+    }
+    // Written aside, then linked into place: two starts racing agree on one.
+    let id = format!("n-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, &id).with_context(|| format!("writing {}", tmp.display()))?;
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(id),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            read(&path).ok_or_else(|| anyhow!("{} is empty", path.display()))
+        }
+        Err(e) => Err(e).with_context(|| format!("writing {}", path.display())),
+    }
 }
 
 /// Set by `start --daemon` for the detached child: the log file it writes to.
@@ -459,7 +534,13 @@ fn load_tls(tls: Option<&TlsConfig>) -> anyhow::Result<Option<apollo_server::Tls
 /// Build the auth interceptor. Authentication is on unless the config says
 /// `[auth] enabled = false`; without a configured `public_key` the server uses
 /// (creating it on first start) the local keypair that `apollo token` reads.
-fn configure_auth(auth: &AuthConfig) -> anyhow::Result<apollo_server::AuthInterceptor> {
+async fn configure_auth(
+    config: &Config,
+    storage: &Arc<dyn apollo_storage::Storage>,
+    node: &str,
+) -> anyhow::Result<apollo_server::AuthInterceptor> {
+    use super::keys::{KeyChoice, within_db_timeout};
+    let auth = &config.auth;
     if !auth.enabled {
         tracing::warn!(
             "authentication is DISABLED ([auth] enabled = false): anyone who can reach this \
@@ -467,36 +548,112 @@ fn configure_auth(auth: &AuthConfig) -> anyhow::Result<apollo_server::AuthInterc
         );
         return Ok(apollo_server::AuthInterceptor::disabled());
     }
-    let public_key = match &auth.public_key {
-        Some(key) => {
-            tracing::info!("PASETO authentication enabled (configured public key)");
-            key.clone()
-        }
-        None => {
-            let (key, path, created) = super::keys::load_or_create_local_keypair()
-                .context("preparing the local signing keypair")?;
-            if created {
-                tracing::info!(path = %path.display(), "generated a new signing keypair");
+    let shared = storage.shared().then(|| storage.as_ref());
+    let local_path = super::keys::local_key_path()?;
+    let secs = config.database.timeout;
+    let (public_key, choice) = within_db_timeout(
+        secs,
+        super::keys::resolve_public_key(auth, shared, node, &local_path),
+    )
+    .await
+    .context("resolving the auth public key")?;
+    let path = local_path.display();
+    match &choice {
+        KeyChoice::Local { created } => {
+            if *created {
+                tracing::info!(%path, "generated a new signing keypair");
             }
             tracing::info!(
-                path = %path.display(),
+                %path,
                 "PASETO authentication enabled (local keypair); mint client tokens with \
                  `apollo token --subject NAME`"
             );
-            key
         }
-    };
+        KeyChoice::Configured { published: false } if shared.is_none() => {
+            tracing::info!("PASETO authentication enabled (configured public key)")
+        }
+        KeyChoice::Configured { published } => tracing::info!(
+            key = %public_key,
+            "PASETO authentication enabled (configured public key, {})",
+            if *published {
+                "published to the database"
+            } else {
+                "matches the database's"
+            }
+        ),
+        KeyChoice::Published { created } => {
+            if *created {
+                tracing::info!(%path, "generated a new signing keypair");
+            }
+            tracing::info!(
+                %path,
+                key = %public_key,
+                "PASETO authentication enabled: published this host's public key to the \
+                 database; every instance sharing it verifies tokens with it — mint tokens on \
+                 this host"
+            );
+        }
+        KeyChoice::SharedLocal => tracing::info!(
+            %path,
+            key = %public_key,
+            "PASETO authentication enabled (local keypair, which is the database's shared key)"
+        ),
+        KeyChoice::Database { node: from, local } => {
+            let from = from.as_deref().unwrap_or("(unknown)");
+            match local {
+                None => tracing::info!(
+                    key = %public_key,
+                    node = from,
+                    "PASETO authentication enabled, with the database's shared public key; mint \
+                     tokens on that node or with its secret key"
+                ),
+                Some((_, true)) => tracing::info!(
+                    key = %public_key,
+                    node = from,
+                    "PASETO authentication enabled: another instance published its key first; \
+                     using it"
+                ),
+                Some((_, false)) => tracing::warn!(
+                    %path,
+                    key = %public_key,
+                    node = from,
+                    "this host's local keypair is not the database's shared key: tokens signed \
+                     with it are rejected here and on every instance sharing the database"
+                ),
+            }
+        }
+    }
     let revocation_file = super::keys::revocation_file(auth)?;
     if !auth.admin_subjects.is_empty() {
         tracing::info!(admins = ?auth.admin_subjects, "admin subjects may access every task");
     }
+    let shared_revocations = shared.map(|_| {
+        Arc::new(super::keys::DbRevocations(Arc::clone(storage)))
+            as Arc<dyn apollo_server::RevocationSource>
+    });
     let interceptor = apollo_server::AuthInterceptor::new(apollo_server::AuthSettings {
         public_key,
         admin_subjects: auth.admin_subjects.clone(),
         revocation_file: Some(revocation_file.clone()),
+        shared_revocations,
     })
     .context("configuring authentication")?;
-    tracing::info!(file = %revocation_file.display(), "token revocation list (watched for changes)");
+    if shared.is_some() {
+        within_db_timeout(secs, async {
+            interceptor
+                .load_shared_revocations()
+                .await
+                .map_err(|e| anyhow!(e))
+        })
+        .await
+        .context("reading token revocations from the database")?;
+        tracing::info!(
+            file = %revocation_file.display(),
+            "token revocations: the file and the database (polled every 10 s)"
+        );
+    } else {
+        tracing::info!(file = %revocation_file.display(), "token revocation list (watched for changes)");
+    }
     Ok(interceptor)
 }
 

@@ -10,10 +10,12 @@ max_memory     = "4gb"                          # soft process-memory cap (incl.
 max_pending    = 1024                           # max queued/in-flight items before backpressure (0 = off)
 max_retries    = 3                              # times a failed item is retried before it is marked failed (0 = off)
 device         = "auto"                         # auto (CUDA → Metal → CPU), or pin one: cpu / metal / cuda
+# node_id      = "apollo-1"                     # this instance's name when several share one database (default: kept in the state dir)
 
 [webhook]
 # enabled         = true                         # false = off, keeping these settings (nothing is kept to send later)
 url = "https://hooks.example.com:443"          # optional; omit the section to disable and let clients poll
+#                                               # (instances sharing a database: the same url and secret on each)
 # secret          = "change-me"                 # optional shared secret; signs each delivery's payload + timestamp (verify on the receiver)
 # redelivery_secs = 60                           # background retry interval for failed deliveries (0 = off)
 
@@ -25,8 +27,11 @@ url = "https://hooks.example.com:443"          # optional; omit the section to d
 # [auth]
 # enabled    = true                                   # false = no authentication (trusted networks only)
 # public_key = "k4.public.REPLACE_WITH_GENERATED_PUBLIC_KEY"
+#                       # several instances on one SurrealDB: leave unset — the first to start publishes
+#                       # its key and the rest verify with it (`apollo publish-key --replace` rotates)
 # admin_subjects  = ["ops"]                         # may read/cancel every task (others see only their own)
 # revocation_file = "/var/lib/apollo/revoked_tokens" # `apollo revoke` writes here; default: state dir
+#                                                   # (on a shared database revocations also go to the database)
 
 # TLS (optional). Without it the API is plaintext — fine on loopback or behind a
 # TLS-terminating proxy. With client_ca_file, clients must present a certificate
@@ -39,6 +44,7 @@ url = "https://hooks.example.com:443"          # optional; omit the section to d
 # Result cache (optional). With [cache] present, model outputs are cached by
 # content hash (with a url->content-hash hint) so identical inputs skip inference.
 # Set ttl_secs to expire stale entries; omit for entries that never expire.
+# Each model's entries are keyed by its output settings and file contents.
 # [cache]
 # enabled = true
 # ttl_secs = 86400
@@ -56,6 +62,9 @@ url = "https://hooks.example.com:443"          # optional; omit the section to d
 [database]
 backend   = "sqlite"            # sqlite | postgres | surrealdb  (postgres: future)
 # retention = "30d"             # how long to keep finished tasks; omit = keep forever
+# lease_secs = 30               # with instances sharing one SurrealDB: a task's claim lasts this long unless renewed
+#                               # (every third); a runner whose last confirmed renewal is 25 s old stops and hands its
+#                               # tasks back (a database outage of 10-25 s can cause this)
 # timeout   = 30                # s a client's call waits for the database (and SurrealDB's connect at start); 0 = no limit
 
 [database.sqlite]
@@ -239,7 +248,7 @@ steps = [
 [models.general]
 architecture   = "vit"
 repo           = "google/vit-base-patch16-224"
-revision       = "main"
+revision       = "main"         # pin a commit sha when instances share a database
 enabled        = true
 keep_in_memory = true
 max_concurrent = 8              # GPU batch size

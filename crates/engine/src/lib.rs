@@ -2,6 +2,7 @@
 //! into a runnable pipeline.
 //!
 //! - `queue`     — submission, startup recovery, maintenance timer
+//! - `lease`     — which tasks this process runs; takeover and hand-back
 //! - `scheduler` — per-task dispatch: fetch-once, fan-out, global concurrency cap
 //! - `worker`    — per-model dedicated-thread batching worker (idle-unload)
 //! - `registry`  — loaded-model registry + submission validation
@@ -23,6 +24,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use apollo_config::Config;
 use apollo_domain::{Input, Item, Task};
@@ -33,6 +35,7 @@ mod aggregate;
 mod catalog;
 mod error;
 mod gate;
+mod lease;
 mod live;
 mod memory;
 mod metrics;
@@ -103,6 +106,9 @@ pub struct Engine {
     /// A snapshot this handle is pinned to (see [`Engine::pinned`]); `None`
     /// reads the current one.
     pinned: Option<Arc<Live>>,
+    /// The run this handle works for: its claim fences the handle's writes
+    /// (see [`Engine::running`]).
+    run: Option<Arc<lease::RunCtl>>,
 }
 
 struct Inner {
@@ -127,10 +133,34 @@ struct Inner {
     /// Of those, how many run each model (by label), for the models'
     /// `max_pending`. Labels with none are absent.
     admitted: Mutex<HashMap<String, usize>>,
-    /// Per-task cooperative cancellation signals, keyed by task id.
-    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// The tasks this process runs, by id: each run's claim and its
+    /// cooperative cancel signal.
+    runs: Mutex<HashMap<String, Arc<lease::RunCtl>>>,
+    /// Claims of runs stopped because no renewal was confirmed in time, not
+    /// yet handed back: the renewal loop hands them back once the database
+    /// answers.
+    unreleased: Mutex<Vec<apollo_storage::Held>>,
     /// Woken on every cancel, so items waiting for a slot can check theirs.
     cancelled: tokio::sync::Notify,
+    /// Woken as a run registers, for the deadline watch.
+    registered: tokio::sync::Notify,
+    /// This instance's node id, and this process's id (one per start).
+    node: String,
+    process: String,
+    /// Who holds this process's claims: `<node>/<process>`.
+    holder: String,
+    /// The finished webhooks this process is delivering, by (task, item):
+    /// each one's lost flag, set once its delivery claim is found taken.
+    deliveries: Mutex<HashMap<(String, usize), Arc<AtomicBool>>>,
+    /// How long a claim lasts unless renewed (`[database].lease_secs`).
+    lease_ttl: Duration,
+    /// Since when the database has answered without a break (for taking over
+    /// lapsed leases).
+    connected_since: Mutex<Option<Instant>>,
+    /// Serializes takeover passes, and what they remember between passes.
+    takeover: tokio::sync::Mutex<lease::Takeover>,
+    /// Shutting down: no new runs, no takeovers.
+    closing: AtomicBool,
     /// Ids of changed tasks, announced by the storage wrapper.
     changes: broadcast::Sender<Arc<str>>,
     /// One lock per `(owner, request_id)` in use: serializes submissions with
@@ -176,11 +206,24 @@ impl Engine {
     /// model, and start the maintenance timer.
     ///
     /// Must be called within a Tokio runtime (it spawns background tasks). Loading
-    /// of model weights is lazy — workers load on first use, not here.
+    /// of model weights is lazy — workers load on first use, not here. Its node
+    /// id is new each time (see [`Engine::with_node`]).
     pub fn new(
         config: Arc<Config>,
         storage: Arc<dyn Storage>,
         webhook: Option<Arc<dyn WebhookSink>>,
+    ) -> Engine {
+        Self::with_node(config, storage, webhook, uuid::Uuid::new_v4().to_string())
+    }
+
+    /// [`Engine::new`], as node `node`: the name its node-local inputs
+    /// (uploads, local files) stay with among instances sharing a database,
+    /// the same across restarts.
+    pub fn with_node(
+        config: Arc<Config>,
+        storage: Arc<dyn Storage>,
+        webhook: Option<Arc<dyn WebhookSink>>,
+        node: String,
     ) -> Engine {
         let (_probe, kind) = apollo_inference::select_device(config.app.device);
         tracing::info!(device = %kind, "selected compute device");
@@ -195,6 +238,8 @@ impl Engine {
             metrics: &metrics,
         };
         let (registry, _) = Registry::build(&config, &env, None);
+        let lease_ttl = Duration::from_secs(config.database.lease_secs.max(1).into());
+        let shared = storage.shared();
         let gate = Arc::new(PriorityGate::new(config.app.max_concurrent.max(1) as usize));
         let (changes, _) = broadcast::channel(watch::CHANGE_BUFFER);
         let storage: Arc<dyn Storage> = Arc::new(watch::Notifying {
@@ -202,6 +247,8 @@ impl Engine {
             changes: changes.clone(),
         });
 
+        let process = uuid::Uuid::new_v4().to_string();
+        let holder = format!("{node}/{process}");
         let engine = Engine {
             inner: Arc::new(Inner {
                 storage,
@@ -214,15 +261,30 @@ impl Engine {
                 gate,
                 in_flight: AtomicUsize::new(0),
                 admitted: Mutex::new(HashMap::new()),
-                cancels: Mutex::new(HashMap::new()),
+                runs: Mutex::new(HashMap::new()),
+                unreleased: Mutex::new(Vec::new()),
                 cancelled: tokio::sync::Notify::new(),
+                registered: tokio::sync::Notify::new(),
                 changes,
                 idempotency: Mutex::new(HashMap::new()),
+                node,
+                process,
+                holder,
+                deliveries: Mutex::new(HashMap::new()),
+                lease_ttl,
+                connected_since: Mutex::new(Some(Instant::now())),
+                takeover: tokio::sync::Mutex::new(lease::Takeover::default()),
+                closing: AtomicBool::new(false),
             }),
             pinned: None,
+            run: None,
         };
         engine.spawn_maintenance();
         engine.spawn_redelivery();
+        if shared {
+            engine.spawn_renewal();
+            engine.spawn_deadlines();
+        }
         engine
     }
 
@@ -243,7 +305,8 @@ impl Engine {
     /// storage timeout once `[database].timeout` passes. Only reads, and waits
     /// for work running in a task of its own, go through here: dropping them
     /// cuts no write short. Background work waits as long as the database takes,
-    /// so none of its writes is dropped or overtaken by a later one.
+    /// so none of its writes is dropped or overtaken by a later one. Lease
+    /// renewals have a limit of their own, from `[database].lease_secs`.
     async fn within<T>(
         &self,
         work: impl Future<Output = Result<T, EngineError>>,
@@ -264,6 +327,7 @@ impl Engine {
         Engine {
             inner: Arc::clone(&self.inner),
             pinned: None,
+            run: None,
         }
     }
 
@@ -274,6 +338,7 @@ impl Engine {
         Engine {
             inner: Arc::clone(&self.inner),
             pinned: Some(self.live()),
+            run: self.run.clone(),
         }
     }
 
@@ -291,6 +356,18 @@ impl Engine {
                 .join("apollo"),
         };
         base.join("uploads")
+    }
+
+    /// Whether `path` is a file directly in [`Engine::upload_dir`], where the
+    /// server stages uploads. A task's upload path is read from the database,
+    /// which other instances (or anyone who can write to it) share, so a file
+    /// anywhere else is never read or removed.
+    pub(crate) fn is_staged_upload(&self, path: &std::path::Path) -> bool {
+        path.parent() == Some(self.upload_dir().as_path())
+            && matches!(
+                path.components().next_back(),
+                Some(std::path::Component::Normal(_))
+            )
     }
 
     /// Create the upload directory if needed — owner-only (`0700`) on Unix — and
@@ -381,7 +458,12 @@ impl Engine {
         self.check_memory()?;
         let reservation = self.reserve(&models)?;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        // A keyed task's id comes from its key, so two instances sharing the
+        // database can't both store one: the second finds the first.
+        let id = match &submission.request_id {
+            Some(rid) => request_task_id(owner.as_deref(), rid),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
         let mut task = Task::new(
             id.clone(),
             vec![Item::new(submission.input, models, pipeline)],
@@ -402,17 +484,39 @@ impl Engine {
         let engine = self.clone();
         let stored = tokio::spawn(async move {
             let _serialized = serialized;
-            engine.inner.storage.create_task(&task).await?;
+            let token = uuid::Uuid::new_v4().to_string();
+            // Node-local input stays with this node.
+            let pin = lease::pinned_input(&task).then(|| engine.inner.node.as_str());
+            let claimed_at = Instant::now();
+            match engine
+                .inner
+                .storage
+                .create_task(&task, Some(&engine.lease(&token)), pin)
+                .await
+            {
+                Ok(()) => {}
+                // Another instance stored this key's task after this one
+                // looked for it: that's the task.
+                Err(StorageError::TaskExists(_)) if task.request_id.is_some() => {
+                    return Ok(true);
+                }
+                Err(e) => return Err(e.into()),
+            }
             tracing::info!(task = %task.id, "task submitted");
-            let runner = engine.clone();
-            tokio::spawn(async move { runner.run_task(task, vec![reservation]).await });
-            Ok::<(), EngineError>(())
+            match engine.register(&task.id, token.clone(), claimed_at) {
+                Some(run) => {
+                    let runner = engine.clone();
+                    tokio::spawn(
+                        async move { runner.run_task(task, run, vec![reservation]).await },
+                    );
+                }
+                // Stopping: the next start (or another instance) runs it.
+                None => engine.release(&task.id, &token).await,
+            }
+            Ok::<bool, EngineError>(false)
         });
-        self.within(joined(stored)).await?;
-        Ok(Submitted {
-            id,
-            existing: false,
-        })
+        let existing = self.within(joined(stored)).await?;
+        Ok(Submitted { id, existing })
     }
 
     /// Room for one more item that runs `models`: refused when `[app].max_pending`
@@ -624,15 +728,11 @@ impl Engine {
     }
 
     /// Graceful-shutdown hook, called once the server has stopped accepting
-    /// requests. Releases this run's resume attempt for every incomplete task, so
-    /// a clean restart (e.g. a deploy) never counts toward the poison-task cap —
-    /// only crashes do.
+    /// requests. Stops this process's runs and hands their tasks back, so a
+    /// clean restart (e.g. a deploy) never counts toward the poison-task cap —
+    /// only crashes do — and another instance may take them at once.
     pub async fn shutdown(&self) {
-        match self.inner.storage.release_resume_attempts().await {
-            Ok(n) if n > 0 => tracing::info!(tasks = n, "released resume attempts on shutdown"),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "could not release resume attempts"),
-        }
+        self.hand_back_all().await;
     }
 
     /// Fetch a task by id (backs the `GetTask` RPC, and watches).
@@ -653,31 +753,34 @@ impl Engine {
             return Ok(());
         }
         // The rest runs in a task of its own, so a caller that stops waiting
-        // (the database is slow to answer) doesn't cut the write, or the
-        // clean-up after it, short. All of it: the write must follow the signal
-        // at once, before a woken item can roll the task up as completed.
+        // (the database is slow to answer) doesn't cut it short between the
+        // write and the signal: the task would be cancelled in the database but
+        // keep running here until its next lease renewal.
         let engine = self.clone();
         let id = task_id.to_string();
         let cancelled = tokio::spawn(async move {
-            // Set the signal, creating the token if run_task has not registered
-            // one yet (so a not-yet-started run picks it up via the same map
-            // entry).
-            {
-                let mut map = engine.inner.cancels.lock().unwrap();
-                let token = map
-                    .entry(id.clone())
-                    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                    .clone();
-                token.store(true, Ordering::SeqCst);
+            // The stored state first, so an item that stops on the signal rolls
+            // the task up as cancelled. Conditional: if the task finished in the
+            // meantime it stays finished rather than being relabelled as
+            // cancelled.
+            if !engine.inner.storage.cancel_task_if_active(&id).await? {
+                return Ok(());
+            }
+            // Then the run's signal, if it runs here; a run elsewhere learns of
+            // the cancel when it next renews its lease, and one that hasn't
+            // started yet when its start write finds the task cancelled.
+            let run = engine
+                .inner
+                .runs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .cloned();
+            if let Some(run) = run {
+                run.cancel.store(true, Ordering::SeqCst);
             }
             // Items waiting for a slot stop waiting (and give back their place).
             engine.inner.cancelled.notify_waiters();
-            // Conditional write: if the task finished in the meantime it stays
-            // finished rather than being relabelled as cancelled.
-            if !engine.inner.storage.cancel_task_if_active(&id).await? {
-                engine.inner.cancels.lock().unwrap().remove(&id);
-                return Ok(());
-            }
             tracing::info!(task = %id, "task cancellation requested");
             Ok(())
         });
@@ -705,6 +808,28 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// The id of the task `owner` submits with `request_id`: a UUID made from a
+/// SHA-256 hash of both, the same on every instance.
+fn request_task_id(owner: Option<&str>, request_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"apollo task\0");
+    match owner {
+        Some(owner) => {
+            hash.update([1]);
+            hash.update((owner.len() as u64).to_be_bytes());
+            hash.update(owner.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+    hash.update(request_id.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash.finalize()[..16]);
+    uuid::Builder::from_custom_bytes(bytes)
+        .into_uuid()
+        .to_string()
 }
 
 /// Refuse an item when one of its `models` already has its own `max_pending`

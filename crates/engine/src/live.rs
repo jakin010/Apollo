@@ -24,6 +24,8 @@ pub(crate) struct Live {
     pub(crate) config: Arc<Config>,
     pub(crate) registry: Registry,
     pub(crate) webhook: Option<Arc<dyn WebhookSink>>,
+    /// The receiver [`Live::webhook`] delivers to (see [`WebhookSink::target`]).
+    pub(crate) webhook_target: Option<String>,
     /// SSRF / resource limits applied to remote input fetches.
     pub(crate) fetch_limits: FetchLimits,
     /// Max decoded pixels (`width * height`) per image; `None` disables the cap.
@@ -58,6 +60,7 @@ impl Live {
             max_memory_bytes: config.app.max_memory_bytes(),
             max_pending: config.app.max_pending as usize,
             registry,
+            webhook_target: webhook.as_ref().map(|s| s.target()),
             webhook,
             generation,
             loaded_at: SystemTime::now(),
@@ -162,10 +165,12 @@ fn keep_restart_only(running: &Config, mut new: Config) -> (Config, Vec<String>)
     keep!(app.device, "app.device");
     keep!(app.cache_dir, "app.cache_dir");
     keep!(app.max_concurrent, "app.max_concurrent");
+    keep!(app.node_id, "app.node_id");
     keep!(app.config_file, "app.config_file");
     keep!(tls, "tls");
     keep!(auth, "auth");
     keep!(database.backend, "database.backend");
+    keep!(database.lease_secs, "database.lease_secs");
     keep!(database.sqlite, "database.sqlite");
     keep!(database.surrealdb, "database.surrealdb");
     keep!(database.postgres, "database.postgres");

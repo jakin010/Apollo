@@ -22,6 +22,8 @@
 //! `tests/backends.rs`). Moving to another major version means bumping the
 //! version and revisiting only those.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
@@ -30,14 +32,22 @@ use surrealdb::types::SurrealValue;
 
 use apollo_config::SurrealdbConfig;
 use apollo_domain::{
-    Classification, Input, Item, ItemState, ModelOutput, ModelResult, ModelState, Sample, Task,
-    TaskError, TaskState,
+    Classification, Input, Item, ItemState, ModelOutput, ModelResult, ModelState, Revocation,
+    Sample, Task, TaskError, TaskState,
 };
 
 use crate::error::StorageError;
 use crate::now;
 use crate::resume::PendingWebhook;
-use crate::{Storage, TaskCursor, TaskPage, TaskQuery};
+use crate::{
+    ClaimMode, Claimable, Delivery, Fence, Held, Lease, Renewal, SharedKey, Storage, TaskCursor,
+    TaskPage, TaskQuery,
+};
+
+/// Who holds a claim, for operators: `<node>/<process>`.
+fn holder(lease: &Lease<'_>) -> String {
+    format!("{}/{}", lease.node, lease.process)
+}
 
 type Result<T> = std::result::Result<T, StorageError>;
 
@@ -49,9 +59,21 @@ impl From<surrealdb::Error> for StorageError {
     }
 }
 
+/// The shared auth tables: the public key (one record, `auth_key:current`)
+/// and the token revocations (`revocation:[kind, value]`).
+macro_rules! auth_schema {
+    () => {
+        "
+    DEFINE TABLE IF NOT EXISTS auth_key SCHEMALESS;
+    DEFINE TABLE IF NOT EXISTS revocation SCHEMALESS;"
+    };
+}
+
 /// Idempotent schema: schemaless tables plus the indexes the queries rely on.
 /// `IF NOT EXISTS` makes re-running a no-op.
-const SCHEMA: &str = "
+const SCHEMA: &str = concat!(
+    auth_schema!(),
+    "
     DEFINE TABLE IF NOT EXISTS task SCHEMALESS;
     DEFINE TABLE IF NOT EXISTS item SCHEMALESS;
     DEFINE TABLE IF NOT EXISTS model_result SCHEMALESS;
@@ -65,7 +87,186 @@ const SCHEMA: &str = "
     DEFINE INDEX IF NOT EXISTS item_webhook ON TABLE item FIELDS webhook_delivered, state;
     DEFINE INDEX IF NOT EXISTS mr_item ON TABLE model_result FIELDS task_id, item_idx;
     DEFINE INDEX IF NOT EXISTS frame_key ON TABLE frame FIELDS task_id, item_idx, label;
-";
+"
+);
+
+/// Run `op` until it isn't refused with a write conflict (instances doing the
+/// same at the same moment), a little later each time; at most 8 more tries.
+async fn retry_conflicts<T, F, Fut>(mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, surrealdb::Error>>,
+{
+    let mut tries = 0u64;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if tries < 8 && e.to_string().contains("conflict") => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(20 * tries + jitter_ms())).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// A few milliseconds (0-19), so writers retrying in lockstep drift apart.
+fn jitter_ms() -> u64 {
+    u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+            % 20,
+    )
+}
+
+/// A runner's fence: no fence, or the task's claim is still the token.
+///
+/// A fenced write is one statement (an `IF` block), which SurrealDB runs as one
+/// transaction and re-runs itself on a write conflict. It also writes the task
+/// row (its `updated_at`), so it conflicts with a takeover's claim of that row:
+/// a stale runner's write and the new claim can't both commit.
+macro_rules! held {
+    () => {
+        "$fence = NONE OR (SELECT VALUE claim FROM ONLY type::record('task', $tid)) = $fence"
+    };
+}
+
+/// Set an unfinished item's state while the fence holds; returns whether it
+/// did.
+const SET_ITEM_STATE: &str = concat!(
+    "IF ",
+    held!(),
+    " {
+        LET $won = (UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error
+            WHERE state IN ['queued', 'processing', 'retrying'] RETURN VALUE state);
+        IF array::len($won) > 0 { UPDATE type::record('task', $tid) SET updated_at = $ts; };
+        array::len($won) > 0
+    } ELSE { false }"
+);
+
+/// The finished-webhook fields a finishing write sets (see
+/// [`Delivery`](crate::Delivery)). Binds: `$delivered`, `$target`, `$holder`,
+/// `$ttl`.
+macro_rules! delivery_fields {
+    () => {
+        "webhook_delivered = $delivered, webhook_target = $target, webhook_claim = $holder,
+            webhook_claim_until = IF $holder = NONE THEN NONE ELSE time::now() + $ttl END"
+    };
+}
+
+/// Finish an unfinished item while the fence holds, recording its finished
+/// webhook; returns whether it did.
+const FINISH_ITEM_STATE: &str = concat!(
+    "IF ",
+    held!(),
+    " {
+        LET $won = (UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error, ",
+    delivery_fields!(),
+    "
+            WHERE state IN ['queued', 'processing', 'retrying'] RETURN VALUE state);
+        IF array::len($won) > 0 { UPDATE type::record('task', $tid) SET updated_at = $ts; };
+        array::len($won) > 0
+    } ELSE { false }"
+);
+
+/// Fail an unfinished item, and the listed models with it, while the fence
+/// holds; returns whether it did.
+const FAIL_ITEM: &str = concat!(
+    "IF ",
+    held!(),
+    " {
+        LET $won = (UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error, ",
+    delivery_fields!(),
+    "
+            WHERE state IN ['queued', 'processing', 'retrying'] RETURN VALUE state);
+        IF array::len($won) > 0 {
+            FOR $label IN $models {
+                UPSERT type::record('model_result', [$tid, $idx, $label]) SET
+                    task_id = $tid, item_idx = $idx, label = $label,
+                    state = $mstate, output_json = NONE, error = $error;
+            };
+            UPDATE type::record('task', $tid) SET updated_at = $ts;
+        };
+        array::len($won) > 0
+    } ELSE { false }"
+);
+
+/// Insert or update a model result while the fence holds. UPSERT only touches
+/// the listed fields, so the `steps_completed` marker and the frame rows are
+/// left intact.
+const UPSERT_RESULT: &str = concat!(
+    "IF ",
+    held!(),
+    " {
+        UPSERT type::record('model_result', [$tid, $idx, $label]) SET
+            task_id = $tid, item_idx = $idx, label = $label,
+            state = $state, output_json = $output, error = $error;
+        UPDATE type::record('task', $tid) SET updated_at = $ts;
+        true
+    } ELSE { false }"
+);
+
+/// Set an item's retry count while the fence holds.
+const SET_RETRIES: &str = concat!(
+    "IF ",
+    held!(),
+    " {
+        LET $set = (UPDATE type::record('item', [$tid, $idx]) SET retries = $retries RETURN VALUE retries);
+        IF array::len($set) > 0 { UPDATE type::record('task', $tid) SET updated_at = $ts; };
+        array::len($set) > 0
+    } ELSE { false }"
+);
+
+/// Claimable states: unfinished, or cancelled with unfinished items (`$tid`'s,
+/// for a claim of one task).
+const CLAIMABLE_STATE: &str = "(state IN ['queued', 'processing']
+    OR (state = 'cancelled' AND array::len((SELECT VALUE idx FROM item
+        WHERE task_id = $tid AND state IN ['queued', 'processing', 'retrying'] LIMIT 1)) > 0))";
+
+/// Pinned to another node, and that node's lease ended less than `$grace`
+/// ago: not claimable, unless it's cancelled (finishing it reads no input).
+const PIN_OPEN: &str = "(state = 'cancelled' OR pin = NONE OR pin = $node
+    OR (lease_until != NONE AND lease_until < time::now() - $grace))";
+
+/// The delivery-claim condition for `mode`, on an item. A missing
+/// `webhook_claim_until` is guarded explicitly: `NONE < time::now()` is true.
+fn delivery_open(mode: ClaimMode) -> &'static str {
+    match mode {
+        ClaimMode::Force => "true",
+        ClaimMode::Open => "webhook_claim = NONE",
+        ClaimMode::Expired => {
+            "(webhook_claim = NONE
+              OR (webhook_claim_until != NONE AND webhook_claim_until < time::now()))"
+        }
+    }
+}
+
+/// The bound values of a [`Delivery`]: `$delivered`, `$target`, `$holder`,
+/// `$ttl`.
+fn bind_delivery<'q>(
+    q: surrealdb::method::Query<'q, Any>,
+    delivery: Delivery<'_>,
+) -> surrealdb::method::Query<'q, Any> {
+    let (delivered, target, holder, ttl) = delivery.parts();
+    q.bind(("delivered", delivered))
+        .bind(("target", target.map(str::to_string)))
+        .bind(("holder", holder.map(str::to_string)))
+        .bind(("ttl", ttl))
+}
+
+/// The lease condition for `mode`. A missing `lease_until` is guarded
+/// explicitly: `NONE < time::now()` is true.
+fn lease_open(mode: ClaimMode) -> &'static str {
+    match mode {
+        ClaimMode::Force => "true",
+        ClaimMode::Open => "claim = NONE",
+        ClaimMode::Expired => {
+            "(claim = NONE OR (lease_until != NONE AND lease_until < time::now()))"
+        }
+    }
+}
 
 /// Persist a task, its items, and any pre-existing model results in one
 /// transaction. `FOR` loops keep the bound parameter set fixed regardless of how
@@ -74,7 +275,9 @@ const CREATE_TASK: &str = "
     BEGIN TRANSACTION;
     CREATE type::record('task', $tid) SET
         key = $tid, state = $tstate, attempts = 0, created_at = $ts, updated_at = $ts,
-        owner = $owner, metadata_json = $metadata, request_id = $rid;
+        owner = $owner, metadata_json = $metadata, request_id = $rid,
+        claim = $claim, claimed_by = $holder, pin = $pin,
+        lease_until = IF $claim = NONE THEN NONE ELSE time::now() + $ttl END;
     FOR $it IN $items {
         CREATE type::record('item', [$tid, $it.idx]) SET
             task_id = $tid, idx = $it.idx, input_json = $it.input_json,
@@ -93,6 +296,18 @@ const CREATE_TASK: &str = "
 // ------------------------------- row types -------------------------------
 // Deserialized from query results / serialized for binds. These implement
 // `SurrealValue` (via derive); complex fields are opaque JSON strings.
+
+#[derive(SurrealValue)]
+struct AuthKeyRow {
+    public_key: String,
+    created_by: Option<String>,
+}
+
+#[derive(SurrealValue)]
+struct RevocationRow {
+    kind: String,
+    value: String,
+}
 
 #[derive(SurrealValue)]
 struct TaskStateRow {
@@ -143,12 +358,22 @@ struct StepsRow {
 }
 
 #[derive(SurrealValue)]
+struct ClaimableRow {
+    key: String,
+    state: String,
+    created_at: i64,
+    abandoned_pin: Option<String>,
+    pinned_here: bool,
+    stale: bool,
+}
+
+#[derive(SurrealValue)]
 struct PendingRow {
     task_id: String,
     idx: i64,
 }
 
-#[derive(SurrealValue)]
+#[derive(Clone, SurrealValue)]
 struct ItemInsert {
     idx: i64,
     input_json: String,
@@ -171,7 +396,7 @@ struct SampleInsert {
     class_json: String,
 }
 
-#[derive(SurrealValue)]
+#[derive(Clone, SurrealValue)]
 struct ModelInsert {
     item_idx: i64,
     label: String,
@@ -186,6 +411,14 @@ pub struct SurrealStorage {
 }
 
 impl SurrealStorage {
+    /// Define the shared auth tables only (for the CLI, which runs no full
+    /// migration).
+    pub async fn define_auth_tables(&self) -> Result<()> {
+        retry_conflicts(|| async { self.db.query(auth_schema!()).await.and_then(|r| r.check()) })
+            .await?;
+        Ok(())
+    }
+
     /// Connect to `[database.surrealdb].url` (any scheme the SDK supports: ws,
     /// wss, http, https), sign in as root if credentials are given, and select the
     /// configured namespace + database. The connection is established eagerly so a
@@ -203,17 +436,6 @@ impl SurrealStorage {
             .use_db(cfg.database.clone())
             .await?;
         Ok(Self { db })
-    }
-
-    /// Bump a task's `updated_at` (retention and recency tracking).
-    async fn touch(&self, id: &str) -> Result<()> {
-        self.db
-            .query("UPDATE type::record('task', $tid) SET updated_at = $ts")
-            .bind(("tid", id.to_string()))
-            .bind(("ts", now()))
-            .await?
-            .check()?;
-        Ok(())
     }
 
     /// Shared reconstruction used by `get_task` and `load_incomplete_tasks`.
@@ -312,11 +534,19 @@ impl SurrealStorage {
 #[async_trait]
 impl Storage for SurrealStorage {
     async fn migrate(&self) -> Result<()> {
-        self.db.query(SCHEMA).await?.check()?;
+        // Instances starting together on a new database define the schema at
+        // the same moment, and SurrealDB refuses some of them with a write
+        // conflict: try again, a little later.
+        retry_conflicts(|| async { self.db.query(SCHEMA).await.and_then(|r| r.check()) }).await?;
         Ok(())
     }
 
-    async fn create_task(&self, task: &Task) -> Result<()> {
+    async fn create_task(
+        &self,
+        task: &Task,
+        lease: Option<&Lease<'_>>,
+        pin: Option<&str>,
+    ) -> Result<()> {
         let ts = now();
         let mut items = Vec::with_capacity(task.items.len());
         let mut mrs = Vec::new();
@@ -343,42 +573,84 @@ impl Storage for SurrealStorage {
             }
         }
 
-        self.db
-            .query(CREATE_TASK)
-            .bind(("tid", task.id.clone()))
-            .bind(("tstate", task.state.as_str().to_string()))
-            .bind(("owner", task.owner.clone()))
-            .bind(("metadata", crate::metadata_to_json(&task.metadata)?))
-            .bind(("rid", task.request_id.clone()))
-            .bind(("ts", ts))
-            .bind(("items", items))
-            .bind(("mrs", mrs))
-            .await?
-            .check()?;
-        Ok(())
+        let metadata = crate::metadata_to_json(&task.metadata)?;
+        let mut tries = 0;
+        loop {
+            let created = self
+                .db
+                .query(CREATE_TASK)
+                .bind(("tid", task.id.clone()))
+                .bind(("tstate", task.state.as_str().to_string()))
+                .bind(("owner", task.owner.clone()))
+                .bind(("metadata", metadata.clone()))
+                .bind(("rid", task.request_id.clone()))
+                .bind(("ts", ts))
+                .bind(("items", items.clone()))
+                .bind(("mrs", mrs.clone()))
+                .bind(("claim", lease.map(|l| l.token.to_string())))
+                .bind(("holder", lease.map(holder)))
+                .bind(("ttl", lease.map_or(Duration::ZERO, |l| l.ttl)))
+                .bind(("pin", pin.map(str::to_string)))
+                .await
+                .and_then(|resp| resp.check());
+            let Err(e) = created else {
+                return Ok(());
+            };
+            // Another writer may have stored this id first: reported as
+            // "already exists", or, when the two writes overlapped, as a
+            // failed commit. Either way it rolled back; look.
+            let mut resp = self
+                .db
+                .query("SELECT VALUE key FROM ONLY type::record('task', $tid)")
+                .bind(("tid", task.id.clone()))
+                .await?;
+            let stored: Option<String> = resp.take(0)?;
+            if stored.is_some() {
+                return Err(StorageError::TaskExists(task.id.clone()));
+            }
+            // Not stored: a conflict with some other write; try again, a
+            // little later each time (writers racing in lockstep drift apart).
+            tries += 1;
+            if tries == 6 {
+                return Err(e.into());
+            }
+            let jitter = u64::from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos()
+                    % 20,
+            );
+            tokio::time::sleep(Duration::from_millis(20 * tries + jitter)).await;
+        }
     }
 
     async fn get_task(&self, id: &str) -> Result<Option<Task>> {
         self.load_task(id).await
     }
 
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<()> {
-        // A finished task keeps its first finish time.
+    async fn set_task_state(&self, id: &str, state: TaskState, fence: Fence<'_>) -> Result<bool> {
+        // Conditional on the current state, like `cancel_task_if_active`, and
+        // on the claim.
         let query = if crate::is_terminal(state) {
-            "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts,
-                finished_at = IF finished_at THEN finished_at ELSE $ts END"
+            "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts, finished_at = $ts
+             WHERE state IN ['queued', 'processing'] AND ($fence = NONE OR claim = $fence)
+             RETURN VALUE state"
         } else {
-            "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts,
-                finished_at = NONE"
+            "UPDATE type::record('task', $tid) SET state = $state, updated_at = $ts
+             WHERE state IN ['queued', 'processing'] AND ($fence = NONE OR claim = $fence)
+             RETURN VALUE state"
         };
-        self.db
+        let mut resp = self
+            .db
             .query(query)
             .bind(("tid", id.to_string()))
             .bind(("state", state.as_str().to_string()))
             .bind(("ts", now()))
-            .await?
-            .check()?;
-        Ok(())
+            .bind(("fence", fence.token().map(str::to_string)))
+            .await?;
+        let vals: Vec<String> = resp.take(0)?;
+        Ok(!vals.is_empty())
     }
 
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool> {
@@ -406,16 +678,56 @@ impl Storage for SurrealStorage {
         item: usize,
         state: ItemState,
         error: Option<&TaskError>,
-    ) -> Result<()> {
-        self.db
-            .query("UPDATE type::record('item', [$tid, $idx]) SET state = $state, error = $error")
+        fence: Fence<'_>,
+        delivery: Delivery<'_>,
+    ) -> Result<bool> {
+        let finish = crate::item_terminal(state);
+        let q = self
+            .db
+            .query(if finish {
+                FINISH_ITEM_STATE
+            } else {
+                SET_ITEM_STATE
+            })
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
             .bind(("state", state.as_str().to_string()))
             .bind(("error", crate::error_to_json(error)?))
-            .await?
-            .check()?;
-        self.touch(task_id).await
+            .bind(("fence", fence.token().map(str::to_string)))
+            .bind(("ts", now()));
+        let q = if finish {
+            bind_delivery(q, delivery)
+        } else {
+            q
+        };
+        let mut resp = q.await?;
+        let written: Option<bool> = resp.take(0)?;
+        Ok(written == Some(true))
+    }
+
+    async fn set_item_failed(
+        &self,
+        task_id: &str,
+        item: usize,
+        error: &TaskError,
+        models: &[String],
+        fence: Fence<'_>,
+        delivery: Delivery<'_>,
+    ) -> Result<bool> {
+        let q = self
+            .db
+            .query(FAIL_ITEM)
+            .bind(("tid", task_id.to_string()))
+            .bind(("idx", item as i64))
+            .bind(("state", ItemState::Failed.as_str().to_string()))
+            .bind(("mstate", ModelState::Failed.as_str().to_string()))
+            .bind(("error", crate::error_to_json(Some(error))?))
+            .bind(("models", models.to_vec()))
+            .bind(("fence", fence.token().map(str::to_string)))
+            .bind(("ts", now()));
+        let mut resp = bind_delivery(q, delivery).await?;
+        let written: Option<bool> = resp.take(0)?;
+        Ok(written == Some(true))
     }
 
     async fn upsert_model_result(
@@ -424,28 +736,26 @@ impl Storage for SurrealStorage {
         item: usize,
         label: &str,
         result: &ModelResult,
-    ) -> Result<()> {
+        fence: Fence<'_>,
+    ) -> Result<bool> {
         let output_json = match &result.output {
             Some(o) => Some(serde_json::to_string(o)?),
             None => None,
         };
-        // UPSERT only touches the listed fields, so a concurrent `steps_completed`
-        // marker and the frame rows are left intact.
-        self.db
-            .query(
-                "UPSERT type::record('model_result', [$tid, $idx, $label]) SET
-                    task_id = $tid, item_idx = $idx, label = $label,
-                    state = $state, output_json = $output, error = $error",
-            )
+        let mut resp = self
+            .db
+            .query(UPSERT_RESULT)
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
             .bind(("label", label.to_string()))
             .bind(("state", result.state.as_str().to_string()))
             .bind(("output", output_json))
             .bind(("error", crate::error_to_json(result.error.as_ref())?))
-            .await?
-            .check()?;
-        self.touch(task_id).await
+            .bind(("fence", fence.token().map(str::to_string)))
+            .bind(("ts", now()))
+            .await?;
+        let written: Option<bool> = resp.take(0)?;
+        Ok(written == Some(true))
     }
 
     async fn append_samples(
@@ -684,17 +994,194 @@ impl Storage for SurrealStorage {
         Ok(vals.into_iter().next().unwrap_or(0) as u32)
     }
 
-    async fn release_resume_attempts(&self) -> Result<u64> {
+    fn shared(&self) -> bool {
+        true
+    }
+
+    async fn claimable_tasks(
+        &self,
+        mode: ClaimMode,
+        node: &str,
+        skip: &[String],
+        grace: Duration,
+        after: Option<&TaskCursor>,
+        limit: usize,
+    ) -> Result<Vec<Claimable>> {
+        let pin = if mode == ClaimMode::Force {
+            "true"
+        } else {
+            PIN_OPEN
+        };
+        let cursor = if after.is_some() {
+            " AND (created_at > $cur_ts OR (created_at = $cur_ts AND key > $cur_id))"
+        } else {
+            ""
+        };
+        let filter = format!(
+            "{} AND {pin} AND key NOTINSIDE $skip{cursor}",
+            lease_open(mode)
+        );
+        let fields = "key, state, created_at,
+            (IF state != 'cancelled' AND pin != NONE AND pin != $node THEN pin ELSE NONE END)
+                AS abandoned_pin,
+            (pin = $node) AS pinned_here,
+            ((claim = NONE AND lease_until = NONE)
+                OR (lease_until != NONE AND lease_until < time::now() - $grace)) AS stale";
+        // Unfinished tasks, then cancelled ones with unfinished items (found
+        // through those items, not by scanning every cancelled task kept).
+        let sql = format!(
+            "SELECT {fields} FROM task WHERE state IN ['queued', 'processing'] AND {filter}
+                ORDER BY created_at, key LIMIT $limit;
+             LET $open = array::distinct((SELECT VALUE task_id FROM item
+                WHERE state IN ['queued', 'processing', 'retrying']));
+             SELECT {fields} FROM task WHERE state = 'cancelled' AND key INSIDE $open AND {filter}
+                ORDER BY created_at, key LIMIT $limit;"
+        );
+        let (cur_ts, cur_id) = after.map_or((0, String::new()), |c| (c.created_at, c.id.clone()));
         let mut resp = self
             .db
-            .query(
-                "UPDATE task SET attempts -= 1
-                 WHERE state IN ['queued', 'processing'] AND attempts > 0
-                 RETURN VALUE attempts",
-            )
+            .query(sql)
+            .bind(("node", node.to_string()))
+            .bind(("skip", skip.to_vec()))
+            .bind(("grace", grace))
+            .bind(("cur_ts", cur_ts))
+            .bind(("cur_id", cur_id))
+            .bind(("limit", limit.max(1) as i64))
             .await?;
-        let vals: Vec<i64> = resp.take(0)?;
-        Ok(vals.len() as u64)
+        let mut rows: Vec<ClaimableRow> = resp.take(0)?;
+        let cancelled: Vec<ClaimableRow> = resp.take(2)?;
+        rows.extend(cancelled);
+        rows.sort_by(|a, b| (a.created_at, &a.key).cmp(&(b.created_at, &b.key)));
+        rows.truncate(limit.max(1));
+        rows.into_iter()
+            .map(|r| {
+                Ok(Claimable {
+                    id: r.key,
+                    state: r.state.parse()?,
+                    created_at: r.created_at,
+                    abandoned_pin: r.abandoned_pin,
+                    pinned_here: r.pinned_here,
+                    stale: r.stale,
+                })
+            })
+            .collect()
+    }
+
+    async fn claim_task(
+        &self,
+        id: &str,
+        lease: &Lease<'_>,
+        mode: ClaimMode,
+        grace: Duration,
+    ) -> Result<Option<u32>> {
+        let pin = if mode == ClaimMode::Force {
+            "true"
+        } else {
+            PIN_OPEN
+        };
+        // SET's right-hand sides see the record as it was: `claim` is the one
+        // being replaced.
+        let sql = format!(
+            "UPDATE type::record('task', $tid) SET
+                attempts += IF claim != NONE THEN 1 ELSE 0 END,
+                claim = $claim, claimed_by = $holder, lease_until = time::now() + $ttl
+             WHERE {CLAIMABLE_STATE} AND {} AND {pin}
+             RETURN VALUE attempts",
+            lease_open(mode)
+        );
+        let mut resp = self
+            .db
+            .query(sql)
+            .bind(("tid", id.to_string()))
+            .bind(("claim", lease.token.to_string()))
+            .bind(("holder", holder(lease)))
+            .bind(("ttl", lease.ttl))
+            .bind(("node", lease.node.to_string()))
+            .bind(("grace", grace))
+            .await?;
+        let attempts: Vec<i64> = resp.take(0)?;
+        Ok(attempts.first().map(|&n| n as u32))
+    }
+
+    async fn renew_claims(&self, held: &[Held], ttl: Duration) -> Result<Vec<Renewal>> {
+        // One statement per claim: each runs (and may conflict) on its own.
+        let mut out = Vec::with_capacity(held.len());
+        for chunk in held.chunks(64) {
+            let sql: String = (0..chunk.len())
+                .map(|i| {
+                    format!(
+                        "UPDATE type::record('task', $id{i}) SET lease_until = time::now() + $ttl
+                         WHERE claim = $tok{i} RETURN VALUE state;"
+                    )
+                })
+                .collect();
+            let mut q = self.db.query(sql).bind(("ttl", ttl));
+            for (i, h) in chunk.iter().enumerate() {
+                q = q
+                    .bind((format!("id{i}"), h.task_id.clone()))
+                    .bind((format!("tok{i}"), h.token.clone()));
+            }
+            let mut resp = q.await?;
+            for i in 0..chunk.len() {
+                out.push(match resp.take::<Vec<String>>(i) {
+                    Ok(states) => match states.first() {
+                        Some(s) => Renewal::Held(s.parse()?),
+                        None => Renewal::Lost,
+                    },
+                    Err(_) => Renewal::Unknown,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn release_claims(&self, held: &[Held]) -> Result<u64> {
+        // One statement per claim. One that fails (a write conflict with a
+        // late renewal of the same task, say) is tried again; any still
+        // failing makes the whole call fail, so the caller keeps them.
+        let mut released = 0;
+        let mut pending: Vec<&Held> = held.iter().collect();
+        for tries in 1u64.. {
+            let mut failed = Vec::new();
+            for chunk in pending.chunks(64) {
+                let sql: String = (0..chunk.len())
+                    .map(|i| {
+                        format!(
+                            "UPDATE type::record('task', $id{i})
+                             SET claim = NONE, claimed_by = NONE, lease_until = time::now()
+                             WHERE claim = $tok{i} RETURN VALUE key;"
+                        )
+                    })
+                    .collect();
+                let mut q = self.db.query(sql);
+                for (i, h) in chunk.iter().enumerate() {
+                    q = q
+                        .bind((format!("id{i}"), h.task_id.clone()))
+                        .bind((format!("tok{i}"), h.token.clone()));
+                }
+                let mut resp = q.await?;
+                for (i, h) in chunk.iter().enumerate() {
+                    match resp.take::<Vec<String>>(i) {
+                        Ok(keys) if !keys.is_empty() => released += 1,
+                        Ok(_) => {}
+                        Err(_) => failed.push(*h),
+                    }
+                }
+            }
+            if failed.is_empty() {
+                break;
+            }
+            if tries == 5 {
+                return Err(StorageError::Surreal(format!(
+                    "handing back {} of {} claims kept failing",
+                    failed.len(),
+                    held.len()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20 * tries + jitter_ms())).await;
+            pending = failed;
+        }
+        Ok(released)
     }
 
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>> {
@@ -716,25 +1203,181 @@ impl Storage for SurrealStorage {
             .collect())
     }
 
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<()> {
-        self.db
-            .query("UPDATE type::record('item', [$tid, $idx]) SET webhook_delivered = true")
-            .bind(("tid", task_id.to_string()))
-            .bind(("idx", item as i64))
-            .await?
-            .check()?;
-        Ok(())
+    async fn claim_pending_webhooks(
+        &self,
+        holder: &str,
+        target: Option<&str>,
+        mode: ClaimMode,
+        ttl: Duration,
+        limit: usize,
+    ) -> Result<Vec<PendingWebhook>> {
+        let open = delivery_open(mode);
+        let mut resp = self
+            .db
+            .query(format!(
+                "SELECT task_id, idx FROM item
+                 WHERE webhook_delivered = false
+                   AND state IN ['completed', 'failed', 'cancelled']
+                   AND ($target = NONE OR webhook_target = NONE OR webhook_target = $target)
+                   AND {open}
+                 ORDER BY rand() LIMIT $limit"
+            ))
+            .bind(("target", target.map(str::to_string)))
+            .bind(("limit", limit as i64))
+            .await?;
+        let rows: Vec<PendingRow> = resp.take(0)?;
+        // In no particular order, so events that keep failing don't keep the
+        // rest waiting. One statement per item: each runs (and may conflict
+        // with another claimer) on its own, and a conflict only means not
+        // claimed.
+        let mut claimed = Vec::new();
+        for chunk in rows.chunks(64) {
+            let sql: String = (0..chunk.len())
+                .map(|i| {
+                    format!(
+                        "UPDATE type::record('item', [$t{i}, $x{i}])
+                         SET webhook_claim = $holder, webhook_claim_until = time::now() + $ttl
+                         WHERE webhook_delivered = false AND {open} RETURN VALUE idx;"
+                    )
+                })
+                .collect();
+            let mut q = self
+                .db
+                .query(sql)
+                .bind(("holder", holder.to_string()))
+                .bind(("ttl", ttl));
+            for (i, r) in chunk.iter().enumerate() {
+                q = q
+                    .bind((format!("t{i}"), r.task_id.clone()))
+                    .bind((format!("x{i}"), r.idx));
+            }
+            // A chunk that fails is not claimed; those claimed before it are
+            // still returned.
+            let mut resp = match q.await {
+                Ok(resp) => resp,
+                Err(e) if claimed.is_empty() => return Err(e.into()),
+                Err(_) => break,
+            };
+            for (i, r) in chunk.iter().enumerate() {
+                if resp.take::<Vec<i64>>(i).is_ok_and(|won| !won.is_empty()) {
+                    claimed.push(PendingWebhook {
+                        task_id: r.task_id.clone(),
+                        item_index: r.idx as usize,
+                    });
+                }
+            }
+        }
+        Ok(claimed)
     }
 
-    async fn set_item_retries(&self, task_id: &str, item: usize, retries: u32) -> Result<()> {
-        self.db
-            .query("UPDATE type::record('item', [$tid, $idx]) SET retries = $retries")
+    async fn renew_webhook_claims(
+        &self,
+        holder: &str,
+        items: &[PendingWebhook],
+        ttl: Duration,
+    ) -> Result<Vec<bool>> {
+        let mut out = Vec::with_capacity(items.len());
+        for chunk in items.chunks(64) {
+            let sql: String = (0..chunk.len())
+                .map(|i| {
+                    format!(
+                        "UPDATE type::record('item', [$t{i}, $x{i}])
+                         SET webhook_claim_until = time::now() + $ttl
+                         WHERE webhook_delivered = false AND webhook_claim = $holder
+                         RETURN VALUE idx;"
+                    )
+                })
+                .collect();
+            let mut q = self
+                .db
+                .query(sql)
+                .bind(("holder", holder.to_string()))
+                .bind(("ttl", ttl));
+            for (i, p) in chunk.iter().enumerate() {
+                q = q
+                    .bind((format!("t{i}"), p.task_id.clone()))
+                    .bind((format!("x{i}"), p.item_index as i64));
+            }
+            let mut resp = q.await?;
+            for i in 0..chunk.len() {
+                // A statement that failed (a conflict) says nothing: the claim
+                // is taken as held, and lapses by itself if it isn't.
+                out.push(
+                    resp.take::<Vec<i64>>(i)
+                        .map_or(true, |kept| !kept.is_empty()),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn release_webhook_claim(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool> {
+        // Retried on a conflict (with this process's renewal of it, say).
+        let released: Vec<i64> = retry_conflicts(|| async {
+            self.db
+                .query(
+                    "UPDATE type::record('item', [$tid, $idx])
+                     SET webhook_claim = NONE, webhook_claim_until = NONE
+                     WHERE webhook_delivered = false AND webhook_claim = $holder RETURN VALUE idx",
+                )
+                .bind(("tid", task_id.to_string()))
+                .bind(("idx", item as i64))
+                .bind(("holder", holder.to_string()))
+                .await?
+                .take(0)
+        })
+        .await?;
+        Ok(!released.is_empty())
+    }
+
+    async fn mark_webhook_delivered(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool> {
+        // Retried on a conflict (with this process's renewal of it, say): a
+        // mark that fails leaves the event to be sent again.
+        let marked: Vec<i64> = retry_conflicts(|| async {
+            self.db
+                .query(
+                    "UPDATE type::record('item', [$tid, $idx])
+                     SET webhook_delivered = true, webhook_claim = NONE, webhook_claim_until = NONE
+                     WHERE webhook_delivered = false AND webhook_claim = $holder RETURN VALUE idx",
+                )
+                .bind(("tid", task_id.to_string()))
+                .bind(("idx", item as i64))
+                .bind(("holder", holder.to_string()))
+                .await?
+                .take(0)
+        })
+        .await?;
+        Ok(!marked.is_empty())
+    }
+
+    async fn set_item_retries(
+        &self,
+        task_id: &str,
+        item: usize,
+        retries: u32,
+        fence: Fence<'_>,
+    ) -> Result<bool> {
+        let mut resp = self
+            .db
+            .query(SET_RETRIES)
             .bind(("tid", task_id.to_string()))
             .bind(("idx", item as i64))
             .bind(("retries", retries as i64))
-            .await?
-            .check()?;
-        self.touch(task_id).await
+            .bind(("fence", fence.token().map(str::to_string)))
+            .bind(("ts", now()))
+            .await?;
+        let written: Option<bool> = resp.take(0)?;
+        Ok(written == Some(true))
     }
 
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64> {
@@ -886,5 +1529,114 @@ impl Storage for SurrealStorage {
             .await?
             .check()?;
         Ok((content.len() + urls.len()) as u64)
+    }
+
+    async fn auth_key(&self) -> Result<Option<SharedKey>> {
+        let mut resp = self
+            .db
+            .query("SELECT public_key, created_by FROM ONLY type::record('auth_key', 'current')")
+            .await?;
+        let row: Option<AuthKeyRow> = resp.take(0)?;
+        Ok(row.map(|r| SharedKey {
+            public_key: r.public_key,
+            node: r.created_by,
+        }))
+    }
+
+    async fn publish_auth_key(&self, public_key: &str, node: &str) -> Result<SharedKey> {
+        // CREATE on the one record id is the set-if-absent.
+        let mut tries = 0;
+        loop {
+            let created = self
+                .db
+                .query(
+                    "CREATE type::record('auth_key', 'current')
+                     CONTENT { public_key: $key, created_by: $node, created_at: time::now() }
+                     RETURN NONE",
+                )
+                .bind(("key", public_key.to_string()))
+                .bind(("node", node.to_string()))
+                .await
+                .and_then(|r| r.check());
+            let Err(e) = created else {
+                return Ok(SharedKey {
+                    public_key: public_key.to_string(),
+                    node: Some(node.to_string()),
+                });
+            };
+            // Stored first by another ("already exists", or a failed commit
+            // when the two overlapped), or ours went through and its answer
+            // was lost: look.
+            if let Some(stored) = self.auth_key().await? {
+                return Ok(stored);
+            }
+            tries += 1;
+            if tries == 6 {
+                return Err(e.into());
+            }
+            tokio::time::sleep(Duration::from_millis(20 * tries + jitter_ms())).await;
+        }
+    }
+
+    async fn replace_auth_key(&self, public_key: &str, node: &str) -> Result<()> {
+        retry_conflicts(|| async {
+            self.db
+                .query(
+                    "UPSERT type::record('auth_key', 'current')
+                     CONTENT { public_key: $key, created_by: $node, created_at: time::now() }
+                     RETURN NONE",
+                )
+                .bind(("key", public_key.to_string()))
+                .bind(("node", node.to_string()))
+                .await
+                .and_then(|r| r.check())
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn add_revocation(&self, revocation: &Revocation) -> Result<()> {
+        retry_conflicts(|| async {
+            self.db
+                .query(
+                    "UPSERT type::record('revocation', [$kind, $value])
+                     CONTENT { kind: $kind, value: $value, revoked_at: time::now() }
+                     RETURN NONE",
+                )
+                .bind(("kind", revocation.kind().to_string()))
+                .bind(("value", revocation.value().to_string()))
+                .await
+                .and_then(|r| r.check())
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_revocation(&self, revocation: &Revocation) -> Result<bool> {
+        let mut resp = self
+            .db
+            .query("DELETE type::record('revocation', [$kind, $value]) RETURN BEFORE")
+            .bind(("kind", revocation.kind().to_string()))
+            .bind(("value", revocation.value().to_string()))
+            .await?;
+        let removed: Vec<RevocationRow> = resp.take(0)?;
+        Ok(!removed.is_empty())
+    }
+
+    async fn revocations(&self) -> Result<Vec<Revocation>> {
+        // A row of the wrong shape (written by hand) is left out, not a
+        // failure of every read.
+        let mut resp = self
+            .db
+            .query(
+                "SELECT kind, value FROM revocation
+                 WHERE type::is_string(kind) AND type::is_string(value)",
+            )
+            .await?;
+        let rows: Vec<RevocationRow> = resp.take(0)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| Revocation::from_parts(&r.kind, &r.value))
+            .collect())
     }
 }

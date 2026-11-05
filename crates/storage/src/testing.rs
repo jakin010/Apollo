@@ -29,6 +29,19 @@ impl SurrealScratch {
     /// `None` when `APOLLO_TEST_SURREAL_URL` isn't set, so the test can skip;
     /// a panic instead when `APOLLO_TEST_REQUIRE_SURREAL` is set.
     pub async fn create() -> Option<Self> {
+        let scratch = Self::create_empty().await?;
+        SurrealStorage::connect(&scratch.config)
+            .await
+            .expect("connecting to the test database")
+            .migrate()
+            .await
+            .expect("migrating the test database");
+        Some(scratch)
+    }
+
+    /// Like [`SurrealScratch::create`], without the schema: as a new
+    /// database is before the first instance starts on it.
+    pub async fn create_empty() -> Option<Self> {
         let Ok(url) = std::env::var("APOLLO_TEST_SURREAL_URL") else {
             assert!(
                 std::env::var_os("APOLLO_TEST_REQUIRE_SURREAL").is_none(),
@@ -86,9 +99,6 @@ impl SurrealScratch {
             .use_db(config.database.clone())
             .await
             .expect("selecting the test database");
-        retry(|| async { SurrealStorage::connect(&config).await?.migrate().await })
-            .await
-            .expect("migrating the test database");
         Some(Self { config, admin })
     }
 
@@ -107,6 +117,71 @@ impl SurrealScratch {
             .expect("reading a task's attempts");
         let attempts: Option<i64> = resp.take(0).expect("reading a task's attempts");
         attempts.expect("the task row and its attempts field") as u32
+    }
+
+    /// End a task's lease `ago` ago, as if its holder had stopped renewing
+    /// it then (its claim stays).
+    pub async fn expire_lease(&self, task_id: &str, ago: Duration) {
+        self.admin
+            .query("UPDATE type::record('task', $tid) SET lease_until = time::now() - $ago")
+            .bind(("tid", task_id.to_string()))
+            .bind(("ago", ago))
+            .await
+            .and_then(|resp| resp.check())
+            .expect("expiring a lease");
+    }
+
+    /// Who holds a task's claim (`<node>/<process>`), if anyone, and whether
+    /// its lease is still running.
+    pub async fn lease(&self, task_id: &str) -> (Option<String>, bool) {
+        let mut resp = self
+            .admin
+            .query(
+                "SELECT VALUE claimed_by FROM ONLY type::record('task', $tid);
+                 SELECT VALUE lease_until != NONE AND lease_until > time::now()
+                    FROM ONLY type::record('task', $tid);",
+            )
+            .bind(("tid", task_id.to_string()))
+            .await
+            .expect("reading a lease");
+        let holder: Option<String> = resp.take(0).expect("reading a lease's holder");
+        let live: Option<bool> = resp.take(1).expect("reading a lease's end");
+        (holder, live.expect("the task row"))
+    }
+
+    /// Who holds an item's finished-webhook delivery claim, if anyone, and
+    /// whether it is still running.
+    pub async fn delivery_claim(&self, task_id: &str, item: usize) -> (Option<String>, bool) {
+        let mut resp = self
+            .admin
+            .query(
+                "SELECT VALUE webhook_claim FROM ONLY type::record('item', [$tid, $idx]);
+                 SELECT VALUE webhook_claim_until != NONE AND webhook_claim_until > time::now()
+                    FROM ONLY type::record('item', [$tid, $idx]);",
+            )
+            .bind(("tid", task_id.to_string()))
+            .bind(("idx", item as i64))
+            .await
+            .expect("reading a delivery claim");
+        let holder: Option<String> = resp.take(0).expect("reading a delivery claim's holder");
+        let live: Option<bool> = resp.take(1).expect("reading a delivery claim's end");
+        (holder, live.expect("the item row"))
+    }
+
+    /// End an item's delivery claim `ago` ago, as if its holder had stopped
+    /// renewing it then (the claim stays).
+    pub async fn expire_delivery_claim(&self, task_id: &str, item: usize, ago: Duration) {
+        self.admin
+            .query(
+                "UPDATE type::record('item', [$tid, $idx])
+                 SET webhook_claim_until = time::now() - $ago",
+            )
+            .bind(("tid", task_id.to_string()))
+            .bind(("idx", item as i64))
+            .bind(("ago", ago))
+            .await
+            .and_then(|resp| resp.check())
+            .expect("expiring a delivery claim");
     }
 
     /// Drop the database.

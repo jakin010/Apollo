@@ -3,6 +3,8 @@
 
 use super::*;
 
+use apollo_storage::ClaimMode;
+
 use apollo_domain::Classification;
 
 /// `[app] max_concurrent = 1`, so a test can take the only slot.
@@ -11,11 +13,12 @@ fn one_slot(models: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until cross-instance cancel (the runner sees a cancel written elsewhere, \
-            at its next lease renewal; the lease PR gives this test a short lease)"]
 async fn a_cancel_through_another_instance_doesnt_stop_the_task() {
     fleet_test(|fleet| async move {
-        let a = fleet.start("a", &one_slot(NSFW)).await;
+        // A renews its lease every third of a second: that's how it learns.
+        let a = fleet
+            .start("a", &one_slot(&format!("{SHORT_LEASE}{NSFW}")))
+            .await;
         let b = fleet.start("b", NSFW).await;
         // A's item waits for A's only slot.
         let slot = a.engine.inner.gate.clone().acquire(0).await;
@@ -27,7 +30,7 @@ async fn a_cancel_through_another_instance_doesnt_stop_the_task() {
         // a_cancelled_item_waiting_for_a_slot_gives_back_its_place). From B, A
         // can only learn of it when it next renews its lease.
         let stopped = wait_within(WAIT, || a.in_flight() == 0).await;
-        let b_tokens = b.engine.inner.cancels.lock().unwrap().len();
+        let b_tokens = b.runs();
 
         drop(slot);
         a.wait_idle().await;
@@ -45,14 +48,16 @@ async fn a_cancel_through_another_instance_doesnt_stop_the_task() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until conditional state writes (the first terminal state wins)"]
 async fn finishing_overwrites_a_cancel_from_another_instance() {
     fleet_test(|fleet| async move {
         let a = fleet.start("a", NSFW).await;
         let b = fleet.start("b", NSFW).await;
         // A's item has failed; A has read the task to roll it up, and is about
         // to write it failed.
-        let hold = a.hold_storage(1, |c| matches!(c, Call::SetTaskState(_, s) if finished(*s)));
+        let hold = a.hold_storage(
+            1,
+            |c| matches!(c, Call::SetTaskState(_, s, _) if finished(*s)),
+        );
         let t = a.submit(refused()).await.id;
         hold.entered("a marks the task failed").await;
 
@@ -72,10 +77,11 @@ async fn finishing_overwrites_a_cancel_from_another_instance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until conditional state writes (a finished item stays finished)"]
 async fn a_second_runner_overwrites_a_finished_result() {
     fleet_test(|fleet| async move {
-        let url = "file:///nonexistent/apollo-test.png";
+        let origin = Origin::start();
+        let url = origin.url("/t.png");
+        let url = url.as_str();
         let a = fleet
             .start("a", &one_slot(&format!("[cache]\n{NSFW}")))
             .await;
@@ -89,9 +95,10 @@ async fn a_second_runner_overwrites_a_finished_result() {
         // runs its own copy of the task, as a takeover does: it finishes it
         // from the cache.
         let content = sha256_hex(b"the image");
+        let key = b.engine.cache_key("nsfw").unwrap();
         fleet
             .store
-            .url_cache_store(&sha256_hex(url.as_bytes()), "nsfw", "main", &content)
+            .url_cache_store(&sha256_hex(url.as_bytes()), "nsfw", &key, &content)
             .await
             .unwrap();
         fleet
@@ -99,21 +106,13 @@ async fn a_second_runner_overwrites_a_finished_result() {
             .cache_store(
                 &content,
                 "nsfw",
-                "main",
+                &key,
                 &ModelOutput::Classification(Classification::default()),
             )
             .await
             .unwrap();
-        let copy = fleet.task(&t).await;
-        b.on(move |e| async move {
-            let reservations: Vec<_> = copy
-                .items
-                .iter()
-                .map(|item| e.reserve_resumed(&item.models))
-                .collect();
-            e.run_task(copy, reservations).await;
-        })
-        .await;
+        fleet.db.expire_lease(&t, Duration::from_secs(1)).await;
+        assert!(b.take(&t, ClaimMode::Expired).await);
         fleet.log.delivered("b", &t).await;
         let by_b = fleet.task(&t).await;
         assert_eq!(
@@ -122,9 +121,14 @@ async fn a_second_runner_overwrites_a_finished_result() {
             "B finished it from the cache"
         );
 
-        // Then A's item gets its slot.
+        // Then A's item gets its slot, and downloads the input (its look at
+        // the cache was before the result was there).
         drop(slot);
-        a.wait_idle().await;
+        tokio::join!(a.wait_idle(), async {
+            if let Some(download) = origin.next_within(Duration::from_secs(5)).await {
+                download.reply(Reply::Garbage);
+            }
+        });
         let a_wrote = wait_within(Duration::from_secs(2), || {
             fleet
                 .log

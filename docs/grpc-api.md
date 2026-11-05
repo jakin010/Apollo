@@ -37,7 +37,7 @@ A validation failure returns `INVALID_ARGUMENT` and no task is created. On succe
 - with `wait_seconds = 0` (the default), as it is now (usually `QUEUED`);
 - otherwise once it finishes, or after `wait_seconds` with whatever state it reached by then. Either way you get a `Task` back; check `state`.
 
-**Idempotency:** with a `request_id`, submitting again with the same `request_id` (as the same caller) returns the existing task instead of creating a new one, whatever the new request contains. Use it to retry a `Classify` that timed out without risking a duplicate. Keys are scoped to the caller (token subject), so two callers can use the same key.
+**Idempotency:** with a `request_id`, submitting again with the same `request_id` (as the same caller) returns the existing task instead of creating a new one, whatever the new request contains. Use it to retry a `Classify` that timed out without risking a duplicate. Keys are scoped to the caller (token subject), so two callers can use the same key. The task's id is made from the caller and the key, so a retry through another instance sharing the database gets the same task. A key is remembered while its task is stored: once [retention](./database.md#retention) removes the task, the same key makes a new task, with the same id.
 
 **Inline content:** `media.data` carries the bytes themselves instead of a `url`. It is bounded by the gRPC message size (4 MiB by default) and by `[limits].max_download`; stream larger files with `ClassifyStream`. The server stages the bytes to a private upload file and removes it when the task finishes.
 
@@ -56,7 +56,7 @@ Returns the current `Task`. `view` picks the result detail: `SUMMARY` (the defau
 
 ### `WatchTask(WatchTaskRequest) → stream Task`
 
-Sends the task as it is now, then again each time it changes (it starts processing, a model finishes, a retry begins, …), and ends the stream after sending it `COMPLETED`, `FAILED` or `CANCELLED`. Updates may be coalesced: a burst of changes can arrive as one message carrying the latest state. Use it when you can't receive webhooks and don't want to poll. `view` works as for `GetTask`.
+Sends the task as it is now, then again each time it changes (it starts processing, a model finishes, a retry begins, …), and ends the stream after sending it `COMPLETED`, `FAILED` or `CANCELLED`. Updates may be coalesced: a burst of changes can arrive as one message carrying the latest state. A change made by another instance sharing the database shows up within about 2 seconds. Use it when you can't receive webhooks and don't want to poll. `view` works as for `GetTask`.
 
 ### `ListTasks(ListTasksRequest) → ListTasksResponse`
 
@@ -66,7 +66,7 @@ With authentication on, a caller lists only its own tasks; [admin subjects](./co
 
 ### `CancelTask(CancelTaskRequest) → Task`
 
-Requests cooperative cancellation and returns the task **after** the request: `CANCELLED`, unless it had already finished. Running work stops at the next checkpoint: between models, or between sampled video frames. Results of models that finished before are kept; models that had not finished are reported `CANCELLED`. Returns `NOT_FOUND` for an unknown id.
+Requests cooperative cancellation and returns the task **after** the request: `CANCELLED`, unless it had already finished. Running work stops at the next checkpoint: between models, or between sampled video frames. With instances sharing one database, a cancel through another instance than the one running the task reaches it when that one next renews its lease (within a third of `[database].lease_secs`). Results of models that finished before are kept; models that had not finished are reported `CANCELLED`. Returns `NOT_FOUND` for an unknown id.
 
 ### `ListModels(ListModelsRequest) → ListModelsResponse`
 
@@ -355,11 +355,11 @@ Nothing is kept when a request is refused as overloaded, so the same request may
 
 By default every `Inference` RPC must carry a valid **PASETO v4** token; health and reflection remain open. (Set `[auth] enabled = false` to turn this off on a trusted network.)
 
-- Mint tokens with `apollo token --subject NAME [--expires 30d]`. Without `[auth].public_key` the server uses a local keypair it creates on first start, which `apollo token` reads; or generate one with `apollo keygen` and configure its public key.
+- Mint tokens with `apollo token --subject NAME [--expires 30d]`. Without `[auth].public_key` the server uses a local keypair it creates on first start, which `apollo token` reads; or generate one with `apollo keygen` and configure its public key. Instances sharing one SurrealDB verify with one key, stored there by the first to start.
 - Clients send the token in the **`authorization`** metadata header, with or without a `Bearer ` prefix.
-- The server verifies the signature and any `iat`/`nbf`/`exp` claims; non‑expiring tokens are accepted (revoke by rotating the keypair).
+- The server verifies the signature and any `iat`/`nbf`/`exp` claims; non‑expiring tokens are accepted.
 - With `apollo-client`, pass the token via `Client::builder(url).token("v4.public.…")`.
-- A missing, invalid, or **revoked** token is rejected with `UNAUTHENTICATED`. Tokens carry an id; `apollo revoke --id …` (or `--subject …`) revokes them without rotating the keypair, effective within ~10 s.
+- A missing, invalid, or **revoked** token is rejected with `UNAUTHENTICATED`. Tokens carry an id; `apollo revoke --id …` (or `--subject …`) revokes them without rotating the keypair, effective within ~10 s, on every instance sharing the database.
 - Tasks belong to the token subject that submitted them: `GetTask`, `WatchTask` and `CancelTask` by any other subject return `NOT_FOUND` (as for an unknown id), and `ListTasks` lists only the caller's own tasks, unless the subject is listed in `[auth].admin_subjects`.
 
 See [configuration.md → Authentication](./configuration.md#auth--authentication) for the full setup.

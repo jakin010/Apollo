@@ -224,7 +224,7 @@ async fn starting_times_out_and_calls_wait_out_an_outage() {
         );
         let write = tokio::spawn({
             let (store, task) = (store.clone(), task.clone());
-            async move { store.create_task(&task).await }
+            async move { store.create_task(&task, None, None).await }
         });
         tokio::time::sleep(LIMIT * 2).await;
         assert!(!write.is_finished(), "the write didn't wait for the server");

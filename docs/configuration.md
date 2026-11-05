@@ -43,11 +43,12 @@ A running server picks up an edited file with `apollo reload` (or `SIGHUP`), wit
 | `max_memory` | size | `"4gb"` | Soft ceiling on the server process's memory. New work is rejected with `RESOURCE_EXHAUSTED` while usage is above it (`0` = off). On macOS usage is the process's physical footprint (what Activity Monitor and `footprint` show), which includes Metal GPU buffers; on Apple Silicon these hold the model weights and activations and are not part of the resident set size. Elsewhere it is the resident set size, so CUDA device memory is not counted. |
 | `max_pending` | u32 | `1024` | Max items queued or in‑flight before submissions are rejected with `RESOURCE_EXHAUSTED`, tagged `apollo-overloaded: queue` (backpressure). `0` = off. A model can have its own limit too (`[models.<label>].max_pending`). |
 | `max_retries` | u32 | `3` | Times an item is retried after a **transient** failure (network error, HTTP 5xx/408/429, model timeout or load failure, inference error): a failed fetch is re‑fetched, failed models (or the failed pipeline step) re‑run while finished ones are kept. Permanent failures (refused URL, HTTP 4xx, undecodable or over‑limit input) are not retried. `0` = no retries. |
+| `node_id` | string | *(kept in the state dir)* | This instance's name among instances sharing one database: its uploads and local-file inputs stay with this name, and other instances fail them only once their lease has lapsed for ten leases. 1 to 64 letters, digits, `.`, `_` or `-`. Without it, an id is made on first start and kept in the state directory (one per upload directory). Set it where the state directory doesn't survive a restart (containers). Restart-only. |
 | `device` | string | `"auto"` | Compute backend for the models. `auto` picks the first that initializes: CUDA (only in `cuda` builds), then Metal (macOS), then CPU. `cpu` always uses the CPU, even on a GPU machine. `metal` / `cuda` pin that backend and fall back to CPU, with a warning, if it can't be used. |
 
 **CPU threads.** Inference on the CPU uses one thread per physical core the server may run on: the performance cores on Apple silicon, and on Linux no more than its CPU affinity (`taskset`) and container CPU limit allow. The count is logged at startup (`CPU threads for inference`). To use fewer, for example when other heavy processes share the machine, set `CANDLE_NUM_THREADS` (or `RAYON_NUM_THREADS`) in the server's environment.
 
-**CPU speed features.** Three build features make inference on the CPU faster, at the cost of bit-for-bit reproducible scores: they move in the last digits (at most 1e-5; no label changed in testing). They are off by default; enable them with `cargo build -p apollo --release --features <name>[,<name>]`.
+**CPU speed features.** Three build features make inference on the CPU faster, at the cost of bit-for-bit reproducible scores: they move in the last digits (at most 1e-5; no label changed in testing). They are off by default; enable them with `cargo build -p apollo --release --features <name>[,<name>]`. A build with any of them (or a model on another device) keeps result-cache entries of its own.
 
 | Feature | Where | Effect (measured) |
 |---|---|---|
@@ -59,7 +60,7 @@ A running server picks up an edited file with `apollo reload` (or `SIGHUP`), wit
 
 ## `[webhook]` — outbound delivery
 
-Optional. Omit the whole section, or set `enabled = false`, to disable delivery and let clients poll. See [webhooks.md](./webhooks.md) for semantics.
+Optional. Omit the whole section, or set `enabled = false`, to disable delivery and let clients poll. See [webhooks.md](./webhooks.md) for semantics. Instances sharing one database need the same `url` (and `secret`): each sends only the pending events of its own receiver.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -77,9 +78,9 @@ Optional. Omit the whole section, or set `enabled = false`, to disable delivery 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `enabled` | bool | `true` | Require a token on every `Inference` RPC. Set `false` only on a trusted network — anyone who can reach the port can then submit work and read results (the server logs a warning at startup). |
-| `public_key` | string | *(none)* | PASERK‑encoded v4 **public** key (`k4.public.…`) used to verify tokens. When unset, the server uses a **local keypair** (below). |
+| `public_key` | string | *(none)* | PASERK‑encoded v4 **public** key (`k4.public.…`) used to verify tokens. When unset, the server uses a **local keypair** (below). On a shared SurrealDB it is also stored in the database if none is; a different stored key refuses the start. |
 | `admin_subjects` | list | `[]` | Token subjects that may read and cancel **every** task. Everyone else only sees tasks created by their own subject. |
-| `revocation_file` | string | `<state dir>/revoked_tokens` | Revoked token ids / subjects, written by `apollo revoke` and re‑read by running servers within ~10 s. Relative paths resolve from the config file's directory. |
+| `revocation_file` | string | `<state dir>/revoked_tokens` | Revoked token ids / subjects, written by `apollo revoke` and re‑read by running servers within ~10 s. Relative paths resolve from the config file's directory. On a shared database `apollo revoke` also stores the revocation there, and servers apply both lists. |
 
 **Zero‑config (local keypair).** Without `public_key`, the server creates a signing keypair on first start and keeps it in `auth.key` in its private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS; owner‑only). `apollo token` reads that file when no other secret key is given, so the minimal setup is:
 
@@ -99,6 +100,18 @@ export APOLLO_SECRET_KEY="k4.secret.…"
 apollo token --subject ci-runner --expires 30d
 ```
 
+**Several instances on one SurrealDB.** They verify with one public key, stored in the database. The first instance to start publishes its own (its local keypair's, or `public_key`); its secret key stays on that host. The others verify with it, without making a keypair of their own, and log the node that published it. Mint tokens on that host, or with its secret key (`--secret-key-file` / `APOLLO_SECRET_KEY`): `apollo token` refuses a secret key whose public key isn't the shared one (`--no-db-check` skips the check; pass `--config` for a config other than the standard one). An instance whose `public_key` differs from the stored key refuses to start. Anyone who can write to the database can replace the key (taking effect as instances restart) or remove its revocations, so the database is part of the trust boundary: set `public_key` on every instance to pin it.
+
+**Rotating the shared key.**
+
+```bash
+(umask 077; apollo keygen > new.key)                     # owner-only; keep new.key safe
+apollo publish-key --replace --secret-key-file new.key   # store its public key as the shared one
+apollo token --secret-key-file new.key --subject …       # mint tokens with it
+```
+
+Then restart every instance (and change `public_key` where it is set): each verifies with the new key from its restart on, rejecting tokens signed with the old one. `apollo publish-key` without `--replace` stores a key only when none is.
+
 To turn authentication off: `apollo config set auth.enabled false`.
 
 **Task ownership.** Every task records the subject (`sub`) of the token that submitted it. `GetTask` and `CancelTask` from any other subject return `NOT_FOUND` — the same answer as for an id that does not exist — unless the caller's subject is in `admin_subjects`. Tasks submitted while authentication was disabled have no owner and are visible only to admins once it is on. Give each client (or tenant) its own subject.
@@ -111,7 +124,7 @@ apollo revoke --token "v4.public.…"  # one token, reading its id from the toke
 apollo revoke --subject ci-runner    # every token of a subject (incl. tokens minted before ids existed)
 ```
 
-Each command appends a line (`id <id>` or `subject <name>`) to the revocation file; running servers pick it up within about 10 seconds. The file is plain text: delete a line to un‑revoke. Run `apollo revoke` as the server's OS user (or pass `--config` when `revocation_file` is set there). If the file becomes unreadable, the server keeps the last list it loaded.
+Each command appends a line (`id <id>` or `subject <name>`) to the revocation file; running servers pick it up within about 10 seconds. On a database instances share, it also stores the revocation there, so every instance applies it. `apollo revoke --undo …` takes a revocation back, from this host's file and the database (an instance whose own revocation file lists it keeps refusing it). The file is plain text: deleting a line also un‑revokes, unless the database revokes it too. Run `apollo revoke` as the server's OS user, with `--config <the servers' config>` whenever the servers don't use the standard config path: that config's `[database]` is where instances sharing a database read revocations, and its `revocation_file` the file it writes. Without a config it changes only this host's file, and says so. If the file becomes unreadable, the server keeps the last list it loaded.
 
 Clients send the token in the **`authorization`** metadata header (with or without a `Bearer ` prefix). See [grpc-api.md → Authentication](./grpc-api.md#authentication).
 
@@ -165,7 +178,7 @@ Guards applied to inputs: SSRF protection when fetching remote URLs, a gate on l
 
 ## `[cache]` — result cache
 
-Optional. A bare `[cache]` section turns it on (`enabled` defaults to `true`). When enabled, model outputs are cached by **content hash** (with a URL→content‑hash hint) so identical inputs skip inference. The URL hint assumes a URL's content does not change within `ttl_secs` (forever, without a TTL); set a TTL if your URLs can serve different content over time. The hint is only recorded when the content came from `main`, not from `fallback`. See [database.md → Result cache](./database.md#result-cache).
+Optional. A bare `[cache]` section turns it on (`enabled` defaults to `true`). When enabled, model outputs are cached by **content hash** (with a URL→content‑hash hint) so identical inputs skip inference. The URL hint assumes a URL's content does not change within `ttl_secs` (forever, without a TTL); set a TTL if your URLs can serve different content over time. The hint is only recorded when the content came from `main`, not from `fallback`, and never for local files, which are read each time. Results are keyed by each model's output fingerprint: its output settings, the contents of its taxonomy or hash list, its video strategy, the device and CPU speed features. Instances sharing a database share results only where those match. See [database.md → Result cache](./database.md#result-cache).
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -194,7 +207,8 @@ See [database.md](./database.md) for the full picture.
 |-------|------|---------|---------|
 | `backend` | enum | `sqlite` | `sqlite` \| `postgres` \| `surrealdb`. (`postgres` is a future seam and currently fails at startup.) |
 | `retention` | duration | *(none)* | How long to keep finished tasks (e.g. `"30d"`). Omit to keep forever. |
-| `timeout` | u32 (s) | `30` | How long a client's call waits for the database before it fails with `UNAVAILABLE`, and how long connecting to SurrealDB may take at startup (the schema migration after it has no limit). Background work (running tasks, webhooks) always waits, so none of its writes is dropped. A Classify told `UNAVAILABLE` may still have its task stored and run once the database answers: retry it with the same `request_id` to get that task. `0` waits as long as it takes. |
+| `lease_secs` | u32 | `30` | Seconds a task's claim lasts unless its runner renews it (every third of this); 1 to 3600. With instances sharing one database (SurrealDB), another instance takes a task over once its lease has lapsed this long. A runner whose last confirmed renewal was sent 5/6 of this ago stops its tasks and hands them back once the database answers: a database outage of a third to 5/6 of this can stop them, depending on when it starts. Also how long a finished webhook's delivery claim lasts unless renewed. Keep it the same on every instance. Restart-only. |
+| `timeout` | u32 (s) | `30` | How long a client's call waits for the database before it fails with `UNAVAILABLE`, and how long connecting to SurrealDB may take at startup (the schema migration after it has no limit). Background work (running tasks, webhooks) always waits, so none of its writes is dropped. A Classify told `UNAVAILABLE` may still have its task stored and run once the database answers: retry it with the same `request_id` to get that task. `0` waits as long as it takes. Lease renewals have their own limit (a third of `lease_secs`), whatever this is. |
 
 Each backend has its own sub‑table; the one matching `backend` is required (except `sqlite`, which has defaults).
 
@@ -325,7 +339,7 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 |-------|------|---------|---------|
 | `architecture` | enum | *(required)* | Image models: `vit` (fixed‑head classifier), `siglip` (open‑vocabulary), or `pdq` (perceptual-hash block list; see [below](#perceptual-hash-block-lists-pdq)). Text models: `bert`, `distilbert`, `xlm_roberta` (also RoBERTa checkpoints; `roberta` is an alias), `modernbert`, `deberta_v2` (also DeBERTa-v3); see [text models](#text-models). Reading text in images: `paddleocr_vl`; see [reading text](#reading-text-in-images-paddleocr_vl). |
 | `repo` | string | *(required, except for `pdq`)* | Hugging Face repo. `pdq` has none. |
-| `revision` | string | `"main"` | Repo revision/branch/tag. |
+| `revision` | string | `"main"` | Repo revision/branch/tag. Pin a commit sha when instances share a database: a branch can move between their downloads, and the result cache can't tell. |
 | `enabled` | bool | `true` | If `false`, the model is rejected at submit time. |
 | `keep_in_memory` | bool | `false` | Load the weights at startup and keep them resident (skip idle‑unload). |
 | `max_concurrent` | u32 | `8` | GPU **batch size** for this model's worker. |

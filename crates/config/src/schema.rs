@@ -52,7 +52,8 @@ pub struct AuthConfig {
     /// PASERK-encoded v4 **public** key (`k4.public.…`) used to verify tokens.
     /// When unset, the server uses — creating on first start — a keypair kept in
     /// an owner-only `auth.key` file in its state directory, which `apollo token`
-    /// also reads.
+    /// also reads. On a SurrealDB that instances share, it is also stored there
+    /// if no key is, and a different stored key refuses the start.
     #[serde(default)]
     pub public_key: Option<String>,
     /// Token subjects (`sub`) that may read and cancel every task. Everyone else
@@ -62,7 +63,8 @@ pub struct AuthConfig {
     /// File listing revoked token ids and subjects (written by `apollo revoke`,
     /// re-read by running servers within seconds). Defaults to
     /// `revoked_tokens` in the server's state directory. Relative paths resolve
-    /// from the config file's directory.
+    /// from the config file's directory. On a database instances share, `apollo
+    /// revoke` also stores the revocation there, and servers apply both lists.
     #[serde(default)]
     pub revocation_file: Option<String>,
 }
@@ -177,6 +179,12 @@ pub struct AppConfig {
     /// Compute backend for the model workers. `auto` picks CUDA → Metal → CPU.
     #[serde(default)]
     pub device: DevicePreference,
+    /// This instance's name among instances sharing one database (letters,
+    /// digits, `.`, `_`, `-`; at most 64). Its node-local inputs (uploads,
+    /// local files) stay with this name. Defaults to an id kept in the state
+    /// directory, one per upload directory.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 /// Which compute backend to run models on.
@@ -215,6 +223,7 @@ impl Default for AppConfig {
             max_pending: defaults::max_pending(),
             max_retries: defaults::max_retries(),
             device: DevicePreference::Auto,
+            node_id: None,
         }
     }
 }
@@ -303,6 +312,12 @@ pub struct DatabaseConfig {
     /// How long to keep finished tasks (e.g. "30d"); `None` keeps forever.
     #[serde(default)]
     pub retention: Option<String>,
+    /// Seconds a task's claim lasts unless its runner renews it (every third
+    /// of this). With a shared database (SurrealDB), another instance takes a
+    /// task over once its lease has lapsed this long. Keep it the same on every
+    /// instance.
+    #[serde(default = "crate::defaults::lease_secs")]
+    pub lease_secs: u32,
     #[serde(default)]
     pub sqlite: Option<SqliteConfig>,
     #[serde(default)]
@@ -321,6 +336,7 @@ impl Default for DatabaseConfig {
         Self {
             backend: Backend::Sqlite,
             retention: None,
+            lease_secs: crate::defaults::lease_secs(),
             sqlite: None,
             postgres: None,
             surrealdb: None,

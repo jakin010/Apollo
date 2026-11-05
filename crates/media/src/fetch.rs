@@ -115,6 +115,12 @@ pub async fn fetch(url: &Url, limits: &FetchLimits) -> Result<LocalMedia, MediaE
     })
 }
 
+/// Whether `src` names a file on this machine (`file://` or a bare path)
+/// rather than a URL to download: as [`fetch`] resolves it.
+pub fn is_local_source(src: &str) -> bool {
+    src.starts_with("file://") || !src.contains("://")
+}
+
 async fn resolve(src: &str, limits: &FetchLimits) -> Result<LocalMedia, MediaError> {
     if let Some(rest) = src.strip_prefix("file://") {
         return local(rest, limits);

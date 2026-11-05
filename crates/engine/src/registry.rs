@@ -22,6 +22,11 @@ struct Worker {
     /// What the worker was built from; a reload keeps the worker while this
     /// is unchanged.
     key: LoadKey,
+    /// The key its results are cached under (see
+    /// [`apollo_inference::output_fingerprint`]); `None` when its files
+    /// couldn't be read. Not part of [`LoadKey`] on purpose: a change of
+    /// strategy or `early_exit` keeps the loaded model, not its cached results.
+    fingerprint: Option<Arc<str>>,
 }
 
 /// The parts of a model's config (and the files it reads: a taxonomy, a hash
@@ -91,7 +96,21 @@ impl Registry {
                 continue;
             }
             let key = LoadKey::of(model);
+            let strategy = model
+                .video_strategy
+                .as_deref()
+                .and_then(|s| config.strategies.get(s));
+            let fingerprint: Option<Arc<str>> =
+                apollo_inference::output_fingerprint(model, &key.files, strategy, env.kind)
+                    .map(Arc::from);
             let old = previous.and_then(|p| p.workers.get(label));
+            if old.is_none_or(|w| w.fingerprint != fingerprint) {
+                tracing::info!(
+                    model = %label,
+                    fingerprint = fingerprint.as_deref().unwrap_or("none (its files can't be read)"),
+                    "result cache key"
+                );
+            }
             match old {
                 Some(w) if w.key == key => {
                     changes.kept.push(label.clone());
@@ -100,6 +119,7 @@ impl Registry {
                         Worker {
                             handle: Arc::clone(&w.handle),
                             key,
+                            fingerprint,
                         },
                     );
                     continue;
@@ -113,6 +133,7 @@ impl Registry {
                 Worker {
                     handle: Arc::new(handle),
                     key,
+                    fingerprint,
                 },
             );
         }
@@ -130,6 +151,12 @@ impl Registry {
 
     pub(crate) fn get(&self, label: &str) -> Option<Arc<ModelHandle>> {
         self.workers.get(label).map(|w| Arc::clone(&w.handle))
+    }
+
+    /// The key `label`'s results are cached under; `None` when it has no
+    /// worker, or its files couldn't be read.
+    pub(crate) fn fingerprint(&self, label: &str) -> Option<Arc<str>> {
+        self.workers.get(label).and_then(|w| w.fingerprint.clone())
     }
 
     /// Validate one item's input against its requested models. Rejects unknown or

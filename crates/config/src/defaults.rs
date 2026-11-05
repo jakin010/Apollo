@@ -103,6 +103,9 @@ pub(crate) fn max_pixels() -> u64 {
 pub(crate) fn redelivery_secs() -> u32 {
     60
 }
+pub(crate) fn lease_secs() -> u32 {
+    30
+}
 pub(crate) fn max_retries() -> u32 {
     3
 }

@@ -62,7 +62,11 @@ One row per submission.
 | `id` | TEXT | Primary key (the task id). |
 | `state` | TEXT | `TaskState` token. |
 | `owner` | TEXT | Subject of the token that submitted the task (`NULL` when auth was disabled). Only that subject or an admin can read / cancel / list it. |
-| `attempts` | INTEGER | Crash‑interrupted resume count; a task is failed once this exceeds the cap (poison‑task guard). A graceful shutdown gives the attempt back, so restarts and deploys never count. |
+| `attempts` | INTEGER | Crash‑interrupted resume count; a task is failed once this exceeds the cap (poison‑task guard). A takeover counts one only when the claim it replaces was never handed back (its runner crashed); a graceful shutdown hands claims back, so restarts and deploys never count. |
+| `claim` | TEXT | The current runner's token. Its writes apply only while this is still its token. `NULL` when handed back, or for a task stored before leases. |
+| `claimed_by` | TEXT | Who holds the claim: `<node>/<process>`. |
+| `lease_until` | INTEGER | When the claim lapses unless renewed (milliseconds, on the database's clock). |
+| `pin` | TEXT | The node whose upload or local file the task reads, if any: only it may run the task. |
 | `metadata_json` | TEXT | The client's `metadata` as a JSON object (`NULL` when empty). |
 | `request_id` | TEXT | The client's idempotency key, if any. |
 | `created_at` / `updated_at` | INTEGER | UNIX seconds. |
@@ -84,6 +88,9 @@ One row per input within a task. `PRIMARY KEY (task_id, idx)`.
 | `state` | TEXT | `ItemState` token. |
 | `error` | TEXT | Item‑level error as JSON, if failed. |
 | `webhook_delivered` | INTEGER | 0/1 — whether the `FINISHED` webhook event was delivered. |
+| `webhook_target` | TEXT | The receiver its finishing instance's webhook sends to (`scheme://host:port`); `NULL` = any. |
+| `webhook_claim` | TEXT | Who is delivering the `FINISHED` event (`<node>/<process>`), if anyone. |
+| `webhook_claim_until` | INTEGER | Until when (ms, on the database clock) that delivery claim lasts unless renewed. |
 | `retries` | INTEGER | Retry count, compared against `[app].max_retries`. |
 
 ### `model_results`
@@ -122,7 +129,23 @@ The optional result cache (see below).
 | `output_json` | TEXT | | `content_hash` | TEXT |
 | `created_at` | INTEGER | | `created_at` | INTEGER |
 
-`cache` is keyed by `(content_hash, model, revision)`; `url_cache` by `(url_hash, model, revision)`.
+`cache` is keyed by `(content_hash, model, revision)`; `url_cache` by `(url_hash, model, revision)`. Despite its name, `revision` holds the model's output fingerprint (`fp1:<sha-256>`, see below). Rows from before the fingerprint (keyed `main` or a commit) are never matched again; they expire with `[cache].ttl_secs`, or can be removed once every instance runs a version with fingerprints:
+
+- SQLite: `DELETE FROM cache WHERE revision NOT LIKE 'fp1:%'; DELETE FROM url_cache WHERE revision NOT LIKE 'fp1:%';`
+- SurrealDB: `DELETE cache WHERE !string::starts_with(revision, 'fp1:'); DELETE url_cache WHERE !string::starts_with(revision, 'fp1:');`
+
+### `auth_key` and `revocations`
+
+Where instances share the database (SurrealDB), the public key they all verify tokens with and the token revocations they all apply (see [configuration.md → `[auth]`](./configuration.md#auth--authentication)). SQLite has the tables too, but a single instance never uses them: it keeps its key and revocations in files.
+
+| `auth_key` column | Type | | `revocations` column | Type |
+|-------------------|------|---|----------------------|------|
+| `slot` | TEXT | | `kind` | TEXT (`id` \| `subject`) |
+| `public_key` | TEXT | | `value` | TEXT |
+| `created_by` | TEXT | | `revoked_at` | INTEGER |
+| `created_at` | INTEGER | | | |
+
+`auth_key` holds one row (`slot = 'current'`); `revocations` is keyed by `(kind, value)`.
 
 ---
 
@@ -130,10 +153,10 @@ The optional result cache (see below).
 
 The SurrealDB backend models the same data with `SCHEMALESS` tables and explicit indexes:
 
-- **Tables:** `task`, `item`, `model_result`, `frame`, `cache`, `url_cache`.
+- **Tables:** `task`, `item`, `model_result`, `frame`, `cache`, `url_cache`, `auth_key` (one record, `auth_key:current`), `revocation` (records `revocation:[kind, value]`).
 - **Indexes:** `task(state)`, `task(created_at)`, `task(request_id)`, `item(task_id)`, `item(webhook_delivered, state)`, `model_result(task_id, item_idx)`, `frame(task_id, item_idx, label)`.
 
-Records use composite record ids (e.g. `item:[task_id, idx]`, `model_result:[task_id, item_idx, label]`) mirroring the SQLite primary keys, so the same lifecycle, checkpointing, and cache semantics apply.
+Records use composite record ids (e.g. `item:[task_id, idx]`, `model_result:[task_id, item_idx, label]`) mirroring the SQLite primary keys, so the same lifecycle, checkpointing, and cache semantics apply. Item records carry the same delivery-claim fields (`webhook_target`, `webhook_claim`, `webhook_claim_until`, the last a datetime).
 
 ### SurrealDB versions and upgrades
 
@@ -153,12 +176,17 @@ Upgrading a 3.x server to 4.0 (see SurrealDB's [3.x to 4.x guide](https://surrea
 
 ## Resume & recovery
 
-On startup the engine loads every task still in a non‑terminal state, fully reconstructed from these tables, and re‑queues it. Recovery relies on:
+Every task is claimed by the instance that runs it, with a lease it renews every third of `[database].lease_secs`. On startup the engine takes over unfinished tasks, fully reconstructed from these tables, and re‑queues them: on SQLite (one process per file) every one; on SurrealDB the ones nobody holds (stored before leases, or handed back by a graceful stop), and, every third of the lease from then on, also the ones whose lease lapsed (their runner stopped), but only once it has itself been in touch with the database for a whole lease, and only up to its free room and for tasks whose models it has (a task whose input is local to it, it takes back whatever its room). A task cancelled while its runner was gone is taken over too, to finish its items as cancelled. A task that no instance has held for ten leases and that the instance looking at it can't run (its model or pipeline is gone) is failed, saying why. Recovery relies on:
 
 - `tasks.state` (indexed) to find incomplete work,
+- `tasks.claim` and `lease_until` to tell held tasks from lapsed ones,
 - `model_results.state` + `frames` to skip already‑finished models and frames,
-- `tasks.attempts` (bumped per resume, given back on graceful shutdown) to **fail a poison task** once it exceeds its cap instead of crash‑looping — its items are marked failed, its webhook fires, and its staged upload is removed,
-- `items.webhook_delivered` to redeliver any `FINISHED` webhook event that a crash left un‑acknowledged.
+- `tasks.attempts` (bumped by a takeover of a claim never handed back) to **fail a poison task** once it exceeds its cap instead of crash‑looping — its items are marked failed, its webhook fires, and its staged upload is removed,
+- `items.webhook_delivered` to redeliver any `FINISHED` webhook event that a crash left un‑acknowledged, and `webhook_claim` / `webhook_claim_until` so only one instance at a time delivers it (the one that finished the item, until its claim lapses or it gives up).
+
+A runner whose lease was taken over (it lost touch with the database for longer than the lease) is fenced out: its writes no longer apply, and it stops when its next renewal finds the claim gone. A runner whose last confirmed renewal was sent five sixths of a lease ago (the database is out of reach, or answers no renewal within a third of the lease) stops its tasks at their next checkpoint and writes nothing more. It hands them back as soon as the database answers, and they resume, here or elsewhere, with no attempt counted. Renewals go out every third of the lease, so an outage shorter than a third changes nothing, one longer than five sixths always stops tasks, and one in between may, depending on when it starts. A task whose input is an upload or a local file is pinned to the node that accepted it (`[app].node_id`): other instances leave it alone, and fail it with a clear message (submit it again) only once its lease has lapsed for ten leases. Cancelling one needs no input, so any instance finishes a cancelled one. The startup upload sweep removes only unreferenced files older than an hour, so a shared upload directory doesn't lose one still arriving.
+
+State writes only apply to an unfinished task or item: the first finish wins, so a late or second runner can't reopen a task, overwrite a cancel, or start an item another runner finished (one already partway through it can still overwrite its model results). An upload is read, and removed, only from the server's own upload directory (`[app].cache_dir/uploads`), whatever path a task's row holds; anything else fails the item.
 
 ---
 
@@ -172,7 +200,9 @@ If `[database].retention` is set (e.g. `"30d"`), a background timer periodically
 
 When `[cache]` is enabled, model outputs are cached so identical inputs skip inference:
 
-- **Content cache** (`cache` table): keyed by the input's **content hash** + model + revision. A hit returns the stored `ModelOutput` directly, unless it is not the kind of output the model gives now (its label was repointed at a model that reads text, or back). A pipeline step with an `input` is keyed by the text it classifies instead, and not cached when that text is empty.
-- **URL→content hint** (`url_cache` table): maps a URL's hash to the content hash it last resolved to, so a repeated URL can reach the content cache without re‑downloading.
+- **Content cache** (`cache` table): keyed by the input's **content hash** + model + the model's **output fingerprint**. A hit returns the stored `ModelOutput` directly, unless it is not the kind of output the model gives now (its label was repointed at a model that reads text, or back). A pipeline step with an `input` is keyed by the text it classifies instead, and not cached when that text is empty.
+- **URL→content hint** (`url_cache` table): maps a URL's hash to the content hash it last resolved to, so a repeated URL can reach the content cache without re‑downloading. Local files (`file://` or a bare path) get no hint: they are read each time, so a file replaced at the same path gets its own result.
 
-Freshness is controlled by `[cache].ttl_secs`: a lookup passes a lower bound on `created_at`, so entries older than the TTL are ignored, and an hourly job deletes them. Omit `ttl_secs` for entries that never expire. Keying on `revision` means bumping a model's revision naturally invalidates its cached outputs.
+The **output fingerprint** covers what a model's output depends on: its output settings (`architecture`, `repo`, `revision`, `labels`, `prompt_template`, thresholds, `max_results`, the pdq and text and OCR settings, `early_exit`), the contents of its `taxonomy_file` and `hash_list` (not their paths), the contents of its `video_strategy` (and its `max_concurrent` when the strategy confirms triggers, which then depends on the batch size), the device and the CPU speed features in use (except for `pdq`), and the version of Apollo's own output code. Scheduling settings (`timeout`, `priority`, `max_pending`, `max_concurrent` otherwise, `keep_in_memory`), paths, `[limits]` and pipelines are left out. Results for videos are kept apart from those for images of the same bytes (an animated image sent both ways), and a video scan that resumed from frames an earlier run saved isn't cached (those frames may come from another config). Changing any of the covered settings starts new entries; a restart with the same config keeps hitting the old ones. Instances sharing a database share results only where these match, and each logs its models' fingerprints (`result cache key`) at startup and on reload, for comparing them. A `revision` such as `main` can move between downloads without the cache noticing: pin a commit for instances that share a database.
+
+Freshness is controlled by `[cache].ttl_secs`: a lookup passes a lower bound on `created_at`, so entries older than the TTL are ignored, and an hourly job deletes them. Omit `ttl_secs` for entries that never expire.

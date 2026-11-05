@@ -10,10 +10,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 
 use apollo_config::{Backend, DatabaseConfig};
-use apollo_domain::{ItemState, ModelOutput, ModelResult, Sample, Task, TaskError, TaskState};
+use apollo_domain::{
+    ItemState, ModelOutput, ModelResult, Revocation, Sample, Task, TaskError, TaskState,
+};
 
 pub mod backends;
 pub mod error;
+pub mod lease;
 pub mod resume;
 pub mod retention;
 #[cfg(feature = "test-util")]
@@ -21,6 +24,7 @@ pub mod testing;
 
 pub use backends::{SqliteStorage, SurrealStorage};
 pub use error::StorageError;
+pub use lease::{ClaimMode, Claimable, Delivery, Fence, Held, Lease, Renewal};
 
 /// Serialize a task error to the JSON stored in an `error` column.
 fn error_to_json(error: Option<&TaskError>) -> Result<Option<String>, StorageError> {
@@ -70,6 +74,15 @@ pub struct TaskCursor {
     pub id: String,
 }
 
+/// The public key every instance sharing a database verifies tokens with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedKey {
+    /// PASERK (`k4.public.…`).
+    pub public_key: String,
+    /// The node that stored it, if known.
+    pub node: Option<String>,
+}
+
 /// One page of [`Storage::list_tasks`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TaskPage {
@@ -83,6 +96,14 @@ pub(crate) fn is_terminal(state: TaskState) -> bool {
     matches!(
         state,
         TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+    )
+}
+
+/// Whether an item in `state` is finished (its finished webhook is due).
+pub(crate) fn item_terminal(state: ItemState) -> bool {
+    matches!(
+        state,
+        ItemState::Completed | ItemState::Failed | ItemState::Cancelled
     )
 }
 
@@ -110,26 +131,63 @@ pub trait Storage: Send + Sync {
 
     // ----------------------------- lifecycle -----------------------------
 
-    /// Persist a freshly submitted task (and its items) in one transaction.
-    async fn create_task(&self, task: &Task) -> Result<(), StorageError>;
+    /// Persist a freshly submitted task (and its items) in one transaction,
+    /// claimed by `lease` when given, and pinned to `pin` (the node its input
+    /// is local to) when given. Fails with [`StorageError::TaskExists`],
+    /// writing nothing, when a task with its id is already stored.
+    async fn create_task(
+        &self,
+        task: &Task,
+        lease: Option<&Lease<'_>>,
+        pin: Option<&str>,
+    ) -> Result<(), StorageError>;
 
     /// Load a full task, reconstructing per-model results. Backs `GetTask`.
     async fn get_task(&self, id: &str) -> Result<Option<Task>, StorageError>;
 
-    async fn set_task_state(&self, id: &str, state: TaskState) -> Result<(), StorageError>;
+    /// Set the state of a task that is still `Queued` or `Processing`, and
+    /// still claimed as `fence` says. A finished task keeps its state, so the
+    /// first finish wins over any later write (from a stale runner, or another
+    /// instance sharing the database). Returns whether the state was written.
+    async fn set_task_state(
+        &self,
+        id: &str,
+        state: TaskState,
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError>;
 
     /// Mark a task `Cancelled` only if it is still `Queued` or `Processing`, in
     /// one conditional write, so a cancel can never overwrite a task that has
     /// just finished. Returns whether the state changed.
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool, StorageError>;
 
+    /// Set the state (and error) of an item that hasn't finished, while its
+    /// task is claimed as `fence` says. A completed, failed or cancelled item
+    /// keeps its state. A write that finishes the item also records its
+    /// finished webhook as `delivery` says. Returns whether it was written.
     async fn set_item_state(
         &self,
         task_id: &str,
         item: usize,
         state: ItemState,
         error: Option<&TaskError>,
-    ) -> Result<(), StorageError>;
+        fence: Fence<'_>,
+        delivery: Delivery<'_>,
+    ) -> Result<bool, StorageError>;
+
+    /// Fail an item that hasn't finished with `error`, and each of `models`
+    /// with it, in one transaction, while its task is claimed as `fence` says,
+    /// recording its finished webhook as `delivery` says. Nothing is written
+    /// otherwise. Returns whether it was written.
+    async fn set_item_failed(
+        &self,
+        task_id: &str,
+        item: usize,
+        error: &TaskError,
+        models: &[String],
+        fence: Fence<'_>,
+        delivery: Delivery<'_>,
+    ) -> Result<bool, StorageError>;
 
     /// The id of the task `owner` created with idempotency key `request_id`, if
     /// any (`owner` is `None` for tasks submitted without authentication).
@@ -143,15 +201,17 @@ pub trait Storage: Send + Sync {
     /// id). Backs `ListTasks`.
     async fn list_tasks(&self, query: &TaskQuery) -> Result<TaskPage, StorageError>;
 
-    /// Insert or update the result for one (item, model). Leaves frame progress
-    /// and the steps-completed marker untouched.
+    /// Insert or update the result for one (item, model), while its task is
+    /// claimed as `fence` says. Leaves frame progress and the steps-completed
+    /// marker untouched. Returns whether it was written.
     async fn upsert_model_result(
         &self,
         task_id: &str,
         item: usize,
         label: &str,
         result: &ModelResult,
-    ) -> Result<(), StorageError>;
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError>;
 
     // ------------------------- scan checkpoint --------------------------
 
@@ -199,34 +259,119 @@ pub trait Storage: Send + Sync {
     /// `apollo status`.
     async fn count_tasks_by_state(&self) -> Result<Vec<(TaskState, u64)>, StorageError>;
 
-    /// All tasks still in a non-terminal state, fully reconstructed, for
-    /// re-queueing on startup.
+    /// All tasks still in a non-terminal state, fully reconstructed (the
+    /// upload sweep keeps their files).
     async fn load_incomplete_tasks(&self) -> Result<Vec<Task>, StorageError>;
 
-    /// Bump and return the resume attempt count. The engine fails a task once
-    /// this exceeds its cap, so a poison task can't crash-loop.
+    /// Bump and return the resume attempt count. [`Storage::claim_task`] bumps
+    /// it itself; this is for tools and tests.
     async fn increment_attempts(&self, id: &str) -> Result<u32, StorageError>;
 
-    /// Undo one resume attempt for every incomplete task (never below zero).
-    /// Called on a graceful shutdown, so that only interruptions by a crash count
-    /// toward the poison-task cap. Returns the number of tasks adjusted.
-    async fn release_resume_attempts(&self) -> Result<u64, StorageError>;
+    // ------------------------------- leases ------------------------------
+
+    /// Whether other processes may share this database (SurrealDB): then
+    /// leases decide who runs what. SQLite is one process's file.
+    fn shared(&self) -> bool;
+
+    /// Tasks a claim in `mode` may take, oldest first (creation time, then
+    /// id), after `after`: unfinished ones, and cancelled ones with unfinished
+    /// items (to finish them, as cancelled). Leaves out the ids in `skip`, and
+    /// (except in [`ClaimMode::Force`]) tasks pinned to a node other than
+    /// `node` whose lease ended less than `grace` ago.
+    async fn claimable_tasks(
+        &self,
+        mode: ClaimMode,
+        node: &str,
+        skip: &[String],
+        grace: std::time::Duration,
+        after: Option<&TaskCursor>,
+        limit: usize,
+    ) -> Result<Vec<Claimable>, StorageError>;
+
+    /// Claim the task `id` with `lease`, if it is still claimable as for
+    /// [`Storage::claimable_tasks`]. Bumps its resume attempts when the claim
+    /// it replaces was never handed back (its holder stopped: a crash), not
+    /// when it was released or never claimed. Returns the attempts after the
+    /// claim, or `None` when it wasn't claimable any more.
+    async fn claim_task(
+        &self,
+        id: &str,
+        lease: &Lease<'_>,
+        mode: ClaimMode,
+        grace: std::time::Duration,
+    ) -> Result<Option<u32>, StorageError>;
+
+    /// Renew each held claim for `ttl`, whatever its task's state, and say for
+    /// each (in order) whether it is still held. Doesn't count as a change to
+    /// the task.
+    async fn renew_claims(
+        &self,
+        held: &[Held],
+        ttl: std::time::Duration,
+    ) -> Result<Vec<Renewal>, StorageError>;
+
+    /// Hand held claims back (a graceful stop): the tasks are claimable at
+    /// once, and the next claim counts no attempt. Returns how many were
+    /// still held.
+    async fn release_claims(&self, held: &[Held]) -> Result<u64, StorageError>;
 
     // -------------------------- webhook delivery -------------------------
 
-    /// Terminal items whose webhook has not been delivered (recovers a crash
-    /// between reaching a terminal state and delivering).
+    /// Every finished item whose webhook has not been delivered, whoever is
+    /// delivering it (for status and metrics).
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError>;
 
-    async fn mark_webhook_delivered(&self, task_id: &str, item: usize) -> Result<(), StorageError>;
+    /// Claim up to `limit` of the finished items whose webhook is pending, for
+    /// `holder` to deliver, for `ttl` on the database's clock: those whose
+    /// delivery claim `mode` may take, for receiver `target` (or any, with
+    /// `None`; items stored for any receiver go to every one). Returns the
+    /// items claimed.
+    async fn claim_pending_webhooks(
+        &self,
+        holder: &str,
+        target: Option<&str>,
+        mode: ClaimMode,
+        ttl: std::time::Duration,
+        limit: usize,
+    ) -> Result<Vec<PendingWebhook>, StorageError>;
 
-    /// Persist an item's retry count (compared against `[app].max_retries`).
+    /// Renew `holder`'s delivery claims on `items` for `ttl`, saying for each
+    /// (in order) whether `holder` still holds it.
+    async fn renew_webhook_claims(
+        &self,
+        holder: &str,
+        items: &[PendingWebhook],
+        ttl: std::time::Duration,
+    ) -> Result<Vec<bool>, StorageError>;
+
+    /// Hand back `holder`'s delivery claim on an item (its delivery failed),
+    /// so any instance may deliver it. Returns whether `holder` held it.
+    async fn release_webhook_claim(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError>;
+
+    /// Mark an item's webhook delivered, only while `holder` holds its delivery
+    /// claim. Returns whether it did.
+    async fn mark_webhook_delivered(
+        &self,
+        task_id: &str,
+        item: usize,
+        holder: &str,
+    ) -> Result<bool, StorageError>;
+
+    /// Persist an item's retry count (compared against `[app].max_retries`),
+    /// while its task is claimed as `fence` says. Returns whether it was
+    /// written.
     async fn set_item_retries(
         &self,
         task_id: &str,
         item: usize,
         retries: u32,
-    ) -> Result<(), StorageError>;
+        fence: Fence<'_>,
+    ) -> Result<bool, StorageError>;
 
     // ------------------------------ retention ----------------------------
 
@@ -235,6 +380,10 @@ pub trait Storage: Send + Sync {
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError>;
 
     // -------------------------------- cache ------------------------------
+    //
+    // Entries are keyed by content (or URL) hash, model label and `revision`:
+    // the model's result-cache key, its output fingerprint
+    // (`apollo_inference::output_fingerprint`). The column keeps its old name.
 
     /// Look up a cached model output by content hash. `fresh_after` is a lower
     /// bound on `created_at` in unix seconds (`0` = no TTL). Returns the output if
@@ -278,6 +427,37 @@ pub trait Storage: Send + Sync {
     /// Delete content-cache and url-cache entries created before `cutoff` (unix
     /// seconds). Returns the number of entries removed.
     async fn purge_cache_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError>;
+
+    // -------------------------------- auth -------------------------------
+    //
+    // On a database instances share, the public key they all verify tokens
+    // with (its private key stays on the host that made it), and the token
+    // revocations they all apply.
+
+    /// The stored public key, if any.
+    async fn auth_key(&self) -> Result<Option<SharedKey>, StorageError>;
+
+    /// Store `public_key` (from `node`) unless a key is stored already; never
+    /// overwrites. Returns the key stored afterwards, this call's or the
+    /// earlier one: callers racing on an empty database all get the same one.
+    async fn publish_auth_key(
+        &self,
+        public_key: &str,
+        node: &str,
+    ) -> Result<SharedKey, StorageError>;
+
+    /// Store `public_key` (from `node`), replacing any stored key: a rotation.
+    async fn replace_auth_key(&self, public_key: &str, node: &str) -> Result<(), StorageError>;
+
+    /// Record a revocation (again: refreshes when it was revoked).
+    async fn add_revocation(&self, revocation: &Revocation) -> Result<(), StorageError>;
+
+    /// Remove a revocation. Returns whether it was stored.
+    async fn remove_revocation(&self, revocation: &Revocation) -> Result<bool, StorageError>;
+
+    /// Every stored revocation (rows of a kind this version doesn't know are
+    /// left out).
+    async fn revocations(&self) -> Result<Vec<Revocation>, StorageError>;
 }
 
 /// Open the configured backend and run migrations. Returns a trait object so the
@@ -297,21 +477,50 @@ pub async fn open(db: &DatabaseConfig) -> Result<Arc<dyn Storage>, StorageError>
                     "backend is 'surrealdb' but [database.surrealdb] is missing".into(),
                 )
             })?;
-            // Within `[database].timeout`, so a host that doesn't answer fails
-            // the start instead of hanging it. The migration has no limit:
-            // defining an index over existing rows builds it first.
-            let connect = SurrealStorage::connect(&cfg);
-            let store = match db.timeout {
-                0 => connect.await?,
-                secs => {
-                    let limit = std::time::Duration::from_secs(secs.into());
-                    tokio::time::timeout(limit, connect)
-                        .await
-                        .unwrap_or(Err(StorageError::Timeout(limit)))?
-                }
-            };
+            // The migration has no limit: defining an index over existing rows
+            // builds it first.
+            let store = connect_surreal(db, &cfg).await?;
             store.migrate().await?;
             Ok(Arc::new(store))
+        }
+    }
+}
+
+/// Connect to SurrealDB within `[database].timeout`, so a host that doesn't
+/// answer fails the start instead of hanging it.
+async fn connect_surreal(
+    db: &DatabaseConfig,
+    cfg: &apollo_config::SurrealdbConfig,
+) -> Result<SurrealStorage, StorageError> {
+    let connect = SurrealStorage::connect(cfg);
+    match db.timeout {
+        0 => connect.await,
+        secs => {
+            let limit = std::time::Duration::from_secs(secs.into());
+            tokio::time::timeout(limit, connect)
+                .await
+                .unwrap_or(Err(StorageError::Timeout(limit)))
+        }
+    }
+}
+
+/// The configured database when instances may share it (SurrealDB), for the
+/// CLI's auth commands: connected within `[database].timeout`, with only the
+/// auth tables defined (no full migration). `None` for SQLite, which opens no
+/// file.
+pub async fn connect_shared(db: &DatabaseConfig) -> Result<Option<Arc<dyn Storage>>, StorageError> {
+    match db.backend {
+        Backend::Sqlite => Ok(None),
+        Backend::Postgres => Err(StorageError::UnsupportedBackend("postgres".into())),
+        Backend::Surrealdb => {
+            let cfg = db.surrealdb.clone().ok_or_else(|| {
+                StorageError::Surreal(
+                    "backend is 'surrealdb' but [database.surrealdb] is missing".into(),
+                )
+            })?;
+            let store = connect_surreal(db, &cfg).await?;
+            store.define_auth_tables().await?;
+            Ok(Some(Arc::new(store)))
         }
     }
 }

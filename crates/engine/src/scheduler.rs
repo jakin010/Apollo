@@ -18,6 +18,8 @@ use apollo_media::{
     Confirm, FrameRef, FrameRequest, LocalMedia, MediaError, VideoInfo, VideoShare,
 };
 
+use apollo_storage::Delivery;
+
 use crate::Engine;
 use crate::aggregate;
 use crate::error::EngineError;
@@ -231,13 +233,30 @@ impl Engine {
         };
         let mut permit = Some(granted);
 
-        if let Err(e) = self
+        match self
             .inner
             .storage
-            .set_item_state(&task_id, idx, ItemState::Processing, None)
+            // Not a finish: no delivery to record.
+            .set_item_state(
+                &task_id,
+                idx,
+                ItemState::Processing,
+                None,
+                self.fence(),
+                Delivery::Off,
+            )
             .await
         {
-            tracing::error!(task = %task_id, item = idx, error = %e, "set item processing");
+            Ok(true) => {}
+            // It finished meanwhile: another runner (an instance that took
+            // the task over) ran it.
+            Ok(false) => {
+                tracing::info!(task = %task_id, item = idx, "item already finished; not running it");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(task = %task_id, item = idx, error = %e, "set item processing")
+            }
         }
         self.notify_item_change(&task_id, idx).await;
 
@@ -289,7 +308,11 @@ impl Engine {
         let url_hash = if used_fallback {
             None
         } else {
-            item_url(&item.input).map(|u| sha256_hex(u.main.as_bytes()))
+            // Not for a local file: another host's file at that path, or the
+            // same path rewritten, is other bytes.
+            item_url(&item.input)
+                .filter(|u| !apollo_media::fetch::is_local_source(&u.main))
+                .map(|u| sha256_hex(u.main.as_bytes()))
         };
 
         // Pipeline items run as an ordered, gated sequence with strict failure
@@ -397,7 +420,7 @@ impl Engine {
     /// wire still reports the task as processing), notify, and back off. The
     /// concurrency slot is released during the backoff so a retrying item never
     /// blocks other work. Returns `false` if the task was cancelled meanwhile (the
-    /// item is then already marked cancelled).
+    /// item is then already marked cancelled), or the item finished elsewhere.
     #[allow(clippy::too_many_arguments)]
     async fn retry_after_failure(
         &self,
@@ -414,13 +437,24 @@ impl Engine {
         let _ = self
             .inner
             .storage
-            .set_item_retries(task_id, idx, item.retries)
+            .set_item_retries(task_id, idx, item.retries, self.fence())
             .await;
-        let _ = self
+        if let Ok(false) = self
             .inner
             .storage
-            .set_item_state(task_id, idx, ItemState::Retrying, Some(&err))
-            .await;
+            // Not a finish: no delivery to record.
+            .set_item_state(
+                task_id,
+                idx,
+                ItemState::Retrying,
+                Some(&err),
+                self.fence(),
+                Delivery::Off,
+            )
+            .await
+        {
+            return false;
+        }
         tracing::warn!(
             task = %task_id, item = idx, attempt = item.retries, max,
             error = %err.message, "item attempt failed; will retry"
@@ -444,12 +478,21 @@ impl Engine {
                 return false;
             }
         }
-        let _ = self
-            .inner
-            .storage
-            .set_item_state(task_id, idx, ItemState::Processing, None)
-            .await;
-        true
+        !matches!(
+            self.inner
+                .storage
+                // Not a finish: no delivery to record.
+                .set_item_state(
+                    task_id,
+                    idx,
+                    ItemState::Processing,
+                    None,
+                    self.fence(),
+                    Delivery::Off
+                )
+                .await,
+            Ok(false)
+        )
     }
 
     /// Run one model of a parallel set or pipeline step: content-cache fast
@@ -470,15 +513,18 @@ impl Engine {
             Some(_) => (text_hash.as_deref(), None),
             None => (ctx.content_hash, ctx.url_hash),
         };
+        let key = self.item_cache_key(label, ctx.text_input.is_none().then_some(&ctx.item.input));
 
-        // Content-cache fast path: identical bytes already classified by this
-        // model + revision -> reuse the stored output, skip inference.
-        if let Some(ch) = content_hash {
-            let rev = self.model_revision(label);
+        // Content-cache fast path: identical bytes already classified by a
+        // model with this one's output settings -> reuse the stored output,
+        // skip inference.
+        if let Some(ch) = content_hash
+            && let Some(rev) = key.as_deref()
+        {
             match self
                 .inner
                 .storage
-                .cache_lookup(ch, label, &rev, ctx.fresh_after)
+                .cache_lookup(ch, label, rev, ctx.fresh_after)
                 .await
             {
                 // A label repointed at another kind of model (a classifier
@@ -492,14 +538,10 @@ impl Engine {
                     let _ = self
                         .inner
                         .storage
-                        .upsert_model_result(task_id, idx, label, &done)
+                        .upsert_model_result(task_id, idx, label, &done, self.fence())
                         .await;
                     if let Some(uh) = url_hash {
-                        let _ = self
-                            .inner
-                            .storage
-                            .url_cache_store(uh, label, &rev, ch)
-                            .await;
+                        let _ = self.inner.storage.url_cache_store(uh, label, rev, ch).await;
                     }
                     tracing::debug!(task = %task_id, item = idx, model = %label, "cache hit");
                     self.inner
@@ -518,8 +560,24 @@ impl Engine {
         let _ = self
             .inner
             .storage
-            .upsert_model_result(task_id, idx, label, &ModelResult::processing())
+            .upsert_model_result(
+                task_id,
+                idx,
+                label,
+                &ModelResult::processing(),
+                self.fence(),
+            )
             .await;
+
+        // A video scan resuming from frames a previous run saved may mix in
+        // frames of another config (they carry no key): its result isn't
+        // cached. (Before the run: its own frames are saved as it goes.)
+        let resumed = ctx.text_input.is_none()
+            && ctx.item.input.modality() == Modality::Video
+            && !matches!(
+                self.inner.storage.load_samples(task_id, idx, label).await,
+                Ok(saved) if saved.is_empty()
+            );
 
         tracing::debug!(task = %task_id, item = idx, model = %label, "running model");
         // The model's `timeout` bounds each individual classification — a single
@@ -534,8 +592,17 @@ impl Engine {
         };
         let outcome = match run {
             Ok(output) => {
-                self.store_in_cache(task_id, label, content_hash, url_hash, &output)
+                if !resumed {
+                    self.store_in_cache(
+                        task_id,
+                        label,
+                        key.as_deref(),
+                        content_hash,
+                        url_hash,
+                        &output,
+                    )
                     .await;
+                }
                 SetOutcome::Finished(ModelResult::done(output))
             }
             Err(EngineError::Cancelled) => return SetOutcome::Cancelled,
@@ -551,7 +618,7 @@ impl Engine {
         let _ = self
             .inner
             .storage
-            .upsert_model_result(task_id, idx, label, result)
+            .upsert_model_result(task_id, idx, label, result, self.fence())
             .await;
         outcome
     }
@@ -562,28 +629,19 @@ impl Engine {
         &self,
         task_id: &str,
         label: &str,
+        key: Option<&str>,
         content_hash: Option<&str>,
         url_hash: Option<&str>,
         output: &ModelOutput,
     ) {
-        let Some(ch) = content_hash else {
+        let (Some(ch), Some(rev)) = (content_hash, key) else {
             return;
         };
-        let rev = self.model_revision(label);
-        if let Err(e) = self
-            .inner
-            .storage
-            .cache_store(ch, label, &rev, output)
-            .await
-        {
+        if let Err(e) = self.inner.storage.cache_store(ch, label, rev, output).await {
             tracing::warn!(task = %task_id, model = %label, error = %e, "cache store failed");
         }
         if let Some(uh) = url_hash {
-            let _ = self
-                .inner
-                .storage
-                .url_cache_store(uh, label, &rev, ch)
-                .await;
+            let _ = self.inner.storage.url_cache_store(uh, label, rev, ch).await;
         }
     }
 
@@ -733,7 +791,13 @@ impl Engine {
                     let _ = self
                         .inner
                         .storage
-                        .upsert_model_result(task_id, idx, model, &ModelResult::skipped())
+                        .upsert_model_result(
+                            task_id,
+                            idx,
+                            model,
+                            &ModelResult::skipped(),
+                            self.fence(),
+                        )
                         .await;
                 }
             }
@@ -762,30 +826,87 @@ impl Engine {
         }
     }
 
-    /// The configured revision for a model label (part of the cache key, so a
-    /// revision bump invalidates prior cache entries). Empty if unknown.
-    fn model_revision(&self, label: &str) -> String {
-        self.config()
-            .models
-            .get(label)
-            .map(|m| m.revision.clone())
-            .unwrap_or_default()
+    /// The key `label`'s results are cached under: its output fingerprint,
+    /// from this run's config (the worker computing its results). `None` (no
+    /// worker, or its files couldn't be read): its results are neither looked
+    /// up nor stored.
+    pub(crate) fn cache_key(&self, label: &str) -> Option<Arc<str>> {
+        self.live().registry.fingerprint(label)
+    }
+
+    /// [`Engine::cache_key`] for `label` run on `input` (`None`: on text read
+    /// from it), kept apart per kind of media: the same bytes sent as an
+    /// image and as a video give a classification and a scan.
+    pub(crate) fn item_cache_key(&self, label: &str, input: Option<&Input>) -> Option<String> {
+        let key = self.cache_key(label)?;
+        Some(match input.map(Input::modality) {
+            Some(Modality::Video) => format!("{key}:video"),
+            Some(Modality::Audio) => format!("{key}:audio"),
+            _ => key.to_string(),
+        })
+    }
+
+    /// Persist an item's final `state`. `None` when it had already finished
+    /// (another runner finished it): its runner reports it, this one doesn't.
+    /// Otherwise whether its finished webhook is this process's to deliver
+    /// (with webhooks off it was stored as delivered).
+    async fn finish_item(
+        &self,
+        task_id: &str,
+        idx: usize,
+        state: ItemState,
+        error: Option<&TaskError>,
+    ) -> Option<bool> {
+        // A run that lost its claim writes nothing more.
+        if self.lost() {
+            return None;
+        }
+        // The current webhook's, also for a task pinned to an older config.
+        let live = self.current().live();
+        let delivery = self.delivery(&live);
+        match self
+            .inner
+            .storage
+            .set_item_state(task_id, idx, state, error, self.fence(), delivery)
+            .await
+        {
+            Ok(written) => {
+                if !written {
+                    tracing::info!(
+                        task = %task_id, item = idx, state = state.as_str(),
+                        "item already finished; not finishing it again"
+                    );
+                }
+                written.then_some(delivery != Delivery::Off)
+            }
+            // Nothing was stored (each write is one atomic statement), so
+            // nothing is reported; the run's final rollup, or the next run,
+            // picks it up.
+            Err(e) => {
+                tracing::error!(
+                    task = %task_id, item = idx, state = state.as_str(), error = %e,
+                    "could not store the item's final state"
+                );
+                None
+            }
+        }
     }
 
     /// Finalize an item as completed: persist the state, roll up the task, and
     /// fire the terminal webhook.
     async fn complete_item(&self, task_id: &str, idx: usize) {
-        if let Err(e) = self
-            .inner
-            .storage
-            .set_item_state(task_id, idx, ItemState::Completed, None)
+        let Some(claimed) = self
+            .finish_item(task_id, idx, ItemState::Completed, None)
             .await
-        {
-            tracing::error!(task = %task_id, item = idx, error = %e, "set item completed");
-        }
+        else {
+            return;
+        };
+        let delivering = claimed.then(|| self.start_delivery(task_id, idx)).flatten();
         self.inner.metrics.item_finished(ItemState::Completed);
         self.rollup_task_state(task_id).await;
-        self.deliver_webhook(task_id, idx).await;
+        if let Some(delivering) = delivering {
+            self.send_webhook(delivering).await;
+        }
     }
 
     /// All-or-nothing URL fast path. If every not-yet-done model for this item
@@ -793,6 +914,10 @@ impl Engine {
     /// persist those results and return true; on any miss, persist nothing and
     /// return false so the caller fetches and hashes the actual bytes instead.
     async fn try_url_cache(&self, task_id: &str, idx: usize, item: &Item, url: &Url) -> bool {
+        // A local file's path says nothing about its bytes.
+        if apollo_media::fetch::is_local_source(&url.main) {
+            return false;
+        }
         let fresh_after = self.cache_fresh_after();
         let url_hash = sha256_hex(url.main.as_bytes());
         let mut resolved: Vec<(String, ModelOutput)> = Vec::new();
@@ -800,7 +925,9 @@ impl Engine {
             if model_done(item, label) {
                 continue;
             }
-            let rev = self.model_revision(label);
+            let Some(rev) = self.item_cache_key(label, Some(&item.input)) else {
+                return false;
+            };
             let content_hash = match self
                 .inner
                 .storage
@@ -832,7 +959,13 @@ impl Engine {
             let _ = self
                 .inner
                 .storage
-                .upsert_model_result(task_id, idx, &label, &ModelResult::done(output))
+                .upsert_model_result(
+                    task_id,
+                    idx,
+                    &label,
+                    &ModelResult::done(output),
+                    self.fence(),
+                )
                 .await;
         }
         true
@@ -840,48 +973,70 @@ impl Engine {
 
     /// Mark an item cancelled (preserving any results already produced), roll the
     /// task state up, and fire the terminal webhook.
-    async fn cancel_item(&self, task_id: &str, idx: usize) {
-        let _ = self
-            .inner
-            .storage
-            .set_item_state(
-                task_id,
-                idx,
-                ItemState::Cancelled,
-                Some(&TaskError::cancelled("cancelled")),
-            )
-            .await;
+    pub(crate) async fn cancel_item(&self, task_id: &str, idx: usize) {
+        let cancelled = TaskError::cancelled("cancelled");
+        let Some(claimed) = self
+            .finish_item(task_id, idx, ItemState::Cancelled, Some(&cancelled))
+            .await
+        else {
+            return;
+        };
+        let delivering = claimed.then(|| self.start_delivery(task_id, idx)).flatten();
         self.inner.metrics.item_finished(ItemState::Cancelled);
         self.rollup_task_state(task_id).await;
-        self.deliver_webhook(task_id, idx).await;
+        if let Some(delivering) = delivering {
+            self.send_webhook(delivering).await;
+        }
     }
 
-    /// Mark the item (and its not-yet-done models) failed, then fire the webhook.
-    /// Preserves results from models that already finished on a prior run, and
-    /// the errors of models that already failed.
+    /// Mark the item (and its not-yet-done models) failed, in one write, then
+    /// fire the webhook. Preserves results from models that already finished on
+    /// a prior run, and the errors of models that already failed. If the item
+    /// finished meanwhile (elsewhere), nothing is written or reported.
     pub(crate) async fn fail_item(&self, task_id: &str, idx: usize, item: &Item, err: TaskError) {
-        for label in &item.models {
-            let failed = item
-                .results
-                .get(label)
-                .is_some_and(|r| r.state == ModelState::Failed);
-            if model_done(item, label) || failed {
-                continue;
-            }
-            let _ = self
-                .inner
-                .storage
-                .upsert_model_result(task_id, idx, label, &ModelResult::failed(err.clone()))
-                .await;
+        if self.lost() {
+            return;
         }
-        let _ = self
+        let models: Vec<String> = item
+            .models
+            .iter()
+            .filter(|label| {
+                let failed = item
+                    .results
+                    .get(*label)
+                    .is_some_and(|r| r.state == ModelState::Failed);
+                !model_done(item, label) && !failed
+            })
+            .cloned()
+            .collect();
+        let live = self.current().live();
+        let delivery = self.delivery(&live);
+        match self
             .inner
             .storage
-            .set_item_state(task_id, idx, ItemState::Failed, Some(&err))
-            .await;
+            .set_item_failed(task_id, idx, &err, &models, self.fence(), delivery)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(task = %task_id, item = idx, "item already finished; not failing it");
+                return;
+            }
+            // Nothing was stored, so nothing is reported (see finish_item).
+            Err(e) => {
+                tracing::error!(task = %task_id, item = idx, error = %e, "could not store the item's failure");
+                return;
+            }
+        }
+        // With webhooks off it was stored as delivered.
+        let delivering = (delivery != Delivery::Off)
+            .then(|| self.start_delivery(task_id, idx))
+            .flatten();
         self.inner.metrics.item_finished(ItemState::Failed);
         self.rollup_task_state(task_id).await;
-        self.deliver_webhook(task_id, idx).await;
+        if let Some(delivering) = delivering {
+            self.send_webhook(delivering).await;
+        }
     }
 
     /// Recompute the task's lifecycle state from its items and persist it when it
@@ -897,7 +1052,8 @@ impl Engine {
     pub async fn rollup_task_state(&self, task_id: &str) {
         for pause in [0, 500, 2000] {
             tokio::time::sleep(Duration::from_millis(pause)).await;
-            if self.try_rollup_task_state(task_id).await {
+            // Checked each time: the lease may be lost meanwhile.
+            if self.lost() || self.try_rollup_task_state(task_id).await {
                 return;
             }
         }
@@ -919,7 +1075,11 @@ impl Engine {
         } else {
             let desired = aggregate::task_state_for(&task);
             if desired != task.state
-                && let Err(e) = self.inner.storage.set_task_state(task_id, desired).await
+                && let Err(e) = self
+                    .inner
+                    .storage
+                    .set_task_state(task_id, desired, self.fence())
+                    .await
             {
                 tracing::warn!(task = %task_id, error = %e, "failed to roll up task state");
                 return false;
@@ -944,7 +1104,9 @@ impl Engine {
     /// Best-effort removal of `Input::Bytes` upload files for a finished task.
     fn cleanup_uploads(&self, items: &[Item]) {
         for item in items {
-            if let Input::Bytes { path, .. } = &item.input {
+            if let Input::Bytes { path, .. } = &item.input
+                && self.is_staged_upload(path)
+            {
                 match std::fs::remove_file(path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1212,6 +1374,14 @@ impl Engine {
     /// Fetch the input once: download (with fallback), then decode an image or
     /// probe a video.
     async fn fetch_item(&self, input: &Input) -> Result<FetchedInput, EngineError> {
+        if let Input::Bytes { path, .. } = input
+            && !self.is_staged_upload(path)
+        {
+            return Err(EngineError::Media(MediaError::Refused(format!(
+                "{} is not an upload this server staged",
+                path.display()
+            ))));
+        }
         let want_hash = self.cache_enabled();
         let (media, video) = match input {
             Input::Image(url) => (self.fetch_url(url).await?, false),
@@ -1753,6 +1923,11 @@ impl Engine {
     /// Persist classified frames as one checkpoint; a failure is logged, not
     /// fatal (the frames are only re-done on resume).
     async fn save_checkpoint(&self, scan: &FrameScanRun<'_>, frames: &[Sample]) {
+        // A run that lost its claim writes nothing more (checkpoints aren't
+        // fenced).
+        if self.lost() {
+            return;
+        }
         if let Err(e) = self
             .inner
             .storage

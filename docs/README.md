@@ -74,7 +74,7 @@ There is **no separate video architecture** — video is always "an image classi
 4. Results are written per model as they complete. For video, frames are extracted in batches by a single ffmpeg pass (scaled to the model's input size, the next batch extracted while the current one is classified), and each classified batch is checkpointed so an interrupted scan resumes without re‑doing frames.
 5. When every model is done, the task reaches a terminal state, the webhook (if configured) fires, watchers get the final task, and `GetTask` reflects the final result. Transient failures (network errors, model timeouts) are **retried** up to `[app].max_retries`; permanent ones (a refused URL, undecodable input) fail immediately.
 
-On startup the engine **recovers** any tasks left non‑terminal by a previous run and re‑queues them; a poison task that keeps crashing is failed once its resume‑attempt count exceeds the cap.
+On startup the engine **recovers** tasks left non‑terminal and re‑queues them: on SQLite every one; on SurrealDB, where instances share tasks, the ones handed back by a graceful stop at once, and, within about one lease, the ones whose runner stopped (see [database.md](./database.md#resume--recovery)). A poison task that keeps crashing is failed once its resume‑attempt count exceeds the cap.
 
 ## Workspace layout
 
