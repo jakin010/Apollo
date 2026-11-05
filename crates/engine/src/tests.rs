@@ -2034,3 +2034,187 @@ async fn renewal_cap_keeps_to_the_deadline() {
         assert_eq!(cap(&[&lapsed]), period);
     }
 }
+
+/// A `pdq` model `hash` whose block list (in `dir`) lists `ab…ab` as
+/// category `id`, with categories 1 = known and 2 = other; matching any image.
+fn pdq_config(dir: &std::path::Path, id: u32) -> String {
+    let list = dir.join("list.txt");
+    std::fs::write(&list, format!("{} {id}\n", "ab".repeat(32))).unwrap();
+    format!(
+        "[cache]\n[models.hash]\narchitecture = \"pdq\"\nhash_list = \"{}\"\n\
+         categories = {{ 1 = \"known\", 2 = \"other\" }}\nmax_distance = 256\nmin_quality = 0\n",
+        list.display()
+    )
+}
+
+/// A 64×64 binary PPM image, its pixels varied by `seed`.
+fn ppm(seed: u8) -> Vec<u8> {
+    let mut bytes = b"P6\n64 64\n255\n".to_vec();
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            bytes.extend([
+                (x * 4) as u8 ^ seed,
+                (y * 4) as u8,
+                ((x + y) * 2) as u8 ^ seed,
+            ]);
+        }
+    }
+    bytes
+}
+
+/// Classify `input` with `hash`, and the category names it answered.
+async fn classify_hash(engine: &Engine, storage: &Arc<dyn Storage>, input: Input) -> Vec<String> {
+    let submission = Submission {
+        input,
+        run: Run::Models(vec!["hash".into()]),
+        metadata: Default::default(),
+        request_id: None,
+    };
+    let id = engine.submit(submission, None).await.unwrap().id;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let task = loop {
+        let task = storage.get_task(&id).await.unwrap().unwrap();
+        if crate::aggregate::task_terminal(task.state) {
+            break task;
+        }
+        assert!(Instant::now() < deadline, "{id} didn't finish");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    match &task.items[0].results["hash"].output {
+        Some(apollo_domain::ModelOutput::Classification(c)) => {
+            c.predictions.iter().map(|p| p.name.clone()).collect()
+        }
+        other => panic!("no classification: {other:?} in {task:?}"),
+    }
+}
+
+/// An upload of `bytes`, staged for `engine`.
+fn upload(engine: &Engine, bytes: &[u8]) -> Input {
+    let path = engine
+        .ensure_upload_dir()
+        .unwrap()
+        .join(format!("{}.bin", uuid::Uuid::new_v4()));
+    std::fs::write(&path, bytes).unwrap();
+    Input::Bytes {
+        path,
+        kind: MediaKind::Image,
+    }
+}
+
+fn cache_hits(engine: &Engine) -> u64 {
+    engine
+        .inner
+        .metrics
+        .cache_hits
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tokio::test]
+async fn a_restart_with_the_same_config_hits_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(&dir, &pdq_config(dir.path(), 1));
+    let image = ppm(7);
+    {
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        let engine = Engine::new(Arc::new(config.clone()), storage.clone(), None);
+        let input = upload(&engine, &image);
+        assert_eq!(classify_hash(&engine, &storage, input).await, ["known"]);
+        assert_eq!(cache_hits(&engine), 0);
+    }
+    // The next process, with the same config: the key is the same.
+    let storage = apollo_storage::open(&config.database).await.unwrap();
+    let engine = Engine::new(Arc::new(config), storage.clone(), None);
+    let input = upload(&engine, &image);
+    assert_eq!(classify_hash(&engine, &storage, input).await, ["known"]);
+    assert_eq!(cache_hits(&engine), 1);
+}
+
+#[tokio::test]
+async fn a_reload_that_changes_a_list_misses_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = pdq_config(dir.path(), 1);
+    let storage;
+    let engine = {
+        let config = config_in(&dir, &toml);
+        storage = apollo_storage::open(&config.database).await.unwrap();
+        Engine::new(Arc::new(config), storage.clone(), None)
+    };
+    let image = ppm(7);
+    assert_eq!(
+        classify_hash(&engine, &storage, upload(&engine, &image)).await,
+        ["known"]
+    );
+
+    // The same config text, the list rewritten: a new key, so the image is
+    // classified again, by the new list.
+    let toml_other = pdq_config(dir.path(), 2);
+    assert_eq!(toml_other, toml, "only the list's contents changed");
+    engine.reload(config_in(&dir, &toml), None).await.unwrap();
+    assert_eq!(
+        classify_hash(&engine, &storage, upload(&engine, &image)).await,
+        ["other"]
+    );
+    assert_eq!(cache_hits(&engine), 0);
+
+    // Scheduling settings keep the key.
+    let scheduling = toml.replace(
+        "min_quality = 0\n",
+        "min_quality = 0\ntimeout = 7\npriority = 3\nmax_pending = 9\nmax_concurrent = 2\n",
+    );
+    engine
+        .reload(config_in(&dir, &scheduling), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        classify_hash(&engine, &storage, upload(&engine, &image)).await,
+        ["other"]
+    );
+    assert_eq!(cache_hits(&engine), 1);
+}
+
+#[tokio::test]
+async fn local_paths_skip_the_url_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = tempfile::tempdir().unwrap();
+    let toml = format!(
+        "[limits]\nallow_local_files = true\nlocal_roots = [\"{}\"]\n{}",
+        files.path().display(),
+        pdq_config(dir.path(), 1)
+    );
+    let config = config_in(&dir, &toml);
+    let storage = apollo_storage::open(&config.database).await.unwrap();
+    let engine = Engine::new(Arc::new(config), storage.clone(), None);
+    let path = files.path().join("a.ppm");
+    let url = format!("file://{}", path.display());
+    let input = || {
+        Input::Image(apollo_domain::Url {
+            main: url.clone(),
+            fallback: None,
+        })
+    };
+
+    std::fs::write(&path, ppm(7)).unwrap();
+    assert_eq!(classify_hash(&engine, &storage, input()).await, ["known"]);
+    let key = engine.cache_key("hash").unwrap();
+    let url_hash = sha256_hex(url.as_bytes());
+    assert_eq!(
+        storage
+            .url_cache_lookup(&url_hash, "hash", &key, 0)
+            .await
+            .unwrap(),
+        None,
+        "a local path's hint was recorded"
+    );
+    // The file at that path rewritten: read again, not taken for the old one.
+    std::fs::write(&path, ppm(99)).unwrap();
+    assert_eq!(classify_hash(&engine, &storage, input()).await, ["known"]);
+    assert_eq!(cache_hits(&engine), 0);
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}

@@ -41,6 +41,7 @@ url = "https://hooks.example.com:443"          # optional; omit the section to d
 # Result cache (optional). With [cache] present, model outputs are cached by
 # content hash (with a url->content-hash hint) so identical inputs skip inference.
 # Set ttl_secs to expire stale entries; omit for entries that never expire.
+# Each model's entries are keyed by its output settings and file contents.
 # [cache]
 # enabled = true
 # ttl_secs = 86400
@@ -243,7 +244,7 @@ steps = [
 [models.general]
 architecture   = "vit"
 repo           = "google/vit-base-patch16-224"
-revision       = "main"
+revision       = "main"         # pin a commit sha when instances share a database
 enabled        = true
 keep_in_memory = true
 max_concurrent = 8              # GPU batch size

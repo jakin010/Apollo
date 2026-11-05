@@ -367,6 +367,10 @@ pub trait Storage: Send + Sync {
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError>;
 
     // -------------------------------- cache ------------------------------
+    //
+    // Entries are keyed by content (or URL) hash, model label and `revision`:
+    // the model's result-cache key, its output fingerprint
+    // (`apollo_inference::output_fingerprint`). The column keeps its old name.
 
     /// Look up a cached model output by content hash. `fresh_after` is a lower
     /// bound on `created_at` in unix seconds (`0` = no TTL). Returns the output if

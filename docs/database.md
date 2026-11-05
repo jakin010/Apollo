@@ -129,7 +129,10 @@ The optional result cache (see below).
 | `output_json` | TEXT | | `content_hash` | TEXT |
 | `created_at` | INTEGER | | `created_at` | INTEGER |
 
-`cache` is keyed by `(content_hash, model, revision)`; `url_cache` by `(url_hash, model, revision)`.
+`cache` is keyed by `(content_hash, model, revision)`; `url_cache` by `(url_hash, model, revision)`. Despite its name, `revision` holds the model's output fingerprint (`fp1:<sha-256>`, see below). Rows from before the fingerprint (keyed `main` or a commit) are never matched again; they expire with `[cache].ttl_secs`, or can be removed once every instance runs a version with fingerprints:
+
+- SQLite: `DELETE FROM cache WHERE revision NOT LIKE 'fp1:%'; DELETE FROM url_cache WHERE revision NOT LIKE 'fp1:%';`
+- SurrealDB: `DELETE cache WHERE !string::starts_with(revision, 'fp1:'); DELETE url_cache WHERE !string::starts_with(revision, 'fp1:');`
 
 ---
 
@@ -184,7 +187,9 @@ If `[database].retention` is set (e.g. `"30d"`), a background timer periodically
 
 When `[cache]` is enabled, model outputs are cached so identical inputs skip inference:
 
-- **Content cache** (`cache` table): keyed by the input's **content hash** + model + revision. A hit returns the stored `ModelOutput` directly, unless it is not the kind of output the model gives now (its label was repointed at a model that reads text, or back). A pipeline step with an `input` is keyed by the text it classifies instead, and not cached when that text is empty.
-- **URL→content hint** (`url_cache` table): maps a URL's hash to the content hash it last resolved to, so a repeated URL can reach the content cache without re‑downloading.
+- **Content cache** (`cache` table): keyed by the input's **content hash** + model + the model's **output fingerprint**. A hit returns the stored `ModelOutput` directly, unless it is not the kind of output the model gives now (its label was repointed at a model that reads text, or back). A pipeline step with an `input` is keyed by the text it classifies instead, and not cached when that text is empty.
+- **URL→content hint** (`url_cache` table): maps a URL's hash to the content hash it last resolved to, so a repeated URL can reach the content cache without re‑downloading. Local files (`file://` or a bare path) get no hint: they are read each time, so a file replaced at the same path gets its own result.
 
-Freshness is controlled by `[cache].ttl_secs`: a lookup passes a lower bound on `created_at`, so entries older than the TTL are ignored, and an hourly job deletes them. Omit `ttl_secs` for entries that never expire. Keying on `revision` means bumping a model's revision naturally invalidates its cached outputs.
+The **output fingerprint** covers what a model's output depends on: its output settings (`architecture`, `repo`, `revision`, `labels`, `prompt_template`, thresholds, `max_results`, the pdq and text and OCR settings, `early_exit`), the contents of its `taxonomy_file` and `hash_list` (not their paths), the contents of its `video_strategy`, the device and the CPU speed features it runs with (except for `pdq`), and the version of Apollo's own output code. Scheduling settings (`timeout`, `priority`, `max_pending`, `max_concurrent`, `keep_in_memory`), paths, `[limits]` and pipelines are left out. Changing any of the covered settings starts new entries; a restart with the same config keeps hitting the old ones. Instances sharing a database share results only where these match, and each logs its models' fingerprints (`result cache key`) at startup and on reload, for comparing them. A `revision` such as `main` can move between downloads without the cache noticing: pin a commit for instances that share a database.
+
+Freshness is controlled by `[cache].ttl_secs`: a lookup passes a lower bound on `created_at`, so entries older than the TTL are ignored, and an hourly job deletes them. Omit `ttl_secs` for entries that never expire.

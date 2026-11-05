@@ -288,8 +288,10 @@ async fn an_instance_without_the_model_fails_a_task_it_takes_over() {
     .await;
 }
 
+/// Not ignored: instances whose model gives other answers for the same
+/// bytes don't share cached results (the key covers the model's settings and
+/// its block list's contents).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-instance: until the result cache key covers the model's config"]
 async fn differently_configured_instances_share_cached_results() {
     fleet_test(|fleet| async move {
         // One model name, a different block list on each instance: each
@@ -308,19 +310,6 @@ async fn differently_configured_instances_share_cached_results() {
             )
             .await;
 
-        /// The category names `instance` answers for an upload of `bytes`.
-        async fn classify(fleet: &Fleet, instance: &Instance, bytes: &[u8]) -> Vec<String> {
-            let submission = Submission {
-                run: Run::Models(vec!["hash".into()]),
-                ..uploaded(&instance.stage(bytes))
-            };
-            let t = instance.submit(submission).await.id;
-            instance.wait_idle().await;
-            fleet.log.delivered(instance.who, &t).await;
-            let task = fleet.task(&t).await;
-            hash_names(&task).unwrap_or_else(|| panic!("no classification in {task:?}"))
-        }
-
         let image = ppm(64, 64, 7);
         let other = ppm(64, 64, 99);
         assert_eq!(
@@ -334,6 +323,40 @@ async fn differently_configured_instances_share_cached_results() {
             classify(&fleet, &b, &image).await,
             ["other"],
             "B answered with A's cached result for an image A had classified"
+        );
+    })
+    .await;
+}
+
+/// The category names `instance` answers for an upload of `bytes`.
+async fn classify(fleet: &Fleet, instance: &Instance, bytes: &[u8]) -> Vec<String> {
+    let submission = Submission {
+        run: Run::Models(vec!["hash".into()]),
+        ..uploaded(&instance.stage(bytes))
+    };
+    let t = instance.submit(submission).await.id;
+    instance.wait_idle().await;
+    fleet.log.delivered(instance.who, &t).await;
+    let task = fleet.task(&t).await;
+    hash_names(&task).unwrap_or_else(|| panic!("no classification in {task:?}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identically_configured_instances_share_cached_results() {
+    fleet_test(|fleet| async move {
+        // The same block list on each, at a path of its own.
+        let (lists_a, lists_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let model = |dir: &Path| format!("[cache]\n{}", pdq_model(dir, "ab", 1, "known"));
+        let a = fleet.start("a", &model(lists_a.path())).await;
+        let b = fleet.start("b", &model(lists_b.path())).await;
+
+        let image = ppm(64, 64, 7);
+        assert_eq!(classify(&fleet, &a, &image).await, ["known"], "A's");
+        assert_eq!(classify(&fleet, &b, &image).await, ["known"], "B's");
+        assert_eq!(
+            b.engine.inner.metrics.cache_hits.load(Ordering::Relaxed),
+            1,
+            "B answered from A's cached result"
         );
     })
     .await;

@@ -79,7 +79,9 @@ async fn finishing_overwrites_a_cancel_from_another_instance() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_runner_overwrites_a_finished_result() {
     fleet_test(|fleet| async move {
-        let url = "file:///nonexistent/apollo-test.png";
+        let origin = Origin::start();
+        let url = origin.url("/t.png");
+        let url = url.as_str();
         let a = fleet
             .start("a", &one_slot(&format!("[cache]\n{NSFW}")))
             .await;
@@ -93,9 +95,10 @@ async fn a_second_runner_overwrites_a_finished_result() {
         // runs its own copy of the task, as a takeover does: it finishes it
         // from the cache.
         let content = sha256_hex(b"the image");
+        let key = b.engine.cache_key("nsfw").unwrap();
         fleet
             .store
-            .url_cache_store(&sha256_hex(url.as_bytes()), "nsfw", "main", &content)
+            .url_cache_store(&sha256_hex(url.as_bytes()), "nsfw", &key, &content)
             .await
             .unwrap();
         fleet
@@ -103,7 +106,7 @@ async fn a_second_runner_overwrites_a_finished_result() {
             .cache_store(
                 &content,
                 "nsfw",
-                "main",
+                &key,
                 &ModelOutput::Classification(Classification::default()),
             )
             .await
@@ -118,9 +121,14 @@ async fn a_second_runner_overwrites_a_finished_result() {
             "B finished it from the cache"
         );
 
-        // Then A's item gets its slot.
+        // Then A's item gets its slot, and downloads the input (its look at
+        // the cache was before the result was there).
         drop(slot);
-        a.wait_idle().await;
+        tokio::join!(a.wait_idle(), async {
+            if let Some(download) = origin.next_within(Duration::from_secs(5)).await {
+                download.reply(Reply::Garbage);
+            }
+        });
         let a_wrote = wait_within(Duration::from_secs(2), || {
             fleet
                 .log

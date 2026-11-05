@@ -48,7 +48,7 @@ A running server picks up an edited file with `apollo reload` (or `SIGHUP`), wit
 
 **CPU threads.** Inference on the CPU uses one thread per physical core the server may run on: the performance cores on Apple silicon, and on Linux no more than its CPU affinity (`taskset`) and container CPU limit allow. The count is logged at startup (`CPU threads for inference`). To use fewer, for example when other heavy processes share the machine, set `CANDLE_NUM_THREADS` (or `RAYON_NUM_THREADS`) in the server's environment.
 
-**CPU speed features.** Three build features make inference on the CPU faster, at the cost of bit-for-bit reproducible scores: they move in the last digits (at most 1e-5; no label changed in testing). They are off by default; enable them with `cargo build -p apollo --release --features <name>[,<name>]`.
+**CPU speed features.** Three build features make inference on the CPU faster, at the cost of bit-for-bit reproducible scores: they move in the last digits (at most 1e-5; no label changed in testing). They are off by default; enable them with `cargo build -p apollo --release --features <name>[,<name>]`. A build with any of them (or a model on another device) keeps result-cache entries of its own.
 
 | Feature | Where | Effect (measured) |
 |---|---|---|
@@ -166,7 +166,7 @@ Guards applied to inputs: SSRF protection when fetching remote URLs, a gate on l
 
 ## `[cache]` — result cache
 
-Optional. A bare `[cache]` section turns it on (`enabled` defaults to `true`). When enabled, model outputs are cached by **content hash** (with a URL→content‑hash hint) so identical inputs skip inference. The URL hint assumes a URL's content does not change within `ttl_secs` (forever, without a TTL); set a TTL if your URLs can serve different content over time. The hint is only recorded when the content came from `main`, not from `fallback`. See [database.md → Result cache](./database.md#result-cache).
+Optional. A bare `[cache]` section turns it on (`enabled` defaults to `true`). When enabled, model outputs are cached by **content hash** (with a URL→content‑hash hint) so identical inputs skip inference. The URL hint assumes a URL's content does not change within `ttl_secs` (forever, without a TTL); set a TTL if your URLs can serve different content over time. The hint is only recorded when the content came from `main`, not from `fallback`, and never for local files, which are read each time. Results are keyed by each model's output fingerprint: its output settings, the contents of its taxonomy or hash list, its video strategy, the device and CPU speed features. Instances sharing a database share results only where those match. See [database.md → Result cache](./database.md#result-cache).
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -327,7 +327,7 @@ Models are keyed by a **label** (how requests refer to them). `architecture` and
 |-------|------|---------|---------|
 | `architecture` | enum | *(required)* | Image models: `vit` (fixed‑head classifier), `siglip` (open‑vocabulary), or `pdq` (perceptual-hash block list; see [below](#perceptual-hash-block-lists-pdq)). Text models: `bert`, `distilbert`, `xlm_roberta` (also RoBERTa checkpoints; `roberta` is an alias), `modernbert`, `deberta_v2` (also DeBERTa-v3); see [text models](#text-models). Reading text in images: `paddleocr_vl`; see [reading text](#reading-text-in-images-paddleocr_vl). |
 | `repo` | string | *(required, except for `pdq`)* | Hugging Face repo. `pdq` has none. |
-| `revision` | string | `"main"` | Repo revision/branch/tag. |
+| `revision` | string | `"main"` | Repo revision/branch/tag. Pin a commit sha when instances share a database: a branch can move between their downloads, and the result cache can't tell. |
 | `enabled` | bool | `true` | If `false`, the model is rejected at submit time. |
 | `keep_in_memory` | bool | `false` | Load the weights at startup and keep them resident (skip idle‑unload). |
 | `max_concurrent` | u32 | `8` | GPU **batch size** for this model's worker. |

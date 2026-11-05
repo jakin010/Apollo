@@ -23,6 +23,7 @@ use apollo_domain::{Architecture, Classification, DecodedImage, Label};
 mod arch;
 mod device;
 mod error;
+mod fingerprint;
 mod loader;
 mod preprocess;
 
@@ -33,6 +34,7 @@ pub use arch::pdq::{
 };
 pub use device::{DeviceKind, open_device, select_device};
 pub use error::InferenceError;
+pub use fingerprint::{OUTPUT_VERSION, output_fingerprint};
 pub use preprocess::{Normalization, resize_to_input};
 
 /// An image classifier: independent per-image classification, batched.

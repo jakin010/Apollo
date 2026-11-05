@@ -308,7 +308,11 @@ impl Engine {
         let url_hash = if used_fallback {
             None
         } else {
-            item_url(&item.input).map(|u| sha256_hex(u.main.as_bytes()))
+            // Not for a local file: another host's file at that path, or the
+            // same path rewritten, is other bytes.
+            item_url(&item.input)
+                .filter(|u| !apollo_media::fetch::is_local_source(&u.main))
+                .map(|u| sha256_hex(u.main.as_bytes()))
         };
 
         // Pipeline items run as an ordered, gated sequence with strict failure
@@ -510,10 +514,12 @@ impl Engine {
             None => (ctx.content_hash, ctx.url_hash),
         };
 
-        // Content-cache fast path: identical bytes already classified by this
-        // model + revision -> reuse the stored output, skip inference.
-        if let Some(ch) = content_hash {
-            let rev = self.model_revision(label);
+        // Content-cache fast path: identical bytes already classified by a
+        // model with this one's output settings -> reuse the stored output,
+        // skip inference.
+        if let Some(ch) = content_hash
+            && let Some(rev) = self.cache_key(label)
+        {
             match self
                 .inner
                 .storage
@@ -611,10 +617,9 @@ impl Engine {
         url_hash: Option<&str>,
         output: &ModelOutput,
     ) {
-        let Some(ch) = content_hash else {
+        let (Some(ch), Some(rev)) = (content_hash, self.cache_key(label)) else {
             return;
         };
-        let rev = self.model_revision(label);
         if let Err(e) = self
             .inner
             .storage
@@ -813,14 +818,12 @@ impl Engine {
         }
     }
 
-    /// The configured revision for a model label (part of the cache key, so a
-    /// revision bump invalidates prior cache entries). Empty if unknown.
-    fn model_revision(&self, label: &str) -> String {
-        self.config()
-            .models
-            .get(label)
-            .map(|m| m.revision.clone())
-            .unwrap_or_default()
+    /// The key `label`'s results are cached under: its output fingerprint,
+    /// from this run's config (the worker computing its results). `None` (no
+    /// worker, or its files couldn't be read): its results are neither looked
+    /// up nor stored.
+    pub(crate) fn cache_key(&self, label: &str) -> Option<Arc<str>> {
+        self.live().registry.fingerprint(label)
     }
 
     /// Persist an item's final `state`. `false` when it had already finished
@@ -895,6 +898,10 @@ impl Engine {
     /// persist those results and return true; on any miss, persist nothing and
     /// return false so the caller fetches and hashes the actual bytes instead.
     async fn try_url_cache(&self, task_id: &str, idx: usize, item: &Item, url: &Url) -> bool {
+        // A local file's path says nothing about its bytes.
+        if apollo_media::fetch::is_local_source(&url.main) {
+            return false;
+        }
         let fresh_after = self.cache_fresh_after();
         let url_hash = sha256_hex(url.main.as_bytes());
         let mut resolved: Vec<(String, ModelOutput)> = Vec::new();
@@ -902,7 +909,9 @@ impl Engine {
             if model_done(item, label) {
                 continue;
             }
-            let rev = self.model_revision(label);
+            let Some(rev) = self.cache_key(label) else {
+                return false;
+            };
             let content_hash = match self
                 .inner
                 .storage
