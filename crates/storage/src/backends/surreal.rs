@@ -32,16 +32,16 @@ use surrealdb::types::SurrealValue;
 
 use apollo_config::SurrealdbConfig;
 use apollo_domain::{
-    Classification, Input, Item, ItemState, ModelOutput, ModelResult, ModelState, Sample, Task,
-    TaskError, TaskState,
+    Classification, Input, Item, ItemState, ModelOutput, ModelResult, ModelState, Revocation,
+    Sample, Task, TaskError, TaskState,
 };
 
 use crate::error::StorageError;
 use crate::now;
 use crate::resume::PendingWebhook;
 use crate::{
-    ClaimMode, Claimable, Delivery, Fence, Held, Lease, Renewal, Storage, TaskCursor, TaskPage,
-    TaskQuery,
+    ClaimMode, Claimable, Delivery, Fence, Held, Lease, Renewal, SharedKey, Storage, TaskCursor,
+    TaskPage, TaskQuery,
 };
 
 /// Who holds a claim, for operators: `<node>/<process>`.
@@ -59,9 +59,21 @@ impl From<surrealdb::Error> for StorageError {
     }
 }
 
+/// The shared auth tables: the public key (one record, `auth_key:current`)
+/// and the token revocations (`revocation:[kind, value]`).
+macro_rules! auth_schema {
+    () => {
+        "
+    DEFINE TABLE IF NOT EXISTS auth_key SCHEMALESS;
+    DEFINE TABLE IF NOT EXISTS revocation SCHEMALESS;"
+    };
+}
+
 /// Idempotent schema: schemaless tables plus the indexes the queries rely on.
 /// `IF NOT EXISTS` makes re-running a no-op.
-const SCHEMA: &str = "
+const SCHEMA: &str = concat!(
+    auth_schema!(),
+    "
     DEFINE TABLE IF NOT EXISTS task SCHEMALESS;
     DEFINE TABLE IF NOT EXISTS item SCHEMALESS;
     DEFINE TABLE IF NOT EXISTS model_result SCHEMALESS;
@@ -75,7 +87,39 @@ const SCHEMA: &str = "
     DEFINE INDEX IF NOT EXISTS item_webhook ON TABLE item FIELDS webhook_delivered, state;
     DEFINE INDEX IF NOT EXISTS mr_item ON TABLE model_result FIELDS task_id, item_idx;
     DEFINE INDEX IF NOT EXISTS frame_key ON TABLE frame FIELDS task_id, item_idx, label;
-";
+"
+);
+
+/// Run `op` until it isn't refused with a write conflict (instances doing the
+/// same at the same moment), a little later each time; at most 8 more tries.
+async fn retry_conflicts<T, F, Fut>(mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, surrealdb::Error>>,
+{
+    let mut tries = 0u64;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if tries < 8 && e.to_string().contains("conflict") => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(20 * tries + jitter_ms())).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// A few milliseconds (0-19), so writers retrying in lockstep drift apart.
+fn jitter_ms() -> u64 {
+    u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+            % 20,
+    )
+}
 
 /// A runner's fence: no fence, or the task's claim is still the token.
 ///
@@ -254,6 +298,18 @@ const CREATE_TASK: &str = "
 // `SurrealValue` (via derive); complex fields are opaque JSON strings.
 
 #[derive(SurrealValue)]
+struct AuthKeyRow {
+    public_key: String,
+    created_by: Option<String>,
+}
+
+#[derive(SurrealValue)]
+struct RevocationRow {
+    kind: String,
+    value: String,
+}
+
+#[derive(SurrealValue)]
 struct TaskStateRow {
     state: String,
     owner: Option<String>,
@@ -355,6 +411,14 @@ pub struct SurrealStorage {
 }
 
 impl SurrealStorage {
+    /// Define the shared auth tables only (for the CLI, which runs no full
+    /// migration).
+    pub async fn define_auth_tables(&self) -> Result<()> {
+        retry_conflicts(|| async { self.db.query(auth_schema!()).await.and_then(|r| r.check()) })
+            .await?;
+        Ok(())
+    }
+
     /// Connect to `[database.surrealdb].url` (any scheme the SDK supports: ws,
     /// wss, http, https), sign in as root if credentials are given, and select the
     /// configured namespace + database. The connection is established eagerly so a
@@ -473,24 +537,8 @@ impl Storage for SurrealStorage {
         // Instances starting together on a new database define the schema at
         // the same moment, and SurrealDB refuses some of them with a write
         // conflict: try again, a little later.
-        let mut tries = 0u64;
-        loop {
-            match self.db.query(SCHEMA).await.and_then(|r| r.check()) {
-                Ok(_) => return Ok(()),
-                Err(e) if tries < 8 && e.to_string().contains("conflict") => {
-                    tries += 1;
-                    let jitter = u64::from(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .subsec_nanos()
-                            % 20,
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(20 * tries + jitter)).await;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
+        retry_conflicts(|| async { self.db.query(SCHEMA).await.and_then(|r| r.check()) }).await?;
+        Ok(())
     }
 
     async fn create_task(
@@ -1445,5 +1493,106 @@ impl Storage for SurrealStorage {
             .await?
             .check()?;
         Ok((content.len() + urls.len()) as u64)
+    }
+
+    async fn auth_key(&self) -> Result<Option<SharedKey>> {
+        let mut resp = self
+            .db
+            .query("SELECT public_key, created_by FROM ONLY type::record('auth_key', 'current')")
+            .await?;
+        let row: Option<AuthKeyRow> = resp.take(0)?;
+        Ok(row.map(|r| SharedKey {
+            public_key: r.public_key,
+            node: r.created_by,
+        }))
+    }
+
+    async fn publish_auth_key(&self, public_key: &str, node: &str) -> Result<SharedKey> {
+        // CREATE on the one record id is the set-if-absent.
+        let mut tries = 0;
+        loop {
+            let created = self
+                .db
+                .query(
+                    "CREATE type::record('auth_key', 'current')
+                     CONTENT { public_key: $key, created_by: $node, created_at: time::now() }
+                     RETURN NONE",
+                )
+                .bind(("key", public_key.to_string()))
+                .bind(("node", node.to_string()))
+                .await
+                .and_then(|r| r.check());
+            let Err(e) = created else {
+                return Ok(SharedKey {
+                    public_key: public_key.to_string(),
+                    node: Some(node.to_string()),
+                });
+            };
+            // Stored first by another ("already exists", or a failed commit
+            // when the two overlapped), or ours went through and its answer
+            // was lost: look.
+            if let Some(stored) = self.auth_key().await? {
+                return Ok(stored);
+            }
+            tries += 1;
+            if tries == 6 {
+                return Err(e.into());
+            }
+            tokio::time::sleep(Duration::from_millis(20 * tries + jitter_ms())).await;
+        }
+    }
+
+    async fn replace_auth_key(&self, public_key: &str, node: &str) -> Result<()> {
+        retry_conflicts(|| async {
+            self.db
+                .query(
+                    "UPSERT type::record('auth_key', 'current')
+                     CONTENT { public_key: $key, created_by: $node, created_at: time::now() }
+                     RETURN NONE",
+                )
+                .bind(("key", public_key.to_string()))
+                .bind(("node", node.to_string()))
+                .await
+                .and_then(|r| r.check())
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn add_revocation(&self, revocation: &Revocation) -> Result<()> {
+        retry_conflicts(|| async {
+            self.db
+                .query(
+                    "UPSERT type::record('revocation', [$kind, $value])
+                     CONTENT { kind: $kind, value: $value, revoked_at: time::now() }
+                     RETURN NONE",
+                )
+                .bind(("kind", revocation.kind().to_string()))
+                .bind(("value", revocation.value().to_string()))
+                .await
+                .and_then(|r| r.check())
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_revocation(&self, revocation: &Revocation) -> Result<bool> {
+        let mut resp = self
+            .db
+            .query("DELETE type::record('revocation', [$kind, $value]) RETURN BEFORE")
+            .bind(("kind", revocation.kind().to_string()))
+            .bind(("value", revocation.value().to_string()))
+            .await?;
+        let removed: Vec<RevocationRow> = resp.take(0)?;
+        Ok(!removed.is_empty())
+    }
+
+    async fn revocations(&self) -> Result<Vec<Revocation>> {
+        let mut resp = self.db.query("SELECT kind, value FROM revocation").await?;
+        let rows: Vec<RevocationRow> = resp.take(0)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| Revocation::from_parts(&r.kind, &r.value))
+            .collect())
     }
 }

@@ -355,11 +355,11 @@ Nothing is kept when a request is refused as overloaded, so the same request may
 
 By default every `Inference` RPC must carry a valid **PASETO v4** token; health and reflection remain open. (Set `[auth] enabled = false` to turn this off on a trusted network.)
 
-- Mint tokens with `apollo token --subject NAME [--expires 30d]`. Without `[auth].public_key` the server uses a local keypair it creates on first start, which `apollo token` reads; or generate one with `apollo keygen` and configure its public key.
+- Mint tokens with `apollo token --subject NAME [--expires 30d]`. Without `[auth].public_key` the server uses a local keypair it creates on first start, which `apollo token` reads; or generate one with `apollo keygen` and configure its public key. Instances sharing one SurrealDB verify with one key, stored there by the first to start.
 - Clients send the token in the **`authorization`** metadata header, with or without a `Bearer ` prefix.
-- The server verifies the signature and any `iat`/`nbf`/`exp` claims; non‑expiring tokens are accepted (revoke by rotating the keypair).
+- The server verifies the signature and any `iat`/`nbf`/`exp` claims; non‑expiring tokens are accepted.
 - With `apollo-client`, pass the token via `Client::builder(url).token("v4.public.…")`.
-- A missing, invalid, or **revoked** token is rejected with `UNAUTHENTICATED`. Tokens carry an id; `apollo revoke --id …` (or `--subject …`) revokes them without rotating the keypair, effective within ~10 s.
+- A missing, invalid, or **revoked** token is rejected with `UNAUTHENTICATED`. Tokens carry an id; `apollo revoke --id …` (or `--subject …`) revokes them without rotating the keypair, effective within ~10 s, on every instance sharing the database.
 - Tasks belong to the token subject that submitted them: `GetTask`, `WatchTask` and `CancelTask` by any other subject return `NOT_FOUND` (as for an unknown id), and `ListTasks` lists only the caller's own tasks, unless the subject is listed in `[auth].admin_subjects`.
 
 See [configuration.md → Authentication](./configuration.md#auth--authentication) for the full setup.

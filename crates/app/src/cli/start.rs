@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use clap::Args;
 
-use apollo_config::{AuthConfig, Config, Overrides, TlsConfig, load};
+use apollo_config::{Config, Overrides, TlsConfig, load};
 use apollo_engine::{Engine, WebhookSink};
 
 #[derive(Args)]
@@ -110,6 +110,8 @@ async fn serve(
     // Engine::with_node spawns background tasks, so it must run inside the runtime.
     let node = node_id(&config).context("reading the node id")?;
     let config = Arc::new(config);
+    // Kept for the shared auth key and revocations.
+    let db = Arc::clone(&storage);
     let engine = Engine::with_node(config.clone(), storage, webhook, node);
     let reloader = Reloader {
         engine: engine.clone(),
@@ -122,7 +124,7 @@ async fn serve(
     // Owns the PID file for this process; removed on graceful shutdown.
     let _pidfile = crate::daemon::PidFile::create()?;
 
-    let auth = configure_auth(&config.auth)?;
+    let auth = configure_auth(&config, &db, engine.node()).await?;
     auth.watch_revocations(REVOCATION_POLL);
     let tls = load_tls(config.tls.as_ref())?;
 
@@ -198,7 +200,7 @@ async fn serve(
 /// This instance's node id: `[app].node_id`, or one kept in the state directory
 /// for its upload directory (two instances on one machine with their own cache
 /// directories are two nodes), made on first use.
-fn node_id(config: &Config) -> anyhow::Result<String> {
+pub(super) fn node_id(config: &Config) -> anyhow::Result<String> {
     if let Some(node) = &config.app.node_id {
         return Ok(node.clone());
     }
@@ -532,7 +534,13 @@ fn load_tls(tls: Option<&TlsConfig>) -> anyhow::Result<Option<apollo_server::Tls
 /// Build the auth interceptor. Authentication is on unless the config says
 /// `[auth] enabled = false`; without a configured `public_key` the server uses
 /// (creating it on first start) the local keypair that `apollo token` reads.
-fn configure_auth(auth: &AuthConfig) -> anyhow::Result<apollo_server::AuthInterceptor> {
+async fn configure_auth(
+    config: &Config,
+    storage: &Arc<dyn apollo_storage::Storage>,
+    node: &str,
+) -> anyhow::Result<apollo_server::AuthInterceptor> {
+    use super::keys::{KeyChoice, within_db_timeout};
+    let auth = &config.auth;
     if !auth.enabled {
         tracing::warn!(
             "authentication is DISABLED ([auth] enabled = false): anyone who can reach this \
@@ -540,36 +548,112 @@ fn configure_auth(auth: &AuthConfig) -> anyhow::Result<apollo_server::AuthInterc
         );
         return Ok(apollo_server::AuthInterceptor::disabled());
     }
-    let public_key = match &auth.public_key {
-        Some(key) => {
-            tracing::info!("PASETO authentication enabled (configured public key)");
-            key.clone()
-        }
-        None => {
-            let (key, path, created) = super::keys::load_or_create_local_keypair()
-                .context("preparing the local signing keypair")?;
-            if created {
-                tracing::info!(path = %path.display(), "generated a new signing keypair");
+    let shared = storage.shared().then(|| storage.as_ref());
+    let local_path = super::keys::local_key_path()?;
+    let secs = config.database.timeout;
+    let (public_key, choice) = within_db_timeout(
+        secs,
+        super::keys::resolve_public_key(auth, shared, node, &local_path),
+    )
+    .await
+    .context("resolving the auth public key")?;
+    let path = local_path.display();
+    match &choice {
+        KeyChoice::Local { created } => {
+            if *created {
+                tracing::info!(%path, "generated a new signing keypair");
             }
             tracing::info!(
-                path = %path.display(),
+                %path,
                 "PASETO authentication enabled (local keypair); mint client tokens with \
                  `apollo token --subject NAME`"
             );
-            key
         }
-    };
+        KeyChoice::Configured { published: false } if shared.is_none() => {
+            tracing::info!("PASETO authentication enabled (configured public key)")
+        }
+        KeyChoice::Configured { published } => tracing::info!(
+            key = %public_key,
+            "PASETO authentication enabled (configured public key, {})",
+            if *published {
+                "published to the database"
+            } else {
+                "matches the database's"
+            }
+        ),
+        KeyChoice::Published { created } => {
+            if *created {
+                tracing::info!(%path, "generated a new signing keypair");
+            }
+            tracing::info!(
+                %path,
+                key = %public_key,
+                "PASETO authentication enabled: published this host's public key to the \
+                 database; every instance sharing it verifies tokens with it — mint tokens on \
+                 this host"
+            );
+        }
+        KeyChoice::SharedLocal => tracing::info!(
+            %path,
+            key = %public_key,
+            "PASETO authentication enabled (local keypair, which is the database's shared key)"
+        ),
+        KeyChoice::Database { node: from, local } => {
+            let from = from.as_deref().unwrap_or("(unknown)");
+            match local {
+                None => tracing::info!(
+                    key = %public_key,
+                    node = from,
+                    "PASETO authentication enabled, with the database's shared public key; mint \
+                     tokens on that node or with its secret key"
+                ),
+                Some((_, true)) => tracing::info!(
+                    key = %public_key,
+                    node = from,
+                    "PASETO authentication enabled: another instance published its key first; \
+                     using it"
+                ),
+                Some((_, false)) => tracing::warn!(
+                    %path,
+                    key = %public_key,
+                    node = from,
+                    "this host's local keypair is not the database's shared key: tokens signed \
+                     with it are rejected here and on every instance sharing the database"
+                ),
+            }
+        }
+    }
     let revocation_file = super::keys::revocation_file(auth)?;
     if !auth.admin_subjects.is_empty() {
         tracing::info!(admins = ?auth.admin_subjects, "admin subjects may access every task");
     }
+    let shared_revocations = shared.map(|_| {
+        Arc::new(super::keys::DbRevocations(Arc::clone(storage)))
+            as Arc<dyn apollo_server::RevocationSource>
+    });
     let interceptor = apollo_server::AuthInterceptor::new(apollo_server::AuthSettings {
         public_key,
         admin_subjects: auth.admin_subjects.clone(),
         revocation_file: Some(revocation_file.clone()),
+        shared_revocations,
     })
     .context("configuring authentication")?;
-    tracing::info!(file = %revocation_file.display(), "token revocation list (watched for changes)");
+    if shared.is_some() {
+        within_db_timeout(secs, async {
+            interceptor
+                .load_shared_revocations()
+                .await
+                .map_err(|e| anyhow!(e))
+        })
+        .await
+        .context("reading token revocations from the database")?;
+        tracing::info!(
+            file = %revocation_file.display(),
+            "token revocations: the file and the database (polled every 10 s)"
+        );
+    } else {
+        tracing::info!(file = %revocation_file.display(), "token revocation list (watched for changes)");
+    }
     Ok(interceptor)
 }
 

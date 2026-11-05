@@ -10,7 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 
 use apollo_config::{Backend, DatabaseConfig};
-use apollo_domain::{ItemState, ModelOutput, ModelResult, Sample, Task, TaskError, TaskState};
+use apollo_domain::{
+    ItemState, ModelOutput, ModelResult, Revocation, Sample, Task, TaskError, TaskState,
+};
 
 pub mod backends;
 pub mod error;
@@ -70,6 +72,15 @@ pub struct TaskQuery {
 pub struct TaskCursor {
     pub created_at: i64,
     pub id: String,
+}
+
+/// The public key every instance sharing a database verifies tokens with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedKey {
+    /// PASERK (`k4.public.…`).
+    pub public_key: String,
+    /// The node that stored it, if known.
+    pub node: Option<String>,
 }
 
 /// One page of [`Storage::list_tasks`].
@@ -414,6 +425,37 @@ pub trait Storage: Send + Sync {
     /// Delete content-cache and url-cache entries created before `cutoff` (unix
     /// seconds). Returns the number of entries removed.
     async fn purge_cache_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError>;
+
+    // -------------------------------- auth -------------------------------
+    //
+    // On a database instances share, the public key they all verify tokens
+    // with (its private key stays on the host that made it), and the token
+    // revocations they all apply.
+
+    /// The stored public key, if any.
+    async fn auth_key(&self) -> Result<Option<SharedKey>, StorageError>;
+
+    /// Store `public_key` (from `node`) unless a key is stored already; never
+    /// overwrites. Returns the key stored afterwards, this call's or the
+    /// earlier one: callers racing on an empty database all get the same one.
+    async fn publish_auth_key(
+        &self,
+        public_key: &str,
+        node: &str,
+    ) -> Result<SharedKey, StorageError>;
+
+    /// Store `public_key` (from `node`), replacing any stored key: a rotation.
+    async fn replace_auth_key(&self, public_key: &str, node: &str) -> Result<(), StorageError>;
+
+    /// Record a revocation (again: refreshes when it was revoked).
+    async fn add_revocation(&self, revocation: &Revocation) -> Result<(), StorageError>;
+
+    /// Remove a revocation. Returns whether it was stored.
+    async fn remove_revocation(&self, revocation: &Revocation) -> Result<bool, StorageError>;
+
+    /// Every stored revocation (rows of a kind this version doesn't know are
+    /// left out).
+    async fn revocations(&self) -> Result<Vec<Revocation>, StorageError>;
 }
 
 /// Open the configured backend and run migrations. Returns a trait object so the
@@ -433,21 +475,50 @@ pub async fn open(db: &DatabaseConfig) -> Result<Arc<dyn Storage>, StorageError>
                     "backend is 'surrealdb' but [database.surrealdb] is missing".into(),
                 )
             })?;
-            // Within `[database].timeout`, so a host that doesn't answer fails
-            // the start instead of hanging it. The migration has no limit:
-            // defining an index over existing rows builds it first.
-            let connect = SurrealStorage::connect(&cfg);
-            let store = match db.timeout {
-                0 => connect.await?,
-                secs => {
-                    let limit = std::time::Duration::from_secs(secs.into());
-                    tokio::time::timeout(limit, connect)
-                        .await
-                        .unwrap_or(Err(StorageError::Timeout(limit)))?
-                }
-            };
+            // The migration has no limit: defining an index over existing rows
+            // builds it first.
+            let store = connect_surreal(db, &cfg).await?;
             store.migrate().await?;
             Ok(Arc::new(store))
+        }
+    }
+}
+
+/// Connect to SurrealDB within `[database].timeout`, so a host that doesn't
+/// answer fails the start instead of hanging it.
+async fn connect_surreal(
+    db: &DatabaseConfig,
+    cfg: &apollo_config::SurrealdbConfig,
+) -> Result<SurrealStorage, StorageError> {
+    let connect = SurrealStorage::connect(cfg);
+    match db.timeout {
+        0 => connect.await,
+        secs => {
+            let limit = std::time::Duration::from_secs(secs.into());
+            tokio::time::timeout(limit, connect)
+                .await
+                .unwrap_or(Err(StorageError::Timeout(limit)))
+        }
+    }
+}
+
+/// The configured database when instances may share it (SurrealDB), for the
+/// CLI's auth commands: connected within `[database].timeout`, with only the
+/// auth tables defined (no full migration). `None` for SQLite, which opens no
+/// file.
+pub async fn connect_shared(db: &DatabaseConfig) -> Result<Option<Arc<dyn Storage>>, StorageError> {
+    match db.backend {
+        Backend::Sqlite => Ok(None),
+        Backend::Postgres => Err(StorageError::UnsupportedBackend("postgres".into())),
+        Backend::Surrealdb => {
+            let cfg = db.surrealdb.clone().ok_or_else(|| {
+                StorageError::Surreal(
+                    "backend is 'surrealdb' but [database.surrealdb] is missing".into(),
+                )
+            })?;
+            let store = connect_surreal(db, &cfg).await?;
+            store.define_auth_tables().await?;
+            Ok(Some(Arc::new(store)))
         }
     }
 }

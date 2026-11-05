@@ -78,9 +78,9 @@ Optional. Omit the whole section, or set `enabled = false`, to disable delivery 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `enabled` | bool | `true` | Require a token on every `Inference` RPC. Set `false` only on a trusted network — anyone who can reach the port can then submit work and read results (the server logs a warning at startup). |
-| `public_key` | string | *(none)* | PASERK‑encoded v4 **public** key (`k4.public.…`) used to verify tokens. When unset, the server uses a **local keypair** (below). |
+| `public_key` | string | *(none)* | PASERK‑encoded v4 **public** key (`k4.public.…`) used to verify tokens. When unset, the server uses a **local keypair** (below). On a shared SurrealDB it is also stored in the database if none is; a different stored key refuses the start. |
 | `admin_subjects` | list | `[]` | Token subjects that may read and cancel **every** task. Everyone else only sees tasks created by their own subject. |
-| `revocation_file` | string | `<state dir>/revoked_tokens` | Revoked token ids / subjects, written by `apollo revoke` and re‑read by running servers within ~10 s. Relative paths resolve from the config file's directory. |
+| `revocation_file` | string | `<state dir>/revoked_tokens` | Revoked token ids / subjects, written by `apollo revoke` and re‑read by running servers within ~10 s. Relative paths resolve from the config file's directory. On a shared database `apollo revoke` also stores the revocation there, and servers apply both lists. |
 
 **Zero‑config (local keypair).** Without `public_key`, the server creates a signing keypair on first start and keeps it in `auth.key` in its private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS; owner‑only). `apollo token` reads that file when no other secret key is given, so the minimal setup is:
 
@@ -100,6 +100,18 @@ export APOLLO_SECRET_KEY="k4.secret.…"
 apollo token --subject ci-runner --expires 30d
 ```
 
+**Several instances on one SurrealDB.** They verify with one public key, stored in the database. The first instance to start publishes its own (its local keypair's, or `public_key`); its secret key stays on that host. The others verify with it, without making a keypair of their own, and log the node that published it. Mint tokens on that host, or with its secret key (`--secret-key-file` / `APOLLO_SECRET_KEY`): `apollo token` refuses a secret key whose public key isn't the shared one (`--no-db-check` skips the check; pass `--config` for a config other than the standard one). An instance whose `public_key` differs from the stored key refuses to start. Anyone who can write to the database can replace the key (taking effect as instances restart) or remove its revocations, so the database is part of the trust boundary: set `public_key` on every instance to pin it.
+
+**Rotating the shared key.**
+
+```bash
+apollo keygen > new.key                                  # keep new.key safe
+apollo publish-key --replace --secret-key-file new.key   # store its public key as the shared one
+apollo token --secret-key-file new.key --subject …       # mint tokens with it
+```
+
+Then restart every instance (and change `public_key` where it is set): each verifies with the new key from its restart on, rejecting tokens signed with the old one. `apollo publish-key` without `--replace` stores a key only when none is.
+
 To turn authentication off: `apollo config set auth.enabled false`.
 
 **Task ownership.** Every task records the subject (`sub`) of the token that submitted it. `GetTask` and `CancelTask` from any other subject return `NOT_FOUND` — the same answer as for an id that does not exist — unless the caller's subject is in `admin_subjects`. Tasks submitted while authentication was disabled have no owner and are visible only to admins once it is on. Give each client (or tenant) its own subject.
@@ -112,7 +124,7 @@ apollo revoke --token "v4.public.…"  # one token, reading its id from the toke
 apollo revoke --subject ci-runner    # every token of a subject (incl. tokens minted before ids existed)
 ```
 
-Each command appends a line (`id <id>` or `subject <name>`) to the revocation file; running servers pick it up within about 10 seconds. The file is plain text: delete a line to un‑revoke. Run `apollo revoke` as the server's OS user (or pass `--config` when `revocation_file` is set there). If the file becomes unreadable, the server keeps the last list it loaded.
+Each command appends a line (`id <id>` or `subject <name>`) to the revocation file; running servers pick it up within about 10 seconds. On a database instances share, it also stores the revocation there, so every instance applies it. `apollo revoke --undo …` takes a revocation back (from the file and the database). The file is plain text: deleting a line also un‑revokes, unless the database revokes it too. Run `apollo revoke` as the server's OS user (or pass `--config` when `revocation_file` is set there). If the file becomes unreadable, the server keeps the last list it loaded.
 
 Clients send the token in the **`authorization`** metadata header (with or without a `Bearer ` prefix). See [grpc-api.md → Authentication](./grpc-api.md#authentication).
 

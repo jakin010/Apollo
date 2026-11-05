@@ -45,6 +45,9 @@ enum Command {
     Token(keys::TokenArgs),
     /// Revoke a token (by id or the token itself) or every token of a subject.
     Revoke(keys::RevokeArgs),
+    /// Store this host's public key as the shared key of a shared database (or
+    /// rotate it with --replace).
+    PublishKey(keys::PublishKeyArgs),
 }
 
 impl Cli {
@@ -60,6 +63,7 @@ impl Cli {
             Command::Keygen(args) => keys::run_keygen(args),
             Command::Token(args) => keys::run_token(args),
             Command::Revoke(args) => keys::run_revoke(args),
+            Command::PublishKey(args) => keys::run_publish_key(args),
         }
     }
 }
@@ -96,6 +100,35 @@ mod tests {
         assert!(Cli::try_parse_from(["apollo", "revoke", "--subject", "ci"]).is_ok());
         assert!(Cli::try_parse_from(["apollo", "revoke"]).is_err());
         assert!(Cli::try_parse_from(["apollo", "revoke", "--id", "a", "--subject", "b"]).is_err());
+    }
+
+    #[test]
+    fn parses_the_shared_key_commands() {
+        assert!(Cli::try_parse_from(["apollo", "publish-key", "--replace"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "apollo",
+                "publish-key",
+                "--public-key",
+                "k",
+                "--secret-key-file",
+                "f"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["apollo", "revoke", "--undo", "--id", "x"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "apollo",
+                "token",
+                "--subject",
+                "s",
+                "--no-db-check",
+                "--config",
+                "c.toml"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

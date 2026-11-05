@@ -52,7 +52,8 @@ pub struct AuthConfig {
     /// PASERK-encoded v4 **public** key (`k4.public.…`) used to verify tokens.
     /// When unset, the server uses — creating on first start — a keypair kept in
     /// an owner-only `auth.key` file in its state directory, which `apollo token`
-    /// also reads.
+    /// also reads. On a SurrealDB that instances share, it is also stored there
+    /// if no key is, and a different stored key refuses the start.
     #[serde(default)]
     pub public_key: Option<String>,
     /// Token subjects (`sub`) that may read and cancel every task. Everyone else
@@ -62,7 +63,8 @@ pub struct AuthConfig {
     /// File listing revoked token ids and subjects (written by `apollo revoke`,
     /// re-read by running servers within seconds). Defaults to
     /// `revoked_tokens` in the server's state directory. Relative paths resolve
-    /// from the config file's directory.
+    /// from the config file's directory. On a database instances share, `apollo
+    /// revoke` also stores the revocation there, and servers apply both lists.
     #[serde(default)]
     pub revocation_file: Option<String>,
 }

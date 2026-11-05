@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use apollo_config::{SqliteConfig, SurrealdbConfig};
 use apollo_domain::{
     Classification, Input, Item, ItemState, ModelOutput, ModelResult, ModelState, Prediction,
-    Sample, Task, TaskError, TaskState, Url,
+    Revocation, Sample, Task, TaskError, TaskState, Url,
 };
 use apollo_storage::{
     ClaimMode, Delivery, Fence, Held, Lease, PendingWebhook, Renewal, SqliteStorage, Storage,
@@ -1320,6 +1320,76 @@ async fn exercise_webhook_claims(store: &dyn Storage) {
     assert!(winners <= 1, "{winners} claimers got W9");
 }
 
+/// The shared public key and token revocations.
+async fn exercise_auth(store: &dyn Storage) {
+    assert_eq!(store.auth_key().await.unwrap(), None, "a fresh database");
+    // Instances starting together on a new database: one key wins, and every
+    // one of them is told the same.
+    let keys: Vec<String> = (0..8).map(|i| format!("k4.public.key{i}")).collect();
+    let (a, b, c, d) = tokio::join!(
+        store.publish_auth_key(&keys[0], "n0"),
+        store.publish_auth_key(&keys[1], "n1"),
+        store.publish_auth_key(&keys[2], "n2"),
+        store.publish_auth_key(&keys[3], "n3"),
+    );
+    let (e, f, g, h) = tokio::join!(
+        store.publish_auth_key(&keys[4], "n4"),
+        store.publish_auth_key(&keys[5], "n5"),
+        store.publish_auth_key(&keys[6], "n6"),
+        store.publish_auth_key(&keys[7], "n7"),
+    );
+    let told: Vec<_> = [a, b, c, d, e, f, g, h]
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+    let stored = store.auth_key().await.unwrap().unwrap();
+    assert!(told.iter().all(|k| *k == stored), "{told:?} vs {stored:?}");
+    assert!(keys.contains(&stored.public_key));
+    let i = keys.iter().position(|k| *k == stored.public_key).unwrap();
+    assert_eq!(stored.node.as_deref(), Some(format!("n{i}").as_str()));
+
+    // Publishing again never replaces it; replacing does.
+    let other = store
+        .publish_auth_key("k4.public.other", "x")
+        .await
+        .unwrap();
+    assert_eq!(other, stored);
+    store
+        .replace_auth_key("k4.public.rotated", "r")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.auth_key().await.unwrap(),
+        Some(apollo_storage::SharedKey {
+            public_key: "k4.public.rotated".into(),
+            node: Some("r".into()),
+        })
+    );
+
+    // Revocations: once each, however often revoked.
+    assert!(store.revocations().await.unwrap().is_empty());
+    let id = Revocation::Id("jti-1".into());
+    let subject = Revocation::Subject("bob".into());
+    for _ in 0..2 {
+        store.add_revocation(&id).await.unwrap();
+        store.add_revocation(&subject).await.unwrap();
+    }
+    let mut listed = store.revocations().await.unwrap();
+    listed.sort_by_key(|r| r.to_string());
+    assert_eq!(listed, [id.clone(), subject.clone()]);
+    // An id and a subject with the same value are two entries.
+    store
+        .add_revocation(&Revocation::Subject("jti-1".into()))
+        .await
+        .unwrap();
+    assert_eq!(store.revocations().await.unwrap().len(), 3);
+    assert!(store.remove_revocation(&id).await.unwrap());
+    assert!(!store.remove_revocation(&id).await.unwrap());
+    let left = store.revocations().await.unwrap();
+    assert_eq!(left.len(), 2);
+    assert!(!left.contains(&id));
+}
+
 /// Each token tries to claim L6 at the same moment.
 async fn futures_lite_join(store: &dyn Storage, tokens: &[String]) -> Vec<Option<u32>> {
     let leases: Vec<Lease<'_>> = tokens
@@ -1353,6 +1423,7 @@ async fn sqlite_backend_contract() {
     exercise(&store).await;
     exercise_leases(&store).await;
     exercise_webhook_claims(&store).await;
+    exercise_auth(&store).await;
 }
 
 #[tokio::test]
@@ -1390,6 +1461,7 @@ async fn surreal_backend_contract() {
         exercise(&store).await;
         exercise_leases(&store).await;
         exercise_webhook_claims(&store).await;
+        exercise_auth(&store).await;
     })
     .await;
 

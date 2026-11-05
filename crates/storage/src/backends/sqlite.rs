@@ -14,16 +14,16 @@ use sqlx::{Row, SqlitePool};
 
 use apollo_config::SqliteConfig;
 use apollo_domain::{
-    Classification, Item, ItemState, ModelOutput, ModelResult, ModelState, Sample, Task, TaskError,
-    TaskState,
+    Classification, Item, ItemState, ModelOutput, ModelResult, ModelState, Revocation, Sample,
+    Task, TaskError, TaskState,
 };
 
 use crate::error::StorageError;
 use crate::now;
 use crate::resume::PendingWebhook;
 use crate::{
-    ClaimMode, Claimable, Delivery, Fence, Held, Lease, Renewal, Storage, TaskCursor, TaskPage,
-    TaskQuery,
+    ClaimMode, Claimable, Delivery, Fence, Held, Lease, Renewal, SharedKey, Storage, TaskCursor,
+    TaskPage, TaskQuery,
 };
 
 type Result<T> = std::result::Result<T, StorageError>;
@@ -167,6 +167,20 @@ const SCHEMA: &[&str] = &[
         content_hash TEXT NOT NULL,
         created_at   INTEGER NOT NULL,
         PRIMARY KEY (url_hash, model, revision)
+    )",
+    // Shared auth (used only where instances share the database, which
+    // SQLite never is): the public key, and token revocations.
+    "CREATE TABLE IF NOT EXISTS auth_key (
+        slot       TEXT PRIMARY KEY CHECK (slot = 'current'),
+        public_key TEXT NOT NULL,
+        created_by TEXT,
+        created_at INTEGER NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS revocations (
+        kind       TEXT NOT NULL CHECK (kind IN ('id', 'subject')),
+        value      TEXT NOT NULL,
+        revoked_at INTEGER NOT NULL,
+        PRIMARY KEY (kind, value)
     )",
 ];
 
@@ -1244,6 +1258,81 @@ impl Storage for SqliteStorage {
             .rows_affected();
         tx.commit().await?;
         Ok(a + b)
+    }
+
+    async fn auth_key(&self) -> Result<Option<SharedKey>> {
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT public_key, created_by FROM auth_key WHERE slot = 'current'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(public_key, node)| SharedKey { public_key, node }))
+    }
+
+    async fn publish_auth_key(&self, public_key: &str, node: &str) -> Result<SharedKey> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO auth_key (slot, public_key, created_by, created_at)
+             VALUES ('current', ?, ?, ?) ON CONFLICT(slot) DO NOTHING",
+        )
+        .bind(public_key)
+        .bind(node)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+        let (public_key, node): (String, Option<String>) =
+            sqlx::query_as("SELECT public_key, created_by FROM auth_key WHERE slot = 'current'")
+                .fetch_one(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        Ok(SharedKey { public_key, node })
+    }
+
+    async fn replace_auth_key(&self, public_key: &str, node: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO auth_key (slot, public_key, created_by, created_at)
+             VALUES ('current', ?, ?, ?)
+             ON CONFLICT(slot) DO UPDATE SET public_key = excluded.public_key,
+                created_by = excluded.created_by, created_at = excluded.created_at",
+        )
+        .bind(public_key)
+        .bind(node)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn add_revocation(&self, revocation: &Revocation) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO revocations (kind, value, revoked_at) VALUES (?, ?, ?)
+             ON CONFLICT(kind, value) DO UPDATE SET revoked_at = excluded.revoked_at",
+        )
+        .bind(revocation.kind())
+        .bind(revocation.value())
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_revocation(&self, revocation: &Revocation) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM revocations WHERE kind = ? AND value = ?")
+            .bind(revocation.kind())
+            .bind(revocation.value())
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn revocations(&self) -> Result<Vec<Revocation>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT kind, value FROM revocations ORDER BY kind, value")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(kind, value)| Revocation::from_parts(&kind, &value))
+            .collect())
     }
 }
 

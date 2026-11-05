@@ -230,6 +230,34 @@ impl Storage for HeldCreate {
             .release_webhook_claim(task_id, item, holder)
             .await
     }
+    async fn auth_key(&self) -> Result<Option<apollo_storage::SharedKey>, StorageError> {
+        self.inner.auth_key().await
+    }
+    async fn publish_auth_key(
+        &self,
+        public_key: &str,
+        node: &str,
+    ) -> Result<apollo_storage::SharedKey, StorageError> {
+        self.inner.publish_auth_key(public_key, node).await
+    }
+    async fn replace_auth_key(&self, public_key: &str, node: &str) -> Result<(), StorageError> {
+        self.inner.replace_auth_key(public_key, node).await
+    }
+    async fn add_revocation(
+        &self,
+        revocation: &apollo_domain::Revocation,
+    ) -> Result<(), StorageError> {
+        self.inner.add_revocation(revocation).await
+    }
+    async fn remove_revocation(
+        &self,
+        revocation: &apollo_domain::Revocation,
+    ) -> Result<bool, StorageError> {
+        self.inner.remove_revocation(revocation).await
+    }
+    async fn revocations(&self) -> Result<Vec<apollo_domain::Revocation>, StorageError> {
+        self.inner.revocations().await
+    }
     async fn items_pending_webhook(
         &self,
     ) -> Result<Vec<apollo_storage::PendingWebhook>, StorageError> {
@@ -573,6 +601,40 @@ impl Storage for Stalled {
             .release_webhook_claim(task_id, item, holder)
             .await
     }
+    async fn auth_key(&self) -> Result<Option<apollo_storage::SharedKey>, StorageError> {
+        self.pass().await;
+        self.inner.auth_key().await
+    }
+    async fn publish_auth_key(
+        &self,
+        public_key: &str,
+        node: &str,
+    ) -> Result<apollo_storage::SharedKey, StorageError> {
+        self.pass().await;
+        self.inner.publish_auth_key(public_key, node).await
+    }
+    async fn replace_auth_key(&self, public_key: &str, node: &str) -> Result<(), StorageError> {
+        self.pass().await;
+        self.inner.replace_auth_key(public_key, node).await
+    }
+    async fn add_revocation(
+        &self,
+        revocation: &apollo_domain::Revocation,
+    ) -> Result<(), StorageError> {
+        self.pass().await;
+        self.inner.add_revocation(revocation).await
+    }
+    async fn remove_revocation(
+        &self,
+        revocation: &apollo_domain::Revocation,
+    ) -> Result<bool, StorageError> {
+        self.pass().await;
+        self.inner.remove_revocation(revocation).await
+    }
+    async fn revocations(&self) -> Result<Vec<apollo_domain::Revocation>, StorageError> {
+        self.pass().await;
+        self.inner.revocations().await
+    }
     async fn items_pending_webhook(
         &self,
     ) -> Result<Vec<apollo_storage::PendingWebhook>, StorageError> {
@@ -877,6 +939,34 @@ impl Storage for FailFinish {
         self.inner
             .release_webhook_claim(task_id, item, holder)
             .await
+    }
+    async fn auth_key(&self) -> Result<Option<apollo_storage::SharedKey>, StorageError> {
+        self.inner.auth_key().await
+    }
+    async fn publish_auth_key(
+        &self,
+        public_key: &str,
+        node: &str,
+    ) -> Result<apollo_storage::SharedKey, StorageError> {
+        self.inner.publish_auth_key(public_key, node).await
+    }
+    async fn replace_auth_key(&self, public_key: &str, node: &str) -> Result<(), StorageError> {
+        self.inner.replace_auth_key(public_key, node).await
+    }
+    async fn add_revocation(
+        &self,
+        revocation: &apollo_domain::Revocation,
+    ) -> Result<(), StorageError> {
+        self.inner.add_revocation(revocation).await
+    }
+    async fn remove_revocation(
+        &self,
+        revocation: &apollo_domain::Revocation,
+    ) -> Result<bool, StorageError> {
+        self.inner.remove_revocation(revocation).await
+    }
+    async fn revocations(&self) -> Result<Vec<apollo_domain::Revocation>, StorageError> {
+        self.inner.revocations().await
     }
     async fn items_pending_webhook(
         &self,
