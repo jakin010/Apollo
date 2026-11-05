@@ -1333,3 +1333,124 @@ async fn a_returning_key_isnt_stopped_by_an_old_cancel() {
         "it ran: its input is refused"
     );
 }
+
+/// A webhook receiver that records each event: its kind, task and task state.
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<(crate::EventKind, String, TaskState)>>);
+
+#[async_trait::async_trait]
+impl crate::WebhookSink for Recorder {
+    async fn deliver(&self, event: &crate::TaskEvent) -> Result<(), crate::WebhookError> {
+        let mut events = self.0.lock().unwrap();
+        events.push((event.kind, event.task.id.clone(), event.task.state));
+        Ok(())
+    }
+}
+
+impl Recorder {
+    fn finished(&self, task_id: &str) -> Vec<TaskState> {
+        let events = self.0.lock().unwrap();
+        events
+            .iter()
+            .filter(|(kind, id, _)| *kind == crate::EventKind::Finished && id == task_id)
+            .map(|(_, _, state)| *state)
+            .collect()
+    }
+}
+
+const NSFW: &str = "[models.nsfw]\narchitecture = \"vit\"\nrepo = \"test/nsfw\"\n";
+
+#[tokio::test]
+async fn a_rollup_that_fails_still_finishes_the_task_and_sends_its_finished_webhook() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(
+        &dir,
+        &format!("[webhook]\nurl = \"http://127.0.0.1:1\"\n{NSFW}"),
+    );
+    let storage = apollo_storage::open(&config.database).await.unwrap();
+    // The database drops the connection each time the task's finish is written,
+    // three times in a row.
+    let failing = crate::testing::FailFinish::new(storage.clone(), 3);
+    let sink = Arc::new(Recorder::default());
+    let engine = Engine::new(Arc::new(config), Arc::new(failing), Some(sink.clone()));
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while sink.finished(&id).is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        sink.finished(&id),
+        [TaskState::Failed],
+        "one finished event, for the failed task"
+    );
+    let stored = storage.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Failed, "the task was rolled up");
+    let pending = storage.items_pending_webhook().await.unwrap();
+    assert!(pending.is_empty(), "nothing left pending: {pending:?}");
+}
+
+#[tokio::test]
+async fn with_webhooks_off_nothing_is_kept_to_send_later() {
+    let f = fixture_with(NSFW).await;
+    let id = f
+        .engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let task = f.storage.get_task(&id).await.unwrap().unwrap();
+        if task.state == TaskState::Failed || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The item's finish is recorded as handled, so turning webhooks on later
+    // doesn't send events for tasks that finished while they were off.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = f.storage.items_pending_webhook().await.unwrap();
+        if pending.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "left pending with webhooks off: {pending:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_rollup_that_fails_is_tried_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(&dir, NSFW);
+    let storage = apollo_storage::open(&config.database).await.unwrap();
+    // Twice: the rollup as the item finishes, and the one after the task's
+    // run. With no webhook, only trying again finishes the task.
+    let failing = crate::testing::FailFinish::new(storage.clone(), 2);
+    let engine = Engine::new(Arc::new(config), Arc::new(failing), None);
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = storage.get_task(&id).await.unwrap().unwrap().state;
+        if state == TaskState::Failed {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the task stayed {state:?} after its rollups failed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

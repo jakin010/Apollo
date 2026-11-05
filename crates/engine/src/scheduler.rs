@@ -940,10 +940,30 @@ impl Engine {
     /// `Completed` exactly when its last item does (and the webhook payload then
     /// carries the correct task state). A task already in a terminal state
     /// (cancelled, failed) keeps it.
+    ///
+    /// A storage error would leave the task unfinished although its items are,
+    /// so this tries again a little later. If it still can't, the finished
+    /// webhook's delivery rolls the task up (see `push_webhook`), and failing
+    /// that the next start does.
     pub async fn rollup_task_state(&self, task_id: &str) {
+        for pause in [0, 500, 2000] {
+            tokio::time::sleep(Duration::from_millis(pause)).await;
+            if self.try_rollup_task_state(task_id).await {
+                return;
+            }
+        }
+        tracing::error!(task = %task_id, "could not roll up the task's state; left for later");
+    }
+
+    /// One go at [`Engine::rollup_task_state`]: `false` on a storage error.
+    async fn try_rollup_task_state(&self, task_id: &str) -> bool {
         let task = match self.inner.storage.get_task(task_id).await {
             Ok(Some(t)) => t,
-            _ => return,
+            Ok(None) => return true,
+            Err(e) => {
+                tracing::warn!(task = %task_id, error = %e, "rollup: could not load the task");
+                return false;
+            }
         };
         let state = if aggregate::task_terminal(task.state) {
             task.state
@@ -952,7 +972,8 @@ impl Engine {
             if desired != task.state
                 && let Err(e) = self.inner.storage.set_task_state(task_id, desired).await
             {
-                tracing::error!(task = %task_id, error = %e, "failed to roll up task state");
+                tracing::warn!(task = %task_id, error = %e, "failed to roll up task state");
+                return false;
             }
             desired
         };
@@ -968,6 +989,7 @@ impl Engine {
         {
             self.cleanup_uploads(&task.items);
         }
+        true
     }
 
     /// Best-effort removal of `Input::Bytes` upload files for a finished task.

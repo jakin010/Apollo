@@ -59,10 +59,11 @@ A running server picks up an edited file with `apollo reload` (or `SIGHUP`), wit
 
 ## `[webhook]` — outbound delivery
 
-Optional. Omit the whole section to disable delivery and let clients poll. See [webhooks.md](./webhooks.md) for semantics.
+Optional. Omit the whole section, or set `enabled = false`, to disable delivery and let clients poll. See [webhooks.md](./webhooks.md) for semantics.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
+| `enabled` | bool | `true` | Send webhooks. `false` turns delivery off but keeps the settings: nothing is sent, nor kept to send once it's on again. `--webhook-url` turns it on for a run. |
 | `url` | string | *(required if section present)* | gRPC receiver target. Scheme selects transport: `https` = TLS, `http` = plaintext. Path is ignored. |
 | `secret` | string | *(none)* | Shared secret. When set, each delivery is signed: `x-apollo-webhook-signature` = `v1=` + hex HMAC‑SHA256 over the delivery timestamp and the exact payload bytes (see [webhooks.md → Signing](./webhooks.md#signing-and-authenticity)). |
 | `redelivery_secs` | u32 | `60` | Background retry interval for failed deliveries. `0` disables periodic retry (still retried on restart). |
@@ -193,6 +194,7 @@ See [database.md](./database.md) for the full picture.
 |-------|------|---------|---------|
 | `backend` | enum | `sqlite` | `sqlite` \| `postgres` \| `surrealdb`. (`postgres` is a future seam and currently fails at startup.) |
 | `retention` | duration | *(none)* | How long to keep finished tasks (e.g. `"30d"`). Omit to keep forever. |
+| `timeout` | u32 (s) | `30` | How long a client's call waits for the database before it fails with `UNAVAILABLE`, and how long connecting to SurrealDB may take at startup (the schema migration after it has no limit). Background work (running tasks, webhooks) always waits, so none of its writes is dropped. A Classify told `UNAVAILABLE` may still have its task stored and run once the database answers: retry it with the same `request_id` to get that task. `0` waits as long as it takes. |
 
 Each backend has its own sub‑table; the one matching `backend` is required (except `sqlite`, which has defaults).
 
@@ -607,7 +609,7 @@ apollo token --subject NAME [--expires 30d] [--secret-key-file PATH]
 apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
 ```
 
-- **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url`, or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
+- **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url` and turns delivery on (also over `enabled = false`), or enables delivery to that URL when the section is absent. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
 - **`status`** reports whether the server is running and its live state:
   - version, PID, uptime, listen address, TLS/auth, config file (with its generation and when it was reloaded, after a reload), database, and log file;
   - memory in use against `max_memory` (measured as for `max_memory`: physical footprint on macOS, resident set size elsewhere);

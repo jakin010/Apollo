@@ -19,6 +19,7 @@
 //! snapshot it started with.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -238,6 +239,26 @@ impl Engine {
         Arc::clone(&self.live().config)
     }
 
+    /// `work`, a wait for the database on a client's behalf, failing with a
+    /// storage timeout once `[database].timeout` passes. Only reads, and waits
+    /// for work running in a task of its own, go through here: dropping them
+    /// cuts no write short. Background work waits as long as the database takes,
+    /// so none of its writes is dropped or overtaken by a later one.
+    async fn within<T>(
+        &self,
+        work: impl Future<Output = Result<T, EngineError>>,
+    ) -> Result<T, EngineError> {
+        match self.config().database.timeout {
+            0 => work.await,
+            secs => {
+                let limit = std::time::Duration::from_secs(secs.into());
+                tokio::time::timeout(limit, work)
+                    .await
+                    .unwrap_or(Err(StorageError::Timeout(limit).into()))
+            }
+        }
+    }
+
     /// A handle that reads the current snapshot, even from a pinned one.
     pub(crate) fn current(&self) -> Engine {
         Engine {
@@ -348,13 +369,21 @@ impl Engine {
         submission: Submission,
         owner: Option<String>,
     ) -> Result<Submitted, EngineError> {
-        let serialized = match &submission.request_id {
-            Some(rid) => Some(self.request_lock(owner.as_deref(), rid).lock_owned().await),
-            None => None,
-        };
-        if let Some(rid) = &submission.request_id
-            && let Some(id) = self.find_request(owner.as_deref(), rid).await?
-        {
+        let (serialized, earlier) = self
+            .within(async {
+                let Some(rid) = &submission.request_id else {
+                    return Ok((None, None));
+                };
+                let serialized = self.request_lock(owner.as_deref(), rid).lock_owned().await;
+                let earlier = self
+                    .inner
+                    .storage
+                    .find_task_by_request(owner.as_deref(), rid)
+                    .await?;
+                Ok((Some(serialized), earlier))
+            })
+            .await?;
+        if let Some(id) = earlier {
             return Ok(Submitted { id, existing: true });
         }
 
@@ -383,7 +412,10 @@ impl Engine {
         // deadline drops this future) then neither leaks the reservation nor
         // leaves a stored task that nothing runs: the write finishes, and the
         // task either starts or gives the reservation back. The idempotency
-        // lock is held until the task is stored, for the same reason.
+        // lock is held until the task is stored, for the same reason. So this
+        // wait is limited ([database].timeout) but the store isn't: a caller
+        // told the database is unavailable leaves a task that is stored and
+        // starts once it answers, which a retry with the same `request_id` gets.
         let engine = self.clone();
         let stored = tokio::spawn(async move {
             let _serialized = serialized;
@@ -408,11 +440,8 @@ impl Engine {
             tokio::spawn(async move { runner.run_task(task, vec![reservation]).await });
             Ok::<bool, EngineError>(false)
         });
-        match stored.await {
-            Ok(Ok(existing)) => Ok(Submitted { id, existing }),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(EngineError::Join(e.to_string())),
-        }
+        let existing = self.within(joined(stored)).await?;
+        Ok(Submitted { id, existing })
     }
 
     /// Room for one more item that runs `models`: refused when `[app].max_pending`
@@ -470,8 +499,15 @@ impl Engine {
         request_id: &str,
     ) -> Result<Option<String>, EngineError> {
         let lock = self.request_lock(owner, request_id);
-        let _settled = lock.lock().await;
-        self.find_request(owner, request_id).await
+        self.within(async {
+            let _settled = lock.lock().await;
+            Ok(self
+                .inner
+                .storage
+                .find_task_by_request(owner, request_id)
+                .await?)
+        })
+        .await
     }
 
     /// The lock for submissions with `owner`'s `request_id`.
@@ -499,11 +535,14 @@ impl Engine {
         owner: Option<&str>,
         request_id: &str,
     ) -> Result<Option<String>, EngineError> {
-        Ok(self
-            .inner
-            .storage
-            .find_task_by_request(owner, request_id)
-            .await?)
+        self.within(async {
+            Ok(self
+                .inner
+                .storage
+                .find_task_by_request(owner, request_id)
+                .await?)
+        })
+        .await
     }
 
     /// Check a submission without queueing it: model / pipeline / modality
@@ -609,7 +648,8 @@ impl Engine {
 
     /// A page of tasks (backs `ListTasks`).
     pub async fn list_tasks(&self, query: &TaskQuery) -> Result<TaskPage, EngineError> {
-        Ok(self.inner.storage.list_tasks(query).await?)
+        self.within(async { Ok(self.inner.storage.list_tasks(query).await?) })
+            .await
     }
 
     /// Graceful-shutdown hook, called once the server has stopped accepting
@@ -624,9 +664,10 @@ impl Engine {
         }
     }
 
-    /// Fetch a task by id (backs the `GetTask` RPC).
+    /// Fetch a task by id (backs the `GetTask` RPC, and watches).
     pub async fn get_task(&self, id: &str) -> Result<Option<Task>, EngineError> {
-        Ok(self.inner.storage.get_task(id).await?)
+        self.within(async { Ok(self.inner.storage.get_task(id).await?) })
+            .await
     }
 
     /// Request cooperative cancellation of a task (backs `CancelTask`). Idempotent:
@@ -634,35 +675,43 @@ impl Engine {
     /// stop at the next checkpoint (between models / between sampled frames).
     pub async fn cancel(&self, task_id: &str) -> Result<(), EngineError> {
         let task = self
-            .inner
-            .storage
             .get_task(task_id)
             .await?
             .ok_or_else(|| EngineError::UnknownTask(task_id.to_string()))?;
         if aggregate::task_terminal(task.state) {
             return Ok(());
         }
-        // The token, created if run_task hasn't registered one yet, so a run
-        // that starts meanwhile shares it (its start write then sees the
-        // cancel, and sets it).
-        let token = {
-            let mut map = self.inner.cancels.lock().unwrap();
-            map.entry(task_id.to_string())
-                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                .clone()
-        };
-        // The stored state first, so an item that stops on the signal rolls
-        // the task up as cancelled. Conditional: if the task finished in the
-        // meantime it stays finished rather than being relabelled as cancelled.
-        if !self.inner.storage.cancel_task_if_active(task_id).await? {
-            self.inner.cancels.lock().unwrap().remove(task_id);
-            return Ok(());
-        }
-        token.store(true, Ordering::SeqCst);
-        // Items waiting for a slot stop waiting (and give back their place).
-        self.inner.cancelled.notify_waiters();
-        tracing::info!(task = %task_id, "task cancellation requested");
-        Ok(())
+        // The rest runs in a task of its own, so a caller that stops waiting
+        // (the database is slow to answer) doesn't cut it short between the
+        // write and the signal: the task would be cancelled in the database but
+        // keep running here.
+        let engine = self.clone();
+        let id = task_id.to_string();
+        let cancelled = tokio::spawn(async move {
+            // The token, created if run_task hasn't registered one yet, so a
+            // run that starts meanwhile shares it (its start write then sees the
+            // cancel, and sets it).
+            let token = {
+                let mut map = engine.inner.cancels.lock().unwrap();
+                map.entry(id.clone())
+                    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                    .clone()
+            };
+            // The stored state first, so an item that stops on the signal rolls
+            // the task up as cancelled. Conditional: if the task finished in the
+            // meantime it stays finished rather than being relabelled as
+            // cancelled.
+            if !engine.inner.storage.cancel_task_if_active(&id).await? {
+                engine.inner.cancels.lock().unwrap().remove(&id);
+                return Ok(());
+            }
+            token.store(true, Ordering::SeqCst);
+            // Items waiting for a slot stop waiting (and give back their place).
+            engine.inner.cancelled.notify_waiters();
+            tracing::info!(task = %id, "task cancellation requested");
+            Ok(())
+        });
+        self.within(joined(cancelled)).await
     }
 
     /// Reject new work while process memory is over the configured soft cap.
@@ -732,6 +781,14 @@ fn check_models(
         }
     }
     Ok(())
+}
+
+/// The result of work spawned as a task of its own.
+async fn joined<T>(
+    task: tokio::task::JoinHandle<Result<T, EngineError>>,
+) -> Result<T, EngineError> {
+    task.await
+        .unwrap_or_else(|e| Err(EngineError::Join(e.to_string())))
 }
 
 fn queue_full(in_flight: usize, limit: usize) -> EngineError {
