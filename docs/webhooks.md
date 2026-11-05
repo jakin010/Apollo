@@ -2,7 +2,7 @@
 
 Apollo can push task updates to a receiver instead of (or in addition to) clients polling `GetTask`. The direction is inverted from the main API: here **Apollo is the gRPC client** and **you implement the server**.
 
-The contract is `apollo.v1.Webhook`, defined in `proto/webhook.proto` (sharing message types with `common.proto`). Enable it by configuring `[webhook].url`; omit the section to disable delivery and rely on polling.
+The contract is `apollo.v1.Webhook`, defined in `proto/webhook.proto` (sharing message types with `common.proto`). Enable it by configuring `[webhook].url`; omit the section, or set `enabled = false`, to disable delivery and rely on polling or `WatchTask`.
 
 ---
 
@@ -43,7 +43,7 @@ message Ack {}   // empty acknowledgement
 ## Delivery semantics
 
 - **One `FINISHED` event per task**, plus progress events on the way. Every `Classify` submits a single input, so a task finishes once.
-- **At‑least‑once.** Apollo persists a "delivered" flag and only sets it after a successful call, but a crash between finishing and the flag being set causes a redelivery. **Receivers must dedupe on `task.id`.**
+- **At‑least‑once.** Apollo persists a "delivered" flag and only sets it after a successful call, but a crash between finishing and the flag being set causes a redelivery. **Receivers must dedupe on `task.id`.** A `FINISHED` event always carries a finished task: if writing the task's final state failed (e.g. the database dropped the connection just then), the delivery writes it first, and the event waits for redelivery until it can.
 - **Retries on failure.** A failed `FINISHED` delivery is retried right away (three attempts in a few seconds), then by a background loop every `[webhook].redelivery_secs` seconds (default 60; `0` disables periodic retry), and on server **restart**, recovered from the persisted flag. `attempt` counts the attempts of the current round, so it starts again at 1 for each redelivery pass.
 - **Progress events are best‑effort** and may arrive after the task has finished; a progress event is dropped when the task has already finished by the time it is sent. Go by `task.state` (or `type`), not by arrival order.
 
@@ -82,6 +82,7 @@ The signature authenticates the sender and protects the payload's integrity; it 
 
 ```toml
 [webhook]
+# enabled       = true                               # false = no delivery; keeps the settings below
 url             = "https://hooks.example.com:443"   # gRPC target; scheme selects TLS (https) vs plaintext (http)
 secret          = "change-me"                        # optional; signs every delivery (payload + timestamp)
 redelivery_secs = 60                                 # background retry interval for failed deliveries (0 = off)
@@ -89,7 +90,8 @@ redelivery_secs = 60                                 # background retry interval
 
 - `url` is a gRPC endpoint. The **scheme selects transport**: `https://` uses TLS, `http://` is plaintext. Any path component is ignored — the gRPC method path is fixed by the service definition.
 - The channel connects **lazily and reconnects automatically**, so the receiver need not be reachable when Apollo starts.
-- For a quick local override during `start`, use `--webhook-url http://127.0.0.1:9090` (run‑only; it does not persist to the file). It also enables delivery when the config has no `[webhook]` section.
+- `enabled = false` turns delivery off but keeps the settings, like leaving the section out. While it's off nothing is sent, and nothing is kept to send later: turning it back on (with `apollo reload` or a restart) sends events only for tasks that finish from then on.
+- For a quick local override during `start`, use `--webhook-url http://127.0.0.1:9090` (run‑only; it does not persist to the file). It also enables delivery when the config has no `[webhook]` section, or has `enabled = false`.
 - Each delivery has a 10 s connect timeout and a 30 s request timeout; a call that exceeds them counts as a failed delivery and is retried.
 
 See [configuration.md → Webhook](./configuration.md#webhook--outbound-delivery) for field details.

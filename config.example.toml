@@ -12,6 +12,7 @@ max_retries    = 3                              # times a failed item is retried
 device         = "auto"                         # auto (CUDA → Metal → CPU), or pin one: cpu / metal / cuda
 
 [webhook]
+# enabled         = true                         # false = off, keeping these settings (nothing is kept to send later)
 url = "https://hooks.example.com:443"          # optional; omit the section to disable and let clients poll
 # secret          = "change-me"                 # optional shared secret; signs each delivery's payload + timestamp (verify on the receiver)
 # redelivery_secs = 60                           # background retry interval for failed deliveries (0 = off)
@@ -55,6 +56,7 @@ url = "https://hooks.example.com:443"          # optional; omit the section to d
 [database]
 backend   = "sqlite"            # sqlite | postgres | surrealdb  (postgres: future)
 # retention = "30d"             # how long to keep finished tasks; omit = keep forever
+# timeout   = 30                # s a client's call waits for the database (and SurrealDB's connect at start); 0 = no limit
 
 [database.sqlite]
 path            = "/var/lib/apollo/classifications.db"
