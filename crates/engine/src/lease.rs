@@ -7,7 +7,9 @@
 //! still its token, and it renews the claim every third of the lease. With a
 //! shared database another instance takes a task over once its lease has
 //! lapsed; the old runner, if it still runs, is then fenced out, and stops when
-//! its renewal says so.
+//! its renewal says so. A run that can't get a renewal confirmed for 5/6 of the
+//! lease (the database is out of reach) stops before its lease can lapse, and
+//! hands its task back once the database answers, so no attempt is counted.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use apollo_domain::{ErrorKind, Input, Task, TaskError, TaskState};
-use apollo_storage::{ClaimMode, Claimable, Fence, Held, Lease, Renewal, TaskCursor};
+use apollo_storage::{ClaimMode, Claimable, Fence, Held, Lease, Renewal, StorageError, TaskCursor};
 
 use crate::error::{EngineError, Overload};
 use crate::{Engine, Inner, Reservation, Run, aggregate};
@@ -44,14 +46,28 @@ pub(crate) struct RunCtl {
     pub(crate) token: String,
     /// Stops the run's items at their next checkpoint (a cancel).
     pub(crate) cancel: Arc<AtomicBool>,
-    /// The claim is gone (taken over, or handed back on a stop): the run writes
-    /// nothing more.
+    /// The claim is gone (taken over, or handed back on a stop), or no renewal
+    /// was confirmed in time: the run writes nothing more.
     lost: AtomicBool,
+    /// When the last renewal known to have held this claim (or the claim's own
+    /// write) was sent: on the database's clock the lease lasts at least
+    /// `lease_ttl` from then.
+    confirmed: std::sync::Mutex<Instant>,
 }
 
 impl RunCtl {
     pub(crate) fn lost(&self) -> bool {
         self.lost.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn confirmed(&self) -> Instant {
+        *self.confirmed.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A renewal sent at `sent` held the claim.
+    pub(crate) fn confirm(&self, sent: Instant) {
+        let mut confirmed = self.confirmed.lock().unwrap_or_else(|e| e.into_inner());
+        *confirmed = (*confirmed).max(sent);
     }
 
     fn held(&self) -> Held {
@@ -125,14 +141,20 @@ impl Engine {
         self.run.as_ref().is_some_and(|run| run.lost())
     }
 
-    /// Register a run of `task_id` with claim `token`. `None` once the engine
-    /// is shutting down.
-    pub(crate) fn register(&self, task_id: &str, token: String) -> Option<Running> {
+    /// Register a run of `task_id` with claim `token`, whose write was sent at
+    /// `claimed_at`. `None` once the engine is shutting down.
+    pub(crate) fn register(
+        &self,
+        task_id: &str,
+        token: String,
+        claimed_at: Instant,
+    ) -> Option<Running> {
         let ctl = Arc::new(RunCtl {
             task_id: task_id.to_string(),
             token,
             cancel: Arc::new(AtomicBool::new(false)),
             lost: AtomicBool::new(false),
+            confirmed: std::sync::Mutex::new(claimed_at),
         });
         let old = {
             // Checked under the lock the shutdown's snapshot takes: a run is
@@ -181,17 +203,55 @@ impl Engine {
     }
 
     /// The claim `run` holds, renewed now: whether it still holds it, and the
-    /// task's state.
+    /// task's state. On a shared database it waits a renewal period at most.
     pub(crate) async fn renew_one(&self, run: &RunCtl) -> Renewal {
-        match self
-            .inner
-            .storage
-            .renew_claims(&[run.held()], self.inner.lease_ttl)
-            .await
-        {
+        let held = [run.held()];
+        let sent = Instant::now();
+        let renewal = self.inner.storage.renew_claims(&held, self.inner.lease_ttl);
+        let renewed = if self.inner.storage.shared() {
+            match tokio::time::timeout(self.renew_every(), renewal).await {
+                Ok(r) => r,
+                Err(_) => return Renewal::Unknown,
+            }
+        } else {
+            renewal.await
+        };
+        let renewal = match renewed {
             Ok(r) => r.first().copied().unwrap_or(Renewal::Unknown),
             Err(_) => Renewal::Unknown,
+        };
+        if let Renewal::Held(_) = renewal {
+            run.confirm(sent);
         }
+        renewal
+    }
+
+    /// How often claims are renewed, and how long one renewal may take at most.
+    fn renew_every(&self) -> Duration {
+        self.inner.lease_ttl / 3
+    }
+
+    /// How long a run goes on without a confirmed renewal: 5/6 of the lease.
+    /// The last sixth is margin for the database's clock (a step, or skew
+    /// between clustered SurrealDB nodes).
+    pub(crate) fn unconfirmed_limit(&self) -> Duration {
+        self.inner.lease_ttl * 5 / 6
+    }
+
+    /// How long one renewal of `runs` may take: a renewal period, but no longer
+    /// than their earliest deadline (so a run is stopped on time), and at least
+    /// a sixth of the lease (so a run whose claim write was slow still gets a
+    /// try).
+    pub(crate) fn renewal_cap(&self, runs: &[Arc<RunCtl>]) -> Duration {
+        let ttl = self.inner.lease_ttl;
+        runs.iter()
+            .map(|r| {
+                self.unconfirmed_limit()
+                    .saturating_sub(r.confirmed().elapsed())
+            })
+            .min()
+            .unwrap_or(ttl / 3)
+            .clamp(ttl / 6, ttl / 3)
     }
 
     /// Start renewing this process's claims every third of the lease (with a
@@ -200,7 +260,7 @@ impl Engine {
     pub(crate) fn spawn_renewal(&self) {
         let engine = self.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(engine.inner.lease_ttl / 3);
+            let mut tick = tokio::time::interval(engine.renew_every());
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await;
             loop {
@@ -210,44 +270,118 @@ impl Engine {
         });
     }
 
-    /// Renew every run's claim, and act on what the renewal found.
+    /// Renew the claims of the runs still going, and hand back those of runs
+    /// stopped because no renewal was confirmed in time.
     async fn renew_runs(&self) {
-        let runs = self.runs();
-        let held: Vec<Held> = runs.iter().map(|r| r.held()).collect();
-        let renewals = match self
+        let live: Vec<Arc<RunCtl>> = self.runs().into_iter().filter(|r| !r.lost()).collect();
+        let pending = self
             .inner
-            .storage
-            .renew_claims(&held, self.inner.lease_ttl)
-            .await
-        {
-            Ok(r) => {
+            .unreleased
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        tokio::join!(self.renew_live(&live), self.release_unreleased(pending));
+    }
+
+    /// Renew `runs`' claims, act on what the renewal found, and stop the runs
+    /// whose lease may lapse before another renewal is confirmed.
+    async fn renew_live(&self, runs: &[Arc<RunCtl>]) {
+        // No round trip, so nothing to tell about the connection.
+        if runs.is_empty() {
+            return;
+        }
+        let held: Vec<Held> = runs.iter().map(|r| r.held()).collect();
+        let sent = Instant::now();
+        let cap = self.renewal_cap(runs);
+        let renewal = self.inner.storage.renew_claims(&held, self.inner.lease_ttl);
+        match tokio::time::timeout(cap, renewal).await {
+            Ok(Ok(renewals)) => {
                 self.connected(true);
-                r
+                for (run, renewal) in runs.iter().zip(renewals) {
+                    match renewal {
+                        Renewal::Held(state) => {
+                            run.confirm(sent);
+                            // Finished or cancelled elsewhere (a cancel through
+                            // another instance, say): the items stop and finish
+                            // as cancelled.
+                            if aggregate::task_terminal(state)
+                                && !run.cancel.swap(true, Ordering::SeqCst)
+                            {
+                                tracing::info!(task = %run.task_id, state = state.as_str(), "task finished elsewhere; stopping it");
+                                self.inner.cancelled.notify_waiters();
+                            }
+                        }
+                        Renewal::Unknown => {}
+                        Renewal::Lost => {
+                            if !run.lost() {
+                                tracing::warn!(task = %run.task_id, "lost the task's lease (another instance took it over); stopping it");
+                                self.lose(run);
+                            }
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                // Out of touch with the database: keep running, and try again.
+            // Out of touch with the database: the runs go on until their
+            // deadline, and the next tick tries again.
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "could not renew task leases");
                 self.connected(false);
-                return;
             }
-        };
-        for (run, renewal) in runs.iter().zip(renewals) {
-            match renewal {
-                // Finished or cancelled elsewhere (a cancel through another
-                // instance, say): the items stop and finish as cancelled.
-                Renewal::Held(state) if aggregate::task_terminal(state) => {
-                    if !run.cancel.swap(true, Ordering::SeqCst) {
-                        tracing::info!(task = %run.task_id, state = state.as_str(), "task finished elsewhere; stopping it");
-                        self.inner.cancelled.notify_waiters();
-                    }
-                }
-                Renewal::Held(_) | Renewal::Unknown => {}
-                Renewal::Lost => {
-                    if !run.lost() {
-                        tracing::warn!(task = %run.task_id, "lost the task's lease (another instance took it over); stopping it");
-                        self.lose(run);
-                    }
-                }
+            Err(_) => {
+                tracing::warn!(after = ?cap, "renewing task leases timed out");
+                self.connected(false);
+            }
+        }
+        self.stop_unconfirmed(runs);
+    }
+
+    /// Stop the runs with no renewal confirmed for most of the lease: past
+    /// this, their lease may lapse on the database's clock and another
+    /// instance take the task over. Their claims are handed back later.
+    fn stop_unconfirmed(&self, runs: &[Arc<RunCtl>]) {
+        for run in runs {
+            let unconfirmed = run.confirmed().elapsed();
+            if run.lost() || unconfirmed < self.unconfirmed_limit() {
+                continue;
+            }
+            tracing::warn!(task = %run.task_id, ?unconfirmed, "no lease renewal confirmed for most of the lease; stopping the task, to hand it back once the database answers");
+            self.lose(run);
+            self.inner
+                .unreleased
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(run.held());
+        }
+    }
+
+    /// Hand back `held`, claims of stopped runs, waiting a renewal period at
+    /// most; kept for the next tick unless the database answers. Fenced by
+    /// token, so a claim taken over meanwhile is left alone.
+    async fn release_unreleased(&self, held: Vec<Held>) {
+        if held.is_empty() {
+            return;
+        }
+        let limit = self.renew_every();
+        match tokio::time::timeout(limit, self.inner.storage.release_claims(&held)).await {
+            Ok(Ok(n)) => {
+                self.connected(true);
+                self.inner
+                    .unreleased
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|h| !held.contains(h));
+                tracing::info!(
+                    tasks = n,
+                    "handed back tasks whose lease could not be renewed"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "could not hand back stopped tasks; trying again");
+                self.connected(false);
+            }
+            Err(_) => {
+                tracing::warn!(after = ?limit, "handing back stopped tasks timed out; trying again");
+                self.connected(false);
             }
         }
     }
@@ -330,17 +464,28 @@ impl Engine {
             }
             let mut skip: Vec<String> = memo.unrunnable.keys().cloned().collect();
             skip.extend(self.runs().iter().map(|r| r.task_id.clone()));
-            let page = match storage
-                .claimable_tasks(
-                    mode,
-                    &self.inner.node,
-                    &skip,
-                    self.pin_grace(),
-                    after.as_ref(),
-                    PAGE,
-                )
-                .await
-            {
+            let read = storage.claimable_tasks(
+                mode,
+                &self.inner.node,
+                &skip,
+                self.pin_grace(),
+                after.as_ref(),
+                PAGE,
+            );
+            // On a shared database a lease at most: one that hangs leaves this
+            // instance unsettled, as one that fails does.
+            let read = if force {
+                read.await
+            } else {
+                match tokio::time::timeout(self.inner.lease_ttl, read).await {
+                    Ok(read) => read,
+                    Err(_) => {
+                        self.connected(false);
+                        return Err(StorageError::Timeout(self.inner.lease_ttl).into());
+                    }
+                }
+            };
+            let page = match read {
                 Ok(page) => {
                     self.connected(true);
                     page
@@ -423,6 +568,7 @@ impl Engine {
         };
 
         let token = uuid::Uuid::new_v4().to_string();
+        let sent = Instant::now();
         let attempts = match storage
             .claim_task(&task.id, &self.lease(&token), mode, self.pin_grace())
             .await
@@ -435,7 +581,7 @@ impl Engine {
                 return Taken::No;
             }
         };
-        let Some(run) = self.register(&task.id, token.clone()) else {
+        let Some(run) = self.register(&task.id, token.clone(), sent) else {
             self.release(&task.id, &token).await;
             return Taken::Full;
         };
@@ -568,7 +714,16 @@ impl Engine {
         for run in &runs {
             self.lose(run);
         }
-        let held: Vec<Held> = runs.iter().map(|r| r.held()).collect();
+        let mut held: Vec<Held> = runs.iter().map(|r| r.held()).collect();
+        // And those of runs stopped earlier for want of a renewal, not handed
+        // back yet.
+        held.append(
+            &mut self
+                .inner
+                .unreleased
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
         match self.inner.storage.release_claims(&held).await {
             Ok(n) if n > 0 => tracing::info!(tasks = n, "handed unfinished tasks back"),
             Ok(_) => {}

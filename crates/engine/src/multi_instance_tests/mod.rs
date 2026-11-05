@@ -163,6 +163,7 @@ impl Fleet {
                     inner: Arc::new(store),
                     log: log.clone(),
                     holds: Holds::default(),
+                    detached: Holds::default(),
                 });
                 let sink = Arc::new(Sink {
                     who,
@@ -275,6 +276,7 @@ impl Instance {
         let id = id.to_string();
         self.on(move |e| async move {
             let token = uuid::Uuid::new_v4().to_string();
+            let sent = Instant::now();
             let claimed = e
                 .inner
                 .storage
@@ -285,7 +287,7 @@ impl Instance {
                 return false;
             }
             let task = e.get_task(&id).await.unwrap().unwrap();
-            let run = e.register(&id, token).unwrap();
+            let run = e.register(&id, token, sent).unwrap();
             let reservations = task
                 .items
                 .iter()
@@ -300,6 +302,19 @@ impl Instance {
     /// Tasks this instance runs now.
     fn runs(&self) -> usize {
         self.engine.inner.runs.lock().unwrap().len()
+    }
+
+    /// Whether this instance's run of `id` has stopped writing (lost its
+    /// claim, or stopped for want of a renewal); `None` when it has no run of
+    /// `id`.
+    fn run_lost(&self, id: &str) -> Option<bool> {
+        self.engine
+            .inner
+            .runs
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|r| r.lost())
     }
 
     /// Items waiting for one of this instance's slots.
@@ -335,6 +350,17 @@ impl Instance {
         matches: impl Fn(&Call) -> bool + Send + Sync + 'static,
     ) -> Hold {
         self.probe.holds.add(times, matches)
+    }
+
+    /// Like [`Instance::hold_storage`], for renewals and hand-backs only, but
+    /// a held call goes on in a task of its own: a caller that stops waiting
+    /// doesn't cancel it, as a database client's queue wouldn't.
+    fn hold_storage_detached(
+        &self,
+        times: usize,
+        matches: impl Fn(&Call) -> bool + Send + Sync + 'static,
+    ) -> Hold {
+        self.probe.detached.add(times, matches)
     }
 
     /// Hold this instance's next `times` webhook deliveries that `matches`
@@ -381,10 +407,13 @@ enum Call {
     IncrementAttempts(String, u32),
     /// A claim of the task, with its attempts if it won.
     Claim(String, Option<u32>),
-    /// Claims handed back (a graceful stop), with how many were still held.
+    /// Claims handed back (a graceful stop, or a run stopped for want of a
+    /// renewal), with how many were still held.
     Release(u64),
     /// A renewal of this many claims (holdable; not logged).
     Renew(usize),
+    /// A takeover's read of candidates (holdable; not logged).
+    Claimable,
     WebhookDelivered(String, usize),
     /// A webhook event the sink received.
     Webhook(String, EventKind, TaskState),
@@ -482,7 +511,9 @@ struct HoldSlot {
 }
 
 /// A hold on some calls: [`Hold::entered`] waits for one to arrive,
-/// [`Hold::release`] lets one go.
+/// [`Hold::release`] lets one go, [`Hold::open`] all of them. A held call whose
+/// caller stops waiting (a timeout) is dropped, and never runs, unless the hold
+/// is detached ([`Instance::hold_storage_detached`]).
 #[derive(Clone)]
 struct Hold(Arc<(Semaphore, Semaphore)>);
 
@@ -498,6 +529,16 @@ impl Hold {
     fn release(&self) {
         self.0.1.add_permits(1);
     }
+
+    /// Wait until the test lets this call go.
+    async fn wait(&self) {
+        self.0.1.acquire().await.unwrap().forget();
+    }
+
+    /// Let every held call go, and every later one it picks.
+    fn open(&self) {
+        self.0.1.add_permits(1 << 20);
+    }
 }
 
 impl Holds {
@@ -511,22 +552,25 @@ impl Holds {
         hold
     }
 
-    /// Wait here if a hold picks `call` (which carries default results: it
-    /// hasn't run yet).
+    /// The hold that picks `call` (which carries default results: it hasn't
+    /// run yet), if any, told the call has arrived.
+    fn pick(&self, call: &Call) -> Option<Hold> {
+        let mut slots = self.0.lock().unwrap();
+        let hold = slots
+            .iter_mut()
+            .find(|s| s.left > 0 && (s.matches)(call))
+            .map(|s| {
+                s.left -= 1;
+                s.hold.clone()
+            })?;
+        hold.0.0.add_permits(1);
+        Some(hold)
+    }
+
+    /// Wait here if a hold picks `call`.
     async fn pass(&self, call: &Call) {
-        let hold = {
-            let mut slots = self.0.lock().unwrap();
-            slots
-                .iter_mut()
-                .find(|s| s.left > 0 && (s.matches)(call))
-                .map(|s| {
-                    s.left -= 1;
-                    s.hold.clone()
-                })
-        };
-        if let Some(hold) = hold {
-            hold.0.0.add_permits(1);
-            hold.0.1.acquire().await.unwrap().forget();
+        if let Some(hold) = self.pick(call) {
+            hold.wait().await;
         }
     }
 }
@@ -537,6 +581,8 @@ struct Probe {
     inner: Arc<dyn Storage>,
     log: Arc<Log>,
     holds: Holds,
+    /// Holds whose calls wait in a task of their own (renewals and hand-backs).
+    detached: Holds,
 }
 
 impl Probe {
@@ -727,6 +773,7 @@ impl Storage for Probe {
         after: Option<&TaskCursor>,
         limit: usize,
     ) -> Result<Vec<Claimable>, StorageError> {
+        self.pass(Call::Claimable).await;
         self.inner
             .claimable_tasks(mode, node, skip, grace, after, limit)
             .await
@@ -750,15 +797,43 @@ impl Storage for Probe {
         held: &[Held],
         ttl: Duration,
     ) -> Result<Vec<Renewal>, StorageError> {
-        self.pass(Call::Renew(held.len())).await;
-        self.inner.renew_claims(held, ttl).await
+        let call = self.pass(Call::Renew(held.len())).await;
+        let Some(hold) = self.detached.pick(&call) else {
+            return self.inner.renew_claims(held, ttl).await;
+        };
+        let (inner, held) = (self.inner.clone(), held.to_vec());
+        tokio::spawn(async move {
+            hold.wait().await;
+            inner.renew_claims(&held, ttl).await
+        })
+        .await
+        .unwrap()
     }
     async fn release_claims(&self, held: &[Held]) -> Result<u64, StorageError> {
-        let r = self.inner.release_claims(held).await;
-        if let Ok(n) = &r {
-            self.done(Call::Release(*n));
+        let call = self.pass(Call::Release(0)).await;
+        let hold = self.detached.pick(&call);
+        let detached = hold.is_some();
+        let (inner, log, who, held) = (
+            self.inner.clone(),
+            self.log.clone(),
+            self.who,
+            held.to_vec(),
+        );
+        let release = async move {
+            if let Some(hold) = hold {
+                hold.wait().await;
+            }
+            let r = inner.release_claims(&held).await;
+            if let Ok(n) = &r {
+                log.push(who, Call::Release(*n));
+            }
+            r
+        };
+        if detached {
+            tokio::spawn(release).await.unwrap()
+        } else {
+            release.await
         }
-        r
     }
     async fn items_pending_webhook(&self) -> Result<Vec<PendingWebhook>, StorageError> {
         self.inner.items_pending_webhook().await

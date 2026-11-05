@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use apollo_config::{Config, DatabaseConfig, SqliteConfig};
 use apollo_domain::{
@@ -218,7 +218,10 @@ async fn shutdown_hands_back_only_its_own_claims() {
         )
         .await
         .unwrap();
-    let _run = f.engine.register("m", "mine".into()).unwrap();
+    let _run = f
+        .engine
+        .register("m", "mine".into(), Instant::now())
+        .unwrap();
 
     f.engine.shutdown().await;
 
@@ -251,6 +254,55 @@ async fn shutdown_hands_back_only_its_own_claims() {
         .await
         .unwrap();
     assert_eq!(attempts, Some(1));
+}
+
+#[tokio::test]
+async fn shutdown_hands_back_claims_of_stopped_runs() {
+    let f = fixture().await;
+    let mine = apollo_storage::Lease {
+        token: "stopped",
+        node: f.engine.node(),
+        ..crashed_claim()
+    };
+    f.storage
+        .create_task(
+            &task("s", TaskState::Processing, ItemState::Processing, None),
+            Some(&mine),
+            None,
+        )
+        .await
+        .unwrap();
+    // A run stopped for want of a renewal, which has ended, its claim not
+    // handed back yet.
+    f.engine
+        .inner
+        .unreleased
+        .lock()
+        .unwrap()
+        .push(apollo_storage::Held {
+            task_id: "s".into(),
+            token: "stopped".into(),
+        });
+
+    f.engine.shutdown().await;
+
+    let later = apollo_storage::Lease {
+        token: "later",
+        ..crashed_claim()
+    };
+    assert_eq!(
+        f.storage
+            .claim_task(
+                "s",
+                &later,
+                apollo_storage::ClaimMode::Force,
+                Duration::ZERO
+            )
+            .await
+            .unwrap(),
+        Some(0),
+        "handed back at shutdown: taking it counts no attempt"
+    );
 }
 
 #[tokio::test]
@@ -1195,6 +1247,7 @@ const NSFW_ONLY: &str = r#"
 /// stored, and its writes are fenced out).
 async fn run_resumed(engine: &Engine, task: Task) {
     let token = uuid::Uuid::new_v4().to_string();
+    let sent = Instant::now();
     let _ = engine
         .inner
         .storage
@@ -1206,7 +1259,7 @@ async fn run_resumed(engine: &Engine, task: Task) {
         )
         .await
         .unwrap();
-    let run = engine.register(&task.id, token).unwrap();
+    let run = engine.register(&task.id, token, sent).unwrap();
     let reservations = task
         .items
         .iter()
@@ -1517,5 +1570,241 @@ async fn a_rollup_that_fails_is_tried_again() {
             "the task stayed {state:?} after its rollups failed"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// An engine with one slot and a one-second lease, on SQLite behind a
+/// [`Stalled`](crate::testing::Stalled) store. With `shared`, the store says
+/// it is shared, so the engine renews its leases as on SurrealDB.
+async fn stalled_engine(
+    shared: bool,
+) -> (
+    Engine,
+    Arc<dyn Storage>,
+    crate::testing::StallGate,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config_in(&dir, &format!("[app]\nmax_concurrent = 1\n{NSFW}"));
+    config.database.lease_secs = 1;
+    let sqlite = apollo_storage::open(&config.database).await.unwrap();
+    let (stalled, gate) = if shared {
+        crate::testing::Stalled::new_shared(sqlite.clone())
+    } else {
+        crate::testing::Stalled::new(sqlite.clone())
+    };
+    let engine = Engine::new(Arc::new(config), Arc::new(stalled), None);
+    (engine, sqlite, gate, dir)
+}
+
+fn in_flight(engine: &Engine) -> usize {
+    engine
+        .inner
+        .in_flight
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether the run of `id` has lost its claim; `None` when there is none.
+fn run_lost(engine: &Engine, id: &str) -> Option<bool> {
+    engine.inner.runs.lock().unwrap().get(id).map(|r| r.lost())
+}
+
+/// Whether `done` turned true within `limit`.
+async fn wait_within(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + limit;
+    while !done() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    true
+}
+
+#[tokio::test]
+async fn a_run_without_confirmed_renewals_stops_within_its_lease() {
+    let (engine, sqlite, gate, _dir) = stalled_engine(true).await;
+    // The only slot is taken, so the item waits for it.
+    let slot = engine.inner.gate.clone().acquire(0).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    assert!(wait_within(Duration::from_secs(2), || in_flight(&engine) == 1).await);
+    // Renewals that answer keep it going past its first lease.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(run_lost(&engine, &id), Some(false));
+
+    // The database stops answering: the run goes on for a while, then stops
+    // before its lease can lapse.
+    gate.shut();
+    let shut = Instant::now();
+    let stopped = wait_within(Duration::from_secs(2), || {
+        in_flight(&engine) == 0 && engine.inner.runs.lock().unwrap().is_empty()
+    })
+    .await;
+    let took = shut.elapsed();
+    assert!(stopped, "the run never stopped");
+    assert!(
+        took >= Duration::from_millis(400) && took < Duration::from_secs(1),
+        "stopped {took:?} after the database went away"
+    );
+    // It wrote nothing: the item wasn't cancelled.
+    let stored = sqlite.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(
+        (stored.state, stored.items[0].state),
+        (TaskState::Processing, ItemState::Queued)
+    );
+    // Its claim comes back once the database answers, not before.
+    let grace = Duration::from_secs(10);
+    let open = || async {
+        sqlite
+            .claimable_tasks(
+                apollo_storage::ClaimMode::Open,
+                engine.node(),
+                &[],
+                grace,
+                None,
+                10,
+            )
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.id == id)
+    };
+    assert!(!open().await, "handed back while the database was away");
+    gate.open();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !(open().await && engine.inner.unreleased.lock().unwrap().is_empty()) {
+        assert!(Instant::now() < deadline, "the claim wasn't handed back");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Handed back: the next claim counts no attempt.
+    let next = apollo_storage::Lease {
+        token: "next",
+        node: engine.node(),
+        process: "p",
+        ttl: Duration::from_secs(60),
+    };
+    assert_eq!(
+        sqlite
+            .claim_task(&id, &next, apollo_storage::ClaimMode::Open, grace)
+            .await
+            .unwrap(),
+        Some(0)
+    );
+    drop(slot);
+}
+
+#[tokio::test]
+async fn renewals_that_answer_keep_a_run_going() {
+    let (engine, sqlite, _gate, _dir) = stalled_engine(true).await;
+    let slot = engine.inner.gate.clone().acquire(0).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    // Three leases on, renewals still confirm the claim.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(run_lost(&engine, &id), Some(false));
+    assert_eq!(in_flight(&engine), 1);
+
+    // With the slot, the item runs to its end, as without leases.
+    drop(slot);
+    assert!(
+        wait_within(Duration::from_secs(5), || {
+            in_flight(&engine) == 0 && engine.inner.runs.lock().unwrap().is_empty()
+        })
+        .await
+    );
+    let stored = sqlite.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Failed, "local files are refused");
+    let pending = sqlite.items_pending_webhook().await.unwrap();
+    assert!(
+        pending.iter().all(|p| p.task_id != id),
+        "its finished webhook is left pending: {pending:?}"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_runs_have_no_renewal_limit() {
+    let (engine, sqlite, gate, _dir) = stalled_engine(false).await;
+    let slot = engine.inner.gate.clone().acquire(0).await;
+    let id = engine
+        .submit(local_file_submission(), None)
+        .await
+        .unwrap()
+        .id;
+    // Nothing renews a lease on SQLite, so an outage stops nothing.
+    gate.shut();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(run_lost(&engine, &id), Some(false));
+
+    gate.open();
+    drop(slot);
+    assert!(
+        wait_within(Duration::from_secs(5), || {
+            in_flight(&engine) == 0 && engine.inner.runs.lock().unwrap().is_empty()
+        })
+        .await
+    );
+    let stored = sqlite.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Failed);
+}
+
+#[tokio::test]
+async fn renewal_cap_keeps_to_the_deadline() {
+    let ms = Duration::from_millis;
+    let ns = Duration::from_nanos;
+    // (lease, renewal period, how long a run goes unconfirmed, the floor)
+    for (lease_secs, period, limit, floor) in [
+        (30, ms(10_000), ms(25_000), ms(5_000)),
+        (1, ns(333_333_333), ns(833_333_333), ns(166_666_666)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_in(&dir, "");
+        config.database.lease_secs = lease_secs;
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        let engine = Engine::new(Arc::new(config), storage, None);
+        let ttl = Duration::from_secs(lease_secs.into());
+        let mut n = 0;
+        // A run whose last confirmed renewal was sent `ago`.
+        let mut run = |ago: Duration| {
+            n += 1;
+            engine
+                .register(&n.to_string(), "t".into(), Instant::now() - ago)
+                .unwrap()
+        };
+        let cap = |runs: &[&crate::lease::Running]| {
+            let ctls: Vec<_> = runs.iter().map(|r| r.ctl.clone()).collect();
+            engine.renewal_cap(&ctls)
+        };
+
+        assert_eq!(engine.unconfirmed_limit(), limit);
+        // A renewal period, but no further than the deadline, and at least
+        // the floor.
+        let fresh = run(Duration::ZERO);
+        assert_eq!(cap(&[&fresh]), period);
+        let late = run(ttl * 2 / 3);
+        assert_eq!(cap(&[&late]), floor);
+        let lapsed = run(ttl * 4 / 3);
+        assert_eq!(cap(&[&lapsed]), floor);
+        // 8/30 of the lease left until the deadline.
+        let between = run(ttl * 17 / 30);
+        let left = cap(&[&between]);
+        assert!(
+            left <= ttl * 8 / 30 && left > ttl * 7 / 30,
+            "{left:?} of {ttl:?}"
+        );
+        // The earliest deadline among them.
+        let both = cap(&[&fresh, &between]);
+        assert!(both <= left && both > ttl * 7 / 30, "{both:?} of {ttl:?}");
+        // A confirmation moves the deadline on, never back.
+        lapsed.ctl.confirm(Instant::now());
+        assert_eq!(cap(&[&lapsed]), period);
+        lapsed.ctl.confirm(Instant::now() - ttl);
+        assert_eq!(cap(&[&lapsed]), period);
     }
 }

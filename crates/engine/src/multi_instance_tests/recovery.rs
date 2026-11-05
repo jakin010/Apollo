@@ -440,8 +440,9 @@ async fn a_cancelled_task_whose_runner_died_is_finished() {
     .await;
 }
 
-/// Not ignored: a runner whose lease lapsed (it lost touch with the
-/// database) and was taken over stops, and writes nothing more.
+/// Not ignored: a runner cut off from the database (its renewals and its
+/// hand-back hang) stops before its lease lapses, and writes nothing more; the
+/// instance that takes the task over then runs it, counting one attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_runner_whose_lease_was_taken_over_stops() {
     fleet_test(|fleet| async move {
@@ -450,31 +451,184 @@ async fn a_runner_whose_lease_was_taken_over_stops() {
         let b = fleet.start("b", &toml).await;
         b.recover().await;
         let a = fleet.start("a", &toml).await;
-        // A's renewals hang: its lease lapses while it runs the task.
-        let renewals = a.hold_storage(1, |c| matches!(c, Call::Renew(n) if *n > 0));
+        let cut = a.hold_storage(usize::MAX, |c| {
+            matches!(c, Call::Renew(n) if *n > 0) || matches!(c, Call::Release(_))
+        });
         let t = a.submit(image_at(&origin.url("/t.png"))).await.id;
         let download_a = origin.next("a downloads the input").await;
-        renewals.entered("a renews its lease").await;
+        cut.entered("a renews its lease").await;
 
+        // A stops within its lease, before B may take the task over.
+        let stopped = wait_within(LEASE, || a.run_lost(&t) == Some(true)).await;
+        let b_claimed = fleet
+            .log
+            .count(|who, c| who == "b" && matches!(c, Call::Claim(id, Some(_)) if *id == t));
+        assert!(
+            stopped && b_claimed == 0,
+            "A stopped within its lease: {stopped}, B had claimed it {b_claimed} times"
+        );
+
+        // A's hand-back hangs too, so B takes the lapsed lease over, counting
+        // an attempt.
         let download_b = origin.next("b takes the lapsed task over").await;
-        // A's download ends before A learns anything: its writes are fenced
-        // out by B's claim.
+        let claim_b = fleet
+            .log
+            .lock()
+            .iter()
+            .position(|(who, c)| *who == "b" && *c == Call::Claim(t.clone(), Some(1)))
+            .expect("B's claim, counting an attempt");
+        // A's download ends: A writes nothing for it.
         download_a.reply(Reply::Garbage);
         a.wait_idle().await;
-        // A's renewal goes through now and finds the task taken.
-        renewals.release();
+        // A's hand-back goes through now, and finds the task taken.
+        cut.open();
+        fleet
+            .log
+            .wait_for("a hands its claim back", |who, c| {
+                who == "a" && *c == Call::Release(0)
+            })
+            .await;
         download_b.reply(Reply::Garbage);
         fleet.log.delivered("b", &t).await;
         b.wait_idle().await;
 
         assert_eq!(fleet.log.finished(&t), [("b", TaskState::Failed)]);
+        assert_eq!(fleet.db.attempts(&t).await, 1);
+        let after: Vec<Call> = fleet.log.lock()[claim_b..]
+            .iter()
+            .filter(|(who, _)| *who == "a")
+            .map(|(_, c)| c.clone())
+            .collect();
+        assert_eq!(after, [Call::Release(0)], "A's calls after B's claim");
+    })
+    .await;
+}
+
+/// Not ignored: a database outage for every instance, longer than the lease,
+/// stops the running task; once the database is back its runner hands it back,
+/// and it runs again with no attempt counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_outage_for_everyone_hands_runs_back_uncounted() {
+    fleet_test(|fleet| async move {
+        let origin = Origin::start();
+        let toml = format!("{SHORT_LEASE}{NSFW}");
+        let b = fleet.start("b", &toml).await;
+        b.recover().await;
+        let a = fleet.start("a", &toml).await;
+        a.recover().await;
+        let t = a.submit(image_at(&origin.url("/t.png"))).await.id;
+        let download_a = origin.next("a downloads the input").await;
+        // B may take lapsed leases over: only its takeover read, timing out,
+        // keeps it from taking A's task once the database is back.
+        assert!(
+            wait_within(2 * LEASE, || b.engine.settled()).await,
+            "B settled"
+        );
+
+        // Every lease call of both hangs.
+        let lease_calls = |c: &Call| {
+            matches!(c, Call::Renew(n) if *n > 0)
+                || matches!(c, Call::Release(_) | Call::Claimable | Call::Claim(..))
+        };
+        let hold_a = a.hold_storage(usize::MAX, lease_calls);
+        let hold_b = b.hold_storage(usize::MAX, lease_calls);
+        assert!(
+            wait_within(LEASE, || a.run_lost(&t) == Some(true)).await,
+            "A stopped within its lease"
+        );
+        download_a.reply(Reply::Garbage);
+        a.wait_idle().await;
+        // The outage outlasts the lease on the database's clock.
+        tokio::time::sleep(2 * LEASE).await;
+        let during = fleet.task(&t).await;
         assert_eq!(
-            fleet.log.count(|who, c| {
-                who == "a"
-                    && matches!(c, Call::SetItemState(id, _, ItemState::Failed, true) if *id == t)
-            }),
-            0,
-            "A failed the item B had taken over"
+            during.items[0].state,
+            ItemState::Processing,
+            "A wrote nothing after it stopped"
+        );
+
+        // The database answers B half a lease before A. B's reads timed out, so
+        // it isn't settled, and it leaves A's lapsed lease alone until A's
+        // hand-back lands.
+        hold_b.open();
+        tokio::time::sleep(LEASE / 2).await;
+        hold_a.open();
+        let download = origin.next("the task runs again").await;
+        download.reply(Reply::Garbage);
+        fleet
+            .log
+            .wait_for(
+                "the finished webhook is delivered",
+                |_, c| matches!(c, Call::WebhookDelivered(id, _) if *id == t),
+            )
+            .await;
+        a.wait_idle().await;
+        b.wait_idle().await;
+
+        assert_eq!(
+            (
+                fleet.db.attempts(&t).await,
+                fleet
+                    .log
+                    .count(|who, c| who == "a" && *c == Call::Release(1)),
+                fleet.log.finished(&t).len(),
+            ),
+            (0, 1, 1),
+            "(attempts, A's hand-backs, finished webhooks)"
+        );
+    })
+    .await;
+}
+
+/// Not ignored: renewals a stopped run sent, applied late (the database
+/// client queued them), and its hand-back, in whatever order they land, count
+/// no attempt: the task runs again once, as if handed back at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewal_applied_after_the_stop_changes_nothing() {
+    fleet_test(|fleet| async move {
+        let origin = Origin::start();
+        let a = fleet.start("a", &format!("{SHORT_LEASE}{NSFW}")).await;
+        a.recover().await;
+        let t = a.submit(image_at(&origin.url("/t.png"))).await.id;
+        let download_a = origin.next("a downloads the input").await;
+
+        // A's renewals and hand-backs are queued, not lost; and its takeover
+        // can't run the task again until the test says.
+        let queued = a.hold_storage_detached(usize::MAX, |c| {
+            matches!(c, Call::Renew(n) if *n > 0) || matches!(c, Call::Release(_))
+        });
+        let reads = a.hold_storage(usize::MAX, |c| matches!(c, Call::Claimable));
+        assert!(
+            wait_within(LEASE, || a.run_lost(&t) == Some(true)).await,
+            "A stopped within its lease"
+        );
+        download_a.reply(Reply::Garbage);
+        a.wait_idle().await;
+        // The queued calls land after the lease lapsed.
+        tokio::time::sleep(2 * LEASE).await;
+        queued.open();
+        fleet
+            .log
+            .wait_for("a hands its claim back", |who, c| {
+                who == "a" && *c == Call::Release(1)
+            })
+            .await;
+        reads.open();
+        let download = origin.next("the task runs again").await;
+        download.reply(Reply::Garbage);
+        fleet.log.delivered("a", &t).await;
+        a.wait_idle().await;
+
+        assert_eq!(
+            (
+                fleet.db.attempts(&t).await,
+                fleet
+                    .log
+                    .count(|who, c| who == "a" && *c == Call::Release(1)),
+                fleet.log.finished(&t),
+            ),
+            (0, 1, vec![("a", TaskState::Failed)]),
+            "(attempts, A's hand-backs, finished webhooks)"
         );
     })
     .await;

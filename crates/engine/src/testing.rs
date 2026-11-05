@@ -276,6 +276,8 @@ impl Storage for HeldCreate {
 pub struct Stalled {
     pub inner: Arc<dyn Storage>,
     open: tokio::sync::watch::Receiver<bool>,
+    /// Reported as shared, whatever `inner` is.
+    shared: bool,
 }
 
 /// Shuts and opens a [`Stalled`] store (open to begin with).
@@ -293,7 +295,23 @@ impl StallGate {
 impl Stalled {
     pub fn new(inner: Arc<dyn Storage>) -> (Self, StallGate) {
         let (open, rx) = tokio::sync::watch::channel(true);
-        (Self { inner, open: rx }, StallGate(open))
+        let stalled = Self {
+            inner,
+            open: rx,
+            shared: false,
+        };
+        (stalled, StallGate(open))
+    }
+
+    /// [`Stalled::new`], reported as a shared database (so an engine on it
+    /// renews its leases), whatever `inner` is.
+    pub fn new_shared(inner: Arc<dyn Storage>) -> (Self, StallGate) {
+        let (stalled, gate) = Self::new(inner);
+        let stalled = Self {
+            shared: true,
+            ..stalled
+        };
+        (stalled, gate)
     }
 
     async fn pass(&self) {
@@ -441,7 +459,7 @@ impl Storage for Stalled {
         self.inner.increment_attempts(id).await
     }
     fn shared(&self) -> bool {
-        self.inner.shared()
+        self.shared || self.inner.shared()
     }
 
     async fn claimable_tasks(

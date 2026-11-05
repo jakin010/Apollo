@@ -136,6 +136,10 @@ struct Inner {
     /// The tasks this process runs, by id: each run's claim and its
     /// cooperative cancel signal.
     runs: Mutex<HashMap<String, Arc<lease::RunCtl>>>,
+    /// Claims of runs stopped because no renewal was confirmed in time, not
+    /// yet handed back: the renewal loop hands them back once the database
+    /// answers.
+    unreleased: Mutex<Vec<apollo_storage::Held>>,
     /// Woken on every cancel, so items waiting for a slot can check theirs.
     cancelled: tokio::sync::Notify,
     /// This instance's node id, and this process's id (one per start).
@@ -249,6 +253,7 @@ impl Engine {
                 in_flight: AtomicUsize::new(0),
                 admitted: Mutex::new(HashMap::new()),
                 runs: Mutex::new(HashMap::new()),
+                unreleased: Mutex::new(Vec::new()),
                 cancelled: tokio::sync::Notify::new(),
                 changes,
                 idempotency: Mutex::new(HashMap::new()),
@@ -287,7 +292,8 @@ impl Engine {
     /// storage timeout once `[database].timeout` passes. Only reads, and waits
     /// for work running in a task of its own, go through here: dropping them
     /// cuts no write short. Background work waits as long as the database takes,
-    /// so none of its writes is dropped or overtaken by a later one.
+    /// so none of its writes is dropped or overtaken by a later one. Lease
+    /// renewals have a limit of their own, from `[database].lease_secs`.
     async fn within<T>(
         &self,
         work: impl Future<Output = Result<T, EngineError>>,
@@ -468,6 +474,7 @@ impl Engine {
             let token = uuid::Uuid::new_v4().to_string();
             // Node-local input stays with this node.
             let pin = lease::pinned_input(&task).then(|| engine.inner.node.as_str());
+            let claimed_at = Instant::now();
             match engine
                 .inner
                 .storage
@@ -483,7 +490,7 @@ impl Engine {
                 Err(e) => return Err(e.into()),
             }
             tracing::info!(task = %task.id, "task submitted");
-            match engine.register(&task.id, token.clone()) {
+            match engine.register(&task.id, token.clone(), claimed_at) {
                 Some(run) => {
                     let runner = engine.clone();
                     tokio::spawn(

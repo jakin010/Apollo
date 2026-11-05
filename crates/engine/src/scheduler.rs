@@ -1849,6 +1849,11 @@ impl Engine {
     /// Persist classified frames as one checkpoint; a failure is logged, not
     /// fatal (the frames are only re-done on resume).
     async fn save_checkpoint(&self, scan: &FrameScanRun<'_>, frames: &[Sample]) {
+        // A run that lost its claim writes nothing more (checkpoints aren't
+        // fenced).
+        if self.lost() {
+            return;
+        }
         if let Err(e) = self
             .inner
             .storage
