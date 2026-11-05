@@ -380,7 +380,19 @@ pub async fn open(db: &DatabaseConfig) -> Result<Arc<dyn Storage>, StorageError>
                     "backend is 'surrealdb' but [database.surrealdb] is missing".into(),
                 )
             })?;
-            let store = SurrealStorage::connect(&cfg).await?;
+            // Within `[database].timeout`, so a host that doesn't answer fails
+            // the start instead of hanging it. The migration has no limit:
+            // defining an index over existing rows builds it first.
+            let connect = SurrealStorage::connect(&cfg);
+            let store = match db.timeout {
+                0 => connect.await?,
+                secs => {
+                    let limit = std::time::Duration::from_secs(secs.into());
+                    tokio::time::timeout(limit, connect)
+                        .await
+                        .unwrap_or(Err(StorageError::Timeout(limit)))?
+                }
+            };
             store.migrate().await?;
             Ok(Arc::new(store))
         }

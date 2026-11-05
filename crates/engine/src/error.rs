@@ -78,6 +78,14 @@ pub enum EngineError {
 }
 
 impl EngineError {
+    /// Whether the database didn't answer in time (it may be unreachable).
+    pub fn is_storage_timeout(&self) -> bool {
+        matches!(
+            self,
+            EngineError::Storage(apollo_storage::StorageError::Timeout(_))
+        )
+    }
+
     /// Whether retrying the same work could plausibly succeed. Input that was
     /// refused or could not be decoded, and configuration mismatches, are final.
     pub(crate) fn is_transient(&self) -> bool {

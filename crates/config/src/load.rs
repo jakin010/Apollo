@@ -95,11 +95,16 @@ impl Config {
         }
         if let Some(u) = &o.webhook_url {
             match self.webhook.as_mut() {
-                Some(w) => w.url = u.clone(),
+                // Also when the section turns delivery off: the flag asks for it.
+                Some(w) => {
+                    w.url = u.clone();
+                    w.enabled = true;
+                }
                 // No [webhook] section: the flag alone enables delivery for this
                 // run (unsigned, default redelivery interval).
                 None => {
                     self.webhook = Some(crate::schema::WebhookConfig {
+                        enabled: true,
                         url: u.clone(),
                         secret: None,
                         redelivery_secs: crate::defaults::redelivery_secs(),

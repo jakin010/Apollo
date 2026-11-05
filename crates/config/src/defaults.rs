@@ -55,6 +55,9 @@ pub(crate) fn sqlite_path() -> String {
 pub(crate) fn wal() -> bool {
     true
 }
+pub(crate) fn database_timeout() -> u32 {
+    30
+}
 pub(crate) fn busy_timeout() -> u32 {
     5000
 }

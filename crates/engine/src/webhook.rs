@@ -56,6 +56,18 @@ pub trait WebhookSink: Send + Sync {
     async fn deliver(&self, event: &TaskEvent) -> Result<(), WebhookError>;
 }
 
+/// What became of one [`Engine::push_webhook`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pushed {
+    /// The receiver took it, or none was needed (a progress event for a task
+    /// that has finished meanwhile).
+    Done,
+    /// Not sent: the task couldn't be read or rolled up, or delivery failed.
+    Failed,
+    /// Webhooks are off.
+    Off,
+}
+
 impl Engine {
     /// Load a task for delivery, logging and returning `None` on miss/error.
     async fn load_task_for_webhook(&self, task_id: &str) -> Option<Task> {
@@ -72,24 +84,37 @@ impl Engine {
     /// Send the task's current state as a `kind` event. A progress event for a
     /// task that has finished meanwhile is dropped (its finished event follows),
     /// and a finished event for a task with items still running goes out as
-    /// progress. Returns `false` if no sink is configured, the task is missing,
-    /// or delivery failed. No bookkeeping.
+    /// progress. A finished event for a task whose items have all finished but
+    /// that isn't rolled up yet rolls it up first. No bookkeeping.
     async fn push_webhook(
         &self,
         task_id: &str,
         item_index: usize,
         kind: EventKind,
         attempt: u32,
-    ) -> bool {
+    ) -> Pushed {
         let Some(sink) = self.live().webhook.clone() else {
-            return false;
+            return Pushed::Off;
         };
-        let Some(task) = self.load_task_for_webhook(task_id).await else {
-            return false;
+        let Some(mut task) = self.load_task_for_webhook(task_id).await else {
+            return Pushed::Failed;
         };
+        if kind == EventKind::Finished
+            && !aggregate::task_terminal(task.state)
+            && aggregate::task_terminal(aggregate::task_state_for(&task))
+        {
+            // The task's rollup didn't land (a storage error as its last item
+            // finished): do it now, so the finished event goes out rather than
+            // a progress one taken for it. Failing that, it stays pending.
+            self.rollup_task_state(task_id).await;
+            match self.load_task_for_webhook(task_id).await {
+                Some(t) if aggregate::task_terminal(t.state) => task = t,
+                _ => return Pushed::Failed,
+            }
+        }
         let finished = aggregate::task_terminal(task.state);
         let kind = match kind {
-            EventKind::Progress if finished => return true,
+            EventKind::Progress if finished => return Pushed::Done,
             EventKind::Finished if !finished => EventKind::Progress,
             kind => kind,
         };
@@ -105,10 +130,10 @@ impl Engine {
         let delivered = sink.deliver(&event).await;
         self.inner.metrics.webhook(name, delivered.is_ok());
         match delivered {
-            Ok(()) => true,
+            Ok(()) => Pushed::Done,
             Err(e) => {
                 tracing::warn!(task = %task_id, item = item_index, error = %e, "webhook delivery failed");
-                false
+                Pushed::Failed
             }
         }
     }
@@ -133,23 +158,34 @@ impl Engine {
     /// Fire the finished event for a terminal item. Spawned so it never blocks the
     /// scheduler; retries a few times with backoff and marks the item delivered on
     /// success, otherwise leaving it pending for the periodic redelivery loop (and,
-    /// ultimately, restart recovery).
+    /// ultimately, restart recovery). With webhooks off the item is marked
+    /// delivered at once: nothing is kept to send once they're on again.
     pub(crate) async fn deliver_webhook(&self, task_id: &str, item_index: usize) {
-        if self.live().webhook.is_none() || self.lost() {
+        // A run that lost its lease leaves the task to its new runner.
+        if self.lost() {
             return;
         }
         // The current webhook, also for a task pinned to an older config.
         let engine = self.current();
+        if engine.live().webhook.is_none() {
+            let _ = engine
+                .inner
+                .storage
+                .mark_webhook_delivered(task_id, item_index)
+                .await;
+            return;
+        }
         let task_id = task_id.to_string();
         tokio::spawn(async move {
             for (attempt, delay) in (1..).zip([0u64, 1, 3]) {
                 if delay > 0 {
                     tokio::time::sleep(Duration::from_secs(delay)).await;
                 }
-                if engine
+                let pushed = engine
                     .push_webhook(&task_id, item_index, EventKind::Finished, attempt)
-                    .await
-                {
+                    .await;
+                // Sent, or webhooks were turned off meanwhile.
+                if pushed != Pushed::Failed {
                     let _ = engine
                         .inner
                         .storage

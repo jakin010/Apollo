@@ -226,10 +226,15 @@ impl Default for AppConfig {
     }
 }
 
-/// `[webhook]` — outbound delivery target. Omit the section to disable.
+/// `[webhook]` — outbound delivery target. Omit the section, or set `enabled =
+/// false`, to disable.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
+    /// Send webhooks. `false` turns delivery off but keeps the settings, like
+    /// leaving the section out: nothing is sent, nor kept to send later.
+    #[serde(default = "crate::defaults::enabled")]
+    pub enabled: bool,
     /// gRPC target; scheme selects TLS (`https`) vs plaintext (`http`). Any path
     /// component is ignored — the gRPC method path is fixed by the service.
     pub url: String,
@@ -317,6 +322,11 @@ pub struct DatabaseConfig {
     pub postgres: Option<PostgresConfig>,
     #[serde(default)]
     pub surrealdb: Option<SurrealdbConfig>,
+    /// Seconds a client's call waits for the database before it fails as
+    /// unavailable, and that connecting to SurrealDB may take at startup. 0
+    /// waits as long as it takes. Background work always waits.
+    #[serde(default = "crate::defaults::database_timeout")]
+    pub timeout: u32,
 }
 
 impl Default for DatabaseConfig {
@@ -328,6 +338,7 @@ impl Default for DatabaseConfig {
             sqlite: None,
             postgres: None,
             surrealdb: None,
+            timeout: defaults::database_timeout(),
         }
     }
 }

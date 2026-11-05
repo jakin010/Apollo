@@ -343,6 +343,7 @@ Runtime failures (an unfetchable URL, a decode error, an inference error, a time
 | Unknown task id, or a task that belongs to another caller | `NOT_FOUND` |
 | Overloaded: `[app].max_pending` inputs in flight, the memory ceiling exceeded, or a model's own `max_pending` reached | `RESOURCE_EXHAUSTED`, with metadata `apollo-overloaded: queue`, `memory` or `model` |
 | Content over the upload cap | `RESOURCE_EXHAUSTED`, with metadata `grpc-retry-pushback-ms: -1` |
+| The database didn't answer within `[database].timeout` (e.g. it's unreachable). A Classify told so may still have its task stored and run once it answers: retry with the same `request_id` to get that task | `UNAVAILABLE` |
 | Missing/invalid auth token (when auth is enabled) | `UNAUTHENTICATED` |
 | Everything else | `INTERNAL` |
 

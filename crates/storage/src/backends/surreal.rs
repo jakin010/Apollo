@@ -1,4 +1,4 @@
-//! SurrealDB backend, targeting the `surrealdb` Rust SDK 4.0.0-beta.1 (a remote
+//! SurrealDB backend, targeting the `surrealdb` Rust SDK 4.0 (a remote
 //! server reached over `ws(s)://` or `http(s)://`). Implements [`crate::Storage`].
 //!
 //! Data model mirrors the SQLite backend's relational shape, but as SurrealDB
@@ -14,13 +14,13 @@
 //! exactly as in SQLite, so they round-trip through `serde_json` and are opaque to
 //! SurrealDB — this keeps storage robust across SurrealDB version changes.
 //!
-//! Upgrade notes: the dependency is pinned to exactly `4.0.0-beta.1` while 4.x is
-//! in beta, since a later beta may still break things. The whole SurrealDB surface
-//! used here is confined to this file — `engine::any::connect`, `Root` auth,
-//! `use_ns`/`use_db`, and `query`/`bind`/`take` — plus the SurrealQL in the
-//! `const` statements below (and, for tests, the throwaway databases in
-//! `testing.rs` and `tests/backends.rs`). Moving to another version means bumping
-//! the version literal and revisiting only those.
+//! Upgrade notes: the dependency is `4.0` (any 4.x release from 4.0.0 on). The
+//! whole SurrealDB surface used here is confined to this file —
+//! `engine::any::connect`, `Root` auth, `use_ns`/`use_db`, and
+//! `query`/`bind`/`take` — plus the SurrealQL in the `const` statements below
+//! (and, for tests, the throwaway databases in `testing.rs` and
+//! `tests/backends.rs`). Moving to another major version means bumping the
+//! version and revisiting only those.
 
 use std::time::Duration;
 

@@ -15,6 +15,11 @@ pub enum StorageError {
     #[error("task '{0}' already exists")]
     TaskExists(String),
 
+    /// The database didn't answer within `[database].timeout`, so it may be
+    /// unreachable: connecting at startup, or a client's call (the engine's).
+    #[error("the database didn't answer within {0:?}; it may be unreachable")]
+    Timeout(std::time::Duration),
+
     #[error("corrupt stored data: {0}")]
     Corrupt(String),
 

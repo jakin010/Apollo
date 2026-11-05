@@ -24,7 +24,8 @@ pub struct StartArgs {
     #[arg(long)]
     pub port: Option<u16>,
     /// Override the webhook receiver URL (e.g. http://127.0.0.1:9090); enables
-    /// delivery for this run even without a [webhook] section.
+    /// delivery for this run even without a [webhook] section, or with its
+    /// `enabled = false`.
     #[arg(long = "webhook-url")]
     pub webhook_url: Option<String>,
     /// Detach and run in the background, writing a PID file.
@@ -257,15 +258,15 @@ struct ServerInfo {
     log_file: Option<String>,
 }
 
-/// The `[webhook]` sink for `config`, if it has one.
+/// The `[webhook]` sink for `config`, if it has one and it's enabled.
 fn webhook_sink(config: &Config) -> anyhow::Result<Option<Arc<dyn WebhookSink>>> {
     match &config.webhook {
-        Some(w) => {
+        Some(w) if w.enabled => {
             let sink = apollo_server::GrpcWebhookSink::new(&w.url, w.secret.clone())
                 .context("configuring webhook client")?;
             Ok(Some(Arc::new(sink) as Arc<dyn WebhookSink>))
         }
-        None => Ok(None),
+        _ => Ok(None),
     }
 }
 
@@ -656,4 +657,19 @@ fn spawn_detached(args: &StartArgs) -> anyhow::Result<()> {
         log_path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_disabled_webhook_builds_no_sink() {
+        let config = |toml: &str| apollo_config::load::from_str(toml).unwrap();
+        let on = "[webhook]\nurl = \"http://127.0.0.1:1\"\n";
+        assert!(webhook_sink(&config(on)).unwrap().is_some());
+        let off = format!("{on}enabled = false\n");
+        assert!(webhook_sink(&config(&off)).unwrap().is_none());
+        assert!(webhook_sink(&config("")).unwrap().is_none());
+    }
 }

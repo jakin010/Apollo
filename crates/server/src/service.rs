@@ -385,8 +385,13 @@ impl InferenceService {
             }
             Err(e) => {
                 // Validation failed before the task existed, so the task
-                // lifecycle will never clean this upload — remove it now.
-                discard(&staged);
+                // lifecycle will never clean this upload — remove it now. Not
+                // on a timeout: the task may be in the hands of its store task,
+                // which stores and runs it once the database answers (at worst
+                // the file waits for the next start's sweep).
+                if !e.is_storage_timeout() {
+                    discard(&staged);
+                }
                 return Err(engine_to_status(e));
             }
         };
@@ -491,9 +496,14 @@ impl TlsSettings {
 }
 
 /// Map engine errors to gRPC status codes. Submit-time validation failures are
-/// client errors; everything else is internal.
+/// client errors, and a database that didn't answer in time is unavailable;
+/// everything else is internal.
 fn engine_to_status(e: EngineError) -> Status {
     match e {
+        // Probably unreachable for now, so worth retrying. A Classify told so may
+        // still have its task stored and run once the database answers: a retry
+        // with the same `request_id` then gets that task instead of another.
+        e if e.is_storage_timeout() => Status::unavailable(e.to_string()),
         EngineError::UnknownModel(_) | EngineError::Incompatible(_) | EngineError::Config(_) => {
             Status::invalid_argument(e.to_string())
         }
@@ -637,9 +647,17 @@ mod tests {
     use std::sync::Arc;
 
     use apollo_config::{Config, DatabaseConfig, SqliteConfig};
-    use apollo_domain::{Item, TaskState, Url};
-    use apollo_storage::Storage;
+    use apollo_domain::{ErrorKind, Item, TaskState, Url};
+    use apollo_storage::{Storage, StorageError};
     use tokio::sync::oneshot;
+
+    #[test]
+    fn a_storage_timeout_is_unavailable_and_other_storage_errors_internal() {
+        let timeout = EngineError::Storage(StorageError::Timeout(Duration::from_secs(30)));
+        assert_eq!(engine_to_status(timeout).code(), tonic::Code::Unavailable);
+        let other = EngineError::Storage(StorageError::Surreal("boom".into()));
+        assert_eq!(engine_to_status(other).code(), tonic::Code::Internal);
+    }
 
     struct Fixture {
         engine: Engine,
@@ -968,6 +986,159 @@ mod tests {
         let stored = storage.find_task_by_request(None, "r").await.unwrap();
         assert_eq!(Some(task.id), stored);
         assert_eq!(uploads(&engine), 0, "a repeat stages nothing");
+    }
+
+    const NSFW: &str = "[models.nsfw]\narchitecture = \"vit\"\nrepo = \"test/nsfw\"\n";
+
+    /// A config with the TOML given and `[database] timeout = 1`, over a temp
+    /// SQLite database in `dir`, and that database's store.
+    async fn one_second_db(dir: &tempfile::TempDir, toml: &str) -> (Config, Arc<dyn Storage>) {
+        let mut config: Config =
+            apollo_config::load::from_str(&format!("[database]\ntimeout = 1\n{toml}")).unwrap();
+        config.validate().unwrap();
+        config.database.sqlite = Some(SqliteConfig {
+            path: dir.path().join("t.db").to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        config.app.cache_dir = Some(dir.path().to_string_lossy().into_owned());
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        (config, storage)
+    }
+
+    /// The only task in `storage` once it has finished, within 10 s.
+    async fn finished_task(storage: &Arc<dyn Storage>) -> apollo_domain::Task {
+        let query = apollo_storage::TaskQuery {
+            owner: None,
+            states: vec![],
+            created_after: None,
+            created_before: None,
+            limit: 10,
+            after: None,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let ids: Vec<String> = storage
+                .list_tasks(&query)
+                .await
+                .unwrap()
+                .tasks
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            if let [id] = ids.as_slice()
+                && let Some(task) = storage.get_task(id).await.unwrap()
+                && matches!(
+                    task.state,
+                    TaskState::Completed | TaskState::Failed | TaskState::Cancelled
+                )
+            {
+                return task;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no single finished task: {ids:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `call`'s outcome, which must come within 5 s (the limit is 1 s).
+    async fn soon<T>(what: &str, call: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap_or_else(|_| panic!("{what} still waiting after 5 s"))
+    }
+
+    fn unavailable(status: Status, what: &str) {
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{what}: {status}");
+    }
+
+    #[tokio::test]
+    async fn calls_are_unavailable_while_the_database_stalls_and_their_work_still_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, storage) = one_second_db(&dir, NSFW).await;
+        let (stalled, gate) = apollo_engine::testing::Stalled::new(storage.clone());
+        let engine = Engine::new(Arc::new(config), Arc::new(stalled), None);
+        let svc = InferenceService::new(engine.clone());
+
+        gate.shut();
+        let id = || "no-such-task".to_string();
+        let get = svc.get_task(Request::new(GetTaskRequest {
+            task_id: id(),
+            ..Default::default()
+        }));
+        unavailable(soon("GetTask", get).await.unwrap_err(), "GetTask");
+        let list = svc.list_tasks(Request::new(ListTasksRequest::default()));
+        unavailable(soon("ListTasks", list).await.unwrap_err(), "ListTasks");
+        let watch = svc.watch_task(Request::new(WatchTaskRequest {
+            task_id: id(),
+            ..Default::default()
+        }));
+        let watch = soon("WatchTask", watch).await;
+        unavailable(watch.err().expect("WatchTask fails"), "WatchTask");
+        let cancel = svc.cancel_task(Request::new(CancelTaskRequest { task_id: id() }));
+        unavailable(soon("CancelTask", cancel).await.unwrap_err(), "CancelTask");
+
+        // A Classify of inline content gets as far as storing its task, which
+        // its store task does once the database answers. The upload stays.
+        let classify = svc.classify(Request::new(classify_data(&["nsfw"], "")));
+        unavailable(soon("Classify", classify).await.unwrap_err(), "Classify");
+        assert_eq!(uploads(&engine), 1, "the upload stays with its task");
+
+        gate.open();
+        let task = finished_task(&storage).await;
+        let error = task.items[0].error.clone().expect("the item failed");
+        assert_eq!(
+            error.kind,
+            ErrorKind::Decode,
+            "the task read its upload (3 bytes, not an image): {}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_classify_told_unavailable_still_runs_its_task_which_a_retry_gets() {
+        use apollo_proto::{Media, ModelList, classify_request, media};
+        let dir = tempfile::tempdir().unwrap();
+        let (config, storage) = one_second_db(&dir, NSFW).await;
+        // The database is slow to store the task.
+        let (held, release) = apollo_engine::testing::HeldCreate::new(storage.clone(), false);
+        let engine = Engine::new(Arc::new(config), Arc::new(held), None);
+        let svc = InferenceService::new(engine.clone());
+        let request = || ClassifyRequest {
+            input: Some(classify_request::Input::Media(Media {
+                kind: apollo_proto::MediaKind::Image as i32,
+                source: Some(media::Source::Url(
+                    "file:///nonexistent/apollo-test.png".into(),
+                )),
+                fallback_url: String::new(),
+            })),
+            run: Some(classify_request::Run::Models(ModelList {
+                names: vec!["nsfw".into()],
+            })),
+            request_id: "r".into(),
+            ..Default::default()
+        };
+
+        let first = svc.classify(Request::new(request()));
+        unavailable(soon("Classify", first).await.unwrap_err(), "Classify");
+        // A retry meanwhile waits for that store, and gives up too.
+        let retry = svc.classify(Request::new(request()));
+        unavailable(soon("the retry", retry).await.unwrap_err(), "the retry");
+        assert_eq!(storage.find_task_by_request(None, "r").await.unwrap(), None);
+
+        // Once the database takes it, the task is stored and runs, and a retry
+        // gets that task rather than making another.
+        release.add_permits(1);
+        let task = finished_task(&storage).await;
+        assert_eq!(task.request_id.as_deref(), Some("r"));
+        let again = svc
+            .classify(Request::new(request()))
+            .await
+            .expect("the stored task")
+            .into_inner();
+        assert_eq!(again.id, task.id);
+        assert_eq!(finished_task(&storage).await.id, task.id, "still one task");
     }
 
     #[tokio::test]
