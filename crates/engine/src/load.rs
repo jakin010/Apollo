@@ -9,10 +9,12 @@
 //!   once and falls with a time constant of 5 s.
 //! - **Weight** is `100·(1−u)` in steps of 5, from 1 to 100; 1 while the
 //!   database is stale, and 0 when not ready.
-//! - **Degraded:** `load` from `[health].degraded_at` until 0.15 below it,
-//!   each state held at least 10 s; `database` while the database is stale.
-//! - **Database** (shared only): stale once out of touch for 5 s, or with no
-//!   answer for two leases; ok again after a third of a lease in touch.
+//! - **Degraded:** `load` from `[health].degraded_at` until 0.15 below it
+//!   (or half of it, if higher), each state held at least 10 s; `database`
+//!   while the database is stale.
+//! - **Database** (shared only): stale 5 s after a call to it failed or timed
+//!   out, or with no answer for two leases; ok again after a third of a lease
+//!   in touch.
 
 use std::future::Future;
 use std::sync::atomic::Ordering;
@@ -78,6 +80,13 @@ impl LoadSnapshot {
             .zip(on)
             .filter_map(|(reason, on)| on.then_some(reason))
             .collect()
+    }
+
+    /// Whether an instance that is `ready` (or not) is also strictly ready:
+    /// in touch with the database, or it isn't shared. What
+    /// `/readyz/strict` answers.
+    pub fn ready_strict(&self, ready: bool) -> bool {
+        ready && !self.database.is_stale()
     }
 
     /// The weight for load balancers, for an instance that is `ready` (or
@@ -350,15 +359,23 @@ impl Engine {
         let engine = self.clone();
         spawn_sampler(self.inner.lifecycle.clone(), sampler, move || {
             let engine = engine.clone();
-            async move {
-                // The memory probe is a system call; keep it off the runtime.
-                let used = tokio::task::spawn_blocking(memory::current_memory_bytes)
-                    .await
-                    .ok()
-                    .flatten();
-                engine.load_inputs(used)
-            }
+            async move { engine.read_load(memory::current_memory_bytes).await }
         });
+    }
+
+    /// What the sampler reads, with memory in use from `probe`, which runs
+    /// only when there is a memory cap to compare it with: it is a system
+    /// call (on Linux it reads every mapping of the process), so it is kept
+    /// off the runtime too.
+    pub(crate) async fn read_load<P>(&self, probe: P) -> Inputs
+    where
+        P: FnOnce() -> Option<u64> + Send + 'static,
+    {
+        let used = match self.live().max_memory_bytes {
+            Some(cap) if cap > 0 => tokio::task::spawn_blocking(probe).await.ok().flatten(),
+            _ => None,
+        };
+        self.load_inputs(used)
     }
 
     /// What the sampler reads, with `memory_used` bytes in use.
@@ -535,6 +552,23 @@ mod tests {
     }
 
     #[test]
+    fn strict_readiness_is_readiness_with_the_database_in_touch() {
+        let last_contact = std::time::Instant::now();
+        for (database, in_touch) in [
+            (Database::NotShared, true),
+            (Database::Ok { last_contact }, true),
+            (Database::Stale { last_contact }, false),
+        ] {
+            let snapshot = LoadSnapshot {
+                database,
+                ..LoadSnapshot::default()
+            };
+            assert_eq!(snapshot.ready_strict(true), in_touch, "{database:?}");
+            assert!(!snapshot.ready_strict(false), "{database:?}");
+        }
+    }
+
+    #[test]
     fn degraded_load_has_hysteresis_and_holds_each_state_10_s() {
         let t0 = Instant::now();
         let at = |secs: u64| t0 + Duration::from_secs(secs);
@@ -556,6 +590,7 @@ mod tests {
         assert!(low.step(0.06, 0.1, at(10)));
         assert!(!low.step(0.04, 0.1, at(10)));
         assert_eq!(clears_below(0.9), 0.9 - HYSTERESIS);
+        assert_eq!(clears_below(0.2), 0.1);
     }
 
     #[test]

@@ -9,7 +9,12 @@ pub struct StopArgs {}
 pub fn run(_args: StopArgs) -> anyhow::Result<()> {
     let pid = crate::daemon::PidFile::read()
         .context("reading PID file")?
-        .ok_or_else(|| anyhow!("no PID file found — is apollo running?"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "no PID file found — is apollo running? (until its database is open it has \
+                 none: send SIGTERM to its PID)"
+            )
+        })?;
     crate::daemon::terminate(pid)?;
     println!("requested graceful shutdown of apollo (pid {pid})");
     Ok(())

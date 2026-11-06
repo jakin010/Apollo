@@ -8,6 +8,7 @@ use crate::error::ConfigError;
 use crate::schema::{Backend, Config, ModelConfig, PipelineConfig, PipelineStep, SamplingKind};
 use apollo_domain::{Architecture, MAX_WAIT_SECONDS, ModelInput, OutputKind};
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::path::Path;
 
 /// Most frames `confirm` may ask for: twice this many are sampled around a
@@ -368,9 +369,10 @@ impl Config {
         }
     }
 
-    /// The listeners that run: no port 0, and each its own port where their
-    /// addresses overlap.
-    fn check_listeners(&self, errs: &mut Vec<String>) {
+    /// The listeners that run, each as its port's field, its host as
+    /// written and its port: the gRPC port, then the health port and the
+    /// agent port, then the metrics port.
+    pub fn listeners(&self) -> Vec<(&'static str, &str, u16)> {
         let mut listeners = vec![("app.port", self.app.endpoint.as_str(), self.app.port)];
         if self.health.enabled {
             let host = self.health.bind_host(&self.app);
@@ -384,6 +386,14 @@ impl Config {
             let host = self.metrics.endpoint.as_str();
             listeners.push(("metrics.port", host, self.metrics.port));
         }
+        listeners
+    }
+
+    /// The listeners that run: no port 0, and each its own port where their
+    /// hosts, as written, overlap. A hostname that names another listener's
+    /// IP is caught at start, once it resolves.
+    fn check_listeners(&self, errs: &mut Vec<String>) {
+        let listeners = self.listeners();
         for (i, &(field, host, port)) in listeners.iter().enumerate() {
             if port == 0 {
                 errs.push(format!("{field} must not be 0"));
@@ -454,15 +464,20 @@ impl Config {
 /// Whether listeners bound to hosts `a` and `b` can clash on one port: the
 /// same host, or a wildcard address that takes the other's connections too.
 fn hosts_overlap(a: &str, b: &str) -> bool {
-    use std::net::IpAddr;
-    // `::` usually takes IPv4 too; `0.0.0.0` only IPv4.
-    let covers =
-        |wild: IpAddr, ip: IpAddr| wild.is_unspecified() && (wild.is_ipv6() || ip.is_ipv4());
     match (a.parse::<IpAddr>(), b.parse::<IpAddr>()) {
-        (Ok(a), Ok(b)) => a == b || covers(a, b) || covers(b, a),
+        (Ok(a), Ok(b)) => addrs_overlap(a, b),
         (Ok(ip), Err(_)) | (Err(_), Ok(ip)) => ip.is_unspecified(),
         (Err(_), Err(_)) => a.eq_ignore_ascii_case(b),
     }
+}
+
+/// Whether listeners bound to `a` and `b` can clash on one port: the same
+/// address, or a wildcard that takes the other's connections too (`::`
+/// usually takes IPv4 too; `0.0.0.0` only IPv4).
+pub fn addrs_overlap(a: IpAddr, b: IpAddr) -> bool {
+    let covers =
+        |wild: IpAddr, ip: IpAddr| wild.is_unspecified() && (wild.is_ipv6() || ip.is_ipv4());
+    a == b || covers(a, b) || covers(b, a)
 }
 
 /// The fewest pixels PaddleOCR-VL reads an image at (its

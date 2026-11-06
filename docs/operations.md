@@ -38,7 +38,7 @@ Two metrics come from the database: `apollo_tasks` and `apollo_webhooks_pending`
 | `apollo_lb_weight` | gauge | | The weight for load balancers: 1 to 100, 1 while the database is stale, 0 when not ready. |
 | `apollo_degraded` | gauge | `reason` | 1 while degraded for that reason: `load` or `database`. See [Degraded](#degraded). |
 | `apollo_database_up` | gauge | | 1 while in touch with a shared database, 0 while contact is stale. Only with a shared database (SurrealDB). |
-| `apollo_database_last_contact_seconds` | gauge | | Seconds since a shared database last answered. Only with a shared database. |
+| `apollo_database_last_contact_seconds` | gauge | | Seconds since a shared database last answered. It grows to about a third of a lease between the calls of an idle instance, so alert on it above a lease or so. Only with a shared database. |
 | `apollo_submissions_total` | counter | `outcome` | Submissions: `accepted`, `existing` (a repeated `request_id`), `invalid`, `overloaded` (backpressure), `error`. |
 | `apollo_submissions_overloaded_total` | counter | `reason` | Overloaded submissions by the limit that refused them: `queue` (`[app].max_pending`), `memory` (`[app].max_memory`), `model` (a model's `max_pending`). |
 | `apollo_items_finished_total` | counter | `state` | Inputs that finished: `completed`, `failed`, `cancelled`. |
@@ -54,7 +54,7 @@ Two metrics come from the database: `apollo_tasks` and `apollo_webhooks_pending`
 | `apollo_cache_hits_total` | counter | | Model results served from the result cache. |
 | `apollo_webhooks_pending` | gauge | | Finished inputs whose webhook event is not delivered yet (with a webhook configured). Left out when the database doesn't answer in time. |
 | `apollo_webhook_deliveries_total` | counter | `event`, `result` | Delivery attempts: `progress` / `finished`, `ok` / `error`. |
-| `apollo_listener_refused_total` | counter | `listener` | Peers a listener's `allow` list refused, at connect or with a 403: `metrics`, `health` or `agent`. |
+| `apollo_listener_refused_total` | counter | `listener` | Peers a listener's `allow` list refused, at connect or with a 403: `metrics`, `health` or `agent`. Each has a series from the start, at 0. |
 | `apollo_model_loaded` | gauge | `model` | 1 while the model's weights are in memory. |
 | `apollo_model_queued_jobs` | gauge | `model` | Requests waiting for the model's worker. |
 | `apollo_model_items_admitted` | gauge | `model` | Inputs accepted and not finished that run the model (what its `max_pending` is checked against). |
@@ -111,9 +111,9 @@ A ready server that is [degraded](#degraded) answers `200 ok degraded: load,data
 
 - `GET`, `HEAD` and `OPTIONS` work. Other methods get `405` with `Allow`, and unknown paths `404`. The `Host` header is ignored, and so is the query except `?verbose` (see [Details for local tools](#details-for-local-tools)). HTTP/1.0 works.
 - Every answer has `cache-control: no-store`. `/load` and `?verbose` answer `application/json`; the others `text/plain; charset=utf-8`, whose first word is meant for matching. There are no redirects and no `429`.
-- The answers come from the server's state in memory, and the load figure from a sample taken every second. A probe never waits on the database, a model or a busy server, so a probe that times out means the process (or the network) is stuck. The time in `starting (…, 41s)` is how long the current step has run.
+- The answers come from the server's state in memory, and the load figure from a sample taken every second. A probe never waits on the database, a model or a busy server, so a probe that times out means the process (or the network) is stuck, or the connection cap below is full. The time in `starting (…, 41s)` is how long the current step has run.
 - There is no authentication and no TLS. To limit who may connect, see [Who may connect](#who-may-connect).
-- At most 256 connections are open at once; more wait until one closes. A connection that sends no complete request head within 10 s, or stays idle for 10 s between requests, is closed.
+- Each connection carries one request: the connection closes after the answer (an HTTP/1.1 answer says `connection: close`), so a checker that keeps its connections open holds none between checks. A client that shuts down its side after sending the request still gets the answer. At most 256 connections are open at once; more wait until one closes. A connection that sends no complete request head within 10 s is closed.
 
 gRPC health on the gRPC port follows the same states: the names `""`, `apollo.v1.Inference` and `readiness` answer like `/readyz`, `readiness-strict` like `/readyz/strict`, and `liveness` like `/livez`, until the stop removes them all. gRPC health has no degraded state: a degraded server is `SERVING` (see [grpc-api.md → Health checking](./grpc-api.md#health-checking)). Prefer the health port: it speaks HTTP/1.1, needs no client certificate under mutual TLS, and answers before tasks are recovered.
 
@@ -194,7 +194,7 @@ On each connection Apollo sends one line, ending in a newline, and closes the co
 |-------|------|-------------------|
 | Serving | `up ready 60%` | `up` marks the server up again if HAProxy's own health check passes too, `ready` ends a drain, and `60%` sets the weight to that share of the server's configured `weight`. The figure is the [weight](#the-load-figure): 1 to 100, and 1 while out of touch with a shared database. |
 | Starting, drained, draining | `drain` | Sends it no new connections, except persistent ones. |
-| Stopping | the port is closed | HAProxy doesn't count an agent it can't reach as an error: the server stays in `drain`, and its health check (503 since the drain began) marks it down. |
+| Stopping | the port is closed | HAProxy doesn't count an agent it can't reach as an error, and keeps the agent's last line: the server stays in `drain` if the agent sent `drain` before the port closed (a `drain_delay_secs` above `agent-inter`, or `apollo drain` beforehand), and otherwise keeps its last `ready` weight. Either way its health check (503 since the drain began) marks it down after `fall` checks. |
 
 Apollo never sends `down` or `maint`: whether the server is up stays with HAProxy's own health check. A backend might look like this:
 
@@ -241,7 +241,9 @@ The first `SIGTERM` or Ctrl-C (`apollo stop` sends `SIGTERM`) starts the stop:
 2. **Stopping**, for at most `[app].drain_timeout_secs`: the gRPC port closes, so new connections are refused at once, and open connections are told to finish. An open `WatchTask` ends with `UNAVAILABLE`, and a `Classify` waiting in `wait_seconds` returns the task as it is. The stop waits for the calls still running (an upload, say) and cuts them when the timeout passes; `0` waits as long as they take.
 3. **Handing back**, for at most 5 s: unfinished tasks are handed back, so another instance (or the next start) takes them at once, with no resume attempt counted. If the database doesn't answer in time, Apollo logs a warning and exits. Those claims then lapse after `[database].lease_secs`, and each counts a resume attempt.
 
-A second signal stops at once: it skips the rest of the drain delay and cuts the open calls, then hands the tasks back (up to 5 s). A signal before the gRPC port serves (while the database opens, auth is set up or tasks are recovered) ends the start instead: that step is dropped, the tasks recovery took are handed back (up to 5 s), and the process exits with status 0. A second one then exits without handing them back. The health port answers all along, until the process exits.
+A second signal stops at once: it skips the rest of the drain delay and cuts the open calls, then hands the tasks back (up to 5 s). A signal before the gRPC port serves (while the database opens, auth is set up or tasks are recovered) ends the start instead: that step is dropped (recovery stops at its next step, once a claim already sent is answered), the tasks recovery took are handed back (up to 5 s), and the process exits with status 0. A second one then exits without handing them back. The health port answers all along, until the process exits.
+
+`apollo stop` finds the server by its PID file, which is written once the database is open. While the database opens it says there is no PID file: send the `SIGTERM` yourself (`kill <pid>`; `apollo start --daemon` prints the PID) or press Ctrl-C.
 
 Both drain settings apply on reload. The delay in force when the signal arrives counts, and the timeout in force when stopping begins. At startup Apollo logs the longest a stop can take:
 
@@ -252,14 +254,14 @@ a stop takes at most 25s (drain delay 5s + drain timeout 15s + 5s to hand tasks 
 **Choosing the values:**
 
 - Give the process manager at least `drain_delay_secs + drain_timeout_secs + 5` seconds before it kills the process: Kubernetes `terminationGracePeriodSeconds`, systemd `TimeoutStopSec`.
-- Make `drain_delay_secs` at least the balancer's check `interval × unhealthy threshold + timeout` (add the jitter to the interval if it has one), so every balancer sees the instance unready before its port closes. A check every 5 s, unready after 2 failures, with a 1 s timeout, needs at least 11 s.
+- Make `drain_delay_secs` at least the balancer's check `interval × unhealthy threshold + timeout` (add the jitter to the interval if it has one), so every balancer sees the instance unready before its port closes. A balancer that checks every 10 s, takes 3 failures and waits 2 s for each needs at least 32 s.
 - Use either `drain_delay_secs` or a Kubernetes `preStop` hook that sleeps, not both: they add up.
 
-**On Kubernetes**, for example:
+**On Kubernetes** that rule doesn't apply to the pod's own `readinessProbe`: a Service stops sending new connections to a pod as soon as its deletion begins, whatever the probe says. The delay only has to cover the few seconds that takes to reach every node (and an Ingress controller), so the example assumes `drain_delay_secs = 5`:
 
 ```yaml
 spec:
-  terminationGracePeriodSeconds: 30   # >= drain_delay_secs + drain_timeout_secs + 5
+  terminationGracePeriodSeconds: 30   # >= drain_delay_secs (5) + drain_timeout_secs (15) + 5 = 25
   containers:
     - name: apollo
       ports:
@@ -298,7 +300,7 @@ While drained:
 
 - `/readyz`, `/` and `/readyz/strict` answer `503 not ready: drained`, and the gRPC readiness names (`""`, `apollo.v1.Inference`, `readiness`, `readiness-strict`) `NOT_SERVING`. The weight is 0, and the [HAProxy agent](#the-haproxy-agent) sends `drain`. `/livez` and gRPC `liveness` still pass.
 - Every call is still served, new ones included, as while a stop drains. Balancers stop sending work here at their next check; a client that connects directly can still send it.
-- The server takes no tasks over from other instances, and the background redelivery of failed webhooks (`[webhook].redelivery_secs`) waits. Tasks it runs go on, and their webhooks are sent.
+- The server takes no tasks over from other instances, and the redelivery of failed webhooks waits: the background one (`[webhook].redelivery_secs`) and, on a shared database, the one after a start for the webhooks a crash left. Tasks it runs go on, and their webhooks are sent. On a shared database it still takes back its own uploads and local-file tasks when they are handed back (after a database hiccup, say), since no other instance can run them.
 - `apollo status` shows `drained` next to the phase, `/load` has `"drained": true`, and `apollo_drained` is 1.
 
 What it doesn't do:
@@ -307,7 +309,7 @@ What it doesn't do:
 - It isn't kept: a restart starts the server undrained.
 - `--undo` makes the server ready again only while it serves. During startup it is ready once startup ends; during a stop it stays unready.
 
-`apollo drain` prints what changed. It goes over the same owner-only local socket as `apollo status`, so only the OS user running the server can drain it. When no server answers there, it fails and nothing changes.
+`apollo drain` prints what changed. It goes over the same owner-only local socket as `apollo status`, so only the OS user running the server can drain it. When no server answers there, it fails and nothing changes. The socket answers from the end of task recovery on, so during the startup steps before the models load, `apollo drain` fails too.
 
 ### Load balancer recipes
 
@@ -346,7 +348,7 @@ Unset, anyone who can reach the port may scrape it. A peer that isn't listed is 
 metrics 0.0.0.0:9464 allows 10.0.0.0/8 (loopback refused)
 ```
 
-`(loopback refused)` means a local `curl http://127.0.0.1:9464/metrics` is refused. Add `127.0.0.1` (and `::1`) to allow it. A list that can't match the bound address is an error (see [configuration.md → `[metrics]`](./configuration.md#metrics--prometheus-metrics)).
+`(loopback refused)` means a local client is refused, such as `curl http://127.0.0.1:9464/metrics`. Add `127.0.0.1` (and `::1`) to allow it. On `::`, which IPv4 clients usually reach too, a list that admits only one of the two names the other: `(127.0.0.1 refused)`, or `(::1 refused)`, which also refuses `curl http://localhost:9464/metrics` where `localhost` is `::1`. A list that can't match the bound address is an error (see [configuration.md → `[metrics]`](./configuration.md#metrics--prometheus-metrics)).
 
 `[health].allow` lists the peers that may connect to the health port and the agent port, by the same rules:
 
@@ -356,7 +358,7 @@ enabled = true
 allow   = ["10.20.0.0/16", "127.0.0.1"]   # the load balancers' subnet, and local tools
 ```
 
-Unlike `[metrics].allow`, it needs a restart. A list that misses the checkers fails liveness as well as readiness, so an orchestrator restarts the instance; applied by one reload across a fleet, it would hit every instance at once. Unset, anyone who can reach the port may connect, and Apollo logs `health 0.0.0.0:9465 allows everyone` at info.
+Unlike `[metrics].allow`, it needs a restart. A list that misses the checkers fails liveness as well as readiness, so an orchestrator restarts the instance; applied by one reload across a fleet, it would hit every instance at once. A list with no entry that can match on the bound address fails the start. A reload that changes the list but not `endpoint` or `port` checks it against the running health port, logs a warning and has `apollo reload` say `warning: the next start will fail: …` when it would. Unset, anyone who can reach the port may connect, and Apollo logs `health 0.0.0.0:9465 allows everyone` at info.
 
 **What it checks:** the address of the TCP peer, nothing else. Apollo never reads `X-Forwarded-For`, `Forwarded` or the PROXY protocol.
 
@@ -370,7 +372,7 @@ Unlike `[metrics].allow`, it needs a restart. A list that misses the checkers fa
 refused 192.0.2.7 on the metrics port 0.0.0.0:9464 (not in [metrics].allow)
 ```
 
-Each source is logged at most once a minute (IPv6 sources by /64), and at most 10 lines a minute in all. The rest go into one summary a minute: `refused 3412 connections from 977 sources on the metrics port 0.0.0.0:9464 (not in [metrics].allow); latest: …`. `apollo_listener_refused_total` counts every refusal by `listener` (`metrics`, `health` or `agent`), so `increase(apollo_listener_refused_total[10m]) > 0` works as an alert. Change a list on one instance first, and check its log before changing the others.
+Each listener logs a source at most once a minute (IPv6 sources by /64), and at most 10 lines a minute. The metrics, health and agent ports count apart, so a checker refused on both the health and the agent port is logged on each. The rest go into one summary a minute per listener, which counts up to 256 sources: `refused 3412 connections from 256 or more sources on the metrics port 0.0.0.0:9464 (not in [metrics].allow); latest: …`. `apollo_listener_refused_total` counts every refusal by `listener` (`metrics`, `health` or `agent`), so `increase(apollo_listener_refused_total[10m]) > 0` works as an alert. Change a list on one instance first, and check its log before changing the others.
 
 **Lists for common load balancers.** Check the provider's page before you copy a range: they change without notice.
 

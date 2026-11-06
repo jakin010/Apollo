@@ -36,6 +36,12 @@ impl Allowlist {
         }
     }
 
+    /// An `allow` field parsed: `None` (the field left out) admits everyone.
+    /// An invalid list is an error, never "everyone".
+    pub fn parse_field(entries: Option<&[String]>) -> Result<Option<Self>, Vec<String>> {
+        entries.map(Self::parse).transpose()
+    }
+
     /// Whether `peer` is admitted. Never matches across address families.
     pub fn contains(&self, peer: IpAddr) -> bool {
         let peer = peer.to_canonical();
@@ -82,9 +88,11 @@ impl Allowlist {
         Ok(warnings)
     }
 
-    /// Whether a local client, connecting over loopback, can reach a socket
-    /// bound to `local` but is refused.
-    pub fn refuses_loopback(&self, local: SocketAddr, only_v6: bool) -> bool {
+    /// The note for a socket bound to `local` that a local client, connecting
+    /// over loopback, reaches but is refused at: `loopback refused` when every
+    /// loopback address that reaches it is refused, or the one refused
+    /// (`127.0.0.1 refused`) on a dual-stack socket that admits the other.
+    pub fn loopback_note(&self, local: SocketAddr, only_v6: bool) -> Option<String> {
         let reachable: &[IpAddr] = match Reach::of(local.ip(), only_v6) {
             Reach::V4Loopback => &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
             Reach::V6Loopback => &[IpAddr::V6(Ipv6Addr::LOCALHOST)],
@@ -97,7 +105,12 @@ impl Allowlist {
                 IpAddr::V6(Ipv6Addr::LOCALHOST),
             ],
         };
-        !reachable.is_empty() && !reachable.iter().any(|ip| self.contains(*ip))
+        let refused: Vec<&IpAddr> = reachable.iter().filter(|ip| !self.contains(**ip)).collect();
+        match refused[..] {
+            [] => None,
+            [ip] if reachable.len() > 1 => Some(format!("{ip} refused")),
+            _ => Some("loopback refused".into()),
+        }
     }
 }
 
@@ -384,12 +397,31 @@ mod tests {
 
     #[test]
     fn loopback_refused_is_noted_where_a_local_client_reaches_the_socket() {
-        let l = list(&["10.0.0.0/8"]);
-        assert!(l.refuses_loopback(at("0.0.0.0:9464"), false));
-        assert!(!l.refuses_loopback(at("10.0.0.5:9464"), false));
-        assert!(!list(&["10.0.0.0/8", "127.0.0.1"]).refuses_loopback(at("0.0.0.0:9464"), false));
-        assert!(list(&["127.0.0.1"]).refuses_loopback(at("[::]:9464"), true));
-        assert_eq!(l.to_string(), "10.0.0.0/8");
+        let note = |entries: &[&str], local: &str, only_v6: bool| {
+            list(entries).loopback_note(at(local), only_v6)
+        };
+        let refused = Some("loopback refused".to_string());
+        assert_eq!(note(&["10.0.0.0/8"], "0.0.0.0:9464", false), refused);
+        assert_eq!(note(&["10.0.0.0/8"], "10.0.0.5:9464", false), None);
+        assert_eq!(
+            note(&["10.0.0.0/8", "127.0.0.1"], "0.0.0.0:9464", false),
+            None
+        );
+        assert_eq!(note(&["127.0.0.1"], "[::]:9464", true), refused);
+        // Dual-stack `[::]`: each loopback address reaches it, and is noted on
+        // its own when the other is admitted.
+        let both = "[::]:9464";
+        assert_eq!(note(&["10.0.0.0/8"], both, false), refused);
+        assert_eq!(
+            note(&["::1", "10.0.0.0/8"], both, false).as_deref(),
+            Some("127.0.0.1 refused")
+        );
+        assert_eq!(
+            note(&["127.0.0.1"], both, false).as_deref(),
+            Some("::1 refused")
+        );
+        assert_eq!(note(&["127.0.0.1", "::1"], both, false), None);
+        assert_eq!(list(&["10.0.0.0/8"]).to_string(), "10.0.0.0/8");
         assert_eq!(
             list(&["192.0.2.7", "::1/128"]).to_string(),
             "192.0.2.7, ::1"

@@ -171,11 +171,15 @@ struct Inner {
     takeover: tokio::sync::Mutex<lease::Takeover>,
     /// Shutting down: no new runs, no takeovers.
     closing: AtomicBool,
+    /// Woken as `closing` is set, so a takeover pass in progress ends.
+    closed: tokio::sync::Notify,
     /// The process's lifecycle: draining stops takeovers, stopping ends
     /// watches.
     lifecycle: Lifecycle,
     /// Woken as each pinned model's worker finishes its first load attempt.
     preloaded: Arc<tokio::sync::Notify>,
+    /// Called before each load of a model's weights (tests only).
+    load_hook: Option<LoadHook>,
     /// Ids of changed tasks, announced by the storage wrapper.
     changes: broadcast::Sender<Arc<str>>,
     /// One lock per `(owner, request_id)` in use: serializes submissions with
@@ -184,6 +188,11 @@ struct Inner {
     /// first. Other keys never wait on it.
     idempotency: Mutex<RequestLocks>,
 }
+
+/// Called on a model's worker thread, with its label, before each load of
+/// its weights. Only tests set one (`testing::engine_with_load_hook`); it
+/// may hold the load, as a slow download would.
+pub(crate) type LoadHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Locks by `(owner, request_id)`; an entry nobody holds is dropped.
 type RequestLocks = HashMap<(Option<String>, String), Weak<tokio::sync::Mutex<()>>>;
@@ -255,6 +264,18 @@ impl Engine {
         node: String,
         lifecycle: Lifecycle,
     ) -> Engine {
+        Self::build(config, storage, webhook, node, lifecycle, None)
+    }
+
+    /// [`Engine::with_lifecycle`], with a `load_hook` for its workers.
+    pub(crate) fn build(
+        config: Arc<Config>,
+        storage: Arc<dyn Storage>,
+        webhook: Option<Arc<dyn WebhookSink>>,
+        node: String,
+        lifecycle: Lifecycle,
+        load_hook: Option<LoadHook>,
+    ) -> Engine {
         let (_probe, kind) = apollo_inference::select_device(config.app.device);
         tracing::info!(device = %kind, "selected compute device");
 
@@ -268,6 +289,7 @@ impl Engine {
             idle_ms: &idle_ms,
             metrics: &metrics,
             preloaded: &preloaded,
+            load_hook: load_hook.as_ref(),
         };
         let (registry, _) = Registry::build(&config, &env, None);
         let lease_ttl = Duration::from_secs(config.database.lease_secs.max(1).into());
@@ -309,8 +331,10 @@ impl Engine {
                 epoch: Instant::now(),
                 takeover: tokio::sync::Mutex::new(lease::Takeover::default()),
                 closing: AtomicBool::new(false),
+                closed: tokio::sync::Notify::new(),
                 lifecycle,
                 preloaded,
+                load_hook,
             }),
             pinned: None,
             run: None,
@@ -785,8 +809,10 @@ impl Engine {
 
     /// Graceful-shutdown hook, called once the server has stopped accepting
     /// requests. Stops this process's runs and hands their tasks back, so a
-    /// clean restart (e.g. a deploy) never counts toward the poison-task cap —
-    /// only crashes do — and another instance may take them at once.
+    /// clean restart (e.g. a deploy) doesn't count toward the poison-task cap
+    /// and another instance may take them at once. It waits as long as the
+    /// database takes; the server calls [`Engine::hand_back`], which gives up
+    /// after [`HAND_BACK_LIMIT`].
     pub async fn shutdown(&self) {
         self.hand_back_all().await;
     }

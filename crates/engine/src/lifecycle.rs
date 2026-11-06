@@ -64,7 +64,18 @@ impl Phase {
             Phase::Stopping => Self::NAMES[3],
         }
     }
+
+    /// Whether an instance in this phase is ready for work, `drained` by
+    /// hand or not (see [`Lifecycle::ready`]).
+    pub fn ready(self, drained: bool) -> bool {
+        self == Phase::Serving && !drained
+    }
 }
+
+/// The listeners whose allow lists count refusals (the names the app's
+/// listeners count under): each has a series in
+/// `apollo_listener_refused_total` from the start, at 0.
+const LISTENERS: [&str; 3] = ["metrics", "health", "agent"];
 
 /// The process's lifecycle. Clone freely: all clones share one state.
 #[derive(Clone)]
@@ -98,12 +109,18 @@ impl Lifecycle {
     pub fn new() -> Self {
         let (phase, _) = watch::channel(Phase::Starting(Step::OpeningDatabase));
         let (load, _) = watch::channel(Arc::new(LoadSnapshot::default()));
+        // A series that appears at its first refusal hides that refusal from
+        // `increase()`: they start at 0.
+        let refused = CounterVec::default();
+        for listener in LISTENERS {
+            refused.touch(&[listener]);
+        }
         Self(Arc::new(Shared {
             phase,
             since: Mutex::new(Instant::now()),
             forced: AtomicBool::new(false),
             drained: AtomicBool::new(false),
-            refused: CounterVec::default(),
+            refused,
             load,
         }))
     }
@@ -175,13 +192,13 @@ impl Lifecycle {
 
     /// Whether load balancers should send work here.
     pub fn ready(&self) -> bool {
-        self.phase() == Phase::Serving && !self.drained()
+        self.phase().ready(self.drained())
     }
 
     /// [`Lifecycle::ready`], and in touch with the database (or it isn't
     /// shared): what `/readyz/strict` answers.
     pub fn ready_strict(&self) -> bool {
-        self.ready() && !self.load().database.is_stale()
+        self.load().ready_strict(self.ready())
     }
 
     /// The weight load balancers should give this instance: 0 when not
@@ -377,12 +394,25 @@ mod tests {
     #[test]
     fn refusals_are_counted_by_listener() {
         let lc = Lifecycle::new();
+        // Every listener's series is there before its first refusal.
+        assert_eq!(
+            lc.refused().snapshot(),
+            [
+                (vec!["agent"], 0),
+                (vec!["health"], 0),
+                (vec!["metrics"], 0)
+            ]
+        );
         lc.note_refused("health");
         lc.note_refused("health");
         lc.note_refused("metrics");
         assert_eq!(
             lc.refused().snapshot(),
-            [(vec!["health"], 2), (vec!["metrics"], 1)]
+            [
+                (vec!["agent"], 0),
+                (vec!["health"], 2),
+                (vec!["metrics"], 1)
+            ]
         );
     }
 }

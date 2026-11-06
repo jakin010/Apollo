@@ -43,7 +43,7 @@ pub(crate) async fn start(
     if port == 0 {
         return Ok(None);
     }
-    let addr = SocketAddr::new(health.ip(), port);
+    let addr = agent_addr(health, port);
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding the HAProxy agent on {addr}"))?;
@@ -64,6 +64,14 @@ pub(crate) async fn start(
     );
     tokio::spawn(serve(listener, guard, lc.clone()));
     Ok(Some(bound.local))
+}
+
+/// The health listener's address `health` on `port`, with its IPv6 scope
+/// (`fe80::1%eth0`) kept: a link-local address can't be bound without it.
+fn agent_addr(health: SocketAddr, port: u16) -> SocketAddr {
+    let mut addr = health;
+    addr.set_port(port);
+    addr
 }
 
 /// Answer the agent's checks on `listener`, from the peers `guard` admits,
@@ -129,7 +137,7 @@ mod tests {
     use apollo_engine::{Database, LoadSnapshot, Step};
 
     use super::*;
-    use crate::health::tests::{closed, engine_in, free_port, health_config};
+    use crate::health::tests::{closed, engine_in, health_config, start_with_agent};
 
     /// Serve the agent for `lc` on a loopback port, to everyone.
     async fn spawn(lc: &Lifecycle) -> SocketAddr {
@@ -212,6 +220,30 @@ mod tests {
         assert_eq!(line(&lc), "drain\n");
     }
 
+    #[test]
+    fn the_agent_binds_the_health_address_on_its_own_port() {
+        use std::net::SocketAddrV6;
+        // Link-local, with its zone: only the port changes.
+        let health = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 9465, 3, 7));
+        let SocketAddr::V6(agent) = agent_addr(health, 9466) else {
+            panic!("not IPv6");
+        };
+        assert_eq!(
+            (
+                *agent.ip(),
+                agent.port(),
+                agent.flowinfo(),
+                agent.scope_id()
+            ),
+            ("fe80::1".parse::<std::net::Ipv6Addr>().unwrap(), 9466, 3, 7)
+        );
+        let health = SocketAddr::from(([10, 0, 0, 5], 9465));
+        assert_eq!(
+            agent_addr(health, 9466),
+            SocketAddr::from(([10, 0, 0, 5], 9466))
+        );
+    }
+
     #[tokio::test]
     async fn each_connection_gets_one_line_then_a_close() {
         let lc = Lifecycle::new();
@@ -256,11 +288,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lc = Lifecycle::new();
         lc.serving();
-        let agent = free_port();
-        let (config, _) =
-            health_config(&format!("allow = [\"127.0.0.2\"]\nagent_port = {agent}\n"));
-        crate::health::start(&config, &lc).await.unwrap();
-        let stream = TcpStream::connect(("127.0.0.1", agent)).await.unwrap();
+        let (_, agent) = start_with_agent("allow = [\"127.0.0.2\"]\n", &lc).await;
+        let stream = TcpStream::connect(agent).await.unwrap();
         // Reset at accept: no line.
         assert!(closed(stream).await);
 
@@ -272,32 +301,30 @@ mod tests {
             .collect();
         assert_eq!(
             refused,
-            ["apollo_listener_refused_total{listener=\"agent\"} 1"]
+            [
+                "apollo_listener_refused_total{listener=\"agent\"} 1",
+                "apollo_listener_refused_total{listener=\"health\"} 0",
+                "apollo_listener_refused_total{listener=\"metrics\"} 0"
+            ]
         );
     }
 
     #[tokio::test]
     async fn a_peer_in_health_allow_gets_the_line() {
         let lc = Lifecycle::new();
-        let agent = free_port();
-        let (config, _) =
-            health_config(&format!("allow = [\"127.0.0.1\"]\nagent_port = {agent}\n"));
-        crate::health::start(&config, &lc).await.unwrap();
-        let addr = SocketAddr::from(([127, 0, 0, 1], agent));
-        assert_eq!(ask(addr, b"").await, "drain\n");
+        let (_, agent) = start_with_agent("allow = [\"127.0.0.1\"]\n", &lc).await;
+        assert_eq!(ask(agent, b"").await, "drain\n");
     }
 
     #[tokio::test]
     async fn agent_port_0_starts_nothing() {
         let lc = Lifecycle::new();
-        let health = SocketAddr::from(([127, 0, 0, 1], free_port()));
+        let health = SocketAddr::from(([127, 0, 0, 1], 9465));
         assert_eq!(start(health, 0, None, &lc).await.unwrap(), None);
 
         // Nor does an agent_port without [health].
-        let agent = free_port();
-        let (mut config, _) = health_config(&format!("agent_port = {agent}\n"));
+        let mut config = health_config("agent_port = 9466\n");
         config.health.enabled = false;
-        crate::health::start(&config, &lc).await.unwrap();
-        assert!(TcpStream::connect(("127.0.0.1", agent)).await.is_err());
+        assert!(crate::health::start(&config, &lc).await.unwrap().is_none());
     }
 }

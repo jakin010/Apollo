@@ -27,7 +27,9 @@ pub(crate) fn incoming(
     closed: oneshot::Sender<()>,
     server: watch::Receiver<()>,
 ) -> impl Stream<Item = io::Result<Connection>> {
-    let state = (TcpIncoming::from(listener), lc, closed, server);
+    // As tonic's own listener does: small gRPC frames go out at once.
+    let listener = TcpIncoming::from(listener).with_nodelay(Some(true));
+    let state = (listener, lc, closed, server);
     // Not `take_until`, which would keep the listener open.
     futures::stream::unfold(state, |(mut listener, lc, closed, server)| async move {
         tokio::select! {
@@ -206,6 +208,19 @@ where
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn accepted_connections_send_without_delay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed, _on_closed) = oneshot::channel();
+        let (_server, server) = watch::channel(());
+        let incoming = incoming(listener, Lifecycle::new(), closed, server);
+        tokio::pin!(incoming);
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let conn = incoming.next().await.unwrap().unwrap();
+        assert!(conn.io.nodelay().unwrap());
+    }
 
     #[tokio::test]
     async fn a_connection_is_cut_after_its_limit_and_tells_when_it_closes() {

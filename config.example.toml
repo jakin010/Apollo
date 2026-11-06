@@ -234,10 +234,10 @@ fps    = 5
 
 # --- Health checks for load balancers and orchestrators ------------------------
 # Plaintext HTTP on its own port: /livez (200 while the process runs),
-# /readyz (200 only while ready for work; 503 while starting or stopping),
-# /readyz/strict (also 503 while cut off from a shared database) and /load
-# (the load figure, as JSON). Off by default. Every field but degraded_at
-# needs a restart. See docs/operations.md.
+# /readyz (200 only while ready for work; 503 while starting, draining,
+# drained by `apollo drain`, or stopping), /readyz/strict (also 503 while cut
+# off from a shared database) and /load (the load figure, as JSON). Off by
+# default. Every field but degraded_at needs a restart. See docs/operations.md.
 [health]
 enabled = true
 # endpoint = "0.0.0.0"          # default: where [app].endpoint binds

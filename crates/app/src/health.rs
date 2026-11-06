@@ -1,8 +1,8 @@
 //! The health checks load balancers and orchestrators probe (`[health]`):
-//! plaintext HTTP/1.1 on a port of its own, bound before storage opens and
-//! open until the process exits. Answers come from the process's
-//! [`Lifecycle`] and the load sample it holds only, so a probe never waits on
-//! the database or a model.
+//! plaintext HTTP/1.1 on a port of its own, one request per connection,
+//! bound before storage opens and open until the process exits. Answers
+//! come from the process's [`Lifecycle`] and the load sample it holds only,
+//! so a probe never waits on the database or a model.
 //!
 //! | Path | 200 | 503 |
 //! |---|---|---|
@@ -36,10 +36,10 @@ use apollo_engine::{Database, Lifecycle, LoadSnapshot, Phase};
 
 use crate::allow::{self, Bound, Guard, PeerAddr};
 
-/// How long a connection may take to send a request's headers, and may
-/// stay idle between requests.
+/// How long a connection may take to send its request's headers.
 pub(crate) const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// Connections open at once. More wait, unaccepted, until one closes.
+/// Connections open at once, each with one request in progress. More wait,
+/// unaccepted, until one closes.
 pub(crate) const MAX_CONNECTIONS: usize = 256;
 
 /// The methods every path answers.
@@ -67,14 +67,15 @@ impl Default for Limits {
 
 /// Serve the health checks when `[health]` is enabled, and the HAProxy agent
 /// with `agent_port`, following `lc`, to the peers `[health].allow` admits.
-/// Call it inside the runtime.
-pub(crate) async fn start(config: &Config, lc: &Lifecycle) -> anyhow::Result<()> {
+/// Call it inside the runtime. Returns the health listener's socket, or
+/// `None` when `[health]` is off.
+pub(crate) async fn start(config: &Config, lc: &Lifecycle) -> anyhow::Result<Option<Bound>> {
     let health = &config.health;
     if !health.enabled {
         if health.agent_port != 0 {
             tracing::warn!("[health].agent_port is set, but [health] is off: no HAProxy agent");
         }
-        return Ok(());
+        return Ok(None);
     }
     let host = health.bind_host(&config.app);
     let addr = (host, health.port)
@@ -82,10 +83,7 @@ pub(crate) async fn start(config: &Config, lc: &Lifecycle) -> anyhow::Result<()>
         .with_context(|| format!("resolving [health] {host}:{}", health.port))?
         .next()
         .ok_or_else(|| anyhow!("no address for [health] {host}:{}", health.port))?;
-    let list = health
-        .allowlist()
-        .map_err(|errs| anyhow!("health.allow {}", errs.join("; ")))?
-        .map(Arc::new);
+    let list = allow::parsed("health.allow", health.allowlist())?;
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding the health listener on {addr}"))?;
@@ -112,7 +110,7 @@ pub(crate) async fn start(config: &Config, lc: &Lifecycle) -> anyhow::Result<()>
         Arc::new(move |listener| counter.note_refused(listener)),
     );
     tokio::spawn(serve(listener, guard, lc.clone(), Limits::default()));
-    Ok(())
+    Ok(Some(bound))
 }
 
 /// Answer probes on `listener`, from the peers `guard` admits, for as long
@@ -140,10 +138,15 @@ pub(crate) async fn serve(mut listener: TcpListener, guard: Guard, lc: Lifecycle
                 );
                 async move { Ok::<_, Infallible>(response) }
             });
-            // A connection that fails or times out just ends.
+            // One request per connection, so a checker that keeps its
+            // connection holds no slot between checks. A client that shuts
+            // its side down after the request still gets the answer. A
+            // connection that fails or times out just ends.
             let _ = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
                 .header_read_timeout(limits.header_read)
+                .keep_alive(false)
+                .half_close(true)
                 .serve_connection(TokioIo::new(stream), service)
                 .await;
             drop(slot);
@@ -263,12 +266,14 @@ fn may_see_details(peer: IpAddr, headers: &HeaderMap) -> bool {
 /// The `/load` body: the instance's load figure, without model names or the
 /// node id.
 fn load_body(lc: &Lifecycle, load: &LoadSnapshot) -> Value {
-    let ready = lc.ready();
+    // One reading of the state, so the fields agree.
+    let (phase, drained) = (lc.phase(), lc.drained());
+    let ready = phase.ready(drained);
     json!({
-        "phase": lc.phase().name(),
+        "phase": phase.name(),
         "ready": ready,
-        "ready_strict": ready && !load.database.is_stale(),
-        "drained": lc.drained(),
+        "ready_strict": load.ready_strict(ready),
+        "drained": drained,
         "degraded": load.degraded(),
         "utilization": rounded(load.utilization),
         "weight": load.weight(ready),
@@ -393,10 +398,20 @@ pub(crate) mod tests {
         addr
     }
 
-    /// A loopback port free a moment ago.
-    pub(crate) fn free_port() -> u16 {
+    /// A loopback port free a moment ago: something else may take it before
+    /// it is bound.
+    fn free_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
+    }
+
+    /// Whether `e` comes from binding a port that is taken.
+    fn in_use(e: &anyhow::Error) -> bool {
+        e.chain().any(|cause| {
+            cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::AddrInUse)
+        })
     }
 
     /// One answer read from `stream`: the status, the head (lowercase) and,
@@ -419,8 +434,13 @@ pub(crate) mod tests {
         (status, head, String::from_utf8(body).unwrap())
     }
 
-    /// `method path` over HTTP/1.1 on `stream`, kept open.
-    async fn ask(stream: &mut TcpStream, method: &str, path: &str) -> (u16, String, String) {
+    /// `method path` over HTTP/1.1 on `stream`: the status, the head
+    /// (lowercase) and, unless it answers a HEAD, the body.
+    pub(crate) async fn ask(
+        stream: &mut TcpStream,
+        method: &str,
+        path: &str,
+    ) -> (u16, String, String) {
         ask_with(stream, method, path, "").await
     }
 
@@ -468,6 +488,10 @@ pub(crate) mod tests {
             .checked_sub(Duration::from_secs(secs))
             .unwrap()
     }
+
+    /// Far less than the forever a probe would take if it waited on a store
+    /// that never answers, and more than a busy test machine can delay one.
+    pub(crate) const PROMPT: Duration = Duration::from_secs(1);
 
     /// GET `path` on a new connection: the status and the body.
     pub(crate) async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
@@ -525,22 +549,24 @@ pub(crate) mod tests {
     async fn livez_is_ok_in_every_phase_and_readyz_follows_the_phase() {
         let lc = Lifecycle::new();
         let addr = spawn(&lc, Limits::default()).await;
+        // A starting step's answer ends with how long it has run (`0s`, or
+        // more on a slow machine); `{s}` stands for that.
         let phases: [(&dyn Fn(), u16, &str); 7] = [
-            (&|| {}, 503, "not ready: starting (opening database, 0s)\n"),
+            (&|| {}, 503, "not ready: starting (opening database, {s})\n"),
             (
                 &|| lc.starting(Step::ConfiguringAuth),
                 503,
-                "not ready: starting (configuring auth, 0s)\n",
+                "not ready: starting (configuring auth, {s})\n",
             ),
             (
                 &|| lc.starting(Step::RecoveringTasks),
                 503,
-                "not ready: starting (recovering tasks, 0s)\n",
+                "not ready: starting (recovering tasks, {s})\n",
             ),
             (
                 &|| lc.starting(Step::LoadingModels),
                 503,
-                "not ready: starting (loading models, 0s)\n",
+                "not ready: starting (loading models, {s})\n",
             ),
             (&|| lc.serving(), 200, "ok\n"),
             (
@@ -557,13 +583,36 @@ pub(crate) mod tests {
             let phase = lc.phase();
             assert_eq!(get(addr, "/livez").await, (200, "ok\n".into()), "{phase:?}");
             for path in ["/readyz", "/", "/readyz/strict"] {
-                assert_eq!(
-                    get(addr, path).await,
-                    (status, body.into()),
-                    "{phase:?} {path}"
-                );
+                let (got_status, got) = get(addr, path).await;
+                assert_eq!(got_status, status, "{phase:?} {path}");
+                let matches = match body.split_once("{s}") {
+                    Some((before, after)) => got
+                        .strip_prefix(before)
+                        .and_then(|rest| rest.strip_suffix(after))
+                        .and_then(|secs| secs.strip_suffix('s'))
+                        .is_some_and(|secs| secs.parse::<u64>().is_ok()),
+                    None => got == body,
+                };
+                assert!(matches, "{phase:?} {path}: {got:?}");
             }
         }
+    }
+
+    /// `method path` over HTTP/1.1 on a new connection.
+    async fn ask_new(addr: SocketAddr, method: &str, path: &str) -> (u16, String, String) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        ask(&mut stream, method, path).await
+    }
+
+    /// Everything the server sends on `stream` up to its close, within a
+    /// second.
+    async fn read_to_close(stream: &mut TcpStream) -> String {
+        let mut answer = String::new();
+        tokio::time::timeout(Duration::from_secs(1), stream.read_to_string(&mut answer))
+            .await
+            .expect("closed after the answer")
+            .unwrap();
+        answer
     }
 
     #[tokio::test]
@@ -571,20 +620,18 @@ pub(crate) mod tests {
         let lc = Lifecycle::new();
         lc.serving();
         let addr = spawn(&lc, Limits::default()).await;
-        let mut stream = TcpStream::connect(addr).await.unwrap();
 
-        // HEAD: the GET answer's head, with no body (the next answer on the
-        // connection follows at once).
-        let (status, head, _) = ask(&mut stream, "HEAD", "/readyz").await;
+        // HEAD: the GET answer's head, with no body.
+        let (status, head, _) = ask_new(addr, "HEAD", "/readyz").await;
         assert_eq!(status, 200);
         assert!(head.contains("\r\ncontent-length: 3\r\n"), "{head}");
         assert_plain(&head);
-        let (status, head, body) = ask(&mut stream, "OPTIONS", "/livez").await;
+        let (status, head, body) = ask_new(addr, "OPTIONS", "/livez").await;
         assert_eq!((status, body.as_str()), (200, "ok\n"));
         assert!(head.contains("\r\nallow: get, head, options\r\n"), "{head}");
         assert_plain(&head);
         for method in ["POST", "PUT", "DELETE"] {
-            let (status, head, body) = ask(&mut stream, method, "/readyz").await;
+            let (status, head, body) = ask_new(addr, method, "/readyz").await;
             assert_eq!(
                 (status, body.as_str()),
                 (405, "method not allowed\n"),
@@ -594,7 +641,7 @@ pub(crate) mod tests {
             assert_plain(&head);
         }
         for (method, path) in [("GET", "/nope"), ("POST", "/nope"), ("GET", "/readyz/")] {
-            let (status, head, body) = ask(&mut stream, method, path).await;
+            let (status, head, body) = ask_new(addr, method, path).await;
             assert_eq!(
                 (status, body.as_str()),
                 (404, "not found\n"),
@@ -609,17 +656,43 @@ pub(crate) mod tests {
             .write_all(b"GET /readyz HTTP/1.0\r\n\r\n")
             .await
             .unwrap();
-        let mut answer = String::new();
-        tokio::time::timeout(Duration::from_secs(1), stream.read_to_string(&mut answer))
-            .await
-            .expect("closed after the answer")
-            .unwrap();
+        let answer = read_to_close(&mut stream).await;
         assert!(answer.starts_with("HTTP/1.0 200 OK\r\n"), "{answer}");
         assert!(answer.ends_with("\r\n\r\nok\n"), "{answer}");
     }
 
     #[tokio::test]
-    async fn slow_and_idle_connections_are_closed() {
+    async fn a_client_that_shuts_its_side_after_the_request_gets_the_answer() {
+        let lc = Lifecycle::new();
+        lc.serving();
+        let addr = spawn(&lc, Limits::default()).await;
+        // One that fills the server's first read (8 KiB), so it sees the
+        // shutdown before it answers, as it may whenever the two come
+        // together.
+        let start = "GET /livez HTTP/1.1\r\nhost: test\r\nx-pad: ";
+        let pad = "a".repeat(8192 - start.len() - 4);
+        let full = format!("{start}{pad}\r\n\r\n");
+        assert_eq!(full.len(), 8192);
+        for (request, status_line) in [
+            (&b"GET /readyz HTTP/1.0\r\n\r\n"[..], "HTTP/1.0 200 OK\r\n"),
+            (
+                &b"GET /livez HTTP/1.1\r\nhost: test\r\n\r\n"[..],
+                "HTTP/1.1 200 OK\r\n",
+            ),
+            (full.as_bytes(), "HTTP/1.1 200 OK\r\n"),
+        ] {
+            // As `printf '...' | nc -N` does.
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(request).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let answer = read_to_close(&mut stream).await;
+            assert!(answer.starts_with(status_line), "{answer:?}");
+            assert!(answer.ends_with("\r\n\r\nok\n"), "{answer:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_connections_are_closed() {
         let lc = Lifecycle::new();
         let limits = Limits {
             header_read: Duration::from_millis(200),
@@ -632,10 +705,31 @@ pub(crate) mod tests {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(b"GET /livez HTTP/1.1\r\n").await.unwrap();
         assert!(closed(stream).await);
-        // Idle after an answer.
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        assert_eq!(ask(&mut stream, "GET", "/livez").await.0, 200);
-        assert!(closed(stream).await);
+    }
+
+    #[tokio::test]
+    async fn an_answer_closes_its_connection_and_frees_its_slot() {
+        let lc = Lifecycle::new();
+        let limits = Limits {
+            connections: 1,
+            ..Limits::default()
+        };
+        let addr = spawn(&lc, limits).await;
+        // A checker that would keep its connection for the next check...
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let (status, head, _) = ask(&mut first, "GET", "/livez").await;
+        assert_eq!(status, 200);
+        assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
+        // ...is closed at once, long before the header timeout...
+        let mut byte = [0u8; 1];
+        let eof = tokio::time::timeout(Duration::from_secs(1), first.read(&mut byte)).await;
+        assert!(matches!(eof, Ok(Ok(0))), "{eof:?}");
+        // ...so a new connection is answered while it is still open here.
+        let answer = tokio::time::timeout(Duration::from_secs(1), ask_new(addr, "GET", "/livez"))
+            .await
+            .expect("answered past a kept connection");
+        assert_eq!((answer.0, answer.2.as_str()), (200, "ok\n"));
+        drop(first);
     }
 
     #[tokio::test]
@@ -646,10 +740,11 @@ pub(crate) mod tests {
             ..Limits::default()
         };
         let addr = spawn(&lc, limits).await;
+        // A request in progress holds the slot...
         let mut first = TcpStream::connect(addr).await.unwrap();
-        assert_eq!(ask(&mut first, "GET", "/livez").await.0, 200);
+        first.write_all(b"GET /livez HTTP/1.1\r\n").await.unwrap();
 
-        // The second waits while the first stays open...
+        // ...so the second waits while the first stays open...
         let mut second = TcpStream::connect(addr).await.unwrap();
         second
             .write_all(b"GET /livez HTTP/1.1\r\nhost: test\r\n\r\n")
@@ -666,15 +761,17 @@ pub(crate) mod tests {
         assert_eq!((answer.0, answer.2.as_str()), (200, "ok\n"));
     }
 
-    /// An engine on a SQLite database in `dir`, following `lc`, through a
-    /// store that counts its calls; with `stall`, every storage call waits.
+    /// An engine on a SQLite database in `dir`, with its cache there too,
+    /// following `lc`, through a store that counts its calls; with `stall`,
+    /// every storage call waits.
     pub(crate) async fn engine_in(
         dir: &tempfile::TempDir,
         lc: &Lifecycle,
         stall: bool,
     ) -> (Engine, StallGate) {
         let toml = format!(
-            "[database.sqlite]\npath = \"{}\"\n",
+            "[app]\ncache_dir = \"{}\"\n[database.sqlite]\npath = \"{}\"\n",
+            dir.path().display(),
             dir.path().join("apollo.db").display()
         );
         let config = apollo_config::load::from_str(&toml).unwrap();
@@ -690,7 +787,15 @@ pub(crate) mod tests {
             "n".into(),
             lc.clone(),
         );
+        assert_in(&engine, dir);
         (engine, gate)
+    }
+
+    /// That `engine` stages its uploads under `dir`, never in the user's own
+    /// cache directory (which `recover` sweeps).
+    pub(crate) fn assert_in(engine: &Engine, dir: &tempfile::TempDir) {
+        let uploads = engine.upload_dir();
+        assert!(uploads.starts_with(dir.path()), "{}", uploads.display());
     }
 
     #[tokio::test]
@@ -710,31 +815,45 @@ pub(crate) mod tests {
         ] {
             let at = Instant::now();
             assert_eq!(get(addr, path).await, (status, body.into()), "{path}");
-            assert!(
-                at.elapsed() < Duration::from_millis(100),
-                "{path}: {:?}",
-                at.elapsed()
-            );
+            assert!(at.elapsed() < PROMPT, "{path}: {:?}", at.elapsed());
         }
         assert!(lc.drain());
         let at = Instant::now();
         assert_eq!(get(addr, "/readyz").await.0, 503);
-        assert!(
-            at.elapsed() < Duration::from_millis(100),
-            "{:?}",
-            at.elapsed()
-        );
+        assert!(at.elapsed() < PROMPT, "{:?}", at.elapsed());
         assert!(!status.is_finished(), "the store answered");
     }
 
-    /// `[health]` on a free loopback port with the lines `extra` (such as
-    /// `allow`), as the config gives it.
-    pub(crate) fn health_config(extra: &str) -> (Config, SocketAddr) {
-        let port = free_port();
-        let toml =
-            format!("[health]\nenabled = true\nendpoint = \"127.0.0.1\"\nport = {port}\n{extra}");
-        let config = apollo_config::load::from_str(&toml).unwrap();
-        (config, SocketAddr::from(([127, 0, 0, 1], port)))
+    /// `[health]` on loopback with the lines `extra` (such as `allow`), as
+    /// the config gives it. Port 0: each start binds a port of its own.
+    pub(crate) fn health_config(extra: &str) -> Config {
+        let toml = format!("[health]\nenabled = true\nendpoint = \"127.0.0.1\"\nport = 0\n{extra}");
+        apollo_config::load::from_str(&toml).unwrap()
+    }
+
+    /// [`start`] with [`health_config`]`(extra)`: the health address.
+    pub(crate) async fn start_health(extra: &str, lc: &Lifecycle) -> SocketAddr {
+        let bound = start(&health_config(extra), lc).await.unwrap();
+        bound.expect("[health] is on").local
+    }
+
+    /// [`start`] with [`health_config`]`(extra)` and the HAProxy agent on a
+    /// free port: the health and agent addresses. Tried again while the port
+    /// picked for the agent is taken by the time it is bound.
+    pub(crate) async fn start_with_agent(extra: &str, lc: &Lifecycle) -> (SocketAddr, SocketAddr) {
+        for _ in 0..20 {
+            let port = free_port();
+            let config = health_config(&format!("{extra}agent_port = {port}\n"));
+            match start(&config, lc).await {
+                Ok(bound) => {
+                    let health = bound.expect("[health] is on").local;
+                    return (health, SocketAddr::new(health.ip(), port));
+                }
+                Err(e) if in_use(&e) => continue,
+                Err(e) => panic!("{e:#}"),
+            }
+        }
+        panic!("no free port for the agent");
     }
 
     #[tokio::test]
@@ -742,12 +861,12 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lc = Lifecycle::new();
         // Before the engine exists, as at startup.
-        let (config, addr) = health_config("allow = [\"127.0.0.2\"]\n");
-        start(&config, &lc).await.unwrap();
+        let addr = start_health("allow = [\"127.0.0.2\"]\n", &lc).await;
         let stream = TcpStream::connect(addr).await.unwrap();
         assert!(closed(stream).await);
 
-        // One family with the metrics listener's refusals.
+        // One family with the metrics listener's refusals, and every
+        // listener's series from the start.
         let (engine, _) = engine_in(&dir, &lc, false).await;
         engine.note_refused("metrics");
         let text = engine.metrics_text().await;
@@ -758,6 +877,7 @@ pub(crate) mod tests {
         assert_eq!(
             refused,
             [
+                "apollo_listener_refused_total{listener=\"agent\"} 0",
                 "apollo_listener_refused_total{listener=\"health\"} 1",
                 "apollo_listener_refused_total{listener=\"metrics\"} 1"
             ]
@@ -767,31 +887,25 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_peer_in_health_allow_is_answered() {
         let lc = Lifecycle::new();
-        let (config, addr) = health_config("allow = [\"127.0.0.1\"]\n");
-        start(&config, &lc).await.unwrap();
+        let addr = start_health("allow = [\"127.0.0.1\"]\n", &lc).await;
         let at = Instant::now();
         assert_eq!(get(addr, "/livez").await, (200, "ok\n".into()));
-        assert!(
-            at.elapsed() < Duration::from_millis(100),
-            "{:?}",
-            at.elapsed()
-        );
+        assert!(at.elapsed() < PROMPT, "{:?}", at.elapsed());
     }
 
     #[tokio::test]
     async fn a_health_allow_that_cannot_match_fails_the_start() {
         let lc = Lifecycle::new();
-        let (config, _) = health_config("allow = [\"10.0.0.0/8\"]\n");
+        let config = health_config("allow = [\"10.0.0.0/8\"]\n");
         let err = start(&config, &lc).await.unwrap_err().to_string();
         assert!(
             err.starts_with("health.allow: no entry can match on 127.0.0.1:"),
             "{err}"
         );
         // Off: nothing is bound.
-        let (mut config, addr) = health_config("");
+        let mut config = health_config("");
         config.health.enabled = false;
-        start(&config, &lc).await.unwrap();
-        assert!(TcpStream::connect(addr).await.is_err());
+        assert!(start(&config, &lc).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1176,7 +1290,9 @@ pub(crate) mod tests {
         for _ in 0..2 {
             let dir = tempfile::tempdir().unwrap();
             let toml = format!(
-                "[database]\nlease_secs = 1\n[database.sqlite]\npath = \"{}\"\n",
+                "[app]\ncache_dir = \"{}\"\n[database]\nlease_secs = 1\n\
+                 [database.sqlite]\npath = \"{}\"\n",
+                dir.path().display(),
                 dir.path().join("apollo.db").display()
             );
             let config = apollo_config::load::from_str(&toml).unwrap();
@@ -1191,6 +1307,8 @@ pub(crate) mod tests {
                 "n".into(),
                 lc.clone(),
             );
+            // `recover` sweeps the upload directory.
+            assert_in(&engine, &dir);
             engine.recover().await.unwrap();
             lc.serving();
             let addr = spawn(&lc, Limits::default()).await;

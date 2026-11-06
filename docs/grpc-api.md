@@ -367,7 +367,7 @@ Nothing is kept when a request is refused as overloaded, so the same request may
 - **Removed** names end their Watch streams (with `OK`), and Check answers `NOT_FOUND`. An open Watch never holds a stop.
 - **The port speaks HTTP/2 only.** A balancer whose checks speak HTTP/1.1 can't use it; give it the health port instead.
 - **mTLS covers health too.** With `[tls].client_ca_file`, a checker needs a client certificate to reach health here. The health port needs none.
-- **The gRPC port serves only once tasks are recovered.** Before that it accepts connections (a TCP check passes) but answers nothing, so a liveness check here can fail a server that is starting normally. Use `/livez` on the health port for liveness.
+- **The gRPC port serves only once tasks are recovered.** While the database opens (and migrates) and auth is set up, the port isn't bound, so connections are refused; while tasks are recovered it accepts connections (a TCP check passes) but answers nothing. A liveness check here can therefore fail a server that is starting normally: use `/livez` on the health port for liveness.
 
 When the server stops:
 

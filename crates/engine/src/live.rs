@@ -119,12 +119,16 @@ impl Engine {
             idle_ms: &self.inner.idle_ms,
             metrics: &self.inner.metrics,
             preloaded: &self.inner.preloaded,
+            load_hook: self.inner.load_hook.as_ref(),
         };
         let (registry, models) = Registry::build(&config, &env, Some(&current.registry));
         let generation = current.generation + 1;
         let mut live = Live::new(Arc::new(config), registry, webhook, generation);
         live.restart_required = restart_required.clone();
         *self.inner.live.write().unwrap() = Arc::new(live);
+        // A pinned model still loading may be gone, or no longer pinned: the
+        // readiness wait looks again.
+        self.inner.preloaded.notify_waiters();
 
         tracing::info!(
             generation,

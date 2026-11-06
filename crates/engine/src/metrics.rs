@@ -78,6 +78,11 @@ impl CounterVec {
         *self.0.lock().unwrap().entry(labels.to_vec()).or_default() += 1;
     }
 
+    /// Give `labels` a series at 0, if it has none yet.
+    pub(crate) fn touch(&self, labels: &[&'static str]) {
+        self.0.lock().unwrap().entry(labels.to_vec()).or_default();
+    }
+
     pub(crate) fn snapshot(&self) -> Vec<(Vec<&'static str>, u64)> {
         self.0
             .lock()
@@ -242,37 +247,33 @@ impl Engine {
         );
 
         let lc = &self.inner.lifecycle;
+        // One reading of the state and one sample for every figure below, so
+        // they agree.
+        let (phase, drained, load) = (lc.phase(), lc.drained(), lc.load());
+        let ready = phase.ready(drained);
         out.gauge(
             "apollo_ready",
             "1 while ready for work (what /readyz answers).",
-            if lc.ready() { 1.0 } else { 0.0 },
+            if ready { 1.0 } else { 0.0 },
         );
         out.family(
             "apollo_lifecycle_phase",
             "gauge",
             "1 for the phase the process is in: starting, serving, draining or stopping.",
         );
-        let now = lc.phase().name();
-        for phase in Phase::NAMES {
-            let v = if phase == now { 1.0 } else { 0.0 };
-            out.sample("apollo_lifecycle_phase", &[("phase", phase)], v);
+        for name in Phase::NAMES {
+            let v = if name == phase.name() { 1.0 } else { 0.0 };
+            out.sample("apollo_lifecycle_phase", &[("phase", name)], v);
         }
         out.gauge(
             "apollo_drained",
             "1 while taken out of rotation with apollo drain.",
-            if lc.drained() { 1.0 } else { 0.0 },
+            if drained { 1.0 } else { 0.0 },
         );
-        // One sample for every figure below, so they agree.
-        let load = lc.load();
-        let ready = lc.ready();
         out.gauge(
             "apollo_ready_strict",
             "1 while ready and in touch with the database, or it isn't shared (what /readyz/strict answers).",
-            if ready && !load.database.is_stale() {
-                1.0
-            } else {
-                0.0
-            },
+            if load.ready_strict(ready) { 1.0 } else { 0.0 },
         );
         out.gauge(
             "apollo_utilization",

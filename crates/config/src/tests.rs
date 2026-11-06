@@ -1042,6 +1042,40 @@ fn listeners_need_their_own_ports() {
 }
 
 #[test]
+fn the_listeners_that_run_are_listed_for_the_start_to_resolve() {
+    let cfg = load::from_str(
+        "[app]\nendpoint = \"apollo.internal\"\nport = 8080\n[health]\nenabled = true\nagent_port = 9466\n[metrics]\nenabled = true\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.listeners(),
+        [
+            ("app.port", "apollo.internal", 8080),
+            ("health.port", "apollo.internal", 9465),
+            ("health.agent_port", "apollo.internal", 9466),
+            ("metrics.port", "127.0.0.1", 9464),
+        ]
+    );
+    let off = load::from_str("[health]\nagent_port = 9466\n").unwrap();
+    assert_eq!(off.listeners().len(), 1, "only the gRPC port runs");
+}
+
+#[test]
+fn addresses_overlap_where_one_takes_the_others_connections() {
+    use crate::validate::addrs_overlap;
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    assert!(addrs_overlap(ip("127.0.0.1"), ip("127.0.0.1")));
+    assert!(!addrs_overlap(ip("::1"), ip("127.0.0.1")));
+    assert!(!addrs_overlap(ip("10.0.0.5"), ip("10.0.0.6")));
+    assert!(addrs_overlap(ip("0.0.0.0"), ip("127.0.0.1")));
+    assert!(addrs_overlap(ip("127.0.0.1"), ip("0.0.0.0")));
+    assert!(!addrs_overlap(ip("0.0.0.0"), ip("::1")));
+    assert!(addrs_overlap(ip("::"), ip("127.0.0.1")));
+    assert!(addrs_overlap(ip("10.0.0.5"), ip("::")));
+    assert!(addrs_overlap(ip("::"), ip("0.0.0.0")));
+}
+
+#[test]
 fn drain_settings_are_at_most_an_hour() {
     let cfg =
         load::from_str("[app]\ndrain_delay_secs = 3600\ndrain_timeout_secs = 3600\n").unwrap();

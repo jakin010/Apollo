@@ -49,6 +49,16 @@ pub(crate) fn publish(tx: &watch::Sender<Published>, next: Published) -> bool {
     })
 }
 
+/// A config section's `allow` list, as its `allowlist()` parsed it, with
+/// the errors under `field` (`metrics.allow`). `None` admits everyone.
+pub(crate) fn parsed(
+    field: &str,
+    list: Result<Option<Allowlist>, Vec<String>>,
+) -> anyhow::Result<Option<Arc<Allowlist>>> {
+    let list = list.map_err(|errs| anyhow!("{field} {}", errs.join("; ")))?;
+    Ok(list.map(Arc::new))
+}
+
 /// `[metrics].allow`, as last published.
 pub(crate) fn metrics_rules(rx: watch::Receiver<Published>) -> Rules {
     Arc::new(move || rx.borrow().metrics.clone())
@@ -83,14 +93,10 @@ impl Bound {
     pub(crate) fn describe(&self, listener: &str, list: Option<&Allowlist>) -> String {
         match list {
             None => format!("{listener} {} allows everyone", self.local),
-            Some(list) => {
-                let note = if list.refuses_loopback(self.local, self.only_v6) {
-                    " (loopback refused)"
-                } else {
-                    ""
-                };
-                format!("{listener} {} allows {list}{note}", self.local)
-            }
+            Some(list) => match list.loopback_note(self.local, self.only_v6) {
+                Some(note) => format!("{listener} {} allows {list} ({note})", self.local),
+                None => format!("{listener} {} allows {list}", self.local),
+            },
         }
     }
 }
@@ -418,6 +424,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+    use crate::health::tests::{ask, closed};
 
     fn list(entries: &[&str]) -> Option<Arc<Allowlist>> {
         let entries: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
@@ -447,39 +454,13 @@ mod tests {
         (local, count)
     }
 
-    /// GET `path` on `stream`: the status, the head (lowercase) and the body.
-    async fn get_on(stream: &mut TcpStream, path: &str) -> (u16, String, String) {
-        let request = format!("GET {path} HTTP/1.1\r\nhost: test\r\n\r\n");
-        stream.write_all(request.as_bytes()).await.unwrap();
-        let mut head = Vec::new();
-        let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            assert_eq!(stream.read(&mut byte).await.unwrap(), 1, "closed early");
-            head.push(byte[0]);
-        }
-        let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
-        let status = head[9..12].parse().unwrap();
-        let length = head
-            .lines()
-            .find_map(|l| l.strip_prefix("content-length: "))
-            .map_or(0, |n| n.trim().parse().unwrap());
-        let mut body = vec![0; length];
-        stream.read_exact(&mut body).await.unwrap();
-        (status, head, String::from_utf8(body).unwrap())
-    }
-
-    /// Whether the server closed `stream` without an answer (EOF or a reset)
-    /// within a second.
+    /// Whether the server closed `stream` without answering a request (EOF or
+    /// a reset) within a second.
     async fn refused(mut stream: TcpStream) -> bool {
         let _ = stream
             .write_all(b"GET /metrics HTTP/1.1\r\nhost: test\r\n\r\n")
             .await;
-        let mut buf = [0u8; 64];
-        match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await {
-            Ok(Ok(n)) => n == 0,
-            Ok(Err(e)) => e.kind() == io::ErrorKind::ConnectionReset,
-            Err(_) => false,
-        }
+        closed(stream).await
     }
 
     #[tokio::test]
@@ -511,9 +492,49 @@ mod tests {
         );
         let (addr, count) = server(listener, fixed(allow)).await;
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let (status, _, body) = get_on(&mut stream, "/metrics").await;
+        let (status, _, body) = ask(&mut stream, "GET", "/metrics").await;
         assert_eq!((status, body.as_str()), (200, "ok"));
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_dual_stack_socket_names_the_loopback_address_it_refuses() {
+        let bound = Bound {
+            local: "[::]:9464".parse().unwrap(),
+            only_v6: false,
+        };
+        assert_eq!(
+            bound.describe("metrics", list(&["::1", "10.0.0.0/8"]).as_deref()),
+            "metrics [::]:9464 allows ::1, 10.0.0.0/8 (127.0.0.1 refused)"
+        );
+        assert_eq!(
+            bound.describe("metrics", list(&["127.0.0.1"]).as_deref()),
+            "metrics [::]:9464 allows 127.0.0.1 (::1 refused)"
+        );
+        assert_eq!(
+            bound.describe("metrics", list(&["10.0.0.0/8"]).as_deref()),
+            "metrics [::]:9464 allows 10.0.0.0/8 (loopback refused)"
+        );
+        assert_eq!(
+            bound.describe("metrics", list(&["127.0.0.1", "::1"]).as_deref()),
+            "metrics [::]:9464 allows 127.0.0.1, ::1"
+        );
+    }
+
+    #[test]
+    fn a_bad_list_is_an_error_under_its_field() {
+        let bad = vec!["10.0.0.1/8".to_string(), "localhost".to_string()];
+        let err = parsed("health.allow", Allowlist::parse(&bad).map(Some)).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("health.allow `10.0.0.1/8`: host bits are set"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("; `localhost`: hostnames"),
+            "{err}"
+        );
+        assert!(parsed("health.allow", Ok(None)).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -525,7 +546,7 @@ mod tests {
         });
         let (addr, count) = server(listener, metrics_rules(rx)).await;
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        assert_eq!(get_on(&mut stream, "/metrics").await.0, 200);
+        assert_eq!(ask(&mut stream, "GET", "/metrics").await.0, 200);
 
         let next = Published {
             generation: 2,
@@ -533,7 +554,7 @@ mod tests {
         };
         assert!(publish(&tx, next));
         // The same keep-alive connection: 403, then closed.
-        let (status, head, _) = get_on(&mut stream, "/metrics").await;
+        let (status, head, _) = ask(&mut stream, "GET", "/metrics").await;
         assert_eq!(status, 403);
         assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
         let mut buf = [0u8; 1];
@@ -559,7 +580,7 @@ mod tests {
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, addr.port()))
             .await
             .unwrap();
-        assert_eq!(get_on(&mut stream, "/metrics").await.0, 200);
+        assert_eq!(ask(&mut stream, "GET", "/metrics").await.0, 200);
     }
 
     #[cfg(target_os = "linux")]
@@ -591,7 +612,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, router).await });
         for path in ["/metrics", "/nope"] {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            let (status, head, _) = get_on(&mut stream, path).await;
+            let (status, head, _) = ask(&mut stream, "GET", path).await;
             assert_eq!(status, 403, "{path}");
             assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
         }

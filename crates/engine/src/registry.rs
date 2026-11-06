@@ -80,6 +80,7 @@ pub(crate) struct WorkerEnv<'a> {
     pub(crate) metrics: &'a Metrics,
     /// Woken as a pinned model's worker finishes its first load attempt.
     pub(crate) preloaded: &'a Arc<tokio::sync::Notify>,
+    pub(crate) load_hook: Option<&'a crate::LoadHook>,
 }
 
 impl Registry {
@@ -258,7 +259,12 @@ fn spawn(
     let files = files.clone();
     let dev = apollo_inference::open_device(env.kind);
     let dir = env.cache_dir.cloned();
+    let hook = env.load_hook.cloned();
+    let name = label.to_string();
     let loader: Loader = Box::new(move || {
+        if let Some(hook) = &hook {
+            hook(&name);
+        }
         apollo_inference::load(&cfg, &files, &dev, dir.as_deref()).map_err(|e| e.to_string())
     });
     let spec = WorkerSpec {

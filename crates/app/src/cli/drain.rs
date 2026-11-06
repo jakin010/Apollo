@@ -14,15 +14,17 @@ pub struct DrainArgs {
 }
 
 pub fn run(args: DrainArgs) -> anyhow::Result<()> {
-    let pid = crate::daemon::PidFile::read()?.ok_or_else(|| anyhow!("apollo is not running"))?;
+    let pid = crate::daemon::PidFile::read()?
+        .ok_or_else(|| anyhow!("apollo is not running (or is still opening its database)"))?;
     if !crate::daemon::is_alive(pid) {
         return Err(anyhow!(
             "apollo is not running (stale PID file for pid {pid})"
         ));
     }
     let what = if args.undo { "undo its drain" } else { "drain" };
-    let outcome =
-        request(!args.undo).with_context(|| format!("asking apollo (pid {pid}) to {what}"))?;
+    let outcome = request(!args.undo).with_context(|| {
+        format!("asking apollo (pid {pid}) to {what} (it answers once tasks are recovered)")
+    })?;
     print!("{}", render(&outcome));
     Ok(())
 }

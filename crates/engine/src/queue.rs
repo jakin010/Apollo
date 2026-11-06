@@ -8,7 +8,7 @@ use apollo_storage::Renewal;
 
 use crate::aggregate;
 use crate::error::EngineError;
-use crate::lease::{MAX_RESUME_ATTEMPTS, Running};
+use crate::lease::{MAX_RESUME_ATTEMPTS, Running, Scope};
 use crate::{Engine, Phase, Reservation};
 
 /// Upload files younger than this are never swept: one may still be arriving
@@ -26,12 +26,25 @@ impl Engine {
     ///    holds, and, from then on, every third of the lease, also the ones
     ///    whose holder stopped renewing its lease. A takeover of a claim that
     ///    was never handed back counts a resume attempt, failing the task once
-    ///    it exceeds [`MAX_RESUME_ATTEMPTS`] (poison-task guard): only crashes
-    ///    count, since a graceful shutdown hands claims back (see
-    ///    [`Engine::shutdown`]).
+    ///    it exceeds [`MAX_RESUME_ATTEMPTS`] (poison-task guard). A graceful
+    ///    stop hands claims back (see [`Engine::hand_back`]), so it counts
+    ///    none, unless the database doesn't answer within
+    ///    [`HAND_BACK_LIMIT`](crate::HAND_BACK_LIMIT) or a second signal
+    ///    stops a start without the hand-back: those claims lapse, and each
+    ///    counts one.
     ///
     /// Returns the number of tasks taken over now.
+    ///
+    /// It runs in a task of its own, so a caller that stops waiting (a stop
+    /// during startup drops this call) cuts no claim or write short:
+    /// recovery goes on to its next safe point, as a takeover pass does once
+    /// draining, and the hand-back waits for it.
     pub async fn recover(&self) -> Result<usize, EngineError> {
+        let engine = self.clone();
+        crate::joined(tokio::spawn(async move { engine.recover_here().await })).await
+    }
+
+    async fn recover_here(&self) -> Result<usize, EngineError> {
         self.redeliver_pending().await;
         if self.inner.storage.shared() {
             // Once settled, also those whose claim lapsed, until none is left
@@ -59,6 +72,11 @@ impl Engine {
                         continue;
                     }
                     if !engine.redeliver_pending().await {
+                        // Drained by hand meanwhile: not done, so wait for
+                        // the undrain.
+                        if lc.drained() && lc.phase() < Phase::Draining {
+                            continue;
+                        }
                         return;
                     }
                 }
@@ -76,7 +94,7 @@ impl Engine {
             0 => None,
             secs => Some(Duration::from_secs(secs.into())),
         };
-        let resumed = self.take_over(limit).await?;
+        let resumed = self.take_over(Scope::All, limit).await?;
         if self.inner.storage.shared() {
             self.spawn_takeover();
         }

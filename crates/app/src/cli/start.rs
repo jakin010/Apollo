@@ -1,6 +1,6 @@
 //! `start`: load config, apply run-only overrides, optionally daemonize, serve.
 
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use clap::Args;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
-use apollo_config::{Allowlist, Config, Overrides, TlsConfig, load};
+use apollo_config::{Allowlist, Config, Overrides, TlsConfig, load, validate};
 use apollo_engine::{Engine, HAND_BACK_LIMIT, Lifecycle, Phase, Step, WebhookSink};
 
 use crate::allow::{self, Bound, Published};
@@ -79,6 +79,7 @@ pub fn run(args: StartArgs) -> anyhow::Result<()> {
         },
     };
     let config = source.load()?;
+    check_ports(&config)?;
 
     if args.daemon {
         return spawn_detached(&args);
@@ -107,20 +108,79 @@ async fn serve(
     let log_filter = init_tracing(&config.app.log_level);
     let lc = Lifecycle::new();
     stop_on_signals(lc.clone());
-    serve_with(config, config_file, source, log_filter, lc).await
+    // First, so probes answer while the steps below run.
+    let health = crate::health::start(&config, &lc).await?;
+    let run = Run {
+        config_file,
+        source,
+        log_filter,
+        health,
+        pid_file: None,
+        status_socket: None,
+        hangup: true,
+    };
+    serve_with(config, run, lc).await
+}
+
+/// The listeners' ports checked on the addresses their hosts resolve to,
+/// before anything binds: validation compares the hosts as written, so a
+/// hostname that is another listener's IP passes it. A host that doesn't
+/// resolve is left to its listener, which reports it.
+fn check_ports(config: &Config) -> anyhow::Result<()> {
+    let resolved: Vec<(&str, SocketAddr)> = config
+        .listeners()
+        .into_iter()
+        .filter_map(|(field, host, port)| {
+            let addr = (host, port).to_socket_addrs().ok()?.next()?;
+            Some((field, addr))
+        })
+        .collect();
+    let clashes = port_clashes(&resolved);
+    if clashes.is_empty() {
+        return Ok(());
+    }
+    Err(apollo_config::ConfigError::Validation(clashes)).context("config is invalid")
+}
+
+/// A message for each two of `listeners` (field, address) that share a port
+/// where their addresses overlap.
+fn port_clashes(listeners: &[(&str, SocketAddr)]) -> Vec<String> {
+    let mut clashes = Vec::new();
+    for (i, &(field, addr)) in listeners.iter().enumerate() {
+        for &(other, other_addr) in &listeners[..i] {
+            if addr.port() == other_addr.port()
+                && validate::addrs_overlap(addr.ip(), other_addr.ip())
+            {
+                clashes.push(format!(
+                    "{field} {addr} is also {other} {other_addr}: give each listener its own port"
+                ));
+            }
+        }
+    }
+    clashes
+}
+
+/// What [`serve_with`] needs besides the config: where the config comes
+/// from, the health listener started before it, and where it leaves what
+/// other commands find it by. Tests point those at a directory of their own.
+struct Run {
+    /// The config file, as `apollo status` shows it.
+    config_file: Option<PathBuf>,
+    source: ConfigSource,
+    log_filter: Option<LogFilter>,
+    /// The health listener's socket, when `[health]` is on.
+    health: Option<Bound>,
+    /// The PID file; `None` for the default location.
+    pid_file: Option<PathBuf>,
+    /// The status socket; `None` for the default location.
+    status_socket: Option<PathBuf>,
+    /// Reload the config on SIGHUP.
+    hangup: bool,
 }
 
 /// Start, following `lc`, and serve until it stops. A stop during startup
 /// ends the start, handing back what recovery took, and returns `Ok`.
-async fn serve_with(
-    config: Config,
-    config_file: Option<PathBuf>,
-    source: ConfigSource,
-    log_filter: Option<LogFilter>,
-    lc: Lifecycle,
-) -> anyhow::Result<()> {
-    // First, so probes answer while the steps below run.
-    crate::health::start(&config, &lc).await?;
+async fn serve_with(config: Config, run: Run, lc: Lifecycle) -> anyhow::Result<()> {
     log_stop_budget(&config.app);
 
     let addr = (config.app.endpoint.as_str(), config.app.port)
@@ -153,15 +213,21 @@ async fn serve_with(
     let metrics = start_metrics(&config.metrics, engine.clone(), rules).await?;
     let reloader = Reloader {
         engine: engine.clone(),
-        source,
-        log_filter,
+        source: run.source,
+        log_filter: run.log_filter,
         published,
         metrics,
+        health: run.health,
     };
-    reload_on_hangup(reloader.clone());
+    if run.hangup {
+        reload_on_hangup(reloader.clone());
+    }
 
     // Owns the PID file for this process; removed on graceful shutdown.
-    let _pidfile = crate::daemon::PidFile::create()?;
+    let _pidfile = run.pid_file.map_or_else(
+        crate::daemon::PidFile::create,
+        crate::daemon::PidFile::create_at,
+    )?;
 
     lc.starting(Step::ConfiguringAuth);
     let Some(auth) = unless_stopped(&lc, configure_auth(&config, &db, engine.node())).await else {
@@ -181,6 +247,8 @@ async fn serve_with(
     // start would leave its claims to lapse, which the next start counts as a
     // crash of each task.
     lc.starting(Step::RecoveringTasks);
+    // A stop drops only this wait: recovery runs in a task of its own to its
+    // next safe point, and the hand-back waits for it.
     let resumed = match unless_stopped(&lc, engine.recover()).await {
         None => return stopped_starting(&lc, Some(&engine)).await,
         Some(Ok(n)) => n,
@@ -208,7 +276,7 @@ async fn serve_with(
         tls: tls.is_some(),
         mutual_tls: tls.as_ref().is_some_and(|t| t.client_ca_pem.is_some()),
         auth: auth.is_enabled(),
-        config_file: config_file.map(|p| p.display().to_string()),
+        config_file: run.config_file.map(|p| p.display().to_string()),
         database: match config.database.backend {
             // Instances sharing the database tell each other apart by node.
             apollo_config::Backend::Surrealdb => format!(
@@ -220,7 +288,7 @@ async fn serve_with(
         },
         log_file: std::env::var(DAEMON_LOG_ENV).ok(),
     };
-    let _status_socket = start_status_socket(engine.clone(), info, reloader);
+    let _status_socket = start_status_socket(engine.clone(), info, reloader, run.status_socket);
 
     stop_after_drain_delay(engine.clone());
     lc.starting(Step::LoadingModels);
@@ -254,19 +322,32 @@ async fn serve_with(
 
 /// A Ctrl-C or SIGTERM drains; one while draining (or later) stops at once.
 fn stop_on_signals(lc: Lifecycle) {
-    stop_on(lc, crate::daemon::shutdown_signal);
+    let (tx, rx) = mpsc::unbounded_channel();
+    // Listening from here on, so no signal is lost while one is handled.
+    match crate::daemon::shutdown_signals() {
+        Ok(mut signals) => {
+            tokio::spawn(async move {
+                loop {
+                    signals.recv().await;
+                    if tx.send(()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "can't listen for SIGTERM and Ctrl-C: they won't drain the server"
+        ),
+    }
+    stop_on(lc, rx);
 }
 
-/// Each time `signal()` returns: the first drains (drained by hand or not),
-/// any later one stops at once.
-fn stop_on<F, S>(lc: Lifecycle, mut signal: F)
-where
-    F: FnMut() -> S + Send + 'static,
-    S: Future<Output = ()> + Send,
-{
+/// Each signal on `signals`: the first drains (drained by hand or not), any
+/// later one stops at once.
+fn stop_on(lc: Lifecycle, mut signals: mpsc::UnboundedReceiver<()>) {
     tokio::spawn(async move {
-        loop {
-            signal().await;
+        while signals.recv().await.is_some() {
             if lc.drain() {
                 tracing::info!("shutdown signal received; draining (a second one stops at once)");
             } else {
@@ -468,6 +549,8 @@ struct Reloader {
     published: watch::Sender<Published>,
     /// The `/metrics` listener's socket, when it runs.
     metrics: Option<Bound>,
+    /// The health listener's socket, when it runs.
+    health: Option<Bound>,
 }
 
 impl Reloader {
@@ -481,6 +564,7 @@ impl Reloader {
             (Some(bound), Some(list)) => bound.check("metrics.allow", list)?,
             _ => Vec::new(),
         };
+        let next_start = self.check_health_allow(&config);
         let webhook = webhook_sink(&config)?;
         let level = config.app.log_level.clone();
         let report = self.engine.reload(config, webhook).await?;
@@ -500,6 +584,20 @@ impl Reloader {
         if let Some(filter) = &self.log_filter {
             set_log_level(filter, &level);
         }
+        let mut problems = Vec::new();
+        match next_start {
+            Some(Ok(warnings)) => {
+                for warning in warnings {
+                    tracing::warn!("{warning} (from the next start on)");
+                }
+            }
+            Some(Err(e)) => {
+                let problem = format!("the next start will fail: {e}");
+                tracing::warn!("{problem}");
+                problems.push(problem);
+            }
+            None => {}
+        }
         let m = report.models;
         Ok(crate::status::ReloadOutcome {
             generation: report.generation,
@@ -508,7 +606,27 @@ impl Reloader {
             kept: m.kept,
             removed: m.removed,
             restart_required: report.restart_required,
+            warnings: problems,
         })
+    }
+
+    /// A changed `[health].allow` in `config`, which applies at the next
+    /// start, checked as that start will check it: against the health
+    /// listener, while the next start binds the same address. `None` when
+    /// there is nothing to check.
+    fn check_health_allow(&self, config: &Config) -> Option<anyhow::Result<Vec<String>>> {
+        let bound = self.health.as_ref()?;
+        let running = self.engine.config();
+        let (next, now) = (&config.health, &running.health);
+        let same_address = next.enabled
+            && next.port == now.port
+            && next.bind_host(&config.app) == now.bind_host(&running.app);
+        if !same_address || next.allow == now.allow {
+            return None;
+        }
+        // The config is valid, so the list parses.
+        let list = next.allowlist().ok().flatten()?;
+        Some(bound.check("health.allow", &list))
     }
 }
 
@@ -537,11 +655,7 @@ fn reload_on_hangup(reloader: Reloader) {
 
 /// `[metrics].allow` parsed: `None` admits everyone.
 fn metrics_allowlist(config: &Config) -> anyhow::Result<Option<Arc<Allowlist>>> {
-    let list = config
-        .metrics
-        .allowlist()
-        .map_err(|errs| anyhow!("metrics.allow {}", errs.join("; ")))?;
-    Ok(list.map(Arc::new))
+    allow::parsed("metrics.allow", config.metrics.allowlist())
 }
 
 /// Serve `GET /metrics` when `[metrics]` is enabled, to the peers the list
@@ -637,8 +751,9 @@ fn start_status_socket(
     engine: Engine,
     info: ServerInfo,
     reloader: Reloader,
+    path: Option<PathBuf>,
 ) -> Option<crate::status::SocketGuard> {
-    let path = match crate::status::socket_path() {
+    let path = match path.map_or_else(crate::status::socket_path, Ok) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "status socket disabled");
@@ -679,7 +794,12 @@ fn serve_status(
 }
 
 #[cfg(not(unix))]
-fn start_status_socket(_engine: Engine, _info: ServerInfo, _reloader: Reloader) -> Option<()> {
+fn start_status_socket(
+    _engine: Engine,
+    _info: ServerInfo,
+    _reloader: Reloader,
+    _path: Option<PathBuf>,
+) -> Option<()> {
     None
 }
 
@@ -1009,6 +1129,171 @@ fn spawn_detached(args: &StartArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::health::tests::{PROMPT, assert_in, get, start_health};
+
+    /// A config for [`serve_with`] that keeps to `dir`: its database and
+    /// cache there, its node id given and no auth, so nothing outside `dir`
+    /// is read or written. `app` are more `[app]` lines, `rest` more tables.
+    fn config_in(dir: &tempfile::TempDir, app: &str, rest: &str) -> String {
+        format!(
+            "[app]\nnode_id = \"n\"\ncache_dir = \"{}\"\n{app}[auth]\nenabled = false\n\
+             [database.sqlite]\npath = \"{}\"\n{rest}",
+            dir.path().display(),
+            dir.path().join("apollo.db").display()
+        )
+    }
+
+    /// A model that needs no weights, for a config that must have one.
+    fn model_in(dir: &tempfile::TempDir) -> String {
+        let list = dir.path().join("known.txt");
+        std::fs::write(&list, format!("{} 1\n", "ab".repeat(32))).unwrap();
+        format!(
+            "[models.known]\narchitecture = \"pdq\"\nhash_list = \"{}\"\n\
+             categories = {{ 1 = \"known\" }}\n",
+            list.display()
+        )
+    }
+
+    #[test]
+    fn listeners_clash_where_their_resolved_addresses_overlap() {
+        let at = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let clashes = |listeners: &[(&str, &str)]| {
+            let listeners: Vec<(&str, SocketAddr)> =
+                listeners.iter().map(|&(f, a)| (f, at(a))).collect();
+            port_clashes(&listeners)
+        };
+        assert_eq!(
+            clashes(&[
+                ("app.port", "127.0.0.1:8080"),
+                ("metrics.port", "127.0.0.1:8080")
+            ]),
+            [
+                "metrics.port 127.0.0.1:8080 is also app.port 127.0.0.1:8080: \
+              give each listener its own port"
+            ]
+        );
+        assert_eq!(
+            clashes(&[
+                ("app.port", "0.0.0.0:8080"),
+                ("metrics.port", "127.0.0.1:8080")
+            ])
+            .len(),
+            1
+        );
+        assert_eq!(
+            clashes(&[("app.port", "[::]:8080"), ("metrics.port", "10.0.0.5:8080")]).len(),
+            1
+        );
+        let apart: &[&[(&str, &str)]] = &[
+            &[
+                ("app.port", "[::1]:8080"),
+                ("metrics.port", "127.0.0.1:8080"),
+            ],
+            &[
+                ("app.port", "127.0.0.1:8080"),
+                ("metrics.port", "127.0.0.1:8081"),
+            ],
+            &[
+                ("app.port", "10.0.0.5:8080"),
+                ("metrics.port", "10.0.0.6:8080"),
+            ],
+        ];
+        for listeners in apart {
+            assert_eq!(clashes(listeners), Vec::<String>::new(), "{listeners:?}");
+        }
+    }
+
+    #[test]
+    fn a_hostname_that_is_another_listeners_address_fails_the_start() {
+        // Resolving `localhost` reads the hosts file; nothing binds.
+        let local = ("localhost", 0)
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .unwrap()
+            .ip();
+        let config = |metrics: &str| {
+            let toml = format!(
+                "[app]\nendpoint = \"localhost\"\nport = 9464\n\
+                 [metrics]\nenabled = true\nendpoint = \"{metrics}\"\n"
+            );
+            let config = load::from_str(&toml).unwrap();
+            // Validation compares the hosts as written: it can't tell.
+            config.validate().expect("valid as written");
+            config
+        };
+        let err = check_ports(&config(&local.to_string())).unwrap_err();
+        let addr = SocketAddr::new(local, 9464);
+        assert!(
+            format!("{err:#}").contains(&format!(
+                "metrics.port {addr} is also app.port {addr}: give each listener its own port"
+            )),
+            "{err:#}"
+        );
+        // The other loopback address is apart.
+        let other = if local.is_ipv4() { "::1" } else { "127.0.0.1" };
+        check_ports(&config(other)).unwrap();
+    }
+
+    /// A [`Run`] whose PID file and status socket are in `dir`, which reads
+    /// `dir/apollo.toml` on reload, and which leaves SIGHUP alone.
+    fn run_in(dir: &tempfile::TempDir, health: Option<Bound>) -> Run {
+        Run {
+            config_file: None,
+            source: ConfigSource {
+                path: Some(dir.path().join("apollo.toml")),
+                overrides: Overrides::default(),
+            },
+            log_filter: None,
+            health,
+            pid_file: Some(dir.path().join("apollo.pid")),
+            status_socket: Some(dir.path().join("s.sock")),
+            hangup: false,
+        }
+    }
+
+    /// Wait until `done`, failing with `what` after `limit`.
+    async fn until(what: &str, limit: Duration, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + limit;
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// An engine on `toml` (in `dir`), and a [`Reloader`] for it that reads
+    /// `dir/apollo.toml`, with `[metrics]` started as `toml` says and the
+    /// health listener `health`.
+    async fn reloader_in(dir: &tempfile::TempDir, toml: &str, health: Option<Bound>) -> Reloader {
+        let config = load::from_str(toml).unwrap();
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        let engine = Engine::with_lifecycle(
+            Arc::new(config.clone()),
+            storage,
+            None,
+            "n".into(),
+            Lifecycle::new(),
+        );
+        assert_in(&engine, dir);
+        let (published, rules) = watch::channel(Published {
+            generation: engine.config_generation().0,
+            metrics: metrics_allowlist(&config).unwrap(),
+        });
+        let metrics = start_metrics(&config.metrics, engine.clone(), rules)
+            .await
+            .unwrap();
+        Reloader {
+            engine,
+            source: ConfigSource {
+                path: Some(dir.path().join("apollo.toml")),
+                overrides: Overrides::default(),
+            },
+            log_filter: None,
+            published,
+            metrics,
+            health,
+        }
+    }
 
     #[tokio::test]
     async fn a_disabled_webhook_builds_no_sink() {
@@ -1028,11 +1313,11 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let dir = tempfile::tempdir().unwrap();
-        let port = crate::health::tests::free_port();
         let toml = format!(
-            "[database]\ntimeout = 1\n[database.sqlite]\npath = \"{}\"\n\
-             [metrics]\nenabled = true\nport = {port}\n\
+            "[app]\ncache_dir = \"{}\"\n[database]\ntimeout = 1\n[database.sqlite]\npath = \"{}\"\n\
+             [metrics]\nenabled = true\nport = 0\n\
              [webhook]\nurl = \"http://127.0.0.1:1\"\n",
+            dir.path().display(),
             dir.path().join("apollo.db").display()
         );
         let config = load::from_str(&toml).unwrap();
@@ -1040,12 +1325,14 @@ mod tests {
         let (stalled, gate) = apollo_engine::testing::Stalled::new(storage);
         let sink = webhook_sink(&config).unwrap();
         let engine = Engine::new(Arc::new(config.clone()), Arc::new(stalled), sink);
+        assert_in(&engine, &dir);
         let (_tx, rx) = watch::channel(Published {
             generation: 1,
             metrics: None,
         });
-        start_metrics(&config.metrics, engine.clone(), rx)
+        let metrics = start_metrics(&config.metrics, engine.clone(), rx)
             .await
+            .unwrap()
             .unwrap();
         let info = ServerInfo {
             started_at: SystemTime::now(),
@@ -1058,9 +1345,7 @@ mod tests {
             log_file: None,
         };
         let scrape = || async move {
-            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .unwrap();
+            let mut stream = tokio::net::TcpStream::connect(metrics.local).await.unwrap();
             stream
                 .write_all(b"GET /metrics HTTP/1.1\r\nhost: test\r\nconnection: close\r\n\r\n")
                 .await
@@ -1106,17 +1391,16 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn drain_and_undrain_over_the_status_socket_then_a_stop() {
-        use crate::health::tests::{free_port, get, health_config};
+    async fn a_server_drained_by_hand_then_signalled_drains_and_stops() {
+        use crate::health::tests::start_with_agent;
         use crate::status::{DrainOutcome, drain, fetch};
         use tokio::io::AsyncReadExt;
 
         let dir = tempfile::tempdir().unwrap();
         let lc = Lifecycle::new();
-        let agent_port = free_port();
-        let (health_toml, health) = health_config(&format!("agent_port = {agent_port}\n"));
-        crate::health::start(&health_toml, &lc).await.unwrap();
-        let agent = std::net::SocketAddr::from(([127, 0, 0, 1], agent_port));
+        let (signal, signals) = mpsc::unbounded_channel();
+        stop_on(lc.clone(), signals);
+        let (health, agent) = start_with_agent("", &lc).await;
         let agent_line = || async move {
             let mut stream = tokio::net::TcpStream::connect(agent).await.unwrap();
             let mut line = String::new();
@@ -1124,79 +1408,23 @@ mod tests {
             line
         };
 
-        // A server as `serve_with` runs it, with a drain delay of 1 s.
-        let toml = format!(
-            "[app]\ndrain_delay_secs = 1\n[database.sqlite]\npath = \"{}\"\n",
-            dir.path().join("apollo.db").display()
-        );
-        let config = Arc::new(load::from_str(&toml).unwrap());
-        let storage = apollo_storage::open(&config.database).await.unwrap();
-        let engine = Engine::with_lifecycle(config, storage, None, "n".into(), lc.clone());
-        let signal = Arc::new(tokio::sync::Notify::new());
-        stop_on(lc.clone(), {
-            let signal = Arc::clone(&signal);
-            move || {
-                let signal = Arc::clone(&signal);
-                async move { signal.notified().await }
-            }
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        stop_after_drain_delay(engine.clone());
-        lc.starting(Step::LoadingModels);
-        ready_after_preloads(engine.clone());
-        let grpc = apollo_server::Health::new(&lc).await;
-        let served = tokio::spawn({
-            let engine = engine.clone();
-            let lc = lc.clone();
-            async move {
-                let serve = apollo_server::serve_on(
-                    engine,
-                    listener,
-                    grpc,
-                    apollo_server::AuthInterceptor::disabled(),
-                    None,
-                );
-                apollo_server::serve_until_stopped(serve, &lc, || Duration::from_secs(15)).await
-            }
-        });
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !lc.ready() {
-            assert!(std::time::Instant::now() < deadline, "never ready");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // The real start, with a drain delay of 2 s.
+        let app = "endpoint = \"127.0.0.1\"\nport = 0\ndrain_delay_secs = 2\n";
+        let config = load::from_str(&config_in(&dir, app, "")).unwrap();
+        let served = tokio::spawn(serve_with(config, run_in(&dir, None), lc.clone()));
+        until("never ready", Duration::from_secs(5), || lc.ready()).await;
 
-        let path = dir.path().join("s.sock");
-        let info = ServerInfo {
-            started_at: std::time::SystemTime::now(),
-            listen: "127.0.0.1:0".into(),
-            tls: false,
-            mutual_tls: false,
-            auth: false,
-            config_file: None,
-            database: "sqlite".into(),
-            log_file: None,
-        };
-        let reloader = Reloader {
-            engine: engine.clone(),
-            source: ConfigSource {
-                path: None,
-                overrides: Overrides::default(),
-            },
-            log_filter: None,
-            published: watch::channel(Published {
-                generation: 1,
-                metrics: None,
-            })
-            .0,
-            metrics: None,
-        };
-        let _socket = serve_status(&path, engine.clone(), info, reloader).unwrap();
+        // Found where the other commands look: the PID file and the socket.
+        let pid_file = dir.path().join("apollo.pid");
+        let socket = dir.path().join("s.sock");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert_eq!(pid, std::process::id().to_string());
         let ask = |on: bool| {
-            let path = path.clone();
+            let path = socket.clone();
             tokio::task::spawn_blocking(move || drain(&path, on))
         };
         let report = || {
-            let path = path.clone();
+            let path = socket.clone();
             tokio::task::spawn_blocking(move || fetch(&path))
         };
         let outcome = |drained, changed, ready| DrainOutcome {
@@ -1205,6 +1433,11 @@ mod tests {
             phase: "serving".into(),
             ready,
         };
+        let status = report().await.unwrap().unwrap();
+        assert_eq!(
+            (status.phase.as_deref(), status.step, status.drained),
+            (Some("serving"), None, Some(false))
+        );
 
         // Drained: unready everywhere, weight 0, still serving.
         assert_eq!(
@@ -1228,7 +1461,6 @@ mod tests {
             (Some("serving"), Some(true))
         );
         assert_eq!(status.load.unwrap().weight, 0);
-        assert!(engine.metrics_text().await.contains("\napollo_drained 1\n"));
         assert_eq!(
             ask(true).await.unwrap().unwrap(),
             outcome(true, false, false)
@@ -1245,74 +1477,299 @@ mod tests {
         assert_eq!(report().await.unwrap().unwrap().drained, Some(false));
 
         // A signal after the undrain drains, then stops, as usual.
-        signal.notify_one();
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while lc.phase() == Phase::Serving {
-            assert!(std::time::Instant::now() < deadline, "no drain");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        signal.send(()).unwrap();
+        until("no drain", Duration::from_secs(1), || {
+            lc.phase() != Phase::Serving
+        })
+        .await;
         assert_eq!(
             get(health, "/readyz").await,
             (503, "not ready: draining\n".into())
         );
         assert_eq!(agent_line().await, "drain\n");
-        let served = tokio::time::timeout(Duration::from_secs(3), served)
+        // The start ends by itself once the delay has passed, and cleans up.
+        let ended = tokio::time::timeout(Duration::from_secs(5), served)
             .await
             .expect("stopped after the drain delay")
             .unwrap();
-        assert!(served.is_ok(), "{served:?}");
-        lc.stopping();
-        assert!(engine.hand_back().await);
+        assert!(ended.is_ok(), "{ended:?}");
+        assert_eq!(lc.phase(), Phase::Stopping);
         assert_eq!(
             get(health, "/readyz").await,
             (503, "not ready: stopping\n".into())
         );
         assert!(!lc.forced(), "one signal is no forced stop");
+        assert!(!pid_file.exists(), "the PID file stayed");
+        assert!(!socket.exists(), "the status socket stayed");
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_stops_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let lc = Lifecycle::new();
+        let (signal, signals) = mpsc::unbounded_channel();
+        stop_on(lc.clone(), signals);
+        // A drain delay the test never waits out.
+        let app = "endpoint = \"127.0.0.1\"\nport = 0\ndrain_delay_secs = 600\n";
+        let config = load::from_str(&config_in(&dir, app, "")).unwrap();
+        let served = tokio::spawn(serve_with(config, run_in(&dir, None), lc.clone()));
+        until("never ready", Duration::from_secs(5), || lc.ready()).await;
+
+        signal.send(()).unwrap();
+        until("no drain", Duration::from_secs(1), || {
+            lc.phase() == Phase::Draining
+        })
+        .await;
+        assert!(!lc.forced());
+        signal.send(()).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(2), served)
+            .await
+            .expect("stopped at once")
+            .unwrap();
+        assert!(ended.is_ok(), "{ended:?}");
+        assert!(lc.forced());
+        assert_eq!(lc.phase(), Phase::Stopping);
+    }
+
+    #[tokio::test]
+    async fn a_stop_hands_back_the_tasks_still_running() {
+        use apollo_domain::{Input, Item, ItemState, Task, TaskState, Url};
+
+        let dir = tempfile::tempdir().unwrap();
+        // An input whose download never gets an answer, so its run is still
+        // going when the server stops.
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/a.png", source.local_addr().unwrap());
+        let app = "endpoint = \"127.0.0.1\"\nport = 0\n";
+        let rest = format!("{}[limits]\nblock_private_ips = false\n", model_in(&dir));
+        let config = load::from_str(&config_in(&dir, app, &rest)).unwrap();
+        // Left in flight by an earlier run, so the start takes it over.
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        let input = Input::Image(Url {
+            main: url,
+            fallback: None,
+        });
+        let mut item = Item::new(input, vec!["known".into()], None);
+        item.state = ItemState::Processing;
+        let mut task = Task::new("t", vec![item], None);
+        task.state = TaskState::Processing;
+        storage.create_task(&task, None, None).await.unwrap();
+
+        let lc = Lifecycle::new();
+        let (signal, signals) = mpsc::unbounded_channel();
+        stop_on(lc.clone(), signals);
+        let served = tokio::spawn(serve_with(config, run_in(&dir, None), lc.clone()));
+        let _download = tokio::time::timeout(Duration::from_secs(5), source.accept())
+            .await
+            .expect("the task never ran")
+            .unwrap();
+
+        signal.send(()).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(10), served)
+            .await
+            .expect("never stopped")
+            .unwrap();
+        assert!(ended.is_ok(), "{ended:?}");
+        assert!(!lc.forced());
+        // Handed back: the next claim counts no resume attempt.
+        let next = apollo_storage::Lease {
+            token: "next",
+            node: "other",
+            process: "p",
+            ttl: Duration::from_secs(30),
+        };
+        assert_eq!(
+            storage
+                .claim_task("t", &next, apollo_storage::ClaimMode::Force, Duration::ZERO)
+                .await
+                .unwrap(),
+            Some(0),
+            "the stop left its claim to lapse"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_while_starting_skips_the_hand_back() {
+        use crate::health::tests::engine_in;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lc = Lifecycle::new();
+        let (engine, gate) = engine_in(&dir, &lc, false).await;
+        let (signal, signals) = mpsc::unbounded_channel();
+        stop_on(lc.clone(), signals);
+        lc.starting(Step::RecoveringTasks);
+
+        // The first signal ends the start, which hands the tasks back to a
+        // store that doesn't answer...
+        gate.shut();
+        signal.send(()).unwrap();
+        until("no drain", Duration::from_secs(1), || {
+            lc.phase() == Phase::Draining
+        })
+        .await;
+        let ended = tokio::spawn({
+            let lc = lc.clone();
+            async move { stopped_starting(&lc, Some(&engine)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!ended.is_finished(), "the store answered");
+
+        // ...and a second one ends it at once, well within the hand-back
+        // limit.
+        signal.send(()).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(1), ended)
+            .await
+            .expect("ended at once")
+            .unwrap();
+        assert!(ended.is_ok(), "{ended:?}");
+        assert!(lc.forced());
+    }
+
+    #[tokio::test]
+    async fn signals_that_come_together_are_each_handled() {
+        let lc = Lifecycle::new();
+        lc.serving();
+        let (signal, signals) = mpsc::unbounded_channel();
+        // Both arrive before the loop has handled the first.
+        signal.send(()).unwrap();
+        signal.send(()).unwrap();
+        stop_on(lc.clone(), signals);
+        tokio::time::timeout(Duration::from_secs(1), lc.until_forced())
+            .await
+            .expect("the second one stops at once");
+        assert_eq!(lc.phase(), Phase::Stopping);
+    }
+
+    #[tokio::test]
+    async fn a_reload_publishes_metrics_allow_once_it_applies() {
+        use crate::health::tests::ask;
+        use tokio::net::TcpStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("apollo.toml");
+        let model = model_in(&dir);
+        let toml = |port: u16, allow: &str| {
+            let metrics = format!("[metrics]\nenabled = true\nport = {port}\n{allow}{model}");
+            config_in(&dir, "port = 1\n", &metrics)
+        };
+        // Loopback may scrape. Port 0: one of its own.
+        let reloader = reloader_in(&dir, &toml(0, "allow = [\"127.0.0.1\"]\n"), None).await;
+        let addr = reloader.metrics.unwrap().local;
+        let first = reloader.published.borrow().generation;
+        let mut open = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(ask(&mut open, "GET", "/metrics").await.0, 200);
+
+        // A list that can't match on loopback fails the reload, and the
+        // running one stays.
+        std::fs::write(&file, toml(addr.port(), "allow = [\"10.0.0.0/8\"]\n")).unwrap();
+        let err = reloader.reload().await.unwrap_err().to_string();
+        assert!(
+            err.starts_with("metrics.allow: no entry can match on 127.0.0.1:"),
+            "{err}"
+        );
+        assert_eq!(reloader.published.borrow().generation, first);
+        assert_eq!(reloader.engine.config_generation().0, first);
+        assert_eq!(ask(&mut open, "GET", "/metrics").await.0, 200);
+
+        // One that can match there but leaves this peer out applies, with
+        // the reload's generation: the open connection's next request is
+        // refused.
+        std::fs::write(&file, toml(addr.port(), "allow = [\"127.0.0.2\"]\n")).unwrap();
+        let outcome = reloader.reload().await.unwrap();
+        assert!(outcome.generation > first);
+        assert_eq!(reloader.published.borrow().generation, outcome.generation);
+        let (status, head, _) = ask(&mut open, "GET", "/metrics").await;
+        assert_eq!(status, 403);
+        assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn a_reload_warns_of_a_health_allow_the_next_start_refuses() {
+        use crate::health::tests::health_config;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("apollo.toml");
+        let model = model_in(&dir);
+        let lc = Lifecycle::new();
+        let health = crate::health::start(&health_config(""), &lc)
+            .await
+            .unwrap()
+            .unwrap();
+        let port = health.local.port();
+        let toml = |endpoint: &str, allow: &str| {
+            let health = format!(
+                "[health]\nenabled = true\nendpoint = \"{endpoint}\"\nport = {port}\n{allow}{model}"
+            );
+            config_in(&dir, "port = 1\n", &health)
+        };
+        let reloader = reloader_in(&dir, &toml("127.0.0.1", ""), Some(health)).await;
+
+        // On the same address, a list that can't match there: the reload
+        // goes through, and says the next start will fail.
+        std::fs::write(&file, toml("127.0.0.1", "allow = [\"10.20.0.0/16\"]\n")).unwrap();
+        let outcome = reloader.reload().await.unwrap();
+        assert_eq!(outcome.restart_required, ["health.allow"]);
+        let fails = format!(
+            "the next start will fail: health.allow: no entry can match on 127.0.0.1:{port}: "
+        );
+        assert!(
+            outcome.warnings.len() == 1 && outcome.warnings[0].starts_with(&fails),
+            "{:?}",
+            outcome.warnings
+        );
+        // One that can match: nothing to say.
+        std::fs::write(&file, toml("127.0.0.1", "allow = [\"127.0.0.1\"]\n")).unwrap();
+        assert_eq!(
+            reloader.reload().await.unwrap().warnings,
+            Vec::<String>::new()
+        );
+        // On another address, the next start checks it there.
+        std::fs::write(&file, toml("0.0.0.0", "allow = [\"10.20.0.0/16\"]\n")).unwrap();
+        let outcome = reloader.reload().await.unwrap();
+        assert_eq!(
+            outcome.restart_required,
+            ["health.endpoint", "health.allow"]
+        );
+        assert_eq!(outcome.warnings, Vec::<String>::new());
     }
 
     #[tokio::test]
     async fn the_listener_answers_while_storage_opens() {
-        use crate::health::tests::{free_port, get};
+        let dir = tempfile::tempdir().unwrap();
         // A database host that takes connections and never answers.
         let db = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let db_addr = db.local_addr().unwrap();
+        let (reached, reached_db) = tokio::sync::oneshot::channel();
         let held = tokio::spawn(async move {
+            let mut reached = Some(reached);
             let mut held = Vec::new();
             while let Ok((stream, _)) = db.accept().await {
                 held.push(stream);
+                if let Some(reached) = reached.take() {
+                    let _ = reached.send(());
+                }
             }
         });
-        let port = free_port();
+        let lc = Lifecycle::new();
+        // First, as `serve` starts it.
+        let addr = start_health("", &lc).await;
         let toml = format!(
-            "[health]\nenabled = true\nendpoint = \"127.0.0.1\"\nport = {port}\n\
+            "[app]\nnode_id = \"n\"\ncache_dir = \"{}\"\n[auth]\nenabled = false\n\
              [database]\nbackend = \"surrealdb\"\n\
-             [database.surrealdb]\nurl = \"ws://{db_addr}\"\nnamespace = \"n\"\ndatabase = \"d\"\n"
+             [database.surrealdb]\nurl = \"ws://{db_addr}\"\nnamespace = \"n\"\ndatabase = \"d\"\n",
+            dir.path().display()
         );
         let config = load::from_str(&toml).unwrap();
-        let source = ConfigSource {
-            path: None,
-            overrides: Overrides::default(),
-        };
-        let lc = Lifecycle::new();
-        let started = tokio::spawn(serve_with(config, None, source, None, lc.clone()));
+        let started = tokio::spawn(serve_with(config, run_in(&dir, None), lc.clone()));
 
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while tokio::net::TcpStream::connect(addr).await.is_err() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the health port never opened"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(5), reached_db)
+            .await
+            .expect("storage never connected")
+            .unwrap();
         let at = std::time::Instant::now();
         assert_eq!(get(addr, "/livez").await, (200, "ok\n".into()));
         let (status, body) = get(addr, "/readyz").await;
-        assert!(
-            at.elapsed() < Duration::from_millis(100),
-            "{:?}",
-            at.elapsed()
-        );
+        assert!(at.elapsed() < PROMPT, "{:?}", at.elapsed());
         assert_eq!(status, 503);
         assert!(
             body.starts_with("not ready: starting (opening database, "),
@@ -1333,5 +1790,67 @@ mod tests {
             (503, "not ready: stopping\n".into())
         );
         held.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_a_pinned_model_to_load() {
+        use apollo_engine::testing::{HeldLoad, engine_with_load_hook};
+
+        let dir = tempfile::tempdir().unwrap();
+        let lc = Lifecycle::new();
+        let addr = start_health("", &lc).await;
+
+        // A server as `serve_with` starts it, with a model kept in memory
+        // whose weights take as long as the test says.
+        let list = dir.path().join("known.txt");
+        std::fs::write(&list, format!("{} 1\n", "ab".repeat(32))).unwrap();
+        let toml = format!(
+            "[app]\ncache_dir = \"{}\"\n[database.sqlite]\npath = \"{}\"\n\
+             [models.known]\narchitecture = \"pdq\"\nhash_list = \"{}\"\n\
+             categories = {{ 1 = \"known\" }}\nkeep_in_memory = true\n",
+            dir.path().display(),
+            dir.path().join("apollo.db").display(),
+            list.display()
+        );
+        let config = load::from_str(&toml).unwrap();
+        config.validate().unwrap();
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        let held = HeldLoad::new("known");
+        let engine = engine_with_load_hook(
+            Arc::new(config),
+            storage,
+            None,
+            "n".into(),
+            lc.clone(),
+            held.hook(),
+        );
+        assert_in(&engine, &dir);
+        lc.starting(Step::LoadingModels);
+        ready_after_preloads(engine.clone());
+
+        // Not ready while it loads...
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while held.held() == 0 {
+            assert!(std::time::Instant::now() < deadline, "never loaded");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!lc.ready());
+        let (status, body) = get(addr, "/readyz").await;
+        assert_eq!(status, 503);
+        assert!(
+            body.starts_with("not ready: starting (loading models, "),
+            "{body}"
+        );
+
+        // ...and ready once it has.
+        held.release();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !lc.ready() {
+            assert!(std::time::Instant::now() < deadline, "never ready");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(get(addr, "/readyz").await, (200, "ok\n".into()));
+        lc.stopping();
     }
 }

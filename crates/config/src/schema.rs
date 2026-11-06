@@ -145,13 +145,9 @@ impl Default for MetricsConfig {
 }
 
 impl MetricsConfig {
-    /// `allow` parsed: `None` admits everyone. An invalid list is an error,
-    /// never "everyone".
+    /// `allow` parsed; see [`Allowlist::parse_field`](crate::Allowlist::parse_field).
     pub fn allowlist(&self) -> Result<Option<crate::Allowlist>, Vec<String>> {
-        self.allow
-            .as_deref()
-            .map(crate::Allowlist::parse)
-            .transpose()
+        crate::Allowlist::parse_field(self.allow.as_deref())
     }
 }
 
@@ -202,13 +198,9 @@ impl HealthConfig {
         self.endpoint.as_deref().unwrap_or(&app.endpoint)
     }
 
-    /// `allow` parsed: `None` admits everyone. An invalid list is an error,
-    /// never "everyone".
+    /// `allow` parsed; see [`Allowlist::parse_field`](crate::Allowlist::parse_field).
     pub fn allowlist(&self) -> Result<Option<crate::Allowlist>, Vec<String>> {
-        self.allow
-            .as_deref()
-            .map(crate::Allowlist::parse)
-            .transpose()
+        crate::Allowlist::parse_field(self.allow.as_deref())
     }
 }
 

@@ -131,6 +131,10 @@ pub struct ReloadOutcome {
     pub removed: Vec<String>,
     /// Changed settings that only take effect after a restart.
     pub restart_required: Vec<String>,
+    /// What the next start would fail on, from those settings. An older
+    /// server sends none.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// What `apollo drain` (or `--undo`) did.
@@ -1085,6 +1089,7 @@ mod tests {
             kept: vec!["general".into()],
             removed: vec![],
             restart_required: vec!["app.port".into()],
+            warnings: vec![],
         }
     }
 }
