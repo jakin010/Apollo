@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use apollo_domain::ItemState;
 
-use crate::{Engine, EngineError, Overload, Phase};
+use crate::{Engine, Overload, Phase};
 
 /// Upper bounds (seconds) for latency histograms: 5 ms to 2 min.
 const SECONDS: &[f64] = &[
@@ -203,9 +203,16 @@ impl Engine {
 }
 
 impl Engine {
-    /// The current metrics in the Prometheus text format.
-    pub async fn metrics_text(&self) -> Result<String, EngineError> {
-        let status = self.status().await?;
+    /// The current metrics in the Prometheus text format. The database
+    /// counts wait as long as [`Engine::status`] does; without them,
+    /// `apollo_tasks` and `apollo_webhooks_pending` are left out.
+    pub async fn metrics_text(&self) -> String {
+        self.metrics_within(self.status_limit()).await
+    }
+
+    /// [`Engine::metrics_text`], waiting at most `limit` for the database.
+    pub(crate) async fn metrics_within(&self, limit: Duration) -> String {
+        let status = self.status_within(limit).await;
         let live = self.live();
         let m = &self.inner.metrics;
         let mut out = Writer::default();
@@ -270,20 +277,27 @@ impl Engine {
             &m.items_finished,
         );
 
-        out.family(
-            "apollo_tasks",
-            "gauge",
-            "Tasks in storage, by state (until retention purges them).",
+        out.gauge(
+            "apollo_metrics_database_ok",
+            "1 when the database answered this scrape's counts in time (apollo_tasks, apollo_webhooks_pending).",
+            if status.stored.is_some() { 1.0 } else { 0.0 },
         );
-        let t = status.tasks;
-        for (state, n) in [
-            ("queued", t.queued),
-            ("processing", t.processing),
-            ("completed", t.completed),
-            ("failed", t.failed),
-            ("cancelled", t.cancelled),
-        ] {
-            out.sample("apollo_tasks", &[("state", state)], n as f64);
+        if let Some(stored) = &status.stored {
+            out.family(
+                "apollo_tasks",
+                "gauge",
+                "Tasks in storage, by state (until retention purges them).",
+            );
+            let t = stored.tasks;
+            for (state, n) in [
+                ("queued", t.queued),
+                ("processing", t.processing),
+                ("completed", t.completed),
+                ("failed", t.failed),
+                ("cancelled", t.cancelled),
+            ] {
+                out.sample("apollo_tasks", &[("state", state)], n as f64);
+            }
         }
 
         out.gauge(
@@ -348,7 +362,7 @@ impl Engine {
             m.cache_hits.load(Ordering::Relaxed),
         );
 
-        if let Some(pending) = status.webhooks_pending {
+        if let Some(pending) = status.stored.and_then(|s| s.webhooks_pending) {
             out.gauge(
                 "apollo_webhooks_pending",
                 "Finished inputs whose webhook event is not delivered yet.",
@@ -469,7 +483,7 @@ impl Engine {
             "Duration of a weight load, including download and warm-up.",
             &hist(|mm| &mm.load_seconds),
         );
-        Ok(out.0)
+        out.0
     }
 }
 

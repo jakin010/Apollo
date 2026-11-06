@@ -63,7 +63,7 @@ pub use error::{EngineError, Overload};
 pub use lifecycle::{HAND_BACK_LIMIT, Lifecycle, Phase, Step};
 pub use live::ReloadReport;
 pub use registry::RegistryChanges;
-pub use status::{EngineStatus, ModelStatus, TaskCounts};
+pub use status::{EngineStatus, ModelStatus, StoredCounts, TaskCounts};
 pub use watch::TaskWatch;
 pub use webhook::{EventKind, TaskEvent, WebhookError, WebhookSink};
 

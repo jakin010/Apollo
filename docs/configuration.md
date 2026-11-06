@@ -191,7 +191,7 @@ Optional. A bare `[cache]` section turns it on (`enabled` defaults to `true`). W
 
 ## `[metrics]` — Prometheus metrics
 
-Optional, off by default. When enabled, `GET /metrics` serves Prometheus metrics (queue, slots, memory, per-model inferences, batch sizes and latency, loads, scans, fetches, webhooks, …) on a separate listener. The endpoint is not authenticated, so it binds to loopback unless you change it, and `allow` can limit who may connect. `allow` applies on reload; `enabled`, `endpoint` and `port` need a restart. See [operations.md → Prometheus metrics](./operations.md#prometheus-metrics) for every metric.
+Optional, off by default. When enabled, `GET /metrics` serves Prometheus metrics (queue, slots, memory, per-model inferences, batch sizes and latency, loads, scans, fetches, webhooks, …) on a separate listener. The endpoint is not authenticated, so it binds to loopback unless you change it, and `allow` can limit who may connect. `allow` applies on reload; `enabled`, `endpoint` and `port` need a restart. A scrape answers even while the database is down: it waits at most `[database].timeout`, and never more than 5 s, then leaves out the database counts. See [operations.md → Prometheus metrics](./operations.md#prometheus-metrics) for every metric.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -649,7 +649,7 @@ apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
   - version, PID, uptime, phase (`starting` with its step, `serving`, `draining` or `stopping`), listen address, TLS/auth, config file (with its generation and when it was reloaded, after a reload), database, and log file;
   - memory in use against `max_memory` (measured as for `max_memory`: physical footprint on macOS, resident set size elsewhere);
   - the queue (items in flight, busy/waiting concurrency slots);
-  - task counts by state, and pending webhook deliveries;
+  - task counts by state, and pending webhook deliveries. These come from the database, which they wait for as long as `[database].timeout`, and never more than 5 s. If it doesn't answer in time, they show `database unavailable` (in `--json`, `tasks` and `webhook.pending` are `null`);
   - per model: loaded or not, input size, queued requests, batch size, images classified, and last use.
 
   `--json` prints the same as JSON; memory in use is `memory.used_bytes` (earlier builds named it `memory.rss_bytes`). The exit status is `0` when running and `3` when not (like `systemctl status`).

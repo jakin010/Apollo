@@ -43,7 +43,8 @@ pub struct StatusReport {
     pub device: String,
     pub memory: Memory,
     pub queue: Queue,
-    pub tasks: Tasks,
+    /// `None` when the database did not answer in time.
+    pub tasks: Option<Tasks>,
     pub webhook: Option<Webhook>,
     pub models: Vec<Model>,
 }
@@ -80,7 +81,8 @@ pub struct Tasks {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Webhook {
     pub url: String,
-    pub pending: usize,
+    /// `None` when the database did not answer in time.
+    pub pending: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -404,21 +406,26 @@ pub fn render(r: &StatusReport, now: SystemTime, rates: Option<&Rates>) -> Strin
         q.slots_total,
         q.slots_waiting
     ));
-    let t = &r.tasks;
-    line(format!(
-        "tasks      {} queued · {} processing · {} completed · {} failed · {} cancelled",
-        thousands(t.queued),
-        thousands(t.processing),
-        thousands(t.completed),
-        thousands(t.failed),
-        thousands(t.cancelled)
-    ));
+    match &r.tasks {
+        Some(t) => line(format!(
+            "tasks      {} queued · {} processing · {} completed · {} failed · {} cancelled",
+            thousands(t.queued),
+            thousands(t.processing),
+            thousands(t.completed),
+            thousands(t.failed),
+            thousands(t.cancelled)
+        )),
+        None => line(format!("tasks      {UNAVAILABLE}")),
+    }
     if let Some(w) = &r.webhook {
-        line(format!(
-            "webhook    {} — {} pending deliveries",
-            w.url,
-            thousands(w.pending as u64)
-        ));
+        match w.pending {
+            Some(n) => line(format!(
+                "webhook    {} — {} pending deliveries",
+                w.url,
+                thousands(n as u64)
+            )),
+            None => line(format!("webhook    {} — {UNAVAILABLE}", w.url)),
+        }
     }
     if let Some(rates) = rates {
         let total: f64 = rates.values().sum();
@@ -499,6 +506,9 @@ pub fn render(r: &StatusReport, now: SystemTime, rates: Option<&Rates>) -> Strin
     }
     out
 }
+
+/// What `apollo status` shows for counts the database did not answer in time.
+const UNAVAILABLE: &str = "database unavailable";
 
 /// Images per second: one decimal below 100, whole numbers above.
 fn rate(r: f64) -> String {
@@ -581,16 +591,16 @@ mod tests {
                 slots_busy: 2,
                 slots_waiting: 1,
             },
-            tasks: Tasks {
+            tasks: Some(Tasks {
                 queued: 1,
                 processing: 2,
                 completed: 1204,
                 failed: 3,
                 cancelled: 7,
-            },
+            }),
             webhook: Some(Webhook {
                 url: "https://hooks.example.com".into(),
-                pending: 0,
+                pending: Some(0),
             }),
             models: vec![Model {
                 label: "general".into(),
@@ -649,6 +659,40 @@ mod tests {
         assert!(text.contains("loaded (pinned)"));
         assert!(text.contains("12,402"));
         assert!(text.contains("3s ago"), "{text}");
+    }
+
+    #[test]
+    fn renders_database_unavailable_for_counts_it_could_not_read() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000 + 8_000);
+        let mut report = sample();
+        report.tasks = None;
+        report.webhook.as_mut().unwrap().pending = None;
+        let text = render(&report, now, None);
+        assert!(
+            text.contains("\ntasks      database unavailable\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nwebhook    https://hooks.example.com — database unavailable\n"),
+            "{text}"
+        );
+        // The other lines are as usual.
+        let usual = render(&sample(), now, None);
+        let changed: Vec<&str> = usual
+            .lines()
+            .filter(|l| !text.lines().any(|t| t == *l))
+            .collect();
+        assert_eq!(
+            changed,
+            [
+                "tasks      1 queued · 2 processing · 1,204 completed · 3 failed · 7 cancelled",
+                "webhook    https://hooks.example.com — 0 pending deliveries",
+            ]
+        );
+        assert_eq!(text.lines().count(), usual.lines().count());
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["tasks"].is_null(), "{json}");
+        assert!(json["webhook"]["pending"].is_null(), "{json}");
     }
 
     #[test]

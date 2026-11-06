@@ -357,9 +357,10 @@ async fn status_reports_tasks_queue_and_models() {
         .await
         .unwrap();
 
-    let s = f.engine.status().await.unwrap();
+    let s = f.engine.status().await;
+    let stored = s.stored.expect("the database answered");
     assert_eq!(
-        s.tasks,
+        stored.tasks,
         crate::TaskCounts {
             queued: 1,
             completed: 2,
@@ -371,7 +372,7 @@ async fn status_reports_tasks_queue_and_models() {
         (0, 0, 0)
     );
     assert!(s.slots_total >= 1);
-    assert_eq!(s.webhooks_pending, None, "no webhook configured");
+    assert_eq!(stored.webhooks_pending, None, "no webhook configured");
     assert!(s.models.is_empty(), "fixture configures no models");
 }
 
@@ -758,7 +759,7 @@ async fn metrics_render_in_the_prometheus_format() {
     };
     assert!(f.engine.submit(bad, None).await.is_err());
     f.engine.note_refused("metrics");
-    let text = f.engine.metrics_text().await.unwrap();
+    let text = f.engine.metrics_text().await;
     for line in [
         "# TYPE apollo_build_info gauge",
         "apollo_submissions_total{outcome=\"invalid\"} 1",
@@ -770,6 +771,7 @@ async fn metrics_render_in_the_prometheus_format() {
         "apollo_lifecycle_phase{phase=\"serving\"} 1",
         "apollo_lifecycle_phase{phase=\"draining\"} 0",
         "apollo_model_loaded{model=\"nsfw\"} 0",
+        "apollo_metrics_database_ok 1",
         "apollo_tasks{state=\"queued\"} 0",
         "# TYPE apollo_model_batch_seconds histogram",
         "apollo_fetch_seconds_bucket{le=\"+Inf\"} 0",
@@ -790,7 +792,7 @@ async fn metrics_render_in_the_prometheus_format() {
 
     // Draining: no longer ready.
     assert!(f.engine.lifecycle().drain());
-    let text = f.engine.metrics_text().await.unwrap();
+    let text = f.engine.metrics_text().await;
     for line in [
         "apollo_ready 0",
         "apollo_lifecycle_phase{phase=\"serving\"} 0",
@@ -984,7 +986,7 @@ async fn a_model_limit_refuses_only_that_models_work() {
         Some(crate::Overload::Model)
     );
 
-    let status = f.engine.status().await.unwrap();
+    let status = f.engine.status().await;
     let admitted = |label: &str| {
         status
             .models
@@ -1011,7 +1013,7 @@ async fn a_model_limit_refuses_only_that_models_work() {
     );
 
     drop(nsfw);
-    let text = f.engine.metrics_text().await.unwrap();
+    let text = f.engine.metrics_text().await;
     assert!(
         text.contains("apollo_submissions_overloaded_total{reason=\"model\"} 1"),
         "{text}"
@@ -1055,7 +1057,7 @@ fn local_file_submission() -> Submission {
 
 async fn in_flight_drops_to_zero(engine: &Engine) {
     for _ in 0..200 {
-        if engine.status().await.unwrap().items_in_flight == 0 {
+        if engine.status().await.items_in_flight == 0 {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1077,7 +1079,7 @@ async fn a_submission_dropped_while_storing_still_runs_its_task() {
         gave_up.is_err(),
         "the write is held, so the submit can't finish"
     );
-    assert_eq!(engine.status().await.unwrap().items_in_flight, 1);
+    assert_eq!(engine.status().await.items_in_flight, 1);
 
     // The write then finishes, the task runs to its end, and the reservation
     // comes back.
@@ -1113,7 +1115,7 @@ async fn a_task_that_cant_be_stored_gives_its_reservation_back() {
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::Storage(_)), "{err}");
-    assert_eq!(engine.status().await.unwrap().items_in_flight, 0);
+    assert_eq!(engine.status().await.items_in_flight, 0);
 
     // Also when the caller went away before the write failed.
     let gave_up = tokio::time::timeout(
@@ -1147,13 +1149,13 @@ async fn a_cancelled_item_waiting_for_a_slot_gives_back_its_place() {
         .await
         .unwrap();
     for _ in 0..200 {
-        if f.engine.status().await.unwrap().slots_waiting == 1 {
+        if f.engine.status().await.slots_waiting == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(
-        f.engine.status().await.unwrap().slots_waiting,
+        f.engine.status().await.slots_waiting,
         1,
         "the item is waiting for the slot"
     );
@@ -1166,7 +1168,7 @@ async fn a_cancelled_item_waiting_for_a_slot_gives_back_its_place() {
     // Cancelling frees its place at once, though no slot has come free.
     f.engine.cancel(&task.id).await.unwrap();
     in_flight_drops_to_zero(&f.engine).await;
-    let status = f.engine.status().await.unwrap();
+    let status = f.engine.status().await;
     assert_eq!((status.slots_busy, status.slots_waiting), (1, 0));
     f.engine
         .check_submission(&image(), &Run::Models(vec!["nsfw".into()]))
@@ -1176,7 +1178,7 @@ async fn a_cancelled_item_waiting_for_a_slot_gives_back_its_place() {
     assert_eq!(stored.items[0].state, ItemState::Cancelled);
 
     drop(held);
-    assert_eq!(f.engine.status().await.unwrap().slots_busy, 0);
+    assert_eq!(f.engine.status().await.slots_busy, 0);
 }
 
 #[tokio::test]
@@ -1352,7 +1354,7 @@ async fn a_late_runner_leaves_a_finished_task_as_it_ended() {
     let completed = f.storage.get_task("completed").await.unwrap().unwrap();
     assert_eq!(completed.state, TaskState::Completed);
     assert_eq!(completed.items[0].state, ItemState::Queued, "nothing ran");
-    assert_eq!(f.engine.status().await.unwrap().items_in_flight, 0);
+    assert_eq!(f.engine.status().await.items_in_flight, 0);
 }
 
 #[tokio::test]
@@ -1429,8 +1431,8 @@ async fn a_keyed_tasks_id_comes_from_its_owner_and_key() {
     };
     let got = f.engine.submit(keyed, None).await.unwrap();
     assert_eq!((got.id.as_str(), got.existing), (first.id.as_str(), true));
-    assert_eq!(f.engine.status().await.unwrap().items_in_flight, 0);
-    let text = f.engine.metrics_text().await.unwrap();
+    assert_eq!(f.engine.status().await.items_in_flight, 0);
+    let text = f.engine.metrics_text().await;
     assert!(
         text.contains("apollo_submissions_total{outcome=\"existing\"} 1"),
         "{text}"
@@ -2551,6 +2553,77 @@ async fn a_draining_engine_redelivers_no_webhooks() {
         .await
         .unwrap();
     assert_eq!(open.len(), 1, "{open:?}");
+}
+
+/// Whether `text` has a sample or the `# TYPE` line of family `name`.
+fn has_family(text: &str, name: &str) -> bool {
+    text.lines().any(|l| {
+        l.strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('{'))
+            || l.starts_with(&format!("# TYPE {name} "))
+    })
+}
+
+#[tokio::test]
+async fn metrics_answer_while_the_database_hangs() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(&dir, NSFW);
+    let sqlite = apollo_storage::open(&config.database).await.unwrap();
+    let (stalled, gate) = crate::testing::Stalled::new(sqlite);
+    let sink = Arc::new(Recorder::default());
+    let engine = Engine::new(Arc::new(config), Arc::new(stalled), Some(sink));
+
+    gate.shut();
+    let at = Instant::now();
+    let text = engine.metrics_within(Duration::from_millis(300)).await;
+    assert!(at.elapsed() < Duration::from_secs(1), "{:?}", at.elapsed());
+    assert!(
+        text.lines().any(|l| l == "apollo_metrics_database_ok 0"),
+        "{text}"
+    );
+    for name in ["apollo_tasks", "apollo_webhooks_pending"] {
+        assert!(!has_family(&text, name), "{name} in\n{text}");
+    }
+    // The rest needs no database.
+    for line in ["apollo_ready 1", "apollo_model_loaded{model=\"nsfw\"} 0"] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
+        );
+    }
+    assert_eq!(
+        engine.status_within(Duration::from_millis(50)).await.stored,
+        None
+    );
+
+    // Once it answers, so do the counts.
+    gate.open();
+    let text = engine.metrics_text().await;
+    for line in [
+        "apollo_metrics_database_ok 1",
+        "apollo_tasks{state=\"queued\"} 0",
+        "apollo_webhooks_pending 0",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn status_waits_for_the_database_at_most_5_s() {
+    let f = fixture().await;
+    for (timeout, limit) in [(0, 5), (1, 1), (5, 5), (30, 5)] {
+        let mut config = (*f.engine.config()).clone();
+        config.database.timeout = timeout;
+        let engine = Engine::new(Arc::new(config), f.storage.clone(), None);
+        assert_eq!(
+            engine.status_limit(),
+            Duration::from_secs(limit),
+            "[database].timeout = {timeout}"
+        );
+    }
 }
 
 #[tokio::test]

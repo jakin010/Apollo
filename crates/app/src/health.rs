@@ -464,7 +464,7 @@ pub(crate) mod tests {
         let lc = Lifecycle::new();
         let (engine, _gate) = engine_in(&dir, &lc, true).await;
         // The engine waits on the store...
-        let status = tokio::spawn(async move { engine.status().await.is_ok() });
+        let status = tokio::spawn(async move { engine.status().await });
         lc.serving();
         let addr = spawn(&lc, Limits::default()).await;
         // ...and the probes don't.
@@ -514,7 +514,7 @@ pub(crate) mod tests {
         // One family with the metrics listener's refusals.
         let (engine, _) = engine_in(&dir, &lc, false).await;
         engine.note_refused("metrics");
-        let text = engine.metrics_text().await.unwrap();
+        let text = engine.metrics_text().await;
         let refused: Vec<&str> = text
             .lines()
             .filter(|l| l.starts_with("apollo_listener_refused_total"))

@@ -570,20 +570,14 @@ async fn start_metrics(
 
 async fn metrics_handler(
     axum::extract::State(engine): axum::extract::State<Engine>,
-) -> axum::response::Response {
-    use axum::http::{StatusCode, header};
-    use axum::response::IntoResponse;
-    match engine.metrics_text().await {
-        Ok(text) => (
-            [(
-                header::CONTENT_TYPE,
-                "text/plain; version=0.0.4; charset=utf-8",
-            )],
-            text,
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+) -> impl axum::response::IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        engine.metrics_text().await,
+    )
 }
 
 /// The configured database, without credentials.
@@ -617,7 +611,7 @@ fn start_status_socket(
     let report = move || {
         let engine = engine.clone();
         let info = info.clone();
-        async move { build_report(&engine, &info).await }
+        async move { Ok(build_report(&engine, &info).await) }
     };
     let reload = move || {
         let reloader = reloader.clone();
@@ -642,16 +636,13 @@ fn start_status_socket(_engine: Engine, _info: ServerInfo, _reloader: Reloader) 
 
 /// Combine the static server facts with the engine's live state.
 #[cfg(unix)]
-async fn build_report(
-    engine: &Engine,
-    info: &ServerInfo,
-) -> anyhow::Result<crate::status::StatusReport> {
+async fn build_report(engine: &Engine, info: &ServerInfo) -> crate::status::StatusReport {
     use crate::status::{self as st, unix_secs};
-    let s = engine.status().await?;
+    let s = engine.status().await;
     let config = engine.config();
     let (generation, loaded_at) = engine.config_generation();
     let phase = engine.lifecycle().phase();
-    Ok(st::StatusReport {
+    st::StatusReport {
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
         started_at: unix_secs(info.started_at),
@@ -681,20 +672,21 @@ async fn build_report(
             slots_busy: s.slots_busy,
             slots_waiting: s.slots_waiting,
         },
-        tasks: st::Tasks {
-            queued: s.tasks.queued,
-            processing: s.tasks.processing,
-            completed: s.tasks.completed,
-            failed: s.tasks.failed,
-            cancelled: s.tasks.cancelled,
-        },
-        webhook: match (&config.webhook, s.webhooks_pending) {
-            (Some(w), Some(pending)) => Some(st::Webhook {
+        tasks: s.stored.map(|c| st::Tasks {
+            queued: c.tasks.queued,
+            processing: c.tasks.processing,
+            completed: c.tasks.completed,
+            failed: c.tasks.failed,
+            cancelled: c.tasks.cancelled,
+        }),
+        webhook: config
+            .webhook
+            .as_ref()
+            .filter(|w| w.enabled)
+            .map(|w| st::Webhook {
                 url: w.url.clone(),
-                pending,
+                pending: s.stored.and_then(|c| c.webhooks_pending),
             }),
-            _ => None,
-        },
         models: s
             .models
             .into_iter()
@@ -713,7 +705,7 @@ async fn build_report(
                 last_used: m.last_used.map(unix_secs),
             })
             .collect(),
-    })
+    }
 }
 
 /// How often a running server re-checks the token revocation file.
@@ -965,6 +957,90 @@ mod tests {
         let off = format!("{on}enabled = false\n");
         assert!(webhook_sink(&config(&off)).unwrap().is_none());
         assert!(webhook_sink(&config("")).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metrics_and_status_answer_while_the_database_hangs() {
+        use crate::status::{Webhook, render};
+        use std::time::{Instant, SystemTime};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let port = crate::health::tests::free_port();
+        let toml = format!(
+            "[database]\ntimeout = 1\n[database.sqlite]\npath = \"{}\"\n\
+             [metrics]\nenabled = true\nport = {port}\n\
+             [webhook]\nurl = \"http://127.0.0.1:1\"\n",
+            dir.path().join("apollo.db").display()
+        );
+        let config = load::from_str(&toml).unwrap();
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        let (stalled, gate) = apollo_engine::testing::Stalled::new(storage);
+        let sink = webhook_sink(&config).unwrap();
+        let engine = Engine::new(Arc::new(config.clone()), Arc::new(stalled), sink);
+        let (_tx, rx) = watch::channel(Published {
+            generation: 1,
+            metrics: None,
+        });
+        start_metrics(&config.metrics, engine.clone(), rx)
+            .await
+            .unwrap();
+        let info = ServerInfo {
+            started_at: SystemTime::now(),
+            listen: "127.0.0.1:0".into(),
+            tls: false,
+            mutual_tls: false,
+            auth: false,
+            config_file: None,
+            database: describe_database(&config.database),
+            log_file: None,
+        };
+        let scrape = || async move {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            stream
+                .write_all(b"GET /metrics HTTP/1.1\r\nhost: test\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer).await.unwrap();
+            answer
+        };
+
+        gate.shut();
+        let at = Instant::now();
+        let (answer, report) = tokio::join!(scrape(), build_report(&engine, &info));
+        // They wait [database].timeout, 1 s here.
+        assert!(at.elapsed() < Duration::from_secs(2), "{:?}", at.elapsed());
+        assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+        assert!(
+            answer.contains("\napollo_metrics_database_ok 0\n"),
+            "{answer}"
+        );
+        assert_eq!(report.tasks, None);
+        assert_eq!(
+            report.webhook,
+            Some(Webhook {
+                url: "http://127.0.0.1:1".into(),
+                pending: None
+            })
+        );
+        let text = render(&report, SystemTime::now(), None);
+        assert!(
+            text.contains("\ntasks      database unavailable\n"),
+            "{text}"
+        );
+
+        gate.open();
+        let (answer, report) = tokio::join!(scrape(), build_report(&engine, &info));
+        assert!(
+            answer.contains("\napollo_metrics_database_ok 1\n"),
+            "{answer}"
+        );
+        assert!(report.tasks.is_some());
+        assert_eq!(report.webhook.unwrap().pending, Some(0));
     }
 
     #[tokio::test]

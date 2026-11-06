@@ -23,6 +23,8 @@ curl -s http://127.0.0.1:9464/metrics
 
 All metrics are prefixed `apollo_`. Counters start at zero when the server starts. Per-model metrics are kept by model name, so they keep counting when a reload replaces a model's worker.
 
+Two metrics come from the database: `apollo_tasks` and `apollo_webhooks_pending`. A scrape waits for them as long as `[database].timeout`, and never more than 5 s (also when `timeout` is 0). If the database fails or doesn't answer in time, that scrape leaves them out and sets `apollo_metrics_database_ok` to 0. It still answers 200 with every other metric. `apollo status` shows `database unavailable` for the same counts.
+
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
 | `apollo_build_info` | gauge | `version` | Always 1. |
@@ -33,7 +35,8 @@ All metrics are prefixed `apollo_`. Counters start at zero when the server start
 | `apollo_submissions_total` | counter | `outcome` | Submissions: `accepted`, `existing` (a repeated `request_id`), `invalid`, `overloaded` (backpressure), `error`. |
 | `apollo_submissions_overloaded_total` | counter | `reason` | Overloaded submissions by the limit that refused them: `queue` (`[app].max_pending`), `memory` (`[app].max_memory`), `model` (a model's `max_pending`). |
 | `apollo_items_finished_total` | counter | `state` | Inputs that finished: `completed`, `failed`, `cancelled`. |
-| `apollo_tasks` | gauge | `state` | Tasks in the database by state (until [retention](./database.md#retention) purges them). |
+| `apollo_metrics_database_ok` | gauge | | 1 when the database answered this scrape's counts in time; 0 when `apollo_tasks` and `apollo_webhooks_pending` are left out. |
+| `apollo_tasks` | gauge | `state` | Tasks in the database by state (until [retention](./database.md#retention) purges them). Left out when the database doesn't answer in time. |
 | `apollo_items_in_flight` | gauge | | Inputs accepted and not finished. |
 | `apollo_max_pending` | gauge | | `[app].max_pending` (0 = no limit). |
 | `apollo_slots` / `apollo_slots_busy` / `apollo_slots_waiting` | gauge | | `[app].max_concurrent`, the inputs being processed, and those waiting for a slot. |
@@ -42,7 +45,7 @@ All metrics are prefixed `apollo_`. Counters start at zero when the server start
 | `apollo_fetch_seconds` | histogram | | Time to fetch an input. |
 | `apollo_fetch_failures_total` | counter | `kind` | Failed fetches: `transient` (retried) or `permanent`. |
 | `apollo_cache_hits_total` | counter | | Model results served from the result cache. |
-| `apollo_webhooks_pending` | gauge | | Finished inputs whose webhook event is not delivered yet (with a webhook configured). |
+| `apollo_webhooks_pending` | gauge | | Finished inputs whose webhook event is not delivered yet (with a webhook configured). Left out when the database doesn't answer in time. |
 | `apollo_webhook_deliveries_total` | counter | `event`, `result` | Delivery attempts: `progress` / `finished`, `ok` / `error`. |
 | `apollo_listener_refused_total` | counter | `listener` | Peers a listener's `allow` list refused, at connect or with a 403: `metrics` or `health`. |
 | `apollo_model_loaded` | gauge | `model` | 1 while the model's weights are in memory. |
