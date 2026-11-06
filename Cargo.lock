@@ -167,6 +167,7 @@ version = "1.0.0"
 dependencies = [
  "apollo-domain",
  "dirs",
+ "ipnet",
  "serde",
  "tempfile",
  "thiserror 2.0.21",

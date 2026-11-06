@@ -7,9 +7,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use clap::Args;
+use tokio::sync::watch;
 
-use apollo_config::{Config, Overrides, TlsConfig, load};
+use apollo_config::{Allowlist, Config, Overrides, TlsConfig, load};
 use apollo_engine::{Engine, WebhookSink};
+
+use crate::allow::{self, Bound, Published};
 
 #[derive(Args)]
 pub struct StartArgs {
@@ -99,6 +102,7 @@ async fn serve(
         .with_context(|| format!("resolving {}:{}", config.app.endpoint, config.app.port))?
         .next()
         .ok_or_else(|| anyhow!("no address for {}:{}", config.app.endpoint, config.app.port))?;
+    let metrics_allow = metrics_allowlist(&config)?;
 
     // open() runs migrations internally.
     let storage = apollo_storage::open(&config.database)
@@ -113,13 +117,20 @@ async fn serve(
     // Kept for the shared auth key and revocations.
     let db = Arc::clone(&storage);
     let engine = Engine::with_node(config.clone(), storage, webhook, node);
+    // The allow lists in force, replaced by each reload.
+    let (published, rules) = watch::channel(Published {
+        generation: engine.config_generation().0,
+        metrics: metrics_allow,
+    });
+    let metrics = start_metrics(&config.metrics, engine.clone(), rules).await?;
     let reloader = Reloader {
         engine: engine.clone(),
         source,
         log_filter,
+        published,
+        metrics,
     };
     reload_on_hangup(reloader.clone());
-    let _metrics = start_metrics(&config.metrics, engine.clone()).await?;
 
     // Owns the PID file for this process; removed on graceful shutdown.
     let _pidfile = crate::daemon::PidFile::create()?;
@@ -279,6 +290,10 @@ struct Reloader {
     engine: Engine,
     source: ConfigSource,
     log_filter: Option<LogFilter>,
+    /// The allow lists the listeners check.
+    published: watch::Sender<Published>,
+    /// The `/metrics` listener's socket, when it runs.
+    metrics: Option<Bound>,
 }
 
 impl Reloader {
@@ -286,9 +301,28 @@ impl Reloader {
     /// stays as it was.
     async fn reload(&self) -> anyhow::Result<crate::status::ReloadOutcome> {
         let config = self.source.load()?;
+        // A list that can't match the running listener keeps the running config.
+        let metrics_allow = metrics_allowlist(&config)?;
+        let warnings = match (&self.metrics, &metrics_allow) {
+            (Some(bound), Some(list)) => bound.check("metrics.allow", list)?,
+            _ => Vec::new(),
+        };
         let webhook = webhook_sink(&config)?;
         let level = config.app.log_level.clone();
         let report = self.engine.reload(config, webhook).await?;
+        // `allow` is reloadable, so the list read is the one applied.
+        let next = Published {
+            generation: report.generation,
+            metrics: metrics_allow.clone(),
+        };
+        if allow::publish(&self.published, next)
+            && let Some(bound) = &self.metrics
+        {
+            for warning in warnings {
+                tracing::warn!("{warning}");
+            }
+            tracing::info!("{}", bound.describe("metrics", metrics_allow.as_deref()));
+        }
         if let Some(filter) = &self.log_filter {
             set_log_level(filter, &level);
         }
@@ -327,12 +361,23 @@ fn reload_on_hangup(reloader: Reloader) {
     let _ = reloader;
 }
 
-/// Serve `GET /metrics` when `[metrics]` is enabled. The listener runs until
-/// the process exits.
+/// `[metrics].allow` parsed: `None` admits everyone.
+fn metrics_allowlist(config: &Config) -> anyhow::Result<Option<Arc<Allowlist>>> {
+    let list = config
+        .metrics
+        .allowlist()
+        .map_err(|errs| anyhow!("metrics.allow {}", errs.join("; ")))?;
+    Ok(list.map(Arc::new))
+}
+
+/// Serve `GET /metrics` when `[metrics]` is enabled, to the peers the list
+/// in `rules` admits. The listener runs until the process exits. Returns its
+/// socket.
 async fn start_metrics(
     config: &apollo_config::MetricsConfig,
     engine: Engine,
-) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    rules: watch::Receiver<Published>,
+) -> anyhow::Result<Option<Bound>> {
     if !config.enabled {
         return Ok(None);
     }
@@ -350,21 +395,40 @@ async fn start_metrics(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding the metrics listener on {addr}"))?;
-    if !addr.ip().is_loopback() {
-        tracing::warn!(
+    let bound = Bound::of(&listener).context("reading the metrics listener's socket")?;
+    let list = rules.borrow().metrics.clone();
+    match &list {
+        Some(list) => {
+            for warning in bound.check("metrics.allow", list)? {
+                tracing::warn!("{warning}");
+            }
+        }
+        None if !addr.ip().is_loopback() => tracing::warn!(
             %addr,
-            "serving unauthenticated metrics on a non-loopback address"
-        );
+            "serving unauthenticated metrics on a non-loopback address to anyone who can \
+             reach it; set [metrics].allow to choose who may scrape"
+        ),
+        None => {}
     }
+    let counter = engine.clone();
+    let guard = allow::Guard::new(
+        "metrics",
+        "[metrics].allow",
+        bound.local,
+        allow::metrics_rules(rules),
+        Arc::new(move |listener| counter.note_refused(listener)),
+    );
     let app = axum::Router::new()
         .route("/metrics", axum::routing::get(metrics_handler))
         .with_state(engine);
     tracing::info!(%addr, "serving Prometheus metrics on /metrics");
-    Ok(Some(tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+    tracing::info!("{}", bound.describe("metrics", list.as_deref()));
+    tokio::spawn(async move {
+        if let Err(e) = allow::serve(listener, app, guard).await {
             tracing::error!(error = %e, "metrics listener stopped");
         }
-    })))
+    });
+    Ok(Some(bound))
 }
 
 async fn metrics_handler(

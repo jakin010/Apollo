@@ -174,7 +174,9 @@ fn keep_restart_only(running: &Config, mut new: Config) -> (Config, Vec<String>)
     keep!(database.sqlite, "database.sqlite");
     keep!(database.surrealdb, "database.surrealdb");
     keep!(database.postgres, "database.postgres");
-    keep!(metrics, "metrics");
+    keep!(metrics.enabled, "metrics.enabled");
+    keep!(metrics.endpoint, "metrics.endpoint");
+    keep!(metrics.port, "metrics.port");
     (new, changed)
 }
 
@@ -195,5 +197,19 @@ mod tests {
         assert_eq!(applied.app.max_concurrent, running.app.max_concurrent);
         // Live settings are applied.
         assert_eq!(applied.app.max_retries, running.app.max_retries + 1);
+    }
+
+    #[test]
+    fn metrics_allow_applies_on_reload_and_the_listener_settings_wait() {
+        let running: Config = apollo_config::load::from_str("[metrics]\nenabled = true\n").unwrap();
+        let mut new = running.clone();
+        new.metrics.allow = Some(vec!["10.0.0.0/8".into()]);
+        new.metrics.port = 9500;
+        new.metrics.enabled = false;
+        let (applied, changed) = keep_restart_only(&running, new);
+        assert_eq!(changed, ["metrics.enabled", "metrics.port"]);
+        assert_eq!(applied.metrics.allow, Some(vec!["10.0.0.0/8".to_string()]));
+        assert_eq!(applied.metrics.port, running.metrics.port);
+        assert!(applied.metrics.enabled);
     }
 }

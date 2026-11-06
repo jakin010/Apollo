@@ -757,10 +757,12 @@ async fn metrics_render_in_the_prometheus_format() {
         request_id: None,
     };
     assert!(f.engine.submit(bad, None).await.is_err());
+    f.engine.note_refused("metrics");
     let text = f.engine.metrics_text().await.unwrap();
     for line in [
         "# TYPE apollo_build_info gauge",
         "apollo_submissions_total{outcome=\"invalid\"} 1",
+        "apollo_listener_refused_total{listener=\"metrics\"} 1",
         "apollo_config_generation 1",
         "apollo_model_loaded{model=\"nsfw\"} 0",
         "apollo_tasks{state=\"queued\"} 0",

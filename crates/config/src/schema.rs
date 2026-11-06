@@ -113,7 +113,8 @@ pub struct CacheConfig {
 }
 
 /// `[metrics]` — a Prometheus scrape endpoint (`GET /metrics`) on its own
-/// listener, separate from the gRPC port. Off by default; read at startup.
+/// listener, separate from the gRPC port. Off by default. `allow` applies on
+/// reload; the other fields need a restart.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -124,6 +125,10 @@ pub struct MetricsConfig {
     pub endpoint: String,
     #[serde(default = "crate::defaults::metrics_port")]
     pub port: u16,
+    /// IPs and CIDRs of the peers that may connect. Unset admits anyone who
+    /// can reach the port; see [`MetricsConfig::allowlist`].
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
 }
 
 impl Default for MetricsConfig {
@@ -132,7 +137,19 @@ impl Default for MetricsConfig {
             enabled: false,
             endpoint: defaults::metrics_endpoint(),
             port: defaults::metrics_port(),
+            allow: None,
         }
+    }
+}
+
+impl MetricsConfig {
+    /// `allow` parsed: `None` admits everyone. An invalid list is an error,
+    /// never "everyone".
+    pub fn allowlist(&self) -> Result<Option<crate::Allowlist>, Vec<String>> {
+        self.allow
+            .as_deref()
+            .map(crate::Allowlist::parse)
+            .transpose()
     }
 }
 

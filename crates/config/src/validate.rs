@@ -323,6 +323,10 @@ impl Config {
             ));
         }
 
+        if let Err(list) = self.metrics.allowlist() {
+            errs.extend(list.into_iter().map(|e| format!("metrics.allow {e}")));
+        }
+
         match self.database.backend {
             Backend::Postgres if self.database.postgres.is_none() => {
                 errs.push("database.backend = 'postgres' but [database.postgres] is missing".into())

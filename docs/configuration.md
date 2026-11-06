@@ -189,13 +189,16 @@ Optional. A bare `[cache]` section turns it on (`enabled` defaults to `true`). W
 
 ## `[metrics]` — Prometheus metrics
 
-Optional, off by default. When enabled, `GET /metrics` serves Prometheus metrics (queue, slots, memory, per-model inferences, batch sizes and latency, loads, scans, fetches, webhooks, …) on a separate listener. The endpoint is not authenticated, so it binds to loopback unless you change it. Read at startup. See [operations.md → Prometheus metrics](./operations.md#prometheus-metrics) for every metric.
+Optional, off by default. When enabled, `GET /metrics` serves Prometheus metrics (queue, slots, memory, per-model inferences, batch sizes and latency, loads, scans, fetches, webhooks, …) on a separate listener. The endpoint is not authenticated, so it binds to loopback unless you change it, and `allow` can limit who may connect. `allow` applies on reload; `enabled`, `endpoint` and `port` need a restart. See [operations.md → Prometheus metrics](./operations.md#prometheus-metrics) for every metric.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `enabled` | bool | `false` | Serve the endpoint. |
-| `endpoint` | string | `"127.0.0.1"` | Bind host/IP. A non-loopback address logs a warning. |
+| `endpoint` | string | `"127.0.0.1"` | Bind host/IP. A non-loopback address without `allow` logs a warning. |
 | `port` | u16 | `9464` | Bind port. |
+| `allow` | list of strings | *(unset: anyone)* | The peers that may connect, as IPs or CIDRs, IPv4 or IPv6: `["10.0.0.0/8", "127.0.0.1"]`. Other peers are reset as they connect. `["0.0.0.0/0", "::/0"]` allows everyone. See [operations.md → Who may connect](./operations.md#who-may-connect). |
+
+`allow` is checked against the peer's own address only. An IPv4 peer reaching an IPv6 socket matches as IPv4, and an IPv4 entry never matches an IPv6 peer. These entries are config errors, each with a hint: an empty list, a hostname, a port, brackets, a zone id (`fe80::1%eth0`), leading zeros (`010.0.0.0/8`), host bits (`10.0.0.1/8`; write `10.0.0.0/8`), an IPv4-mapped address (`::ffff:10.0.0.1`; write `10.0.0.1`), a bare `0.0.0.0` or `::` (write `0.0.0.0/0` or `::/0`), and multicast addresses. A link-local entry (`fe80::/10`) is accepted with a warning: it matches on every interface. At startup and on reload, the list is checked against the bound address. A list with no entry that can match there is an error (for example `["10.0.0.0/8"]` on the default `127.0.0.1`), and each entry that can't match logs a warning. A reload that fails the check keeps the running config.
 
 ---
 

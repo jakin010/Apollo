@@ -142,6 +142,8 @@ pub(crate) struct Metrics {
     pub(crate) cache_hits: AtomicU64,
     /// By event (`progress`, `finished`) and result (`ok`, `error`).
     webhook_deliveries: CounterVec,
+    /// Peers a listener's allow list refused, by listener.
+    listener_refused: CounterVec,
     models: Mutex<BTreeMap<String, Arc<ModelMetrics>>>,
 }
 
@@ -156,6 +158,7 @@ impl Metrics {
             fetch_failures: CounterVec::default(),
             cache_hits: AtomicU64::new(0),
             webhook_deliveries: CounterVec::default(),
+            listener_refused: CounterVec::default(),
             models: Mutex::new(BTreeMap::new()),
         }
     }
@@ -191,6 +194,18 @@ impl Metrics {
     pub(crate) fn webhook(&self, event: &'static str, ok: bool) {
         self.webhook_deliveries
             .inc(&[event, if ok { "ok" } else { "error" }]);
+    }
+
+    pub(crate) fn listener_refused(&self, listener: &'static str) {
+        self.listener_refused.inc(&[listener]);
+    }
+}
+
+impl Engine {
+    /// Count a connection or request that `listener`'s allow list refused
+    /// (`apollo_listener_refused_total`).
+    pub fn note_refused(&self, listener: &'static str) {
+        self.inner.metrics.listener_refused(listener);
     }
 }
 
@@ -335,6 +350,12 @@ impl Engine {
             "Webhook delivery attempts, by event and result.",
             &["event", "result"],
             &m.webhook_deliveries,
+        );
+        out.counter_vec(
+            "apollo_listener_refused_total",
+            "Connections and requests refused by a listener's allow list, by listener.",
+            &["listener"],
+            &m.listener_refused,
         );
 
         // Per model: gauges for the configured models, counters for every

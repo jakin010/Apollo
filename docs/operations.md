@@ -15,7 +15,7 @@ endpoint = "127.0.0.1"   # default; the endpoint has no authentication
 port     = 9464          # default
 ```
 
-Apollo then serves `GET /metrics` on that address in the Prometheus text format, on its own listener separate from the gRPC port. The section is read at startup; changing it needs a restart. Binding it to a non-loopback address logs a warning, since anyone who can reach it can read the metrics. Put it behind a firewall or a proxy if you need that.
+Apollo then serves `GET /metrics` on that address in the Prometheus text format, on its own listener separate from the gRPC port. `enabled`, `endpoint` and `port` are read at startup; changing them needs a restart. Binding to a non-loopback address without `allow` logs a warning, since anyone who can reach it can read the metrics. To choose who may connect, see [Who may connect](#who-may-connect).
 
 ```bash
 curl -s http://127.0.0.1:9464/metrics
@@ -42,6 +42,7 @@ All metrics are prefixed `apollo_`. Counters start at zero when the server start
 | `apollo_cache_hits_total` | counter | | Model results served from the result cache. |
 | `apollo_webhooks_pending` | gauge | | Finished inputs whose webhook event is not delivered yet (with a webhook configured). |
 | `apollo_webhook_deliveries_total` | counter | `event`, `result` | Delivery attempts: `progress` / `finished`, `ok` / `error`. |
+| `apollo_listener_refused_total` | counter | `listener` | Peers a listener's `allow` list refused, at connect or with a 403: `metrics`. |
 | `apollo_model_loaded` | gauge | `model` | 1 while the model's weights are in memory. |
 | `apollo_model_queued_jobs` | gauge | `model` | Requests waiting for the model's worker. |
 | `apollo_model_items_admitted` | gauge | `model` | Inputs accepted and not finished that run the model (what its `max_pending` is checked against). |
@@ -67,6 +68,41 @@ rate(apollo_model_batch_size_sum[5m]) / rate(apollo_model_batch_size_count[5m])
 # Share of submissions shed by backpressure.
 rate(apollo_submissions_total{outcome="overloaded"}[5m]) / rate(apollo_submissions_total[5m])
 ```
+
+---
+
+## Who may connect
+
+`[metrics].allow` lists the peers that may connect to the metrics port, as IPs or CIDRs:
+
+```toml
+[metrics]
+enabled  = true
+endpoint = "0.0.0.0"
+allow    = ["10.0.0.0/8", "127.0.0.1"]   # the Prometheus servers, and local tools
+```
+
+Unset, anyone who can reach the port may scrape it. A peer that isn't listed is reset as soon as it connects, without an HTTP answer. The list applies on reload, to new connections and to the next request on open ones: a scraper the new list leaves out gets a `403` with `connection: close`, and is reset when it reconnects. The other `[metrics]` fields need a restart. At startup and on each reload, Apollo logs the list in force:
+
+```text
+metrics 0.0.0.0:9464 allows 10.0.0.0/8 (loopback refused)
+```
+
+`(loopback refused)` means a local `curl http://127.0.0.1:9464/metrics` is refused. Add `127.0.0.1` (and `::1`) to allow it. A list that can't match the bound address is an error (see [configuration.md → `[metrics]`](./configuration.md#metrics--prometheus-metrics)).
+
+**What it checks:** the address of the TCP peer, nothing else. Apollo never reads `X-Forwarded-For`, `Forwarded` or the PROXY protocol.
+
+- It is not a firewall. The kernel completes the TCP handshake before Apollo sees the peer, so a TCP health check still passes and a port scan still finds the port open. Use security groups, a NetworkPolicy or nftables as the main control.
+- A proxy, SNAT or a service mesh connects with its own address for every client it forwards (an Istio sidecar uses `127.0.0.6` or `::6`). Listing that address admits everyone behind it.
+- The gRPC port is not covered. Its gRPC health and reflection services answer anyone who can connect there, whatever `allow` says.
+
+**A refused scraper** reports "connection reset by peer" or an EOF. Apollo logs a warning that names the peer, the port and the field to change:
+
+```text
+refused 192.0.2.7 on the metrics port 0.0.0.0:9464 (not in [metrics].allow)
+```
+
+Each source is logged at most once a minute (IPv6 sources by /64), and at most 10 lines a minute in all. The rest go into one summary a minute: `refused 3412 connections from 977 sources on the metrics port 0.0.0.0:9464 (not in [metrics].allow); latest: …`. `apollo_listener_refused_total{listener="metrics"}` counts every refusal, so `increase(apollo_listener_refused_total[10m]) > 0` works as an alert. Change `allow` on one instance first, and check its log before changing the others.
 
 ---
 
@@ -140,7 +176,7 @@ config reloaded (generation 3)
 
 The new config is read the way `start` read it, with the same file and the same `--endpoint` / `--port` / `--webhook-url` overrides. It is validated first; an invalid config (or one without models) is rejected with its errors, and **the running config stays**. `apollo status` shows the generation and when the running config was applied.
 
-**What applies at once:** thresholds and `early_exit`, strategies, pipelines, model `timeout` and `priority`, `[limits]`, `[cache]`, `[webhook]` (URL, secret, redelivery interval), `max_retries`, `max_pending`, `max_memory`, `idle_timeout`, `database.retention`, and `log_level` (unless `RUST_LOG` is set, which keeps winning).
+**What applies at once:** thresholds and `early_exit`, strategies, pipelines, model `timeout` and `priority`, `[limits]`, `[cache]`, `[webhook]` (URL, secret, redelivery interval), `max_retries`, `max_pending`, `max_memory`, `idle_timeout`, `database.retention`, `metrics.allow`, and `log_level` (unless `RUST_LOG` is set, which keeps winning). A `metrics.allow` that can't match the running listener's address rejects the reload.
 
 **Models:** each model's worker is kept, loaded weights included, unless something its weights depend on changed: `architecture`, `repo`, `revision`, `labels`, `prompt_template`, `score_threshold`, `max_results`, `taxonomy_file` (or the taxonomy file's contents), `keep_in_memory` or `max_concurrent`. A model with such a change gets a new worker, which loads on first use (or at once with `keep_in_memory`). Added or newly enabled models get a worker. Removed or disabled models are rejected for new requests at once; their workers finish the work they have, then unload. A change to any setting that changes outputs (including `early_exit`, the video strategy and a list's contents) starts new result-cache entries, even when the worker is kept.
 
@@ -148,7 +184,7 @@ The new config is read the way `start` read it, with the same file and the same 
 
 **Tasks already running** finish on the config they started with, so a scan is not switched to a different strategy halfway, and a pipeline keeps its steps. New submissions use the new config.
 
-**Restart-only:** `app.endpoint`, `app.port`, `app.device`, `app.cache_dir`, `app.max_concurrent`, `app.node_id`, `[tls]`, `[auth]`, `[database]` (except `retention`) and `[metrics]`. A reload reports these and keeps their running values until the next restart. Uploads are read only from the current `app.cache_dir`, so uploaded inputs still waiting when it changes fail: let them finish first.
+**Restart-only:** `app.endpoint`, `app.port`, `app.device`, `app.cache_dir`, `app.max_concurrent`, `app.node_id`, `[tls]`, `[auth]`, `[database]` (except `retention`), `metrics.enabled`, `metrics.endpoint` and `metrics.port`. A reload reports these and keeps their running values until the next restart. Uploads are read only from the current `app.cache_dir`, so uploaded inputs still waiting when it changes fail: let them finish first.
 
 The request goes over the same owner-only local socket as `apollo status`, so only the OS user running the server can reload it.
 

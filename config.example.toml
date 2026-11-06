@@ -215,12 +215,16 @@ fps    = 5
 
 # --- Metrics: a Prometheus scrape endpoint ------------------------------------
 # Off by default. `GET /metrics` on its own listener (not the gRPC port). It is
-# not authenticated, so keep it on loopback or behind a firewall. Read at
-# startup. See docs/operations.md for the metrics.
+# not authenticated, so keep it on loopback or behind a firewall, and use
+# `allow` to choose who may connect. `allow` applies on reload; the other
+# fields need a restart. See docs/operations.md for the metrics.
 # [metrics]
 # enabled  = true
 # endpoint = "127.0.0.1"
 # port     = 9464
+# Who may scrape, as IPs or CIDRs (unset = anyone who can reach the port).
+# With endpoint = "0.0.0.0", for example:
+# allow    = ["10.0.0.0/8", "127.0.0.1"]
 
 # ============================== models ==============================
 # Flat. `architecture` selects the candle builder. Almost everything else

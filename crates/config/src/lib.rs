@@ -5,8 +5,10 @@
 //! - [`load`]     — discovery + parsing (resolution order) + run-only overrides
 //! - [`validate`] — invariants (reference integrity, sampling params, ...)
 //! - [`edit`]     — format-preserving `get` / `set` / `remove` + default creation
+//! - [`allow`]    — [`Allowlist`], the peers a monitoring listener admits
 //! - [`error`]    — [`ConfigError`]
 
+pub mod allow;
 pub mod defaults;
 pub mod edit;
 pub mod error;
@@ -19,6 +21,7 @@ pub mod validate;
 #[cfg(test)]
 mod tests;
 
+pub use allow::Allowlist;
 pub use error::ConfigError;
 pub use load::Overrides;
 pub use schema::{

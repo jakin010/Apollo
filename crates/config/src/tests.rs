@@ -784,3 +784,78 @@ fn ocr_models_take_max_pixels_and_max_tokens() {
         assert!(err.contains(needle), "{toml}: {err}");
     }
 }
+
+#[test]
+fn metrics_allow_takes_ips_and_cidrs_of_either_family() {
+    let cfg = load::from_str(
+        "[metrics]\nallow = [\"10.0.0.0/8\", \"192.0.2.7\", \"2001:db8::/32\", \"::1\", \"fe80::1234:5678:9abc\"]\n",
+    )
+    .unwrap();
+    cfg.validate().expect("valid");
+    let list = cfg.metrics.allowlist().unwrap().expect("a list");
+    assert_eq!(
+        list.to_string(),
+        "10.0.0.0/8, 192.0.2.7, 2001:db8::/32, ::1, fe80::1234:5678:9abc"
+    );
+
+    // Unset admits everyone.
+    let cfg = load::from_str("[metrics]\nenabled = true\n").unwrap();
+    assert_eq!(cfg.metrics.allow, None);
+    assert_eq!(cfg.metrics.allowlist(), Ok(None));
+    assert_eq!(load::from_str("").unwrap().metrics.allowlist(), Ok(None));
+
+    // A typo is rejected, not ignored.
+    assert!(load::from_str("[metrics]\nallows = [\"10.0.0.0/8\"]\n").is_err());
+}
+
+#[test]
+fn metrics_allow_rejects_what_cannot_match_with_a_hint() {
+    for (entry, needle) in [
+        ("10.0.0.1/8", "host bits are set: write `10.0.0.0/8`"),
+        ("prometheus.internal", "hostnames are not allowed"),
+        ("localhost", "write `127.0.0.1` and `::1`"),
+        ("fe80::1%eth0", "zone ids are not allowed"),
+        ("10.0.0.1:9090", "remove the port: write `10.0.0.1`"),
+        ("[::1]", "remove the brackets: write `::1`"),
+        (
+            "[::1]:9090",
+            "remove the brackets and the port: write `::1`",
+        ),
+        (
+            "010.0.0.0/8",
+            "leading zeros are not allowed (some tools read them as octal): write `10.0.0.0/8`",
+        ),
+        ("::ffff:10.0.0.0/104", "write `10.0.0.0/8`"),
+        ("::ffff:192.0.2.7", "write `192.0.2.7`"),
+        ("0.0.0.0", "write `0.0.0.0/0`"),
+        ("::", "write `::/0`"),
+        ("224.0.0.1", "multicast"),
+        ("ff02::1", "multicast"),
+        ("10.0.0.0/33", "a number from 0 to 32"),
+        (" 10.0.0.0/8", "remove the spaces"),
+        ("ten", "hostnames are not allowed"),
+    ] {
+        let toml = format!("[metrics]\nallow = [{entry:?}]\n");
+        let err = load::from_str(&toml)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("metrics.allow `{entry}`: ")) && err.contains(needle),
+            "{entry}: {err}"
+        );
+    }
+    let err = load::from_str("[metrics]\nallow = []\n")
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("metrics.allow must list at least one IP or CIDR"),
+        "{err}"
+    );
+    // The accessor fails closed too.
+    let cfg = load::from_str("[metrics]\nallow = [\"10.0.0.0/8\", \"nope.example\"]\n").unwrap();
+    assert_eq!(cfg.metrics.allowlist().unwrap_err().len(), 1);
+}
