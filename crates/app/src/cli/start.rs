@@ -188,15 +188,16 @@ async fn serve(
     };
     let _status_socket = start_status_socket(engine.clone(), info, reloader);
 
+    // A signal stops the lifecycle, which closes the port.
+    let lifecycle = engine.lifecycle().clone();
+    tokio::spawn(async move {
+        crate::daemon::shutdown_signal().await;
+        lifecycle.drain();
+        lifecycle.stopping();
+    });
+    let health = apollo_server::Health::new(engine.lifecycle()).await;
     tracing::info!(%addr, models = config.model_count(), "apollo listening");
-    let served = apollo_server::serve_on(
-        engine.clone(),
-        listener,
-        crate::daemon::shutdown_signal(),
-        auth,
-        tls,
-    )
-    .await;
+    let served = apollo_server::serve_on(engine.clone(), listener, health, auth, tls).await;
 
     // Hand unfinished tasks back, also when serving failed: a clean stop must
     // not count toward the poison-task cap for whatever was still in flight,

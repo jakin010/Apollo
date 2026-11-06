@@ -5,7 +5,7 @@ Apollo exposes one gRPC service that clients call: **`apollo.v1.Inference`**. It
 - **Transport:** gRPC over HTTP/2.
 - **TLS:** served natively when `[tls]` is configured (optionally with mutual TLS), or terminate it at a proxy in front. The examples below use `-plaintext` for a local server; with `[tls]`, drop `-plaintext` (add `-cacert ca.pem` for a private CA).
 - **Server reflection** is enabled, so tools like `grpcurl` and Postman can discover the schema without a local copy of the `.proto` files.
-- **Health checking** (`grpc.health.v1.Health`) is enabled; the server reports the `Inference` service as `SERVING`.
+- **Health checking** (`grpc.health.v1.Health`) is enabled. The names `""`, `apollo.v1.Inference` and `readiness` answer `SERVING` while the server is ready for work, and `NOT_SERVING` while it starts or drains before a stop. `liveness` answers `SERVING` until the stop. When the server stops, every name is removed: their Watch streams end, and Check answers `NOT_FOUND`.
 - **Authentication** is **on by default** and applies to every `Inference` RPC (health and reflection stay open). See [Authentication](#authentication).
 
 Work is asynchronous: `Classify` returns the queued task right away. Get the result by waiting in the call (`wait_seconds`), streaming updates with `WatchTask`, polling `GetTask`, or receiving a [webhook](./webhooks.md).
@@ -35,7 +35,7 @@ Submits a single input. Validation happens **before** the task is created:
 A validation failure returns `INVALID_ARGUMENT` and no task is created. On success the task is persisted and returned:
 
 - with `wait_seconds = 0` (the default), as it is now (usually `QUEUED`);
-- otherwise once it finishes, or after `wait_seconds` with whatever state it reached by then. Either way you get a `Task` back; check `state`.
+- otherwise once it finishes, or after `wait_seconds` with whatever state it reached by then, or sooner when the server stops. Either way you get a `Task` back; check `state`.
 
 **Idempotency:** with a `request_id`, submitting again with the same `request_id` (as the same caller) returns the existing task instead of creating a new one, whatever the new request contains. Use it to retry a `Classify` that timed out without risking a duplicate. Keys are scoped to the caller (token subject), so two callers can use the same key. The task's id is made from the caller and the key, so a retry through another instance sharing the database gets the same task. A key is remembered while its task is stored: once [retention](./database.md#retention) removes the task, the same key makes a new task, with the same id.
 
@@ -56,7 +56,7 @@ Returns the current `Task`. `view` picks the result detail: `SUMMARY` (the defau
 
 ### `WatchTask(WatchTaskRequest) → stream Task`
 
-Sends the task as it is now, then again each time it changes (it starts processing, a model finishes, a retry begins, …), and ends the stream after sending it `COMPLETED`, `FAILED` or `CANCELLED`. Updates may be coalesced: a burst of changes can arrive as one message carrying the latest state. A change made by another instance sharing the database shows up within about 2 seconds. Use it when you can't receive webhooks and don't want to poll. `view` works as for `GetTask`.
+Sends the task as it is now, then again each time it changes (it starts processing, a model finishes, a retry begins, …), and ends the stream after sending it `COMPLETED`, `FAILED` or `CANCELLED`. Updates may be coalesced: a burst of changes can arrive as one message carrying the latest state. A change made by another instance sharing the database shows up within about 2 seconds. Use it when you can't receive webhooks and don't want to poll. `view` works as for `GetTask`. When the server stops, the stream ends with `UNAVAILABLE` (`server stopping; watch again`): watch again, through another instance if there is one.
 
 ### `ListTasks(ListTasksRequest) → ListTasksResponse`
 
@@ -344,6 +344,7 @@ Runtime failures (an unfetchable URL, a decode error, an inference error, a time
 | Overloaded: `[app].max_pending` inputs in flight, the memory ceiling exceeded, or a model's own `max_pending` reached | `RESOURCE_EXHAUSTED`, with metadata `apollo-overloaded: queue`, `memory` or `model` |
 | Content over the upload cap | `RESOURCE_EXHAUSTED`, with metadata `grpc-retry-pushback-ms: -1` |
 | The database didn't answer within `[database].timeout` (e.g. it's unreachable). A Classify told so may still have its task stored and run once it answers: retry with the same `request_id` to get that task | `UNAVAILABLE` |
+| The server is stopping (ends an open `WatchTask`) | `UNAVAILABLE` |
 | Missing/invalid auth token (when auth is enabled) | `UNAUTHENTICATED` |
 | Everything else | `INTERNAL` |
 

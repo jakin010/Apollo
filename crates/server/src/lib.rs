@@ -10,6 +10,10 @@
 //! - `auth` — PASETO v4 (asymmetric) token verification with per-token
 //!   revocation, applied to the `Inference` service as a tonic interceptor
 //!   (health/reflection stay open); identifies the [`Caller`] that owns tasks.
+//! - `health` — [`Health`], the gRPC health names, following the engine's
+//!   lifecycle.
+//! - `stop` — closing the port as the lifecycle stops, and
+//!   [`serve_until_stopped`], which cuts what is left at the drain deadline.
 //!
 //! Model validation is intentionally *not* duplicated here: `Engine::submit`
 //! rejects unknown/disabled models and modality mismatches synchronously, and
@@ -19,12 +23,16 @@
 
 mod auth;
 mod convert;
+mod health;
 mod service;
+mod stop;
 mod webhook;
 
 pub use auth::{AuthInterceptor, AuthSettings, Caller, KeyError, Revocation, RevocationSource};
+pub use health::Health;
 pub use service::{
-    InferenceService, TlsSettings, inference_service, install_crypto_provider, serve, serve_on,
-    serve_with_shutdown,
+    InferenceService, ServeError, TlsSettings, inference_service, install_crypto_provider, serve,
+    serve_on, serve_with_shutdown,
 };
+pub use stop::serve_until_stopped;
 pub use webhook::GrpcWebhookSink;
