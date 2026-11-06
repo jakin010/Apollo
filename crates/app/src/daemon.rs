@@ -112,7 +112,8 @@ pub fn terminate(_pid: u32) -> anyhow::Result<()> {
     Err(anyhow!("`stop` is only supported on Unix platforms"))
 }
 
-/// Resolves on Ctrl-C or SIGTERM; drives the server's graceful drain.
+/// Resolves on Ctrl-C or SIGTERM: the server drains, or stops at once when
+/// it is draining already.
 pub async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -133,5 +134,4 @@ pub async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
-    tracing::info!("shutdown signal received; draining");
 }

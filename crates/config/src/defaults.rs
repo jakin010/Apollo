@@ -118,6 +118,14 @@ pub(crate) fn metrics_port() -> u16 {
     9464
 }
 
+pub(crate) fn health_port() -> u16 {
+    9465
+}
+
+pub(crate) fn drain_timeout_secs() -> u32 {
+    15
+}
+
 pub(crate) fn max_text() -> String {
     "100kb".to_string()
 }

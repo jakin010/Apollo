@@ -5,7 +5,7 @@ Apollo exposes one gRPC service that clients call: **`apollo.v1.Inference`**. It
 - **Transport:** gRPC over HTTP/2.
 - **TLS:** served natively when `[tls]` is configured (optionally with mutual TLS), or terminate it at a proxy in front. The examples below use `-plaintext` for a local server; with `[tls]`, drop `-plaintext` (add `-cacert ca.pem` for a private CA).
 - **Server reflection** is enabled, so tools like `grpcurl` and Postman can discover the schema without a local copy of the `.proto` files.
-- **Health checking** (`grpc.health.v1.Health`) is enabled. The names `""`, `apollo.v1.Inference` and `readiness` answer `SERVING` while the server is ready for work, and `NOT_SERVING` while it starts or drains before a stop. `liveness` answers `SERVING` until the stop. When the server stops, every name is removed: their Watch streams end, and Check answers `NOT_FOUND`.
+- **Health checking** (`grpc.health.v1.Health`) is enabled, and follows the server's state: see [Health checking](#health-checking). Load balancers do better with the HTTP checks on the health port ([operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers)).
 - **Authentication** is **on by default** and applies to every `Inference` RPC (health and reflection stay open). See [Authentication](#authentication).
 
 Work is asynchronous: `Classify` returns the queued task right away. Get the result by waiting in the call (`wait_seconds`), streaming updates with `WatchTask`, polling `GetTask`, or receiving a [webhook](./webhooks.md).
@@ -349,6 +349,30 @@ Runtime failures (an unfetchable URL, a decode error, an inference error, a time
 | Everything else | `INTERNAL` |
 
 Nothing is kept when a request is refused as overloaded, so the same request may be sent to another instance. It's usually refused before any content arrives: `ClassifyStream` at its `init` frame, and an inline-content `Classify` before its bytes are written to disk. If the instance fills up while an upload is arriving, the refusal comes after it and the bytes are discarded. With several instances, a proxy or client retries it elsewhere on the `apollo-overloaded` tag (see [operations.md → Several instances](./operations.md#several-instances-sending-work-to-a-less-busy-one)). The upload cap is the same on every instance, so that refusal carries `grpc-retry-pushback-ms: -1`, which tells gRPC retry policies not to retry it.
+
+---
+
+## Health checking
+
+`grpc.health.v1.Health` on the gRPC port answers these names:
+
+| Name | Starting | Serving | Draining | Stopping |
+|------|----------|---------|----------|----------|
+| `""`, `apollo.v1.Inference`, `readiness` | `NOT_SERVING` | `SERVING` | `NOT_SERVING` | removed |
+| `liveness` | `SERVING` | `SERVING` | `SERVING` | removed |
+
+- **Starting** lasts until tasks are recovered and every model with `keep_in_memory` has tried its first load (loaded or not). **Draining** starts at the first `SIGTERM` or Ctrl-C and lasts `[app].drain_delay_secs`; calls are still served meanwhile. **Stopping** follows: see [operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers).
+- **Removed** names end their Watch streams (with `OK`), and Check answers `NOT_FOUND`. An open Watch never holds a stop.
+- **The port speaks HTTP/2 only.** A balancer whose checks speak HTTP/1.1 can't use it; give it the health port instead.
+- **mTLS covers health too.** With `[tls].client_ca_file`, a checker needs a client certificate to reach health here. The health port needs none.
+- **The gRPC port serves only once tasks are recovered.** Before that it accepts connections (a TCP check passes) but answers nothing, so a liveness check here can fail a server that is starting normally. Use `/livez` on the health port for liveness.
+
+When the server stops:
+
+- the port closes, so new connections are refused, and open ones are told to finish (`GOAWAY`);
+- an open `WatchTask` ends with `UNAVAILABLE` (`server stopping; watch again`): watch again, through another instance if there is one;
+- a `Classify` waiting in `wait_seconds` returns the task as it is, unfinished;
+- calls still open after `[app].drain_timeout_secs` are cut.
 
 ---
 

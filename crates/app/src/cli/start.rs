@@ -4,13 +4,14 @@ use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use clap::Args;
 use tokio::sync::watch;
 
 use apollo_config::{Allowlist, Config, Overrides, TlsConfig, load};
-use apollo_engine::{Engine, WebhookSink};
+use apollo_engine::{Engine, HAND_BACK_LIMIT, Lifecycle, Phase, Step, WebhookSink};
 
 use crate::allow::{self, Bound, Published};
 
@@ -31,6 +32,9 @@ pub struct StartArgs {
     /// `enabled = false`.
     #[arg(long = "webhook-url")]
     pub webhook_url: Option<String>,
+    /// Override the health check port ([health].port) for this run only.
+    #[arg(long = "health-port")]
+    pub health_port: Option<u16>,
     /// Detach and run in the background, writing a PID file.
     #[arg(long)]
     pub daemon: bool,
@@ -67,6 +71,7 @@ pub fn run(args: StartArgs) -> anyhow::Result<()> {
             endpoint: args.endpoint.clone(),
             port: args.port,
             webhook_url: args.webhook_url.clone(),
+            health_port: args.health_port,
         },
     };
     let config = source.load()?;
@@ -96,6 +101,23 @@ async fn serve(
     source: ConfigSource,
 ) -> anyhow::Result<()> {
     let log_filter = init_tracing(&config.app.log_level);
+    let lc = Lifecycle::new();
+    stop_on_signals(lc.clone());
+    serve_with(config, config_file, source, log_filter, lc).await
+}
+
+/// Start, following `lc`, and serve until it stops. A stop during startup
+/// ends the start, handing back what recovery took, and returns `Ok`.
+async fn serve_with(
+    config: Config,
+    config_file: Option<PathBuf>,
+    source: ConfigSource,
+    log_filter: Option<LogFilter>,
+    lc: Lifecycle,
+) -> anyhow::Result<()> {
+    // First, so probes answer while the steps below run.
+    crate::health::start(&config, &lc).await?;
+    log_stop_budget(&config.app);
 
     let addr = (config.app.endpoint.as_str(), config.app.port)
         .to_socket_addrs()
@@ -105,18 +127,20 @@ async fn serve(
     let metrics_allow = metrics_allowlist(&config)?;
 
     // open() runs migrations internally.
-    let storage = apollo_storage::open(&config.database)
-        .await
-        .context("opening storage")?;
+    let Some(storage) = unless_stopped(&lc, apollo_storage::open(&config.database)).await else {
+        return stopped_starting(&lc, None).await;
+    };
+    let storage = storage.context("opening storage")?;
 
     let webhook = webhook_sink(&config)?;
 
-    // Engine::with_node spawns background tasks, so it must run inside the runtime.
+    // Engine::with_lifecycle spawns background tasks, so it must run inside
+    // the runtime.
     let node = node_id(&config).context("reading the node id")?;
     let config = Arc::new(config);
     // Kept for the shared auth key and revocations.
     let db = Arc::clone(&storage);
-    let engine = Engine::with_node(config.clone(), storage, webhook, node);
+    let engine = Engine::with_lifecycle(config.clone(), storage, webhook, node, lc.clone());
     // The allow lists in force, replaced by each reload.
     let (published, rules) = watch::channel(Published {
         generation: engine.config_generation().0,
@@ -135,7 +159,11 @@ async fn serve(
     // Owns the PID file for this process; removed on graceful shutdown.
     let _pidfile = crate::daemon::PidFile::create()?;
 
-    let auth = configure_auth(&config, &db, engine.node()).await?;
+    lc.starting(Step::ConfiguringAuth);
+    let Some(auth) = unless_stopped(&lc, configure_auth(&config, &db, engine.node())).await else {
+        return stopped_starting(&lc, Some(&engine)).await;
+    };
+    let auth = auth?;
     auth.watch_revocations(REVOCATION_POLL);
     let tls = load_tls(config.tls.as_ref())?;
 
@@ -148,11 +176,13 @@ async fn serve(
     // Take tasks over only once nothing above can fail the start: a failed
     // start would leave its claims to lapse, which the next start counts as a
     // crash of each task.
-    let resumed = match engine.recover().await {
-        Ok(n) => n,
-        Err(e) => {
+    lc.starting(Step::RecoveringTasks);
+    let resumed = match unless_stopped(&lc, engine.recover()).await {
+        None => return stopped_starting(&lc, Some(&engine)).await,
+        Some(Ok(n)) => n,
+        Some(Err(e)) => {
             // Hand back whatever it took before failing.
-            engine.shutdown().await;
+            engine.hand_back().await;
             return Err(e).context("recovering tasks");
         }
     };
@@ -188,25 +218,131 @@ async fn serve(
     };
     let _status_socket = start_status_socket(engine.clone(), info, reloader);
 
-    // A signal stops the lifecycle, which closes the port.
-    let lifecycle = engine.lifecycle().clone();
-    tokio::spawn(async move {
-        crate::daemon::shutdown_signal().await;
-        lifecycle.drain();
-        lifecycle.stopping();
-    });
-    let health = apollo_server::Health::new(engine.lifecycle()).await;
+    stop_after_drain_delay(engine.clone());
+    lc.starting(Step::LoadingModels);
+    ready_after_preloads(engine.clone());
+    let health = apollo_server::Health::new(&lc).await;
     tracing::info!(%addr, models = config.model_count(), "apollo listening");
-    let served = apollo_server::serve_on(engine.clone(), listener, health, auth, tls).await;
+    // Stopping closes the port; the drain timeout (as the config says when
+    // the stop begins) or a second signal cuts the calls still open.
+    let timeout = {
+        let engine = engine.clone();
+        move || Duration::from_secs(engine.config().app.drain_timeout_secs.into())
+    };
+    let served = apollo_server::serve_until_stopped(
+        apollo_server::serve_on(engine.clone(), listener, health, auth, tls),
+        &lc,
+        timeout,
+    )
+    .await;
+    // Also when serving failed: probes say so while the tasks go back.
+    lc.stopping();
 
     // Hand unfinished tasks back, also when serving failed: a clean stop must
     // not count toward the poison-task cap for whatever was still in flight,
     // and the next start (or another instance) takes them at once.
-    engine.shutdown().await;
+    engine.hand_back().await;
     served.context("gRPC server error")?;
 
     tracing::info!("apollo shut down cleanly");
     Ok(())
+}
+
+/// A Ctrl-C or SIGTERM drains; one while draining (or later) stops at once.
+fn stop_on_signals(lc: Lifecycle) {
+    tokio::spawn(async move {
+        loop {
+            crate::daemon::shutdown_signal().await;
+            if lc.drain() {
+                tracing::info!("shutdown signal received; draining (a second one stops at once)");
+            } else {
+                tracing::warn!("another shutdown signal: stopping at once");
+                lc.force();
+            }
+        }
+    });
+}
+
+/// `step`, unless a stop is asked for first: then it is dropped, and `None`.
+async fn unless_stopped<T>(lc: &Lifecycle, step: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        biased;
+        () = lc.reached(Phase::Draining) => None,
+        done = step => Some(done),
+    }
+}
+
+/// End a start that a stop interrupted: hand back what recovery took
+/// (within the hand-back limit), unless a second signal says to stop at once.
+async fn stopped_starting(lc: &Lifecycle, engine: Option<&Engine>) -> anyhow::Result<()> {
+    lc.stopping();
+    tracing::info!("stopped while starting");
+    if let Some(engine) = engine {
+        tokio::select! {
+            _ = engine.hand_back() => {}
+            () = lc.until_forced() => {
+                tracing::warn!("stopping at once, without handing the tasks back")
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stop serving `[app].drain_delay_secs` after the drain begins (as the
+/// config says then), or at once when forced.
+fn stop_after_drain_delay(engine: Engine) {
+    tokio::spawn(async move {
+        let lc = engine.lifecycle().clone();
+        lc.reached(Phase::Draining).await;
+        let delay = Duration::from_secs(engine.config().app.drain_delay_secs.into());
+        if !delay.is_zero() {
+            tracing::info!(
+                ?delay,
+                "unready, and still serving while load balancers stop sending work here"
+            );
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = lc.until_forced() => {}
+            }
+        }
+        lc.stopping();
+    });
+}
+
+/// Serving, once every pinned model has tried its first load (loaded or
+/// not), unless a stop comes first.
+fn ready_after_preloads(engine: Engine) {
+    tokio::spawn(async move {
+        let lc = engine.lifecycle().clone();
+        tokio::select! {
+            () = engine.preloads_attempted() => {}
+            () = lc.reached(Phase::Draining) => return,
+        }
+        lc.serving();
+        if lc.ready() {
+            tracing::info!("apollo ready");
+        }
+    });
+}
+
+/// Log the longest a stop takes, for the process manager's grace period.
+fn log_stop_budget(app: &apollo_config::AppConfig) {
+    let hand_back = HAND_BACK_LIMIT.as_secs();
+    let delay = app.drain_delay_secs;
+    match app.drain_timeout_secs {
+        0 => tracing::info!(
+            drain_delay_secs = delay,
+            "a stop waits for the open calls with no time limit ([app].drain_timeout_secs = 0)"
+        ),
+        timeout => {
+            let budget = u64::from(delay) + u64::from(timeout) + hand_back;
+            tracing::info!(
+                "a stop takes at most {budget}s (drain delay {delay}s + drain timeout {timeout}s \
+                 + {hand_back}s to hand tasks back): give it that long, e.g. \
+                 terminationGracePeriodSeconds >= {budget}"
+            );
+        }
+    }
 }
 
 /// This instance's node id: `[app].node_id`, or one kept in the state directory
@@ -514,10 +650,16 @@ async fn build_report(
     let s = engine.status().await?;
     let config = engine.config();
     let (generation, loaded_at) = engine.config_generation();
+    let phase = engine.lifecycle().phase();
     Ok(st::StatusReport {
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
         started_at: unix_secs(info.started_at),
+        phase: Some(phase.name().to_string()),
+        step: match phase {
+            apollo_engine::Phase::Starting(step) => Some(step.name().to_string()),
+            _ => None,
+        },
         listen: info.listen.clone(),
         tls: info.tls,
         mutual_tls: info.mutual_tls,
@@ -789,6 +931,9 @@ fn spawn_detached(args: &StartArgs) -> anyhow::Result<()> {
     if let Some(u) = &args.webhook_url {
         cmd.arg("--webhook-url").arg(u);
     }
+    if let Some(p) = args.health_port {
+        cmd.arg("--health-port").arg(p.to_string());
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
@@ -820,5 +965,70 @@ mod tests {
         let off = format!("{on}enabled = false\n");
         assert!(webhook_sink(&config(&off)).unwrap().is_none());
         assert!(webhook_sink(&config("")).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_listener_answers_while_storage_opens() {
+        use crate::health::tests::{free_port, get};
+        // A database host that takes connections and never answers.
+        let db = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let db_addr = db.local_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = db.accept().await {
+                held.push(stream);
+            }
+        });
+        let port = free_port();
+        let toml = format!(
+            "[health]\nenabled = true\nendpoint = \"127.0.0.1\"\nport = {port}\n\
+             [database]\nbackend = \"surrealdb\"\n\
+             [database.surrealdb]\nurl = \"ws://{db_addr}\"\nnamespace = \"n\"\ndatabase = \"d\"\n"
+        );
+        let config = load::from_str(&toml).unwrap();
+        let source = ConfigSource {
+            path: None,
+            overrides: Overrides::default(),
+        };
+        let lc = Lifecycle::new();
+        let started = tokio::spawn(serve_with(config, None, source, None, lc.clone()));
+
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::TcpStream::connect(addr).await.is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the health port never opened"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let at = std::time::Instant::now();
+        assert_eq!(get(addr, "/livez").await, (200, "ok\n".into()));
+        let (status, body) = get(addr, "/readyz").await;
+        assert!(
+            at.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            at.elapsed()
+        );
+        assert_eq!(status, 503);
+        assert!(
+            body.starts_with("not ready: starting (opening database, "),
+            "{body}"
+        );
+        assert!(!started.is_finished(), "storage opened");
+
+        // A stop while it opens ends the start at once, cleanly; the probes
+        // still answer.
+        assert!(lc.drain());
+        let ended = tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .expect("the start ended")
+            .unwrap();
+        assert!(ended.is_ok(), "{ended:?}");
+        assert_eq!(
+            get(addr, "/readyz").await,
+            (503, "not ready: stopping\n".into())
+        );
+        held.abort();
     }
 }

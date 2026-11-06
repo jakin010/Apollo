@@ -5,6 +5,7 @@
 mod allow;
 mod cli;
 mod daemon;
+mod health;
 mod status;
 
 use clap::Parser;

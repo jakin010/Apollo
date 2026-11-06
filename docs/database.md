@@ -188,6 +188,10 @@ A runner whose lease was taken over (it lost touch with the database for longer 
 
 State writes only apply to an unfinished task or item: the first finish wins, so a late or second runner can't reopen a task, overwrite a cancel, or start an item another runner finished (one already partway through it can still overwrite its model results). An upload is read, and removed, only from the server's own upload directory (`[app].cache_dir/uploads`), whatever path a task's row holds; anything else fails the item.
 
+### Health checks and the database
+
+A database outage while serving doesn't change the health checks ([operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers)): `/readyz` and the gRPC `readiness` names stay ready, and `/livez` never looks at the database. Every instance sharing a database loses it at once, so a readiness that followed it would take the whole fleet out of the load balancer together. Meanwhile calls that need the database fail with `UNAVAILABLE` after `[database].timeout`, and running tasks behave as described above. At startup it's different: until the database opens (and its migration finishes), `/readyz` answers `503 not ready: starting (opening database, …)`.
+
 ---
 
 ## Retention

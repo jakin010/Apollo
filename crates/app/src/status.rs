@@ -20,6 +20,12 @@ pub struct StatusReport {
     pub pid: u32,
     /// Unix seconds.
     pub started_at: u64,
+    /// `starting`, `serving`, `draining` or `stopping`, and while starting
+    /// the step (`loading models`). Unset from older servers.
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub step: Option<String>,
     pub listen: String,
     pub tls: bool,
     pub mutual_tls: bool,
@@ -344,6 +350,11 @@ pub fn render(r: &StatusReport, now: SystemTime, rates: Option<&Rates>) -> Strin
         r.pid,
         duration(now_secs.saturating_sub(r.started_at))
     ));
+    match (&r.phase, &r.step) {
+        (Some(phase), Some(step)) => line(format!("  phase      {phase} ({step})")),
+        (Some(phase), None) => line(format!("  phase      {phase}")),
+        _ => {}
+    }
     let on = |b: bool| if b { "on" } else { "off" };
     line(format!(
         "  listening  {}   TLS {}{}, auth {}",
@@ -547,6 +558,8 @@ mod tests {
             version: "1.0.0".into(),
             pid: 4242,
             started_at: 1_000_000,
+            phase: Some("serving".into()),
+            step: None,
             listen: "127.0.0.1:8080".into(),
             tls: true,
             mutual_tls: false,
@@ -622,6 +635,7 @@ mod tests {
             text.starts_with("apollo 1.0.0 — running (pid 4242), up 2h 13m"),
             "{text}"
         );
+        assert!(text.contains("\n  phase      serving\n"), "{text}");
         assert!(text.contains("TLS on, auth on"), "{text}");
         assert!(
             text.contains("/etc/apollo/config.toml (generation 3, reloaded 2m 0s ago)"),
@@ -644,6 +658,36 @@ mod tests {
         assert_eq!(m.used_bytes, Some(1024));
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["used_bytes"], 1024);
+    }
+
+    #[test]
+    fn renders_the_step_while_starting_and_reads_reports_without_a_phase() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000 + 8_000);
+        let mut report = sample();
+        report.phase = Some("starting".into());
+        report.step = Some("loading models".into());
+        let text = render(&report, now, None);
+        assert!(
+            text.contains("\n  phase      starting (loading models)\n"),
+            "{text}"
+        );
+
+        // An older server sends neither.
+        let mut json = serde_json::to_value(sample()).unwrap();
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("phase");
+        fields.remove("step");
+        let old: StatusReport = serde_json::from_value(json).unwrap();
+        assert_eq!((old.phase, old.step), (None, None));
+        let text = render(
+            &StatusReport {
+                phase: None,
+                ..sample()
+            },
+            now,
+            None,
+        );
+        assert!(!text.contains("phase"), "{text}");
     }
 
     #[test]

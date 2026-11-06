@@ -46,6 +46,14 @@ fn parses_and_validates_example() {
 
     let moderation = cfg.pipelines.get("moderation").expect("pipeline");
     assert_eq!(moderation.models(), ["nsfw", "category", "general"]);
+
+    // Health checks on, and a stop that waits for load balancers.
+    assert!(cfg.health.enabled);
+    assert_eq!(cfg.health.allow, None);
+    assert_eq!(
+        (cfg.app.drain_delay_secs, cfg.app.drain_timeout_secs),
+        (5, 15)
+    );
 }
 
 #[test]
@@ -106,9 +114,8 @@ fn webhooks_turn_off_and_the_url_flag_turns_them_back_on() {
     let mut cfg = load::from_str(&off).unwrap();
     assert!(!cfg.webhook.as_ref().unwrap().enabled);
     cfg.apply_overrides(&load::Overrides {
-        endpoint: None,
-        port: None,
         webhook_url: Some("http://other:2".into()),
+        ..Default::default()
     });
     let w = cfg.webhook.unwrap();
     assert_eq!((w.enabled, w.url.as_str()), (true, "http://other:2"));
@@ -858,4 +865,150 @@ fn metrics_allow_rejects_what_cannot_match_with_a_hint() {
     // The accessor fails closed too.
     let cfg = load::from_str("[metrics]\nallow = [\"10.0.0.0/8\", \"nope.example\"]\n").unwrap();
     assert_eq!(cfg.metrics.allowlist().unwrap_err().len(), 1);
+}
+
+#[test]
+fn health_and_drain_defaults() {
+    let cfg = load::from_str("").unwrap();
+    let h = &cfg.health;
+    assert!(!h.enabled, "off unless asked for");
+    assert_eq!(
+        (h.endpoint.as_deref(), h.port, h.allow.as_deref()),
+        (None, 9465, None)
+    );
+    // Unset binds where the gRPC port does.
+    assert_eq!(h.bind_host(&cfg.app), "0.0.0.0");
+    assert_eq!(h.allowlist(), Ok(None));
+    assert_eq!(
+        (cfg.app.drain_delay_secs, cfg.app.drain_timeout_secs),
+        (0, 15)
+    );
+    cfg.validate().expect("valid");
+
+    let cfg = load::from_str(
+        "[app]\ndrain_delay_secs = 5\ndrain_timeout_secs = 0\n[health]\nenabled = true\nendpoint = \"10.0.0.5\"\nport = 9500\nallow = [\"10.0.0.0/8\"]\n",
+    )
+    .unwrap();
+    cfg.validate().expect("valid");
+    assert_eq!(cfg.health.bind_host(&cfg.app), "10.0.0.5");
+    assert_eq!(cfg.health.port, 9500);
+    assert!(cfg.health.allowlist().unwrap().is_some());
+    assert_eq!(
+        (cfg.app.drain_delay_secs, cfg.app.drain_timeout_secs),
+        (5, 0)
+    );
+
+    // Typos are rejected, not ignored.
+    assert!(load::from_str("[health]\nenable = true\n").is_err());
+    assert!(load::from_str("[app]\ndrain_delay = 5\n").is_err());
+}
+
+#[test]
+fn the_health_port_flag_overrides_the_port_only() {
+    let mut cfg = load::from_str("[health]\nport = 9500\n").unwrap();
+    cfg.apply_overrides(&load::Overrides {
+        health_port: Some(9600),
+        ..Default::default()
+    });
+    assert_eq!(cfg.health.port, 9600);
+    assert!(!cfg.health.enabled);
+}
+
+#[test]
+fn listeners_need_their_own_ports() {
+    let err = |toml: &str| match load::from_str(toml).unwrap().validate() {
+        Ok(()) => String::new(),
+        Err(e) => e.to_string(),
+    };
+    // The health port where the gRPC port is.
+    let clash = err("[app]\nport = 9465\n[health]\nenabled = true\n");
+    assert!(
+        clash.contains("health.port 9465 is also app.port: give each listener its own port"),
+        "{clash}"
+    );
+    // A listener that doesn't run can't clash.
+    assert_eq!(err("[app]\nport = 9465\n[health]\nport = 9465\n"), "");
+    // Metrics on loopback and health on all addresses share 9464.
+    let clash = err("[health]\nenabled = true\nport = 9464\n[metrics]\nenabled = true\n");
+    assert!(
+        clash.contains("metrics.port 9464 is also health.port"),
+        "{clash}"
+    );
+    let clash = err("[app]\nendpoint = \"::\"\nport = 9464\n[metrics]\nenabled = true\n");
+    assert!(
+        clash.contains("metrics.port 9464 is also app.port"),
+        "{clash}"
+    );
+    // Different addresses may share a port.
+    assert_eq!(
+        err(
+            "[app]\nendpoint = \"10.0.0.5\"\n[health]\nenabled = true\nport = 9464\n[metrics]\nenabled = true\n"
+        ),
+        ""
+    );
+    assert_eq!(
+        err(
+            "[app]\nendpoint = \"0.0.0.0\"\nport = 9464\n[metrics]\nenabled = true\nendpoint = \"::1\"\n"
+        ),
+        ""
+    );
+    let clash = err(
+        "[app]\nendpoint = \"apollo.internal\"\nport = 9464\n[health]\nenabled = true\nendpoint = \"Apollo.Internal\"\nport = 9464\n",
+    );
+    assert!(
+        clash.contains("health.port 9464 is also app.port"),
+        "{clash}"
+    );
+
+    // No port 0.
+    let zero = err("[app]\nport = 0\n[health]\nenabled = true\nport = 0\n");
+    assert!(zero.contains("app.port must not be 0"), "{zero}");
+    assert!(zero.contains("health.port must not be 0"), "{zero}");
+    assert!(!zero.contains("is also"), "{zero}");
+}
+
+#[test]
+fn drain_settings_are_at_most_an_hour() {
+    let cfg =
+        load::from_str("[app]\ndrain_delay_secs = 3600\ndrain_timeout_secs = 3600\n").unwrap();
+    cfg.validate().expect("valid");
+    let err = load::from_str("[app]\ndrain_delay_secs = 3601\ndrain_timeout_secs = 7200\n")
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("app.drain_delay_secs must be at most 3600 (got 3601)"),
+        "{err}"
+    );
+    assert!(
+        err.contains("app.drain_timeout_secs must be at most 3600 (got 7200)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn health_allow_follows_the_metrics_rules() {
+    let err = load::from_str("[health]\nallow = [\"10.0.0.1/8\", \"localhost\"]\n")
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("health.allow `10.0.0.1/8`: ") && err.contains("write `10.0.0.0/8`"),
+        "{err}"
+    );
+    assert!(err.contains("health.allow `localhost`: "), "{err}");
+    let err = load::from_str("[health]\nallow = []\n")
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("health.allow must list at least one IP or CIDR"),
+        "{err}"
+    );
+    // The lists are separate: [metrics].allow says nothing about health.
+    let cfg = load::from_str("[metrics]\nallow = [\"10.0.0.0/8\"]\n").unwrap();
+    assert_eq!(cfg.health.allowlist(), Ok(None));
 }

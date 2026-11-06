@@ -178,6 +178,10 @@ fn keep_restart_only(running: &Config, mut new: Config) -> (Config, Vec<String>)
     keep!(metrics.enabled, "metrics.enabled");
     keep!(metrics.endpoint, "metrics.endpoint");
     keep!(metrics.port, "metrics.port");
+    keep!(health.enabled, "health.enabled");
+    keep!(health.endpoint, "health.endpoint");
+    keep!(health.port, "health.port");
+    keep!(health.allow, "health.allow");
     (new, changed)
 }
 
@@ -212,5 +216,32 @@ mod tests {
         assert_eq!(applied.metrics.allow, Some(vec!["10.0.0.0/8".to_string()]));
         assert_eq!(applied.metrics.port, running.metrics.port);
         assert!(applied.metrics.enabled);
+    }
+
+    #[test]
+    fn the_health_listener_waits_for_a_restart_and_the_drain_settings_apply() {
+        let running: Config = apollo_config::load::from_str("[health]\nenabled = true\n").unwrap();
+        let mut new = running.clone();
+        new.health.enabled = false;
+        new.health.endpoint = Some("10.0.0.5".into());
+        new.health.port = 9500;
+        new.health.allow = Some(vec!["10.0.0.0/8".into()]);
+        new.app.drain_delay_secs = 5;
+        new.app.drain_timeout_secs = 0;
+        let (applied, changed) = keep_restart_only(&running, new);
+        assert_eq!(
+            changed,
+            [
+                "health.enabled",
+                "health.endpoint",
+                "health.port",
+                "health.allow"
+            ]
+        );
+        assert_eq!(applied.health, running.health);
+        assert_eq!(
+            (applied.app.drain_delay_secs, applied.app.drain_timeout_secs),
+            (5, 0)
+        );
     }
 }

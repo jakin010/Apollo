@@ -36,6 +36,33 @@ pub enum Phase {
     Stopping,
 }
 
+impl Step {
+    /// How probes and logs name it: `recovering tasks`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Step::OpeningDatabase => "opening database",
+            Step::ConfiguringAuth => "configuring auth",
+            Step::RecoveringTasks => "recovering tasks",
+            Step::LoadingModels => "loading models",
+        }
+    }
+}
+
+impl Phase {
+    /// Every phase's name, in order.
+    pub const NAMES: [&'static str; 4] = ["starting", "serving", "draining", "stopping"];
+
+    /// How probes, logs and metrics name it: `starting`, without the step.
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Starting(_) => Self::NAMES[0],
+            Phase::Serving => Self::NAMES[1],
+            Phase::Draining => Self::NAMES[2],
+            Phase::Stopping => Self::NAMES[3],
+        }
+    }
+}
+
 /// The process's lifecycle. Clone freely: all clones share one state.
 #[derive(Clone)]
 pub struct Lifecycle(Arc<Shared>);

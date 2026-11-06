@@ -17,7 +17,7 @@ Models are loaded from [Hugging Face](https://huggingface.co/) and executed with
 - **Skip repeated work.** An optional result **cache** keys model outputs by content hash, so identical inputs don't get re‑inferred, and a `request_id` makes a retried submission return the existing task.
 - **Follow a task.** `Classify` can wait for the result (`wait_seconds`), `WatchTask` streams each change, and an optional **webhook** sends a `TaskEvent` as the task moves on and once it finishes.
 - **Discover what to run.** `ListModels` lists the configured models with their labels, and the pipelines; `ListTasks` lists your tasks.
-- **Operate it.** Prometheus metrics on `/metrics`, config changes applied without a restart (`apollo reload`), and thresholds chosen from labelled examples (`apollo calibrate`).
+- **Operate it.** Prometheus metrics on `/metrics`, health checks for load balancers (`/livez`, `/readyz`) with a stop that drains first, config changes applied without a restart (`apollo reload`), and thresholds chosen from labelled examples (`apollo calibrate`).
 
 ## Core concepts
 
@@ -54,6 +54,7 @@ There is **no separate video architecture** — video is always "an image classi
    │   watch      – announces task changes (WatchTask, wait_seconds)       │
    │   webhook    – sends task events via an injected sink                 │
    │   live       – the reloadable config snapshot, config reload          │
+   │   lifecycle  – starting, serving, draining, stopping (health checks)  │
    │   metrics    – Prometheus counters, histograms and the text format     │
    └───────┬───────────────────────────┬───────────────────────┬───────────┘
            ▼                           ▼                       ▼
@@ -133,5 +134,5 @@ The server exits at startup if **no models are configured** — there would be n
 | [grpc-api.md](./grpc-api.md) | The `Inference` service: methods, messages, states, segments, error codes, auth, and examples. |
 | [webhooks.md](./webhooks.md) | The `Webhook` service you implement to receive task events, delivery semantics, and payload signing. |
 | [configuration.md](./configuration.md) | Every config section and field, defaults, units, validation, and the CLI. |
-| [operations.md](./operations.md) | Prometheus metrics, live config reload, and threshold calibration. |
+| [operations.md](./operations.md) | Prometheus metrics, health checks and stopping, live config reload, and threshold calibration. |
 | [database.md](./database.md) | Persistence: backends, schema, migrations, retention, and the result cache. |

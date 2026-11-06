@@ -31,6 +31,8 @@ pub struct Config {
     #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
+    pub health: HealthConfig,
+    #[serde(default)]
     pub strategies: BTreeMap<String, StrategyConfig>,
     #[serde(default)]
     pub pipelines: BTreeMap<String, PipelineConfig>,
@@ -153,6 +155,52 @@ impl MetricsConfig {
     }
 }
 
+/// `[health]` — HTTP health checks for load balancers and orchestrators
+/// (`/livez`, `/readyz`) on their own plaintext listener, separate from the
+/// gRPC port. Off by default. Every field needs a restart.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind host/IP. Unset binds where `[app].endpoint` does.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "crate::defaults::health_port")]
+    pub port: u16,
+    /// IPs and CIDRs of the peers that may connect. Unset admits anyone who
+    /// can reach the port; see [`HealthConfig::allowlist`].
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            port: defaults::health_port(),
+            allow: None,
+        }
+    }
+}
+
+impl HealthConfig {
+    /// The host it binds: `endpoint`, or `app`'s when unset.
+    pub fn bind_host<'a>(&'a self, app: &'a AppConfig) -> &'a str {
+        self.endpoint.as_deref().unwrap_or(&app.endpoint)
+    }
+
+    /// `allow` parsed: `None` admits everyone. An invalid list is an error,
+    /// never "everyone".
+    pub fn allowlist(&self) -> Result<Option<crate::Allowlist>, Vec<String>> {
+        self.allow
+            .as_deref()
+            .map(crate::Allowlist::parse)
+            .transpose()
+    }
+}
+
 /// `[app]` — application-wide settings.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -202,6 +250,14 @@ pub struct AppConfig {
     /// directory, one per upload directory.
     #[serde(default)]
     pub node_id: Option<String>,
+    /// Seconds a stop keeps serving after it begins, while load balancers
+    /// see the instance unready and stop sending it work (at most 3600).
+    #[serde(default)]
+    pub drain_delay_secs: u32,
+    /// Seconds a stop then waits for the calls still open before it cuts
+    /// them (at most 3600; `0` = no limit).
+    #[serde(default = "crate::defaults::drain_timeout_secs")]
+    pub drain_timeout_secs: u32,
 }
 
 /// Which compute backend to run models on.
@@ -241,6 +297,8 @@ impl Default for AppConfig {
             max_retries: defaults::max_retries(),
             device: DevicePreference::Auto,
             node_id: None,
+            drain_delay_secs: 0,
+            drain_timeout_secs: defaults::drain_timeout_secs(),
         }
     }
 }

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use apollo_domain::ItemState;
 
-use crate::{Engine, EngineError, Overload};
+use crate::{Engine, EngineError, Overload, Phase};
 
 /// Upper bounds (seconds) for latency histograms: 5 ms to 2 min.
 const SECONDS: &[f64] = &[
@@ -233,6 +233,23 @@ impl Engine {
             &[],
             unix_secs(live.loaded_at),
         );
+
+        let lc = &self.inner.lifecycle;
+        out.gauge(
+            "apollo_ready",
+            "1 while ready for work (what /readyz answers).",
+            if lc.ready() { 1.0 } else { 0.0 },
+        );
+        out.family(
+            "apollo_lifecycle_phase",
+            "gauge",
+            "1 for the phase the process is in: starting, serving, draining or stopping.",
+        );
+        let now = lc.phase().name();
+        for phase in Phase::NAMES {
+            let v = if phase == now { 1.0 } else { 0.0 };
+            out.sample("apollo_lifecycle_phase", &[("phase", phase)], v);
+        }
 
         out.counter_vec(
             "apollo_submissions_total",

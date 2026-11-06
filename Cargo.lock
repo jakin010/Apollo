@@ -133,6 +133,8 @@ dependencies = [
  "axum",
  "clap",
  "dirs",
+ "hyper",
+ "hyper-util",
  "libc",
  "mimalloc",
  "pasetors",

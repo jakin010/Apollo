@@ -764,6 +764,11 @@ async fn metrics_render_in_the_prometheus_format() {
         "apollo_submissions_total{outcome=\"invalid\"} 1",
         "apollo_listener_refused_total{listener=\"metrics\"} 1",
         "apollo_config_generation 1",
+        "# TYPE apollo_ready gauge",
+        "apollo_ready 1",
+        "apollo_lifecycle_phase{phase=\"starting\"} 0",
+        "apollo_lifecycle_phase{phase=\"serving\"} 1",
+        "apollo_lifecycle_phase{phase=\"draining\"} 0",
         "apollo_model_loaded{model=\"nsfw\"} 0",
         "apollo_tasks{state=\"queued\"} 0",
         "# TYPE apollo_model_batch_seconds histogram",
@@ -780,6 +785,20 @@ async fn metrics_render_in_the_prometheus_format() {
         assert!(
             value.parse::<f64>().is_ok() || value == "+Inf",
             "bad sample {line:?}"
+        );
+    }
+
+    // Draining: no longer ready.
+    assert!(f.engine.lifecycle().drain());
+    let text = f.engine.metrics_text().await.unwrap();
+    for line in [
+        "apollo_ready 0",
+        "apollo_lifecycle_phase{phase=\"serving\"} 0",
+        "apollo_lifecycle_phase{phase=\"draining\"} 1",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
         );
     }
 }
