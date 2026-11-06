@@ -6,7 +6,7 @@
 
 use crate::error::ConfigError;
 use crate::schema::{Backend, Config, ModelConfig, PipelineConfig, PipelineStep, SamplingKind};
-use apollo_domain::{Architecture, ModelInput, OutputKind};
+use apollo_domain::{Architecture, MAX_WAIT_SECONDS, ModelInput, OutputKind};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -343,6 +343,13 @@ impl Config {
             if secs > 3600 {
                 errs.push(format!("{field} must be at most 3600 (got {secs})"));
             }
+        }
+        let grace = self.app.max_connection_age_grace_secs;
+        if grace < MAX_WAIT_SECONDS {
+            errs.push(format!(
+                "app.max_connection_age_grace_secs must be at least {MAX_WAIT_SECONDS}, \
+                 the longest wait_seconds (got {grace})"
+            ));
         }
 
         match self.database.backend {

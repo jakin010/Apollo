@@ -2,7 +2,7 @@
 
 Apollo exposes one gRPC service that clients call: **`apollo.v1.Inference`**. It is defined in `proto/inference.proto` and shares its message types with `proto/common.proto`.
 
-- **Transport:** gRPC over HTTP/2.
+- **Transport:** gRPC over HTTP/2. With `[app].max_connection_age_secs` set, a connection that old (give or take 10%) is told to finish (`GOAWAY`), and clients open a new one on their own; calls still open on it get `[app].max_connection_age_grace_secs` (300 s by default) and are then cut.
 - **TLS:** served natively when `[tls]` is configured (optionally with mutual TLS), or terminate it at a proxy in front. The examples below use `-plaintext` for a local server; with `[tls]`, drop `-plaintext` (add `-cacert ca.pem` for a private CA).
 - **Server reflection** is enabled, so tools like `grpcurl` and Postman can discover the schema without a local copy of the `.proto` files.
 - **Health checking** (`grpc.health.v1.Health`) is enabled, and follows the server's state: see [Health checking](#health-checking). Load balancers do better with the HTTP checks on the health port ([operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers)).

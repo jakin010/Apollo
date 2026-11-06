@@ -48,13 +48,15 @@ pub fn load(cli_config: Option<&Path>) -> Result<Config, ConfigError> {
 /// Run-only overrides supplied on the `start` command line. These do not persist
 /// to the file (that is what `config set` is for). `webhook_url` replaces
 /// `[webhook].url`, or enables delivery to that URL when the section is absent.
-/// `health_port` replaces `[health].port` (it doesn't turn the listener on).
+/// `health_port` and `metrics_port` replace `[health].port` and
+/// `[metrics].port` (they don't turn the listeners on).
 #[derive(Debug, Default, Clone)]
 pub struct Overrides {
     pub endpoint: Option<String>,
     pub port: Option<u16>,
     pub webhook_url: Option<String>,
     pub health_port: Option<u16>,
+    pub metrics_port: Option<u16>,
 }
 
 impl Config {
@@ -97,6 +99,9 @@ impl Config {
         }
         if let Some(p) = o.health_port {
             self.health.port = p;
+        }
+        if let Some(p) = o.metrics_port {
+            self.metrics.port = p;
         }
         if let Some(u) = &o.webhook_url {
             match self.webhook.as_mut() {

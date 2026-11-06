@@ -134,5 +134,5 @@ The server exits at startup if **no models are configured** — there would be n
 | [grpc-api.md](./grpc-api.md) | The `Inference` service: methods, messages, states, segments, error codes, auth, and examples. |
 | [webhooks.md](./webhooks.md) | The `Webhook` service you implement to receive task events, delivery semantics, and payload signing. |
 | [configuration.md](./configuration.md) | Every config section and field, defaults, units, validation, and the CLI. |
-| [operations.md](./operations.md) | Prometheus metrics, health checks and stopping, live config reload, and threshold calibration. |
+| [operations.md](./operations.md) | Prometheus metrics, health checks, load balancer recipes and stopping, live config reload, and threshold calibration. |
 | [database.md](./database.md) | Persistence: backends, schema, migrations, retention, and the result cache. |

@@ -172,6 +172,11 @@ fn keep_restart_only(running: &Config, mut new: Config) -> (Config, Vec<String>)
     keep!(app.max_concurrent, "app.max_concurrent");
     keep!(app.node_id, "app.node_id");
     keep!(app.config_file, "app.config_file");
+    keep!(app.max_connection_age_secs, "app.max_connection_age_secs");
+    keep!(
+        app.max_connection_age_grace_secs,
+        "app.max_connection_age_grace_secs"
+    );
     keep!(tls, "tls");
     keep!(auth, "auth");
     keep!(database.backend, "database.backend");
@@ -207,6 +212,29 @@ mod tests {
         assert_eq!(applied.app.max_concurrent, running.app.max_concurrent);
         // Live settings are applied.
         assert_eq!(applied.app.max_retries, running.app.max_retries + 1);
+    }
+
+    #[test]
+    fn the_connection_age_waits_for_a_restart() {
+        let running: Config = apollo_config::load::from_str("").unwrap();
+        let mut new = running.clone();
+        new.app.max_connection_age_secs = 600;
+        new.app.max_connection_age_grace_secs = 900;
+        let (applied, changed) = keep_restart_only(&running, new);
+        assert_eq!(
+            changed,
+            [
+                "app.max_connection_age_secs",
+                "app.max_connection_age_grace_secs"
+            ]
+        );
+        assert_eq!(
+            (
+                applied.app.max_connection_age_secs,
+                applied.app.max_connection_age_grace_secs
+            ),
+            (0, 300)
+        );
     }
 
     #[test]

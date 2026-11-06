@@ -47,6 +47,8 @@ A running server picks up an edited file with `apollo reload` (or `SIGHUP`), wit
 | `device` | string | `"auto"` | Compute backend for the models. `auto` picks the first that initializes: CUDA (only in `cuda` builds), then Metal (macOS), then CPU. `cpu` always uses the CPU, even on a GPU machine. `metal` / `cuda` pin that backend and fall back to CPU, with a warning, if it can't be used. |
 | `drain_delay_secs` | u32 (s) | `0` | How long a stop keeps serving after `SIGTERM` or Ctrl-C, while it reports itself unready so load balancers stop sending it work. At most 3600. Applies on reload. See [operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers). |
 | `drain_timeout_secs` | u32 (s) | `15` | How long a stop then waits for the calls still open (uploads, `wait_seconds`) before it cuts them. At most 3600; `0` = no limit. Applies on reload. |
+| `max_connection_age_secs` | u32 (s) | `0` (off) | How long a gRPC connection stays open before it is told to finish (`GOAWAY`), give or take 10% so connections opened together don't all go at once. Its client then opens a new one, which an L4 or DNS balancer may send to another instance. Restart-only. See [operations.md → Several instances](./operations.md#several-instances-sending-work-to-a-less-busy-one). |
+| `max_connection_age_grace_secs` | u32 (s) | `300` | How long the calls still open on such a connection then get before it is cut. At least 300, the longest `wait_seconds`. Restart-only. |
 
 **CPU threads.** Inference on the CPU uses one thread per physical core the server may run on: the performance cores on Apple silicon, and on Linux no more than its CPU affinity (`taskset`) and container CPU limit allow. The count is logged at startup (`CPU threads for inference`). To use fewer, for example when other heavy processes share the machine, set `CANDLE_NUM_THREADS` (or `RAYON_NUM_THREADS`) in the server's environment.
 
@@ -197,7 +199,7 @@ Optional, off by default. When enabled, `GET /metrics` serves Prometheus metrics
 |-------|------|---------|---------|
 | `enabled` | bool | `false` | Serve the endpoint. |
 | `endpoint` | string | `"127.0.0.1"` | Bind host/IP. A non-loopback address without `allow` logs a warning. |
-| `port` | u16 | `9464` | Bind port. |
+| `port` | u16 | `9464` | Bind port. `--metrics-port` overrides it for a run, e.g. for several instances on one host. |
 | `allow` | list of strings | *(unset: anyone)* | The peers that may connect, as IPs or CIDRs, IPv4 or IPv6: `["10.0.0.0/8", "127.0.0.1"]`. Other peers are reset as they connect. `["0.0.0.0/0", "::/0"]` allows everyone. See [operations.md → Who may connect](./operations.md#who-may-connect). |
 
 `allow` is checked against the peer's own address only. An IPv4 peer reaching an IPv6 socket matches as IPv4, and an IPv4 entry never matches an IPv6 peer. These entries are config errors, each with a hint: an empty list, a hostname, a port, brackets, a zone id (`fe80::1%eth0`), leading zeros (`010.0.0.0/8`), host bits (`10.0.0.1/8`; write `10.0.0.0/8`), an IPv4-mapped address (`::ffff:10.0.0.1`; write `10.0.0.1`), a bare `0.0.0.0` or `::` (write `0.0.0.0/0` or `::/0`), and multicast addresses. A link-local entry (`fe80::/10`) is accepted with a warning: it matches on every interface. At startup and on reload, the list is checked against the bound address. A list with no entry that can match there is an error (for example `["10.0.0.0/8"]` on the default `127.0.0.1`), and each entry that can't match logs a warning. A reload that fails the check keeps the running config.
@@ -623,7 +625,7 @@ SigLIP's own sigmoid probabilities against short prompts are tiny: a clear match
 - **Models:** `repo` is required, except for `pdq`; text models cannot set `video_strategy`; `multi_label` only applies to text models, and `max_tokens` to text models (at least 16) and `paddleocr_vl` (at least 1); `max_pixels` (at least 147384) and `min_confidence` (0 to 1) only apply to `paddleocr_vl`, which cannot set `early_exit` or the `siglip` fields; a `pdq` model needs a `hash_list` whose lines parse and name its `categories`, and cannot set `labels`, `taxonomy_file`, `prompt_template`, `score_threshold` or `max_results` (while the `pdq` fields are rejected on other architectures); `video_strategy` must name a defined strategy; `early_exit` must list at least one label, and on an image model requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
 - **Pipelines:** at least one step; no empty step; every `model` must be defined, and in at most one step; unique `order`s; a `stop_if` must list at least one label id, name its step's model (`stop_if.model`) when the step runs several, and not check a `paddleocr_vl` model (it has no labels); a step's `input` must be a `paddleocr_vl` model of an earlier step, and the step's models text models.
 - **Taxonomies:** a category `threshold` must be a number from 0 to 1 with at most 2 decimals, as must a `siglip` model's `score_threshold`.
-- **Listeners:** no port may be 0 (`[health].agent_port = 0` is off). The gRPC port, the health port and the agent port (when `[health]` is enabled) and the metrics port (when `[metrics]` is enabled) must differ wherever their addresses overlap: the same host, `0.0.0.0` and any IPv4 address, or `::` and any address. `drain_delay_secs` and `drain_timeout_secs` are at most 3600. `[health].degraded_at` is above 0 and at most 1.
+- **Listeners:** no port may be 0 (`[health].agent_port = 0` is off). The gRPC port, the health port and the agent port (when `[health]` is enabled) and the metrics port (when `[metrics]` is enabled) must differ wherever their addresses overlap: the same host, `0.0.0.0` and any IPv4 address, or `::` and any address. `drain_delay_secs` and `drain_timeout_secs` are at most 3600, and `max_connection_age_grace_secs` is at least 300. `[health].degraded_at` is above 0 and at most 1.
 - **Database:** selecting `postgres`/`surrealdb` requires the matching `[database.<backend>]` section.
 
 ---
@@ -631,7 +633,8 @@ SigLIP's own sigmoid probabilities against short prompts are tiny: a clear match
 ## CLI reference
 
 ```text
-apollo start [--config PATH] [--endpoint HOST] [--port N] [--webhook-url URL] [--health-port N] [--daemon]
+apollo start [--config PATH] [--endpoint HOST] [--port N] [--webhook-url URL] [--health-port N]
+             [--metrics-port N] [--daemon]
 apollo stop  [...]                       # gracefully stop a running daemon
 apollo status [--json] [--watch [-n SECONDS]]   # is it running, and what is it doing
 apollo reload [--json]                   # apply the edited config without a restart
@@ -646,7 +649,7 @@ apollo token --subject NAME [--expires 30d] [--secret-key-file PATH]
 apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
 ```
 
-- **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url`/`--health-port` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url` and turns delivery on (also over `enabled = false`), or enables delivery to that URL when the section is absent. `--health-port` replaces `[health].port`; it doesn't turn the health checks on. The first `SIGTERM` or Ctrl-C drains and stops the server (see [operations.md → Stopping](./operations.md#stopping)); a second one stops it at once. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
+- **`start`** loads the config, applies **run‑only** overrides (`--endpoint`/`--port`/`--webhook-url`/`--health-port`/`--metrics-port` do **not** persist to the file), validates, and serves. `--webhook-url` replaces `[webhook].url` and turns delivery on (also over `enabled = false`), or enables delivery to that URL when the section is absent. `--health-port` and `--metrics-port` replace `[health].port` and `[metrics].port`; they don't turn those listeners on. The first `SIGTERM` or Ctrl-C drains and stops the server (see [operations.md → Stopping](./operations.md#stopping)); a second one stops it at once. `--daemon` re‑executes the binary detached, writing `apollo.pid` and logging to `apollo.log` in a private per‑user state directory (`~/.local/state/apollo` on Linux, `~/Library/Application Support/apollo` on macOS).
 - **`status`** reports whether the server is running and its live state:
   - version, PID, uptime, phase (`starting` with its step, `serving`, `draining` or `stopping`), listen address, TLS/auth, config file (with its generation and when it was reloaded, after a reload), database, and log file;
   - memory in use against `max_memory` (measured as for `max_memory`: physical footprint on macOS, resident set size elsewhere);

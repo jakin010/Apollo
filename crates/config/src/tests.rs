@@ -918,6 +918,56 @@ fn the_health_port_flag_overrides_the_port_only() {
 }
 
 #[test]
+fn the_metrics_port_flag_overrides_the_port_only() {
+    let mut cfg = load::from_str("[metrics]\nport = 9500\n").unwrap();
+    cfg.apply_overrides(&load::Overrides {
+        metrics_port: Some(9600),
+        ..Default::default()
+    });
+    assert_eq!(cfg.metrics.port, 9600);
+    assert!(!cfg.metrics.enabled);
+    // Validated like the port in the file.
+    let mut cfg = load::from_str("[metrics]\nenabled = true\n").unwrap();
+    cfg.apply_overrides(&load::Overrides {
+        metrics_port: Some(8080),
+        ..Default::default()
+    });
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("metrics.port 8080 is also app.port"), "{err}");
+}
+
+#[test]
+fn connection_age_is_off_and_its_grace_covers_the_longest_wait() {
+    let cfg = load::from_str("").unwrap();
+    assert_eq!(
+        (
+            cfg.app.max_connection_age_secs,
+            cfg.app.max_connection_age_grace_secs
+        ),
+        (0, 300)
+    );
+    let cfg = load::from_str(
+        "[app]\nmax_connection_age_secs = 600\nmax_connection_age_grace_secs = 300\n",
+    )
+    .unwrap();
+    cfg.validate().expect("valid");
+    assert_eq!(cfg.app.max_connection_age_secs, 600);
+
+    let err = load::from_str("[app]\nmax_connection_age_grace_secs = 299\n")
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(
+            "app.max_connection_age_grace_secs must be at least 300, the longest wait_seconds (got 299)"
+        ),
+        "{err}"
+    );
+    assert!(load::from_str("[app]\nmax_connection_age = 600\n").is_err());
+}
+
+#[test]
 fn listeners_need_their_own_ports() {
     let err = |toml: &str| match load::from_str(toml).unwrap().validate() {
         Ok(()) => String::new(),

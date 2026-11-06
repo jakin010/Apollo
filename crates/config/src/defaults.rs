@@ -126,6 +126,10 @@ pub(crate) fn drain_timeout_secs() -> u32 {
     15
 }
 
+pub(crate) fn max_connection_age_grace_secs() -> u32 {
+    apollo_domain::MAX_WAIT_SECONDS
+}
+
 pub(crate) fn degraded_at() -> f64 {
     0.9
 }

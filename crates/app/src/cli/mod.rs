@@ -87,6 +87,22 @@ mod tests {
     #[test]
     fn parses_start_with_overrides() {
         assert!(Cli::try_parse_from(["apollo", "start", "--port", "8080", "--daemon"]).is_ok());
+        let cli = Cli::try_parse_from([
+            "apollo",
+            "start",
+            "--health-port",
+            "9500",
+            "--metrics-port",
+            "9501",
+        ])
+        .unwrap();
+        let super::Command::Start(args) = cli.command else {
+            panic!("not start");
+        };
+        assert_eq!(
+            (args.health_port, args.metrics_port),
+            (Some(9500), Some(9501))
+        );
     }
 
     #[test]

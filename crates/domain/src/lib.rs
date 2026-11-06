@@ -17,6 +17,6 @@ pub use result::{
 };
 pub use revocation::Revocation;
 pub use task::{
-    ErrorKind, Input, Item, ItemState, MediaKind, ModelResult, ModelState, ParseStateError, Task,
-    TaskError, TaskState, Url,
+    ErrorKind, Input, Item, ItemState, MAX_WAIT_SECONDS, MediaKind, ModelResult, ModelState,
+    ParseStateError, Task, TaskError, TaskState, Url,
 };

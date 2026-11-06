@@ -35,6 +35,9 @@ pub struct StartArgs {
     /// Override the health check port ([health].port) for this run only.
     #[arg(long = "health-port")]
     pub health_port: Option<u16>,
+    /// Override the metrics port ([metrics].port) for this run only.
+    #[arg(long = "metrics-port")]
+    pub metrics_port: Option<u16>,
     /// Detach and run in the background, writing a PID file.
     #[arg(long)]
     pub daemon: bool,
@@ -72,6 +75,7 @@ pub fn run(args: StartArgs) -> anyhow::Result<()> {
             port: args.port,
             webhook_url: args.webhook_url.clone(),
             health_port: args.health_port,
+            metrics_port: args.metrics_port,
         },
     };
     let config = source.load()?;
@@ -933,6 +937,9 @@ fn spawn_detached(args: &StartArgs) -> anyhow::Result<()> {
     }
     if let Some(p) = args.health_port {
         cmd.arg("--health-port").arg(p.to_string());
+    }
+    if let Some(p) = args.metrics_port {
+        cmd.arg("--metrics-port").arg(p.to_string());
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))

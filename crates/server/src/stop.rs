@@ -45,13 +45,15 @@ pub(crate) fn incoming(
     })
 }
 
-/// An accepted connection, which fails once the server is dropped, so the
-/// calls still open on it end too.
+/// An accepted connection, which fails once the server is dropped (or it is
+/// too old), so the calls still open on it end too.
 pub(crate) struct Connection {
     io: TcpStream,
-    /// Ends when the server is dropped.
-    dropped: Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// Ends when the connection is to be cut.
+    cutting: Pin<Box<dyn Future<Output = ()> + Send>>,
     cut: bool,
+    /// Dropped with the connection, which tells its server it closed.
+    _closed: Option<oneshot::Sender<()>>,
 }
 
 impl Connection {
@@ -59,14 +61,34 @@ impl Connection {
         Self {
             io,
             // Nothing is ever sent; it ends when the sender drops.
-            dropped: Box::pin(async move { while server.changed().await.is_ok() {} }),
+            cutting: Box::pin(async move { while server.changed().await.is_ok() {} }),
             cut: false,
+            _closed: None,
         }
     }
 
-    /// Whether the server is gone. While it isn't, `cx` is woken when it goes.
+    /// This connection, also cut `limit` from now, and a receiver that ends
+    /// once it is dropped.
+    pub(crate) fn cut_after(self, limit: Duration) -> (Self, oneshot::Receiver<()>) {
+        let (closed, on_closed) = oneshot::channel();
+        let (server, too_old) = (self.cutting, tokio::time::sleep(limit));
+        let conn = Self {
+            io: self.io,
+            cutting: Box::pin(async move {
+                tokio::select! {
+                    () = server => {}
+                    () = too_old => {}
+                }
+            }),
+            cut: self.cut,
+            _closed: Some(closed),
+        };
+        (conn, on_closed)
+    }
+
+    /// Whether to cut it. Until then, `cx` is woken when it is time.
     fn poll_cut(&mut self, cx: &mut Context<'_>) -> bool {
-        if !self.cut && self.dropped.as_mut().poll(cx).is_ready() {
+        if !self.cut && self.cutting.as_mut().poll(cx).is_ready() {
             self.cut = true;
         }
         self.cut
@@ -76,7 +98,7 @@ impl Connection {
 fn cut<T>() -> Poll<io::Result<T>> {
     Poll::Ready(Err(io::Error::new(
         io::ErrorKind::ConnectionAborted,
-        "the server stopped",
+        "the server cut the connection",
     )))
 }
 
@@ -177,5 +199,40 @@ where
             tracing::warn!(?timeout, "the drain timeout passed: closing the calls still open");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn a_connection_is_cut_after_its_limit_and_tells_when_it_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (io, _) = listener.accept().await.unwrap();
+        let (_server, server) = watch::channel(());
+        let limit = Duration::from_millis(300);
+        let (mut conn, closed) = Connection::new(io, server).cut_after(limit);
+
+        let started = std::time::Instant::now();
+        client.write_all(b"hi").await.unwrap();
+        let mut buf = [0; 2];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hi");
+        // Reads fail once the limit passes, while the server still runs.
+        let cut = conn.read(&mut buf).await.unwrap_err();
+        assert_eq!(cut.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(started.elapsed() >= limit, "{:?}", started.elapsed());
+        assert!(conn.write(b"x").await.is_err());
+
+        drop(conn);
+        tokio::time::timeout(Duration::from_secs(1), closed)
+            .await
+            .expect("told it closed")
+            .unwrap_err();
     }
 }

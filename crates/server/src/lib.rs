@@ -14,6 +14,8 @@
 //!   lifecycle.
 //! - `stop` — closing the port as the lifecycle stops, and
 //!   [`serve_until_stopped`], which cuts what is left at the drain deadline.
+//! - `age` — telling connections to reconnect at
+//!   `[app].max_connection_age_secs`.
 //!
 //! Model validation is intentionally *not* duplicated here: `Engine::submit`
 //! rejects unknown/disabled models and modality mismatches synchronously, and
@@ -21,6 +23,7 @@
 //! checks (a set `media` and `run`, metadata and `wait_seconds` limits) live in
 //! `convert`.
 
+mod age;
 mod auth;
 mod convert;
 mod health;

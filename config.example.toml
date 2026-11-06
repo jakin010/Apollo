@@ -13,6 +13,10 @@ device         = "auto"                         # auto (CUDA → Metal → CPU),
 # node_id      = "apollo-1"                     # this instance's name when several share one database (default: kept in the state dir)
 drain_delay_secs   = 5                          # a stop keeps serving this long while load balancers see it unready (default 0)
 drain_timeout_secs = 15                         # then waits this long for open calls before cutting them (0 = no limit)
+# Several instances behind an L4 or DNS balancer: tell each gRPC connection to
+# reconnect after this long (give or take 10%), so new instances get a share.
+# max_connection_age_secs       = 300           # 0 = off (the default)
+# max_connection_age_grace_secs = 300           # then calls still open get this long (at least 300)
 
 [webhook]
 # enabled         = true                         # false = off, keeping these settings (nothing is kept to send later)
@@ -223,7 +227,7 @@ fps    = 5
 # [metrics]
 # enabled  = true
 # endpoint = "127.0.0.1"
-# port     = 9464
+# port     = 9464               # several instances on one host: one port each (or --metrics-port)
 # Who may scrape, as IPs or CIDRs (unset = anyone who can reach the port).
 # With endpoint = "0.0.0.0", for example:
 # allow    = ["10.0.0.0/8", "127.0.0.1"]

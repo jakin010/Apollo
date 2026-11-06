@@ -269,6 +269,15 @@ pub struct AppConfig {
     /// them (at most 3600; `0` = no limit).
     #[serde(default = "crate::defaults::drain_timeout_secs")]
     pub drain_timeout_secs: u32,
+    /// Seconds a gRPC connection stays open before it is told to finish
+    /// (GOAWAY), give or take 10%, so its client reconnects, perhaps to
+    /// another instance (`0` = off).
+    #[serde(default)]
+    pub max_connection_age_secs: u32,
+    /// Seconds the calls still open on such a connection then get before it
+    /// is cut (at least 300, the longest `wait_seconds`).
+    #[serde(default = "crate::defaults::max_connection_age_grace_secs")]
+    pub max_connection_age_grace_secs: u32,
 }
 
 /// Which compute backend to run models on.
@@ -310,6 +319,8 @@ impl Default for AppConfig {
             node_id: None,
             drain_delay_secs: 0,
             drain_timeout_secs: defaults::drain_timeout_secs(),
+            max_connection_age_secs: 0,
+            max_connection_age_grace_secs: defaults::max_connection_age_grace_secs(),
         }
     }
 }
