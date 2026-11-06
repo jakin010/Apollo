@@ -21,6 +21,7 @@
 
 mod cancel;
 mod data;
+mod drain;
 mod recovery;
 mod webhooks;
 

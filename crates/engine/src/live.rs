@@ -115,6 +115,7 @@ impl Engine {
             cache_dir: self.inner.cache_dir.as_ref(),
             idle_ms: &self.inner.idle_ms,
             metrics: &self.inner.metrics,
+            preloaded: &self.inner.preloaded,
         };
         let (registry, models) = Registry::build(&config, &env, Some(&current.registry));
         let generation = current.generation + 1;

@@ -20,7 +20,7 @@ use apollo_domain::{ErrorKind, Input, Task, TaskError, TaskState};
 use apollo_storage::{ClaimMode, Claimable, Fence, Held, Lease, Renewal, StorageError, TaskCursor};
 
 use crate::error::{EngineError, Overload};
-use crate::{Engine, Inner, Reservation, Run, aggregate};
+use crate::{Engine, Inner, Phase, Reservation, Run, aggregate};
 
 /// Resume attempts before a task is declared poison and failed.
 pub(crate) const MAX_RESUME_ATTEMPTS: u32 = 3;
@@ -459,6 +459,9 @@ impl Engine {
                 if engine.inner.closing.load(Ordering::SeqCst) {
                     return;
                 }
+                if !engine.inner.lifecycle.taking_work() {
+                    continue;
+                }
                 if let Err(e) = engine.take_over(Some(engine.inner.lease_ttl)).await {
                     tracing::warn!(error = %e, "could not look for tasks to take over");
                 }
@@ -474,9 +477,13 @@ impl Engine {
     /// On a shared database each read of candidates waits `limit` at most
     /// (`None`: as long as it takes); one that times out leaves this instance
     /// unsettled, as one that fails does.
+    ///
+    /// A drain ends the pass at once (a claim already sent finishes first),
+    /// so a stop's hand-back needn't wait for it.
     pub(crate) async fn take_over(&self, limit: Option<Duration>) -> Result<usize, EngineError> {
         let mut memo = self.inner.takeover.lock().await;
-        if self.inner.closing.load(Ordering::SeqCst) {
+        let lifecycle = &self.inner.lifecycle;
+        if self.inner.closing.load(Ordering::SeqCst) || !lifecycle.taking_work() {
             return Ok(0);
         }
         let storage = &self.inner.storage;
@@ -494,7 +501,7 @@ impl Engine {
         let mut after: Option<TaskCursor> = None;
         let mut looked_again = false;
         for page_no in 0.. {
-            if !force && page_no == PASS_PAGES {
+            if (!force && page_no == PASS_PAGES) || !lifecycle.taking_work() {
                 break;
             }
             let mut skip: Vec<String> = memo.unrunnable.keys().cloned().collect();
@@ -508,15 +515,22 @@ impl Engine {
                 PAGE,
             );
             let sent = Instant::now();
-            let read = match limit.filter(|_| !force) {
-                None => read.await,
-                Some(limit) => match tokio::time::timeout(limit, read).await {
+            let limited = async {
+                match limit.filter(|_| !force) {
+                    None => Ok(read.await),
+                    Some(limit) => tokio::time::timeout(limit, read).await.map_err(|_| limit),
+                }
+            };
+            // Only a read, so a drain may drop it.
+            let read = tokio::select! {
+                read = limited => match read {
                     Ok(read) => read,
-                    Err(_) => {
+                    Err(limit) => {
                         self.connected(false);
                         return Err(StorageError::Timeout(limit).into());
                     }
                 },
+                () = lifecycle.reached(Phase::Draining) => return Ok(taken),
             };
             let page = match read {
                 Ok(page) => {
@@ -533,8 +547,10 @@ impl Engine {
                     {
                         tracing::warn!(took = ?sent.elapsed(), "looking for tasks to take over was slow; looking again in half a lease");
                         looked_again = true;
-                        tokio::time::sleep(self.inner.lease_ttl / 2).await;
-                        continue;
+                        tokio::select! {
+                            () = tokio::time::sleep(self.inner.lease_ttl / 2) => continue,
+                            () = lifecycle.reached(Phase::Draining) => return Ok(taken),
+                        }
                     }
                     page
                 }
@@ -550,6 +566,9 @@ impl Engine {
             });
             let full = page.len() < PAGE;
             for candidate in page {
+                if !lifecycle.taking_work() {
+                    return Ok(taken);
+                }
                 match self.take(&candidate, mode, &mut memo).await {
                     Taken::Yes => taken += 1,
                     Taken::No => {}

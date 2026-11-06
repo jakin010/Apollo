@@ -11,6 +11,7 @@
 //! - `watch`     — task change notifications (`WatchTask`, `wait_seconds`)
 //! - `catalog`   — the configured models and pipelines (`ListModels`)
 //! - `live`      — the reloadable part of the engine, and config reload
+//! - `lifecycle` — starting, serving, draining and stopping
 //! - `metrics`   — Prometheus counters, histograms and the text format
 //!
 //! [`Engine`] is a cheap clonable handle around a shared `Inner`; cloning it does
@@ -36,6 +37,7 @@ mod catalog;
 mod error;
 mod gate;
 mod lease;
+mod lifecycle;
 mod live;
 mod memory;
 mod metrics;
@@ -58,6 +60,7 @@ pub use aggregate::task_error;
 pub use apollo_storage::{TaskCursor, TaskPage, TaskQuery};
 pub use catalog::{Catalog, Gate, ModelInfo, PipelineInfo, PipelineStepInfo, Trigger};
 pub use error::{EngineError, Overload};
+pub use lifecycle::{HAND_BACK_LIMIT, Lifecycle, Phase, Step};
 pub use live::ReloadReport;
 pub use registry::RegistryChanges;
 pub use status::{EngineStatus, ModelStatus, TaskCounts};
@@ -161,6 +164,11 @@ struct Inner {
     takeover: tokio::sync::Mutex<lease::Takeover>,
     /// Shutting down: no new runs, no takeovers.
     closing: AtomicBool,
+    /// The process's lifecycle: draining stops takeovers, stopping ends
+    /// watches.
+    lifecycle: Lifecycle,
+    /// Woken as each pinned model's worker finishes its first load attempt.
+    preloaded: Arc<tokio::sync::Notify>,
     /// Ids of changed tasks, announced by the storage wrapper.
     changes: broadcast::Sender<Arc<str>>,
     /// One lock per `(owner, request_id)` in use: serializes submissions with
@@ -218,12 +226,27 @@ impl Engine {
 
     /// [`Engine::new`], as node `node`: the name its node-local inputs
     /// (uploads, local files) stay with among instances sharing a database,
-    /// the same across restarts.
+    /// the same across restarts. Its lifecycle is serving already.
     pub fn with_node(
         config: Arc<Config>,
         storage: Arc<dyn Storage>,
         webhook: Option<Arc<dyn WebhookSink>>,
         node: String,
+    ) -> Engine {
+        let lifecycle = Lifecycle::new();
+        lifecycle.serving();
+        Self::with_lifecycle(config, storage, webhook, node, lifecycle)
+    }
+
+    /// [`Engine::with_node`], following the process's `lifecycle`: once it
+    /// drains, the engine takes no tasks or webhook deliveries over from
+    /// other instances; once it stops, watches and waits end.
+    pub fn with_lifecycle(
+        config: Arc<Config>,
+        storage: Arc<dyn Storage>,
+        webhook: Option<Arc<dyn WebhookSink>>,
+        node: String,
+        lifecycle: Lifecycle,
     ) -> Engine {
         let (_probe, kind) = apollo_inference::select_device(config.app.device);
         tracing::info!(device = %kind, "selected compute device");
@@ -231,11 +254,13 @@ impl Engine {
         let cache_dir = config.app.cache_dir.clone().map(PathBuf::from);
         let idle_ms = Arc::new(AtomicU64::new(live::idle_ms(&config)));
         let metrics = metrics::Metrics::new();
+        let preloaded = Arc::new(tokio::sync::Notify::new());
         let env = WorkerEnv {
             kind,
             cache_dir: cache_dir.as_ref(),
             idle_ms: &idle_ms,
             metrics: &metrics,
+            preloaded: &preloaded,
         };
         let (registry, _) = Registry::build(&config, &env, None);
         let lease_ttl = Duration::from_secs(config.database.lease_secs.max(1).into());
@@ -275,6 +300,8 @@ impl Engine {
                 connected_since: Mutex::new(Some(Instant::now())),
                 takeover: tokio::sync::Mutex::new(lease::Takeover::default()),
                 closing: AtomicBool::new(false),
+                lifecycle,
+                preloaded,
             }),
             pinned: None,
             run: None,
@@ -299,6 +326,25 @@ impl Engine {
     /// The config in effect (for this handle).
     pub fn config(&self) -> Arc<Config> {
         Arc::clone(&self.live().config)
+    }
+
+    /// The lifecycle the engine follows.
+    pub fn lifecycle(&self) -> &Lifecycle {
+        &self.inner.lifecycle
+    }
+
+    /// Returns once every pinned model (`keep_in_memory`) has made its first
+    /// load attempt, whether it loaded or not.
+    pub async fn preloads_attempted(&self) {
+        worker::wait_preloads(&self.inner.preloaded, || {
+            self.inner
+                .live
+                .read()
+                .unwrap()
+                .registry
+                .preloads_attempted()
+        })
+        .await;
     }
 
     /// `work`, a wait for the database on a client's behalf, failing with a
@@ -733,6 +779,27 @@ impl Engine {
     /// only crashes do — and another instance may take them at once.
     pub async fn shutdown(&self) {
         self.hand_back_all().await;
+    }
+
+    /// [`Engine::shutdown`], giving up after [`HAND_BACK_LIMIT`] (the database
+    /// doesn't answer). Returns whether it finished.
+    pub async fn hand_back(&self) -> bool {
+        self.shutdown_within(HAND_BACK_LIMIT).await
+    }
+
+    /// [`Engine::shutdown`], giving up after `limit`. The claims not handed
+    /// back then lapse after the lease, and each counts a resume attempt
+    /// when it is taken over.
+    pub(crate) async fn shutdown_within(&self, limit: Duration) -> bool {
+        if tokio::time::timeout(limit, self.shutdown()).await.is_ok() {
+            return true;
+        }
+        tracing::warn!(
+            after = ?limit,
+            lease = ?self.inner.lease_ttl,
+            "could not hand the tasks back in time; their claims lapse after the lease, and each counts a resume attempt when it is taken over"
+        );
+        false
     }
 
     /// Fetch a task by id (backs the `GetTask` RPC, and watches).

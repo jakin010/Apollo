@@ -71,14 +71,14 @@ impl Histogram {
 
 /// Counters keyed by a small set of label values.
 #[derive(Default)]
-struct CounterVec(Mutex<BTreeMap<Vec<&'static str>, u64>>);
+pub(crate) struct CounterVec(Mutex<BTreeMap<Vec<&'static str>, u64>>);
 
 impl CounterVec {
-    fn inc(&self, labels: &[&'static str]) {
+    pub(crate) fn inc(&self, labels: &[&'static str]) {
         *self.0.lock().unwrap().entry(labels.to_vec()).or_default() += 1;
     }
 
-    fn snapshot(&self) -> Vec<(Vec<&'static str>, u64)> {
+    pub(crate) fn snapshot(&self) -> Vec<(Vec<&'static str>, u64)> {
         self.0
             .lock()
             .unwrap()
@@ -142,8 +142,6 @@ pub(crate) struct Metrics {
     pub(crate) cache_hits: AtomicU64,
     /// By event (`progress`, `finished`) and result (`ok`, `error`).
     webhook_deliveries: CounterVec,
-    /// Peers a listener's allow list refused, by listener.
-    listener_refused: CounterVec,
     models: Mutex<BTreeMap<String, Arc<ModelMetrics>>>,
 }
 
@@ -158,7 +156,6 @@ impl Metrics {
             fetch_failures: CounterVec::default(),
             cache_hits: AtomicU64::new(0),
             webhook_deliveries: CounterVec::default(),
-            listener_refused: CounterVec::default(),
             models: Mutex::new(BTreeMap::new()),
         }
     }
@@ -195,17 +192,13 @@ impl Metrics {
         self.webhook_deliveries
             .inc(&[event, if ok { "ok" } else { "error" }]);
     }
-
-    pub(crate) fn listener_refused(&self, listener: &'static str) {
-        self.listener_refused.inc(&[listener]);
-    }
 }
 
 impl Engine {
     /// Count a connection or request that `listener`'s allow list refused
     /// (`apollo_listener_refused_total`).
     pub fn note_refused(&self, listener: &'static str) {
-        self.inner.metrics.listener_refused(listener);
+        self.inner.lifecycle.note_refused(listener);
     }
 }
 
@@ -355,7 +348,7 @@ impl Engine {
             "apollo_listener_refused_total",
             "Connections and requests refused by a listener's allow list, by listener.",
             &["listener"],
-            &m.listener_refused,
+            self.inner.lifecycle.refused(),
         );
 
         // Per model: gauges for the configured models, counters for every
