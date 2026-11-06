@@ -14,6 +14,9 @@
 //! A ready answer while degraded (load, database) says so, with
 //! `x-envoy-degraded: 1`. `?verbose` on a readiness path answers with the
 //! details as JSON, only to a local peer that no proxy forwarded for.
+//!
+//! With `agent_port`, the HAProxy agent ([`crate::agent`]) starts beside it,
+//! for the same peers.
 
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
@@ -62,11 +65,15 @@ impl Default for Limits {
     }
 }
 
-/// Serve the health checks when `[health]` is enabled, following `lc`, to
-/// the peers `[health].allow` admits. Call it inside the runtime.
+/// Serve the health checks when `[health]` is enabled, and the HAProxy agent
+/// with `agent_port`, following `lc`, to the peers `[health].allow` admits.
+/// Call it inside the runtime.
 pub(crate) async fn start(config: &Config, lc: &Lifecycle) -> anyhow::Result<()> {
     let health = &config.health;
     if !health.enabled {
+        if health.agent_port != 0 {
+            tracing::warn!("[health].agent_port is set, but [health] is off: no HAProxy agent");
+        }
         return Ok(());
     }
     let host = health.bind_host(&config.app);
@@ -93,6 +100,8 @@ pub(crate) async fn start(config: &Config, lc: &Lifecycle) -> anyhow::Result<()>
         "serving health checks on /livez, /readyz, /readyz/strict and /load"
     );
     tracing::info!("{}", bound.describe("health", list.as_deref()));
+    // Before the health checks serve: a port it can't bind fails the start.
+    crate::agent::start(addr, health.agent_port, list.clone(), lc).await?;
     // Counted in the lifecycle, which exists before the engine does.
     let counter = lc.clone();
     let guard = Guard::new(
@@ -478,7 +487,7 @@ pub(crate) mod tests {
 
     /// Whether the server closed `stream` without an answer (EOF or a
     /// reset) within a second.
-    async fn closed(mut stream: TcpStream) -> bool {
+    pub(crate) async fn closed(mut stream: TcpStream) -> bool {
         let mut buf = [0u8; 64];
         match tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await {
             Ok(Ok(n)) => n == 0,
@@ -652,7 +661,7 @@ pub(crate) mod tests {
 
     /// An engine on a SQLite database in `dir`, following `lc`, through a
     /// store that counts its calls; with `stall`, every storage call waits.
-    async fn engine_in(
+    pub(crate) async fn engine_in(
         dir: &tempfile::TempDir,
         lc: &Lifecycle,
         stall: bool,
@@ -711,11 +720,12 @@ pub(crate) mod tests {
         assert!(!status.is_finished(), "the store answered");
     }
 
-    /// `[health]` on a free loopback port with `allow`, as the config gives it.
-    fn health_config(allow: &str) -> (Config, SocketAddr) {
+    /// `[health]` on a free loopback port with the lines `extra` (such as
+    /// `allow`), as the config gives it.
+    pub(crate) fn health_config(extra: &str) -> (Config, SocketAddr) {
         let port = free_port();
         let toml =
-            format!("[health]\nenabled = true\nendpoint = \"127.0.0.1\"\nport = {port}\n{allow}");
+            format!("[health]\nenabled = true\nendpoint = \"127.0.0.1\"\nport = {port}\n{extra}");
         let config = apollo_config::load::from_str(&toml).unwrap();
         (config, SocketAddr::from(([127, 0, 0, 1], port)))
     }

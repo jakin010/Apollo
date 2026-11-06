@@ -368,6 +368,10 @@ impl Config {
         if self.health.enabled {
             let host = self.health.bind_host(&self.app);
             listeners.push(("health.port", host, self.health.port));
+            // 0 is off.
+            if self.health.agent_port != 0 {
+                listeners.push(("health.agent_port", host, self.health.agent_port));
+            }
         }
         if self.metrics.enabled {
             let host = self.metrics.endpoint.as_str();

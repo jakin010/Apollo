@@ -53,7 +53,7 @@ Two metrics come from the database: `apollo_tasks` and `apollo_webhooks_pending`
 | `apollo_cache_hits_total` | counter | | Model results served from the result cache. |
 | `apollo_webhooks_pending` | gauge | | Finished inputs whose webhook event is not delivered yet (with a webhook configured). Left out when the database doesn't answer in time. |
 | `apollo_webhook_deliveries_total` | counter | `event`, `result` | Delivery attempts: `progress` / `finished`, `ok` / `error`. |
-| `apollo_listener_refused_total` | counter | `listener` | Peers a listener's `allow` list refused, at connect or with a 403: `metrics` or `health`. |
+| `apollo_listener_refused_total` | counter | `listener` | Peers a listener's `allow` list refused, at connect or with a 403: `metrics`, `health` or `agent`. |
 | `apollo_model_loaded` | gauge | `model` | 1 while the model's weights are in memory. |
 | `apollo_model_queued_jobs` | gauge | `model` | Requests waiting for the model's worker. |
 | `apollo_model_items_admitted` | gauge | `model` | Inputs accepted and not finished that run the model (what its `max_pending` is checked against). |
@@ -141,7 +141,7 @@ gRPC health on the gRPC port follows the same states: the names `""`, `apollo.v1
 | Handing tasks back (up to 5 s) | 200 | 503 stopping | 503 stopping | 0 | closed |
 | The process is stuck | no answer | no answer | no answer | no answer | no answer |
 
-gRPC health answers `SERVING` where the table says 200 (degraded or not), and `NOT_SERVING` for 503. The weight is the one `/load` and `apollo_lb_weight` give.
+gRPC health answers `SERVING` where the table says 200 (degraded or not), and `NOT_SERVING` for 503. The weight is the one `/load` and `apollo_lb_weight` give. The [HAProxy agent](#the-haproxy-agent) sends it where it is above 0, `drain` where it is 0, and closes its port once stopping.
 
 Starting ends once every model with `keep_in_memory` has tried its first load, whether it loaded or not; a model that failed to load shows in the log and `apollo status`. A model download can take long, and `/livez` passes meanwhile.
 
@@ -175,6 +175,43 @@ A degraded server stays in rotation. `/readyz` and `/readyz/strict` (when it pas
 - `sampled_ms_ago`: the age of the sample, taken every second; `null` before the first one.
 
 The figure covers the whole server. It names no models and no node; per-model load is in [Details for local tools](#details-for-local-tools) and `apollo_model_utilization`.
+
+### The HAProxy agent
+
+For HAProxy's `agent-check`, Apollo can report its weight and state on a TCP port of its own:
+
+```toml
+[health]
+enabled    = true
+agent_port = 9466   # 0 (the default) is off; same address as the health port
+```
+
+On each connection Apollo sends one line, ending in a newline, and closes the connection. It ignores what HAProxy sends (`agent-send`).
+
+| State | Line | What HAProxy does |
+|-------|------|-------------------|
+| Serving | `up ready 60%` | `up` marks the server up again if HAProxy's own health check passes too, `ready` ends a drain, and `60%` sets the weight to that share of the server's configured `weight`. The figure is the [weight](#the-load-figure): 1 to 100, and 1 while out of touch with a shared database. |
+| Starting, draining | `drain` | Sends it no new connections, except persistent ones. |
+| Stopping | the port is closed | HAProxy doesn't count an agent it can't reach as an error: the server stays in `drain`, and its health check (503 since the drain began) marks it down. |
+
+Apollo never sends `down` or `maint`: whether the server is up stays with HAProxy's own health check. A backend might look like this:
+
+```text
+backend apollo
+    mode http
+    balance roundrobin
+    option httpchk GET /readyz
+    default-server check port 9465 check-proto h1 rise 2 fall 3 agent-check agent-port 9466 weight 100
+    server apollo1 10.0.0.11:8080 proto h2
+    server apollo2 10.0.0.12:8080 proto h2
+```
+
+- `weight 100` matters. HAProxy's default weight is 1, and it rounds a percentage of it down: with weight 1, any line under `100%` gives weight 0.
+- Use a dynamic `balance` such as `roundrobin` or `leastconn`. With `static-rr` HAProxy takes only 0 and 100%.
+- `check-proto h1`: the health port speaks HTTP/1.1, while `proto h2` would make the checks speak HTTP/2 too.
+- `drain` takes effect at the next agent check (`agent-inter`, 2 s by default), without waiting for `fall` failed health checks. With the agent, a `drain_delay_secs` a little above `agent-inter` lets HAProxy see the drain before the gRPC port closes.
+- `ready` also ends a drain or maintenance set by hand in HAProxy. To take a server out by hand, first stop its agent checks on HAProxy's runtime API (`disable agent apollo/apollo1`), or stop the instance.
+- `[health].allow`, when set, covers the agent port too, and a refused peer is reset as on the health port.
 
 ### Details for local tools
 
@@ -249,7 +286,7 @@ spec:
 
 ## Who may connect
 
-Two lists choose, by IP or CIDR, who may connect to the monitoring ports: `[metrics].allow` for the metrics port, and `[health].allow` for the health port. Each covers only its own port; neither falls back to the other.
+Two lists choose, by IP or CIDR, who may connect to the monitoring ports: `[metrics].allow` for the metrics port, and `[health].allow` for the health port and the [agent port](#the-haproxy-agent). Each covers only its own ports; neither falls back to the other.
 
 `[metrics].allow` lists the peers that may scrape:
 
@@ -268,7 +305,7 @@ metrics 0.0.0.0:9464 allows 10.0.0.0/8 (loopback refused)
 
 `(loopback refused)` means a local `curl http://127.0.0.1:9464/metrics` is refused. Add `127.0.0.1` (and `::1`) to allow it. A list that can't match the bound address is an error (see [configuration.md → `[metrics]`](./configuration.md#metrics--prometheus-metrics)).
 
-`[health].allow` lists the peers that may connect to the health port, by the same rules:
+`[health].allow` lists the peers that may connect to the health port and the agent port, by the same rules:
 
 ```toml
 [health]
@@ -290,7 +327,7 @@ Unlike `[metrics].allow`, it needs a restart. A list that misses the checkers fa
 refused 192.0.2.7 on the metrics port 0.0.0.0:9464 (not in [metrics].allow)
 ```
 
-Each source is logged at most once a minute (IPv6 sources by /64), and at most 10 lines a minute in all. The rest go into one summary a minute: `refused 3412 connections from 977 sources on the metrics port 0.0.0.0:9464 (not in [metrics].allow); latest: …`. `apollo_listener_refused_total` counts every refusal by `listener` (`metrics` or `health`), so `increase(apollo_listener_refused_total[10m]) > 0` works as an alert. Change a list on one instance first, and check its log before changing the others.
+Each source is logged at most once a minute (IPv6 sources by /64), and at most 10 lines a minute in all. The rest go into one summary a minute: `refused 3412 connections from 977 sources on the metrics port 0.0.0.0:9464 (not in [metrics].allow); latest: …`. `apollo_listener_refused_total` counts every refusal by `listener` (`metrics`, `health` or `agent`), so `increase(apollo_listener_refused_total[10m]) > 0` works as an alert. Change a list on one instance first, and check its log before changing the others.
 
 **Lists for common load balancers.** Check the provider's page before you copy a range: they change without notice.
 
@@ -410,7 +447,7 @@ The new config is read the way `start` read it, with the same file and the same 
 
 **Tasks already running** finish on the config they started with, so a scan is not switched to a different strategy halfway, and a pipeline keeps its steps. New submissions use the new config.
 
-**Restart-only:** `app.endpoint`, `app.port`, `app.device`, `app.cache_dir`, `app.max_concurrent`, `app.node_id`, `[tls]`, `[auth]`, `[database]` (except `retention`), `metrics.enabled`, `metrics.endpoint`, `metrics.port`, and `[health]` except `degraded_at` (`enabled`, `endpoint`, `port`, `allow`). A reload reports these and keeps their running values until the next restart. Uploads are read only from the current `app.cache_dir`, so uploaded inputs still waiting when it changes fail: let them finish first.
+**Restart-only:** `app.endpoint`, `app.port`, `app.device`, `app.cache_dir`, `app.max_concurrent`, `app.node_id`, `[tls]`, `[auth]`, `[database]` (except `retention`), `metrics.enabled`, `metrics.endpoint`, `metrics.port`, and `[health]` except `degraded_at` (`enabled`, `endpoint`, `port`, `allow`, `agent_port`). A reload reports these and keeps their running values until the next restart. Uploads are read only from the current `app.cache_dir`, so uploaded inputs still waiting when it changes fail: let them finish first.
 
 The request goes over the same owner-only local socket as `apollo status`, so only the OS user running the server can reload it.
 

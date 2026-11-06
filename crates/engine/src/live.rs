@@ -186,6 +186,7 @@ fn keep_restart_only(running: &Config, mut new: Config) -> (Config, Vec<String>)
     keep!(health.endpoint, "health.endpoint");
     keep!(health.port, "health.port");
     keep!(health.allow, "health.allow");
+    keep!(health.agent_port, "health.agent_port");
     (new, changed)
 }
 
@@ -230,6 +231,7 @@ mod tests {
         new.health.endpoint = Some("10.0.0.5".into());
         new.health.port = 9500;
         new.health.allow = Some(vec!["10.0.0.0/8".into()]);
+        new.health.agent_port = 9466;
         new.health.degraded_at = 0.8;
         new.app.drain_delay_secs = 5;
         new.app.drain_timeout_secs = 0;
@@ -240,16 +242,18 @@ mod tests {
                 "health.enabled",
                 "health.endpoint",
                 "health.port",
-                "health.allow"
+                "health.allow",
+                "health.agent_port"
             ]
         );
         assert_eq!(
             (
                 &applied.health.endpoint,
                 applied.health.port,
-                &applied.health.allow
+                &applied.health.allow,
+                applied.health.agent_port
             ),
-            (&running.health.endpoint, running.health.port, &None)
+            (&running.health.endpoint, running.health.port, &None, 0)
         );
         assert!(applied.health.enabled);
         // These apply.

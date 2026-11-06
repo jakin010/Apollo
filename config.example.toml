@@ -241,6 +241,8 @@ enabled = true
 # Who may connect, as IPs or CIDRs (unset = anyone who can reach the port).
 # On Kubernetes leave it unset and use a NetworkPolicy. For example:
 # allow    = ["10.20.0.0/16", "127.0.0.1"]
+# A HAProxy agent for agent-check (0 = off): "up ready 60%" or "drain".
+# agent_port = 9466
 # From this utilization (0 to 1), /readyz answers "200 ok degraded: load".
 # degraded_at = 0.9
 

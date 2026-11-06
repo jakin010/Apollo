@@ -879,6 +879,7 @@ fn health_and_drain_defaults() {
     // Unset binds where the gRPC port does.
     assert_eq!(h.bind_host(&cfg.app), "0.0.0.0");
     assert_eq!(h.allowlist(), Ok(None));
+    assert_eq!(h.agent_port, 0, "no agent unless asked for");
     assert_eq!(h.degraded_at, 0.9);
     assert_eq!(
         (cfg.app.drain_delay_secs, cfg.app.drain_timeout_secs),
@@ -887,12 +888,13 @@ fn health_and_drain_defaults() {
     cfg.validate().expect("valid");
 
     let cfg = load::from_str(
-        "[app]\ndrain_delay_secs = 5\ndrain_timeout_secs = 0\n[health]\nenabled = true\nendpoint = \"10.0.0.5\"\nport = 9500\nallow = [\"10.0.0.0/8\"]\n",
+        "[app]\ndrain_delay_secs = 5\ndrain_timeout_secs = 0\n[health]\nenabled = true\nendpoint = \"10.0.0.5\"\nport = 9500\nallow = [\"10.0.0.0/8\"]\nagent_port = 9501\n",
     )
     .unwrap();
     cfg.validate().expect("valid");
     assert_eq!(cfg.health.bind_host(&cfg.app), "10.0.0.5");
     assert_eq!(cfg.health.port, 9500);
+    assert_eq!(cfg.health.agent_port, 9501);
     assert!(cfg.health.allowlist().unwrap().is_some());
     assert_eq!(
         (cfg.app.drain_delay_secs, cfg.app.drain_timeout_secs),
@@ -961,11 +963,32 @@ fn listeners_need_their_own_ports() {
         "{clash}"
     );
 
-    // No port 0.
+    // The agent port, where it runs, clashes like the others.
+    let clash = err("[health]\nenabled = true\nagent_port = 9465\n");
+    assert!(
+        clash.contains("health.agent_port 9465 is also health.port"),
+        "{clash}"
+    );
+    let clash = err("[app]\nport = 9466\n[health]\nenabled = true\nagent_port = 9466\n");
+    assert!(
+        clash.contains("health.agent_port 9466 is also app.port"),
+        "{clash}"
+    );
+    let clash = err("[health]\nenabled = true\nagent_port = 9464\n[metrics]\nenabled = true\n");
+    assert!(
+        clash.contains("metrics.port 9464 is also health.agent_port"),
+        "{clash}"
+    );
+    assert_eq!(err("[health]\nenabled = true\nagent_port = 9466\n"), "");
+    // Without [health] it doesn't run.
+    assert_eq!(err("[app]\nport = 9466\n[health]\nagent_port = 9466\n"), "");
+
+    // No port 0 (an agent_port of 0 is off).
     let zero = err("[app]\nport = 0\n[health]\nenabled = true\nport = 0\n");
     assert!(zero.contains("app.port must not be 0"), "{zero}");
     assert!(zero.contains("health.port must not be 0"), "{zero}");
     assert!(!zero.contains("is also"), "{zero}");
+    assert!(!zero.contains("agent_port"), "{zero}");
 }
 
 #[test]

@@ -157,8 +157,8 @@ impl MetricsConfig {
 
 /// `[health]` — HTTP health checks for load balancers and orchestrators
 /// (`/livez`, `/readyz`, `/readyz/strict`, `/load`) on their own plaintext
-/// listener, separate from the gRPC port. Off by default. Every field but
-/// `degraded_at` needs a restart.
+/// listener, separate from the gRPC port, and optionally a HAProxy agent.
+/// Off by default. Every field but `degraded_at` needs a restart.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthConfig {
@@ -173,6 +173,10 @@ pub struct HealthConfig {
     /// can reach the port; see [`HealthConfig::allowlist`].
     #[serde(default)]
     pub allow: Option<Vec<String>>,
+    /// Port of the HAProxy agent (`agent-check`), on `endpoint`, for the
+    /// peers `allow` admits. 0 (the default) is off.
+    #[serde(default)]
+    pub agent_port: u16,
     /// Utilization (0 to 1) at which the instance reports itself degraded
     /// for load, above 0 and at most 1. Applies on reload.
     #[serde(default = "crate::defaults::degraded_at")]
@@ -186,6 +190,7 @@ impl Default for HealthConfig {
             endpoint: None,
             port: defaults::health_port(),
             allow: None,
+            agent_port: 0,
             degraded_at: defaults::degraded_at(),
         }
     }
