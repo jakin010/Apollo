@@ -1,7 +1,7 @@
 //! Where the process is in its life: starting, serving, draining before a
-//! stop, or stopping. It only moves forward. Probes read it without waiting
-//! on anything; the engine takes no work over once it drains, and ends
-//! watches and waits once it stops.
+//! stop, or stopping. It only moves forward. Probes read it, and the latest
+//! load sample it holds, without waiting on anything; the engine takes no
+//! work over once it drains, and ends watches and waits once it stops.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
+use crate::load::LoadSnapshot;
 use crate::metrics::CounterVec;
 
 /// How long a stop waits for the tasks to be handed back (see
@@ -77,6 +78,8 @@ struct Shared {
     /// refused, by listener. Kept here, as those listeners may start before
     /// the engine.
     refused: CounterVec,
+    /// The engine's latest load sample (see [`crate::load`]).
+    load: watch::Sender<Arc<LoadSnapshot>>,
 }
 
 impl Default for Lifecycle {
@@ -89,11 +92,13 @@ impl Lifecycle {
     /// A lifecycle opening the database, its first step.
     pub fn new() -> Self {
         let (phase, _) = watch::channel(Phase::Starting(Step::OpeningDatabase));
+        let (load, _) = watch::channel(Arc::new(LoadSnapshot::default()));
         Self(Arc::new(Shared {
             phase,
             since: Mutex::new(Instant::now()),
             forced: AtomicBool::new(false),
             refused: CounterVec::default(),
+            load,
         }))
     }
 
@@ -147,6 +152,33 @@ impl Lifecycle {
     /// Whether load balancers should send work here.
     pub fn ready(&self) -> bool {
         self.phase() == Phase::Serving
+    }
+
+    /// [`Lifecycle::ready`], and in touch with the database (or it isn't
+    /// shared): what `/readyz/strict` answers.
+    pub fn ready_strict(&self) -> bool {
+        self.ready() && !self.load().database.is_stale()
+    }
+
+    /// The weight load balancers should give this instance: 0 when not
+    /// ready, 1 while the database is stale, otherwise 1 to 100 from its
+    /// utilization.
+    pub fn weight(&self) -> u32 {
+        self.load().weight(self.ready())
+    }
+
+    /// The latest load sample; an empty one until the engine takes the first.
+    pub fn load(&self) -> Arc<LoadSnapshot> {
+        Arc::clone(&self.0.load.borrow())
+    }
+
+    /// The latest load sample, and each one after it.
+    pub fn subscribe_load(&self) -> watch::Receiver<Arc<LoadSnapshot>> {
+        self.0.load.subscribe()
+    }
+
+    pub(crate) fn publish_load(&self, snapshot: LoadSnapshot) {
+        self.0.load.send_replace(Arc::new(snapshot));
     }
 
     /// Whether this instance takes tasks and webhook deliveries over from

@@ -641,7 +641,9 @@ async fn build_report(engine: &Engine, info: &ServerInfo) -> crate::status::Stat
     let s = engine.status().await;
     let config = engine.config();
     let (generation, loaded_at) = engine.config_generation();
-    let phase = engine.lifecycle().phase();
+    let lc = engine.lifecycle();
+    let phase = lc.phase();
+    let load = lc.load();
     st::StatusReport {
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
@@ -672,6 +674,12 @@ async fn build_report(engine: &Engine, info: &ServerInfo) -> crate::status::Stat
             slots_busy: s.slots_busy,
             slots_waiting: s.slots_waiting,
         },
+        load: Some(st::Load {
+            utilization: load.utilization,
+            weight: load.weight(lc.ready()),
+            degraded: load.degraded().into_iter().map(String::from).collect(),
+            database: load.database.name().to_string(),
+        }),
         tasks: s.stored.map(|c| st::Tasks {
             queued: c.tasks.queued,
             processing: c.tasks.processing,

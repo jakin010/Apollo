@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use apollo_domain::ItemState;
 
-use crate::{Engine, Overload, Phase};
+use crate::{DEGRADED, Database, Engine, Overload, Phase};
 
 /// Upper bounds (seconds) for latency histograms: 5 ms to 2 min.
 const SECONDS: &[f64] = &[
@@ -257,6 +257,54 @@ impl Engine {
             let v = if phase == now { 1.0 } else { 0.0 };
             out.sample("apollo_lifecycle_phase", &[("phase", phase)], v);
         }
+        // One sample for every figure below, so they agree.
+        let load = lc.load();
+        let ready = lc.ready();
+        out.gauge(
+            "apollo_ready_strict",
+            "1 while ready and in touch with the database, or it isn't shared (what /readyz/strict answers).",
+            if ready && !load.database.is_stale() {
+                1.0
+            } else {
+                0.0
+            },
+        );
+        out.gauge(
+            "apollo_utilization",
+            "How close the instance is to refusing work, from 0 to 1 (rises at once, falls over about 5 s).",
+            load.utilization,
+        );
+        out.gauge(
+            "apollo_lb_weight",
+            "The weight for load balancers: 1 to 100, 1 while the database is stale, 0 when not ready.",
+            load.weight(ready).into(),
+        );
+        out.family(
+            "apollo_degraded",
+            "gauge",
+            "1 while degraded, by reason: load (utilization reached [health].degraded_at) or database (stale).",
+        );
+        let degraded = load.degraded();
+        for reason in DEGRADED {
+            let v = if degraded.contains(&reason) { 1.0 } else { 0.0 };
+            out.sample("apollo_degraded", &[("reason", reason)], v);
+        }
+        if let Some(last_contact) = load.database.last_contact() {
+            out.gauge(
+                "apollo_database_up",
+                "1 while in touch with the shared database, 0 while it is stale.",
+                if matches!(load.database, Database::Ok { .. }) {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+            out.gauge(
+                "apollo_database_last_contact_seconds",
+                "Seconds since the shared database last answered.",
+                last_contact.elapsed().as_secs_f64(),
+            );
+        }
 
         out.counter_vec(
             "apollo_submissions_total",
@@ -410,6 +458,22 @@ impl Engine {
         for s in &status.models {
             let v = s.admitted as f64;
             out.sample("apollo_model_items_admitted", &[("model", &s.label)], v);
+        }
+        out.family(
+            "apollo_model_utilization",
+            "gauge",
+            "Inputs admitted over the model's max_pending (models with one).",
+        );
+        for s in status.models.iter().filter(|s| s.enabled) {
+            let limit = live
+                .config
+                .models
+                .get(&s.label)
+                .map_or(0, |m| m.max_pending);
+            if limit > 0 {
+                let v = s.admitted as f64 / f64::from(limit);
+                out.sample("apollo_model_utilization", &[("model", &s.label)], v);
+            }
         }
 
         let models: Vec<(String, Arc<ModelMetrics>)> = m

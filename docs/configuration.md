@@ -206,7 +206,7 @@ Optional, off by default. When enabled, `GET /metrics` serves Prometheus metrics
 
 ## `[health]` — health checks for load balancers
 
-Optional, off by default. When enabled, plaintext HTTP/1.1 health checks answer on a port of their own, from the moment the server starts until it exits: `GET /livez` (200 while the process runs) and `GET /readyz` (200 only while it's ready for work). They have no authentication and no TLS. Every field needs a restart. See [operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers) for what each answers and how to point a load balancer at them.
+Optional, off by default. When enabled, plaintext HTTP/1.1 health checks answer on a port of their own, from the moment the server starts until it exits: `GET /livez` (200 while the process runs), `GET /readyz` (200 only while it's ready for work), `GET /readyz/strict` (also 503 while cut off from a shared database) and `GET /load` (the load figure, as JSON). They have no authentication and no TLS. Every field but `degraded_at` needs a restart. See [operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers) for what each answers and how to point a load balancer at them.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -214,6 +214,7 @@ Optional, off by default. When enabled, plaintext HTTP/1.1 health checks answer 
 | `endpoint` | string | *(`[app].endpoint`)* | Bind host/IP. Unset, they bind where the gRPC port does. |
 | `port` | u16 | `9465` | Bind port. `--health-port` overrides it for a run, e.g. for several instances on one host. |
 | `allow` | list of strings | *(unset: anyone)* | The peers that may connect, as IPs or CIDRs, by the same rules as `[metrics].allow`. Other peers are reset as they connect. It covers only the health port: `[metrics].allow` doesn't apply here, nor this list there. Unset logs `health 0.0.0.0:9465 allows everyone` at info. See [operations.md → Who may connect](./operations.md#who-may-connect). |
+| `degraded_at` | f64 | `0.9` | The utilization (0 to 1) from which a ready server reports itself degraded for `load`: `/readyz` answers `200 ok degraded: load` with `x-envoy-degraded: 1`. It clears below `degraded_at − 0.15`. Above 0 and at most 1. Applies on reload. See [operations.md → Degraded](./operations.md#degraded). |
 
 At most 256 connections are open at once; more wait until one closes. A connection that sends no complete request head within 10 s, or stays idle for 10 s between requests, is closed.
 
@@ -621,7 +622,7 @@ SigLIP's own sigmoid probabilities against short prompts are tiny: a clear match
 - **Models:** `repo` is required, except for `pdq`; text models cannot set `video_strategy`; `multi_label` only applies to text models, and `max_tokens` to text models (at least 16) and `paddleocr_vl` (at least 1); `max_pixels` (at least 147384) and `min_confidence` (0 to 1) only apply to `paddleocr_vl`, which cannot set `early_exit` or the `siglip` fields; a `pdq` model needs a `hash_list` whose lines parse and name its `categories`, and cannot set `labels`, `taxonomy_file`, `prompt_template`, `score_threshold` or `max_results` (while the `pdq` fields are rejected on other architectures); `video_strategy` must name a defined strategy; `early_exit` must list at least one label, and on an image model requires a `video_strategy`; `labels` and `taxonomy_file` are mutually exclusive; a referenced `taxonomy_file` must exist on disk.
 - **Pipelines:** at least one step; no empty step; every `model` must be defined, and in at most one step; unique `order`s; a `stop_if` must list at least one label id, name its step's model (`stop_if.model`) when the step runs several, and not check a `paddleocr_vl` model (it has no labels); a step's `input` must be a `paddleocr_vl` model of an earlier step, and the step's models text models.
 - **Taxonomies:** a category `threshold` must be a number from 0 to 1 with at most 2 decimals, as must a `siglip` model's `score_threshold`.
-- **Listeners:** no port may be 0. The gRPC port, the health port (when `[health]` is enabled) and the metrics port (when `[metrics]` is enabled) must differ wherever their addresses overlap: the same host, `0.0.0.0` and any IPv4 address, or `::` and any address. `drain_delay_secs` and `drain_timeout_secs` are at most 3600.
+- **Listeners:** no port may be 0. The gRPC port, the health port (when `[health]` is enabled) and the metrics port (when `[metrics]` is enabled) must differ wherever their addresses overlap: the same host, `0.0.0.0` and any IPv4 address, or `::` and any address. `drain_delay_secs` and `drain_timeout_secs` are at most 3600. `[health].degraded_at` is above 0 and at most 1.
 - **Database:** selecting `postgres`/`surrealdb` requires the matching `[database.<backend>]` section.
 
 ---
@@ -648,7 +649,8 @@ apollo revoke (--id ID | --token TOKEN | --subject NAME) [--config PATH]
 - **`status`** reports whether the server is running and its live state:
   - version, PID, uptime, phase (`starting` with its step, `serving`, `draining` or `stopping`), listen address, TLS/auth, config file (with its generation and when it was reloaded, after a reload), database, and log file;
   - memory in use against `max_memory` (measured as for `max_memory`: physical footprint on macOS, resident set size elsewhere);
-  - the queue (items in flight, busy/waiting concurrency slots);
+  - the queue (items in flight, busy/waiting concurrency slots), and the load: utilization, the weight for load balancers and any degraded reasons;
+  - with a shared database, whether its contact is `ok` or `stale` (see [database.md → Health checks and the database](./database.md#health-checks-and-the-database));
   - task counts by state, and pending webhook deliveries. These come from the database, which they wait for as long as `[database].timeout`, and never more than 5 s. If it doesn't answer in time, they show `database unavailable` (in `--json`, `tasks` and `webhook.pending` are `null`);
   - per model: loaded or not, input size, queued requests, batch size, images classified, and last use.
 

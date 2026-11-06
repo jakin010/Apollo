@@ -4,17 +4,20 @@
 //! | Name | Starting | Serving | Draining | Stopping |
 //! |---|---|---|---|---|
 //! | `""`, `apollo.v1.Inference`, `readiness` | NOT_SERVING | SERVING | NOT_SERVING | cleared |
+//! | `readiness-strict` | NOT_SERVING | SERVING unless the database is stale | NOT_SERVING | cleared |
 //! | `liveness` | SERVING | SERVING | SERVING | cleared |
 //!
 //! A cleared name ends its Watch streams (with OK), and Check answers it
 //! NOT_FOUND, so an open Watch never holds a stop.
+
+use std::sync::Arc;
 
 use tokio::sync::watch;
 use tonic_health::ServingStatus;
 use tonic_health::pb::health_server::HealthServer;
 use tonic_health::server::{HealthReporter, HealthService};
 
-use apollo_engine::{Lifecycle, Phase};
+use apollo_engine::{Lifecycle, LoadSnapshot, Phase};
 use apollo_proto::inference_server::SERVICE_NAME as INFERENCE;
 
 /// What a name's status follows.
@@ -22,15 +25,18 @@ use apollo_proto::inference_server::SERVICE_NAME as INFERENCE;
 enum Follows {
     /// SERVING while the lifecycle is ready for work.
     Readiness,
+    /// SERVING while ready and the database isn't stale.
+    StrictReadiness,
     /// SERVING until the stop.
     Liveness,
 }
 
 /// Every name, and what it follows.
-const NAMES: [(&str, Follows); 4] = [
+const NAMES: [(&str, Follows); 5] = [
     ("", Follows::Readiness),
     (INFERENCE, Follows::Readiness),
     ("readiness", Follows::Readiness),
+    ("readiness-strict", Follows::StrictReadiness),
     ("liveness", Follows::Liveness),
 ];
 
@@ -45,6 +51,7 @@ fn answers(lc: &Lifecycle) -> Answers {
     NAMES.map(|(_, follows)| {
         let up = match follows {
             Follows::Readiness => lc.ready(),
+            Follows::StrictReadiness => lc.ready_strict(),
             Follows::Liveness => true,
         };
         Some(if up {
@@ -66,13 +73,14 @@ impl Health {
     pub async fn new(lc: &Lifecycle) -> Self {
         // Changes from here on wake the task.
         let phase = lc.subscribe();
+        let load = lc.subscribe_load();
         let mut reporter = HealthReporter::new();
         // Sets `""` too, which tonic-health starts as SERVING.
         let now = answers(lc);
         for ((name, _), answer) in NAMES.iter().zip(now) {
             set(&mut reporter, name, answer).await;
         }
-        tokio::spawn(follow(reporter.clone(), lc.clone(), phase, now));
+        tokio::spawn(follow(reporter.clone(), lc.clone(), phase, load, now));
         Self { reporter }
     }
 
@@ -89,16 +97,22 @@ async fn set(reporter: &mut HealthReporter, name: &str, answer: Option<ServingSt
 }
 
 /// Apply each change in what the names answer, and only a change (each
-/// update reaches every Watch), until they are cleared.
+/// update reaches every Watch), until they are cleared. A new phase or load
+/// sample (the database's state) wakes it.
 async fn follow(
     mut reporter: HealthReporter,
     lc: Lifecycle,
     mut phase: watch::Receiver<Phase>,
+    mut load: watch::Receiver<Arc<LoadSnapshot>>,
     mut last: Answers,
 ) {
     while last.iter().any(Option::is_some) {
-        // `lc` keeps the sender, so this can't fail.
-        if phase.changed().await.is_err() {
+        // `lc` keeps the senders, so these can't fail.
+        let changed = tokio::select! {
+            changed = phase.changed() => changed,
+            changed = load.changed() => changed,
+        };
+        if changed.is_err() {
             return;
         }
         let now = answers(&lc);
@@ -124,7 +138,7 @@ mod tests {
 
     use super::*;
 
-    const READINESS: [&str; 3] = ["", INFERENCE, "readiness"];
+    const READINESS: [&str; 4] = ["", INFERENCE, "readiness", "readiness-strict"];
 
     fn request(name: &str) -> Request<HealthCheckRequest> {
         Request::new(HealthCheckRequest {
@@ -244,5 +258,42 @@ mod tests {
             let late = svc.watch(request(name)).await.map(|_| ());
             assert_eq!(late.map_err(|s| s.code()), Err(tonic::Code::NotFound));
         }
+    }
+
+    #[tokio::test]
+    async fn readiness_strict_follows_the_database() {
+        use apollo_engine::{Database, testing::publish_load};
+
+        let lc = Lifecycle::new();
+        lc.serving();
+        let health = Health::new(&lc).await;
+        let svc = HealthService::from_health_reporter(health.reporter.clone());
+        let mut strict = watch(&svc, "readiness-strict").await;
+        assert_eq!(next(&mut strict).await, Some(Wire::Serving));
+        let mut ready = watch(&svc, "readiness").await;
+        assert_eq!(next(&mut ready).await, Some(Wire::Serving));
+
+        let last_contact = std::time::Instant::now();
+        let with = |database| LoadSnapshot {
+            database,
+            ..LoadSnapshot::default()
+        };
+        publish_load(&lc, with(Database::Stale { last_contact }));
+        assert_eq!(next(&mut strict).await, Some(Wire::NotServing));
+        assert!(quiet(&mut ready).await, "readiness ignores the database");
+        assert_eq!(check(&svc, "").await, Ok(Wire::Serving));
+        // A sample that changes nothing sends nothing.
+        publish_load(&lc, with(Database::Stale { last_contact }));
+        assert!(quiet(&mut strict).await);
+
+        publish_load(&lc, with(Database::Ok { last_contact }));
+        assert_eq!(next(&mut strict).await, Some(Wire::Serving));
+        publish_load(&lc, with(Database::NotShared));
+        assert!(quiet(&mut strict).await, "n/a is as good as ok");
+
+        assert!(lc.drain());
+        assert_eq!(next(&mut strict).await, Some(Wire::NotServing));
+        lc.stopping();
+        assert_eq!(next(&mut strict).await, None);
     }
 }

@@ -37,6 +37,8 @@ pub(crate) struct Live {
     /// 1 for the startup config, then one more per reload.
     pub(crate) generation: u64,
     pub(crate) loaded_at: SystemTime,
+    /// Settings the last reload kept at their running values until a restart.
+    pub(crate) restart_required: Vec<String>,
 }
 
 impl Live {
@@ -64,6 +66,7 @@ impl Live {
             webhook,
             generation,
             loaded_at: SystemTime::now(),
+            restart_required: Vec::new(),
             config,
         }
     }
@@ -119,7 +122,8 @@ impl Engine {
         };
         let (registry, models) = Registry::build(&config, &env, Some(&current.registry));
         let generation = current.generation + 1;
-        let live = Live::new(Arc::new(config), registry, webhook, generation);
+        let mut live = Live::new(Arc::new(config), registry, webhook, generation);
+        live.restart_required = restart_required.clone();
         *self.inner.live.write().unwrap() = Arc::new(live);
 
         tracing::info!(
@@ -219,13 +223,14 @@ mod tests {
     }
 
     #[test]
-    fn the_health_listener_waits_for_a_restart_and_the_drain_settings_apply() {
+    fn the_health_listener_waits_for_a_restart_and_the_drain_and_load_settings_apply() {
         let running: Config = apollo_config::load::from_str("[health]\nenabled = true\n").unwrap();
         let mut new = running.clone();
         new.health.enabled = false;
         new.health.endpoint = Some("10.0.0.5".into());
         new.health.port = 9500;
         new.health.allow = Some(vec!["10.0.0.0/8".into()]);
+        new.health.degraded_at = 0.8;
         new.app.drain_delay_secs = 5;
         new.app.drain_timeout_secs = 0;
         let (applied, changed) = keep_restart_only(&running, new);
@@ -238,7 +243,17 @@ mod tests {
                 "health.allow"
             ]
         );
-        assert_eq!(applied.health, running.health);
+        assert_eq!(
+            (
+                &applied.health.endpoint,
+                applied.health.port,
+                &applied.health.allow
+            ),
+            (&running.health.endpoint, running.health.port, &None)
+        );
+        assert!(applied.health.enabled);
+        // These apply.
+        assert_eq!(applied.health.degraded_at, 0.8);
         assert_eq!(
             (applied.app.drain_delay_secs, applied.app.drain_timeout_secs),
             (5, 0)

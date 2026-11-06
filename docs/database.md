@@ -190,7 +190,15 @@ State writes only apply to an unfinished task or item: the first finish wins, so
 
 ### Health checks and the database
 
-A database outage while serving doesn't change the health checks ([operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers)): `/readyz` and the gRPC `readiness` names stay ready, and `/livez` never looks at the database. Every instance sharing a database loses it at once, so a readiness that followed it would take the whole fleet out of the load balancer together. Meanwhile calls that need the database fail with `UNAVAILABLE` after `[database].timeout`, and running tasks behave as described above. At startup it's different: until the database opens (and its migration finishes), `/readyz` answers `503 not ready: starting (opening database, …)`.
+A database outage while serving doesn't change `/readyz` or the gRPC `readiness` names ([operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers)), and `/livez` never looks at the database. Every instance sharing a database loses it at once, so a readiness that followed it would take the whole fleet out of the load balancer together. Meanwhile calls that need the database fail with `UNAVAILABLE` after `[database].timeout`, and running tasks behave as described above. At startup it's different: until the database opens (and its migration finishes), `/readyz` answers `503 not ready: starting (opening database, …)`.
+
+On a shared database (SurrealDB) each instance also tracks its own contact with it, from the calls it already makes (renewing leases, looking for lapsed tasks, redelivering webhooks); no health check queries the database. Contact goes **stale** when the instance has had no connection for 5 seconds, or no successful call for two leases (`2 × [database].lease_secs`). It's **ok** again once the connection has been back for a third of a lease (and no call has failed since). While contact is stale:
+
+- `/readyz` stays `200`, now `ok degraded: database` with the header `x-envoy-degraded: 1`, and the gRPC `readiness` names stay `SERVING`;
+- `/readyz/strict` answers `503 not ready: database (no contact 47s)` and the gRPC `readiness-strict` name turns `NOT_SERVING`;
+- the instance's load-balancing weight drops to 1 (`/load`, `apollo_lb_weight`), and `apollo_degraded{reason="database"}` is 1.
+
+So an instance that alone has lost the database gets almost no new work, while an outage of the whole database keeps every instance in rotation at weight 1 (nobody can be preferred). Point a balancer that should drop such an instance at `/readyz/strict` instead. `apollo_database_up` and `apollo_database_last_contact_seconds` show the contact on `/metrics`. SQLite is always in reach of its one process, so none of this applies there (`database` is `n/a` in `/load`).
 
 ---
 

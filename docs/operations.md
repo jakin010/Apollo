@@ -32,6 +32,12 @@ Two metrics come from the database: `apollo_tasks` and `apollo_webhooks_pending`
 | `apollo_config_loaded_timestamp_seconds` | gauge | | When the running config was applied. |
 | `apollo_ready` | gauge | | 1 while the server is ready for work (what `/readyz` answers). |
 | `apollo_lifecycle_phase` | gauge | `phase` | 1 for the phase the server is in: `starting`, `serving`, `draining` or `stopping`. See [Health checks and load balancers](#health-checks-and-load-balancers). |
+| `apollo_ready_strict` | gauge | | 1 while ready and in touch with the database, or it isn't shared (what `/readyz/strict` answers). |
+| `apollo_utilization` | gauge | | How close the server is to refusing work, from 0 to 1 (the `utilization` of [`/load`](#the-load-figure)). |
+| `apollo_lb_weight` | gauge | | The weight for load balancers: 1 to 100, 1 while the database is stale, 0 when not ready. |
+| `apollo_degraded` | gauge | `reason` | 1 while degraded for that reason: `load` or `database`. See [Degraded](#degraded). |
+| `apollo_database_up` | gauge | | 1 while in touch with a shared database, 0 while contact is stale. Only with a shared database (SurrealDB). |
+| `apollo_database_last_contact_seconds` | gauge | | Seconds since a shared database last answered. Only with a shared database. |
 | `apollo_submissions_total` | counter | `outcome` | Submissions: `accepted`, `existing` (a repeated `request_id`), `invalid`, `overloaded` (backpressure), `error`. |
 | `apollo_submissions_overloaded_total` | counter | `reason` | Overloaded submissions by the limit that refused them: `queue` (`[app].max_pending`), `memory` (`[app].max_memory`), `model` (a model's `max_pending`). |
 | `apollo_items_finished_total` | counter | `state` | Inputs that finished: `completed`, `failed`, `cancelled`. |
@@ -51,6 +57,7 @@ Two metrics come from the database: `apollo_tasks` and `apollo_webhooks_pending`
 | `apollo_model_loaded` | gauge | `model` | 1 while the model's weights are in memory. |
 | `apollo_model_queued_jobs` | gauge | `model` | Requests waiting for the model's worker. |
 | `apollo_model_items_admitted` | gauge | `model` | Inputs accepted and not finished that run the model (what its `max_pending` is checked against). |
+| `apollo_model_utilization` | gauge | `model` | `apollo_model_items_admitted` over the model's `max_pending`, for models with one. |
 | `apollo_model_inferences_total` | counter | `model` | Images (and video frames) classified. |
 | `apollo_model_failures_total` | counter | `model` | Images whose forward pass failed. |
 | `apollo_model_batch_size` | histogram | `model` | Images per forward pass. |
@@ -96,39 +103,95 @@ Apollo then answers plaintext HTTP/1.1 on that port, from right after it starts 
 |------|-----|-----|------|
 | `/livez` | always | never | `ok` |
 | `/readyz` (and `/`) | ready for work | otherwise | `ok`, or why not: `not ready: starting (recovering tasks, 41s)`, `not ready: draining`, `not ready: stopping` |
+| `/readyz/strict` | `/readyz` passes and the server is in touch with a shared database (or it isn't shared) | otherwise | as `/readyz`, or `not ready: database (no contact 47s)` |
+| `/load` | always | never | the load figure as JSON (see [The load figure](#the-load-figure)) |
 
-- `GET`, `HEAD` and `OPTIONS` work. Other methods get `405` with `Allow`, and unknown paths `404`. The `Host` header and the query are ignored, and HTTP/1.0 works.
-- Every answer is `text/plain; charset=utf-8` with `cache-control: no-store`. Its first word is meant for matching. There are no redirects and no `429`.
-- The answers come from the server's state in memory. A probe never waits on the database, a model or a busy server, so a probe that times out means the process (or the network) is stuck. The time in `starting (…, 41s)` is how long the current step has run.
+A ready server that is [degraded](#degraded) answers `200 ok degraded: load,database` on `/readyz` and `/readyz/strict`, naming the reasons that apply, with the header `x-envoy-degraded: 1`.
+
+- `GET`, `HEAD` and `OPTIONS` work. Other methods get `405` with `Allow`, and unknown paths `404`. The `Host` header is ignored, and so is the query except `?verbose` (see [Details for local tools](#details-for-local-tools)). HTTP/1.0 works.
+- Every answer has `cache-control: no-store`. `/load` and `?verbose` answer `application/json`; the others `text/plain; charset=utf-8`, whose first word is meant for matching. There are no redirects and no `429`.
+- The answers come from the server's state in memory, and the load figure from a sample taken every second. A probe never waits on the database, a model or a busy server, so a probe that times out means the process (or the network) is stuck. The time in `starting (…, 41s)` is how long the current step has run.
 - There is no authentication and no TLS. To limit who may connect, see [Who may connect](#who-may-connect).
 - At most 256 connections are open at once; more wait until one closes. A connection that sends no complete request head within 10 s, or stays idle for 10 s between requests, is closed.
 
-gRPC health on the gRPC port follows the same states: the names `""`, `apollo.v1.Inference` and `readiness` answer like `/readyz`, and `liveness` like `/livez`, until the stop removes them all (see [grpc-api.md → Health checking](./grpc-api.md#health-checking)). Prefer the health port: it speaks HTTP/1.1, needs no client certificate under mutual TLS, and answers before tasks are recovered.
+gRPC health on the gRPC port follows the same states: the names `""`, `apollo.v1.Inference` and `readiness` answer like `/readyz`, `readiness-strict` like `/readyz/strict`, and `liveness` like `/livez`, until the stop removes them all. gRPC health has no degraded state: a degraded server is `SERVING` (see [grpc-api.md → Health checking](./grpc-api.md#health-checking)). Prefer the health port: it speaks HTTP/1.1, needs no client certificate under mutual TLS, and answers before tasks are recovered.
 
 **The rules:**
 
 1. Liveness (`/livez`) means the process answers. Nothing else.
-2. Readiness (`/readyz`) follows the server's own state only. The database is never part of it: an outage of a shared database would take every instance out at once (see [database.md → Health checks and the database](./database.md#health-checks-and-the-database)).
-3. Overload never makes a server unready. A busy server refuses work with `RESOURCE_EXHAUSTED` and `apollo-overloaded`, as before (see [Several instances](#several-instances-sending-work-to-a-less-busy-one)).
+2. Readiness (`/readyz`) follows the server's own state only. The database is never part of it: an outage of a shared database would take every instance out at once (see [database.md → Health checks and the database](./database.md#health-checks-and-the-database)). `/readyz/strict` adds the server's own contact with a shared database, for a balancer that should drop an instance cut off from it, at the price of dropping every instance when the database is out.
+3. Overload never makes a server unready. Its weight drops as it fills, near its limits it is [degraded](#degraded), and at them it refuses work with `RESOURCE_EXHAUSTED` and `apollo-overloaded`, as before (see [Several instances](#several-instances-sending-work-to-a-less-busy-one)).
 
 **What each check answers:**
 
-| State | `/livez` | `/readyz`, gRPC readiness | gRPC port |
-|-------|----------|---------------------------|-----------|
-| Opening the database (and migrating) | 200 | 503 starting | not bound |
-| Configuring auth | 200 | 503 starting | not bound |
-| Recovering tasks | 200 | 503 starting | bound, but answers nothing (a TCP check passes) |
-| Loading the models with `keep_in_memory` | 200 | 503 starting | serves; a Classify waits for its model |
-| Serving | 200 | 200 | serves |
-| Overloaded | 200 | 200 | refuses new work with `apollo-overloaded` |
-| The database is out | 200 | 200 | calls that need it fail with `UNAVAILABLE` after `[database].timeout` |
-| Reloading the config | 200 | 200, with no dip | serves |
-| Draining (`drain_delay_secs`) | 200 | 503 draining | serves as usual; takes no tasks over from other instances |
-| Stopping (up to `drain_timeout_secs`) | 200 | 503 stopping | closed: open calls finish, `WatchTask` ends with `UNAVAILABLE`, waits return |
-| Handing tasks back (up to 5 s) | 200 | 503 stopping | closed |
-| The process is stuck | no answer | no answer | no answer |
+| State | `/livez` | `/readyz`, gRPC readiness | `/readyz/strict`, `readiness-strict` | Weight | gRPC port |
+|-------|----------|---------------------------|--------------------------------------|--------|-----------|
+| Opening the database (and migrating) | 200 | 503 starting | 503 starting | 0 | not bound |
+| Configuring auth | 200 | 503 starting | 503 starting | 0 | not bound |
+| Recovering tasks | 200 | 503 starting | 503 starting | 0 | bound, but answers nothing (a TCP check passes) |
+| Loading the models with `keep_in_memory` | 200 | 503 starting | 503 starting | 0 | serves; a Classify waits for its model |
+| Serving | 200 | 200 | 200 | 100 × (1 − utilization) | serves |
+| Overloaded | 200 | 200 degraded | 200 degraded | low, down to 1 | refuses new work with `apollo-overloaded` |
+| This instance is cut off from a shared database | 200 | 200 degraded | 503 database | 1 | calls that need it fail with `UNAVAILABLE` after `[database].timeout` |
+| A shared database is out for every instance | 200 | 200 degraded on every instance | 503 database on every instance | 1 on every instance | as above |
+| SQLite fails | 200 | 200 | 200 | as when serving | as above |
+| Reloading the config | 200 | 200, with no dip | 200, with no dip | unchanged | serves |
+| Draining (`drain_delay_secs`) | 200 | 503 draining | 503 draining | 0 | serves as usual; takes no tasks over from other instances |
+| Stopping (up to `drain_timeout_secs`) | 200 | 503 stopping | 503 stopping | 0 | closed: open calls finish, `WatchTask` ends with `UNAVAILABLE`, waits return |
+| Handing tasks back (up to 5 s) | 200 | 503 stopping | 503 stopping | 0 | closed |
+| The process is stuck | no answer | no answer | no answer | no answer | no answer |
+
+gRPC health answers `SERVING` where the table says 200 (degraded or not), and `NOT_SERVING` for 503. The weight is the one `/load` and `apollo_lb_weight` give.
 
 Starting ends once every model with `keep_in_memory` has tried its first load, whether it loaded or not; a model that failed to load shows in the log and `apollo status`. A model download can take long, and `/livez` passes meanwhile.
+
+### Degraded
+
+A ready server can be degraded, for either reason or both:
+
+- `load`: its [utilization](#the-load-figure) reached `[health].degraded_at` (default 0.9). It stays degraded until utilization falls below `degraded_at − 0.15` (0.75 by default; half of `degraded_at` when that is under 0.3). After each change the new state holds at least 10 s, so a server near the line doesn't flap.
+- `database`: its contact with a shared database is stale (see [database.md → Health checks and the database](./database.md#health-checks-and-the-database)). Its weight is then 1, and `/readyz/strict` fails.
+
+A degraded server stays in rotation. `/readyz` and `/readyz/strict` (when it passes) answer `200 ok degraded: load,database`, naming the reasons that apply, with the header `x-envoy-degraded: 1`: Envoy's active health checks then mark the host degraded and send it traffic only when the healthy hosts aren't enough. To other balancers it is a 200. `apollo_degraded{reason}` and `apollo status` show the reasons.
+
+### The load figure
+
+`/load` answers `200` in every phase, until the process exits, with the server's load as JSON:
+
+```json
+{"phase":"serving","ready":true,"ready_strict":true,"drained":false,"degraded":[],
+ "utilization":0.42,"weight":60,
+ "items":{"in_flight":21,"max_pending":50,"free":29},
+ "slots":{"total":8,"busy":8,"waiting":13},
+ "memory":{"utilization":0.31},"database":"ok","sampled_ms_ago":412}
+```
+
+- `utilization`: how close the server is to refusing work, from 0 to 1. It is the larger of `in_flight / [app].max_pending` and the memory in use over `[app].max_memory`; with no `max_pending`, the inputs being processed or waiting over `[app].max_concurrent` stand in for the queue. A server at its limit (tasks resumed after a restart can take it past) counts as 1. It rises at once and falls over about 5 s (an exponential decay, τ = 5 s), so a burst that just ended still counts for a moment.
+- `weight`: `5 × round(20 × (1 − utilization))`, from 100 when idle down to 1 in steps of 5; 1 while the database contact is stale, and 0 when not ready. For a balancer that takes weights.
+- `ready`, `ready_strict`: what `/readyz` and `/readyz/strict` answer. `drained` is always `false` for now. `degraded`: the [reasons](#degraded), `[]` when none.
+- `items`: inputs accepted and not finished, `[app].max_pending` (0 = no limit), and the room left (`null` with no limit). `slots`: `[app].max_concurrent`, the inputs being processed, and those waiting for a slot.
+- `memory.utilization`: memory in use over `[app].max_memory`; `null` with no cap, or when memory use can't be read.
+- `database`: `ok` or `stale` for a shared database, `n/a` for SQLite (or before the database opens).
+- `sampled_ms_ago`: the age of the sample, taken every second; `null` before the first one.
+
+The figure covers the whole server. It names no models and no node; per-model load is in [Details for local tools](#details-for-local-tools) and `apollo_model_utilization`.
+
+### Details for local tools
+
+`/readyz?verbose` and `/readyz/strict?verbose` answer the same status as JSON, with the details behind it:
+
+```json
+{"phase":"starting","step":"loading models","since_secs":41,"reasons":["starting (loading models, 41s)"],
+ "models":[{"model":"nsfw","pinned":true,"preload":"loading","admitted":0,"max_pending":4}],
+ "database":{"state":"n/a","last_contact_secs":null},"load":{…},
+ "config_generation":1,"restart_required":[]}
+```
+
+- `step` is `null` outside `starting`, and `since_secs` is how long the phase (or the step) has run. `reasons` says why the server isn't ready, and why `/readyz/strict` fails when it does.
+- For each model: whether it has `keep_in_memory` (`pinned`), its first load (`lazy` without `keep_in_memory`, else `loading`, `loaded` or `failed`), the inputs admitted that run it, and its `max_pending` (`null` without one).
+- `load` is the `/load` body. `config_generation` counts configs applied since start (as `apollo_config_generation`), and `restart_required` lists the settings the last reload left at their running values until a restart (such as `app.port`).
+
+Only local tools get them. `?verbose` is honoured when the peer is exactly `127.0.0.1` or `::1` (an IPv4-mapped `::ffff:127.0.0.1` counts as `127.0.0.1`), the request has none of the headers `Forwarded`, `X-Forwarded-For`, `X-Real-IP` and `Via`, and `[health].allow`, when set, admits the peer. Anyone else gets the plain answer, as if the query weren't there. A proxy on the same host connects from loopback too, so make it add one of those headers.
 
 ### Stopping
 
@@ -179,6 +242,7 @@ spec:
 
 - A TCP check on the gRPC port passes while tasks are recovered, before the port answers anything. Check `/readyz` instead.
 - Never make liveness depend on the database: an outage would restart every instance at once. `/livez` doesn't look at it.
+- Don't point a Kubernetes `readinessProbe` at `/readyz/strict`: an outage of a shared database would take every pod out of the Service at once. Use `/readyz`.
 - `/metrics`, the PID file and `apollo start --daemon` returning are not readiness signals: all of them come before the server is ready.
 
 ---
@@ -338,7 +402,7 @@ config reloaded (generation 3)
 
 The new config is read the way `start` read it, with the same file and the same `--endpoint` / `--port` / `--webhook-url` / `--health-port` overrides. It is validated first; an invalid config (or one without models) is rejected with its errors, and **the running config stays**. `apollo status` shows the generation and when the running config was applied.
 
-**What applies at once:** thresholds and `early_exit`, strategies, pipelines, model `timeout` and `priority`, `[limits]`, `[cache]`, `[webhook]` (URL, secret, redelivery interval), `max_retries`, `max_pending`, `max_memory`, `idle_timeout`, `drain_delay_secs`, `drain_timeout_secs`, `database.retention`, `metrics.allow`, and `log_level` (unless `RUST_LOG` is set, which keeps winning). A `metrics.allow` that can't match the running listener's address rejects the reload.
+**What applies at once:** thresholds and `early_exit`, strategies, pipelines, model `timeout` and `priority`, `[limits]`, `[cache]`, `[webhook]` (URL, secret, redelivery interval), `max_retries`, `max_pending`, `max_memory`, `idle_timeout`, `drain_delay_secs`, `drain_timeout_secs`, `database.retention`, `metrics.allow`, `health.degraded_at`, and `log_level` (unless `RUST_LOG` is set, which keeps winning). A `metrics.allow` that can't match the running listener's address rejects the reload.
 
 **Models:** each model's worker is kept, loaded weights included, unless something its weights depend on changed: `architecture`, `repo`, `revision`, `labels`, `prompt_template`, `score_threshold`, `max_results`, `taxonomy_file` (or the taxonomy file's contents), `keep_in_memory` or `max_concurrent`. A model with such a change gets a new worker, which loads on first use (or at once with `keep_in_memory`). Added or newly enabled models get a worker. Removed or disabled models are rejected for new requests at once; their workers finish the work they have, then unload. A change to any setting that changes outputs (including `early_exit`, the video strategy and a list's contents) starts new result-cache entries, even when the worker is kept.
 
@@ -346,7 +410,7 @@ The new config is read the way `start` read it, with the same file and the same 
 
 **Tasks already running** finish on the config they started with, so a scan is not switched to a different strategy halfway, and a pipeline keeps its steps. New submissions use the new config.
 
-**Restart-only:** `app.endpoint`, `app.port`, `app.device`, `app.cache_dir`, `app.max_concurrent`, `app.node_id`, `[tls]`, `[auth]`, `[database]` (except `retention`), `metrics.enabled`, `metrics.endpoint`, `metrics.port`, and all of `[health]` (`enabled`, `endpoint`, `port`, `allow`). A reload reports these and keeps their running values until the next restart. Uploads are read only from the current `app.cache_dir`, so uploaded inputs still waiting when it changes fail: let them finish first.
+**Restart-only:** `app.endpoint`, `app.port`, `app.device`, `app.cache_dir`, `app.max_concurrent`, `app.node_id`, `[tls]`, `[auth]`, `[database]` (except `retention`), `metrics.enabled`, `metrics.endpoint`, `metrics.port`, and `[health]` except `degraded_at` (`enabled`, `endpoint`, `port`, `allow`). A reload reports these and keeps their running values until the next restart. Uploads are read only from the current `app.cache_dir`, so uploaded inputs still waiting when it changes fail: let them finish first.
 
 The request goes over the same owner-only local socket as `apollo status`, so only the OS user running the server can reload it.
 

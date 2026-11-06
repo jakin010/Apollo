@@ -330,6 +330,12 @@ impl Config {
             errs.extend(list.into_iter().map(|e| format!("health.allow {e}")));
         }
         self.check_listeners(&mut errs);
+        let at = self.health.degraded_at;
+        if !(at > 0.0 && at <= 1.0) {
+            errs.push(format!(
+                "health.degraded_at must be above 0 and at most 1 (got {at})"
+            ));
+        }
         for (field, secs) in [
             ("app.drain_delay_secs", self.app.drain_delay_secs),
             ("app.drain_timeout_secs", self.app.drain_timeout_secs),

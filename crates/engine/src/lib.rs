@@ -12,6 +12,7 @@
 //! - `catalog`   — the configured models and pipelines (`ListModels`)
 //! - `live`      — the reloadable part of the engine, and config reload
 //! - `lifecycle` — starting, serving, draining and stopping
+//! - `load`      — the load figure and database contact load balancers read
 //! - `metrics`   — Prometheus counters, histograms and the text format
 //!
 //! [`Engine`] is a cheap clonable handle around a shared `Inner`; cloning it does
@@ -39,6 +40,7 @@ mod gate;
 mod lease;
 mod lifecycle;
 mod live;
+mod load;
 mod memory;
 mod metrics;
 mod queue;
@@ -62,6 +64,7 @@ pub use catalog::{Catalog, Gate, ModelInfo, PipelineInfo, PipelineStepInfo, Trig
 pub use error::{EngineError, Overload};
 pub use lifecycle::{HAND_BACK_LIMIT, Lifecycle, Phase, Step};
 pub use live::ReloadReport;
+pub use load::{DEGRADED, Database, LoadSnapshot, ModelLoad, Preload};
 pub use registry::RegistryChanges;
 pub use status::{EngineStatus, ModelStatus, StoredCounts, TaskCounts};
 pub use watch::TaskWatch;
@@ -160,6 +163,10 @@ struct Inner {
     /// Since when the database has answered without a break (for taking over
     /// lapsed leases).
     connected_since: Mutex<Option<Instant>>,
+    /// When the database last answered, in milliseconds after `epoch`.
+    last_ok: AtomicU64,
+    /// When the engine was built.
+    epoch: Instant,
     /// Serializes takeover passes, and what they remember between passes.
     takeover: tokio::sync::Mutex<lease::Takeover>,
     /// Shutting down: no new runs, no takeovers.
@@ -298,6 +305,8 @@ impl Engine {
                 deliveries: Mutex::new(HashMap::new()),
                 lease_ttl,
                 connected_since: Mutex::new(Some(Instant::now())),
+                last_ok: AtomicU64::new(0),
+                epoch: Instant::now(),
                 takeover: tokio::sync::Mutex::new(lease::Takeover::default()),
                 closing: AtomicBool::new(false),
                 lifecycle,
@@ -308,6 +317,7 @@ impl Engine {
         };
         engine.spawn_maintenance();
         engine.spawn_redelivery();
+        engine.spawn_load();
         if shared {
             engine.spawn_renewal();
             engine.spawn_deadlines();

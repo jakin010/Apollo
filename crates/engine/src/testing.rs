@@ -3,7 +3,7 @@
 //! crates' dev-dependencies).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use apollo_domain::{ItemState, ModelResult, Task, TaskState};
 use std::time::Duration;
@@ -345,29 +345,40 @@ pub struct Stalled {
     open: tokio::sync::watch::Receiver<bool>,
     /// Reported as shared, whatever `inner` is.
     shared: bool,
+    calls: Arc<AtomicUsize>,
 }
 
-/// Shuts and opens a [`Stalled`] store (open to begin with).
-pub struct StallGate(tokio::sync::watch::Sender<bool>);
+/// Shuts and opens a [`Stalled`] store (open to begin with), and counts the
+/// calls that reached it.
+pub struct StallGate {
+    open: tokio::sync::watch::Sender<bool>,
+    calls: Arc<AtomicUsize>,
+}
 
 impl StallGate {
     pub fn shut(&self) {
-        self.0.send_replace(false);
+        self.open.send_replace(false);
     }
     pub fn open(&self) {
-        self.0.send_replace(true);
+        self.open.send_replace(true);
+    }
+    /// Calls made to the store so far (`shared` aside), waiting or not.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
 impl Stalled {
     pub fn new(inner: Arc<dyn Storage>) -> (Self, StallGate) {
         let (open, rx) = tokio::sync::watch::channel(true);
+        let calls = Arc::new(AtomicUsize::new(0));
         let stalled = Self {
             inner,
             open: rx,
             shared: false,
+            calls: Arc::clone(&calls),
         };
-        (stalled, StallGate(open))
+        (stalled, StallGate { open, calls })
     }
 
     /// [`Stalled::new`], reported as a shared database (so an engine on it
@@ -382,6 +393,7 @@ impl Stalled {
     }
 
     async fn pass(&self) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let mut open = self.open.clone();
         // A dropped gate leaves the store as it was: let calls through.
         let _ = open.wait_for(|open| *open).await;
@@ -1047,4 +1059,10 @@ impl Storage for FailFinish {
     async fn purge_cache_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError> {
         self.inner.purge_cache_before(cutoff_unix_secs).await
     }
+}
+
+/// Publish `snapshot` as `lc`'s latest load sample, as an engine's sampler
+/// would.
+pub fn publish_load(lc: &crate::Lifecycle, snapshot: crate::LoadSnapshot) {
+    lc.publish_load(snapshot);
 }

@@ -879,6 +879,7 @@ fn health_and_drain_defaults() {
     // Unset binds where the gRPC port does.
     assert_eq!(h.bind_host(&cfg.app), "0.0.0.0");
     assert_eq!(h.allowlist(), Ok(None));
+    assert_eq!(h.degraded_at, 0.9);
     assert_eq!(
         (cfg.app.drain_delay_secs, cfg.app.drain_timeout_secs),
         (0, 15)
@@ -1011,4 +1012,23 @@ fn health_allow_follows_the_metrics_rules() {
     // The lists are separate: [metrics].allow says nothing about health.
     let cfg = load::from_str("[metrics]\nallow = [\"10.0.0.0/8\"]\n").unwrap();
     assert_eq!(cfg.health.allowlist(), Ok(None));
+}
+
+#[test]
+fn degraded_at_is_above_0_and_at_most_1() {
+    for ok in ["1.0", "0.5", "0.01"] {
+        let cfg = load::from_str(&format!("[health]\ndegraded_at = {ok}\n")).unwrap();
+        cfg.validate().unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+    for bad in ["0.0", "-0.5", "1.5", "nan", "inf"] {
+        let err = load::from_str(&format!("[health]\ndegraded_at = {bad}\n"))
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("health.degraded_at must be above 0 and at most 1 (got "),
+            "{bad}: {err}"
+        );
+    }
 }

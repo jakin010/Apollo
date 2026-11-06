@@ -43,6 +43,9 @@ pub struct StatusReport {
     pub device: String,
     pub memory: Memory,
     pub queue: Queue,
+    /// What load balancers see. Unset from older servers.
+    #[serde(default)]
+    pub load: Option<Load>,
     /// `None` when the database did not answer in time.
     pub tasks: Option<Tasks>,
     pub webhook: Option<Webhook>,
@@ -67,6 +70,18 @@ pub struct Queue {
     pub slots_total: usize,
     pub slots_busy: usize,
     pub slots_waiting: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Load {
+    /// 0 to 1: how close the server is to refusing work.
+    pub utilization: f64,
+    /// The weight for load balancers (0 when not ready).
+    pub weight: u32,
+    /// `load`, `database`, or none.
+    pub degraded: Vec<String>,
+    /// The shared database: `ok` or `stale`; `n/a` when not shared.
+    pub database: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -378,7 +393,12 @@ pub fn render(r: &StatusReport, now: SystemTime, rates: Option<&Rates>) -> Strin
     } else if !generation.is_empty() {
         line(format!("  config    {generation}"));
     }
-    line(format!("  database   {}", r.database));
+    match r.load.as_ref().map(|l| l.database.as_str()) {
+        Some(state @ ("ok" | "stale")) => {
+            line(format!("  database   {} — contact {state}", r.database))
+        }
+        _ => line(format!("  database   {}", r.database)),
+    }
     if let Some(l) = &r.log_file {
         line(format!("  log        {l}"));
     }
@@ -406,6 +426,18 @@ pub fn render(r: &StatusReport, now: SystemTime, rates: Option<&Rates>) -> Strin
         q.slots_total,
         q.slots_waiting
     ));
+    if let Some(l) = &r.load {
+        let degraded = if l.degraded.is_empty() {
+            String::new()
+        } else {
+            format!("; degraded: {}", l.degraded.join(", "))
+        };
+        line(format!(
+            "load       {:.0}% utilization, weight {}{degraded}",
+            l.utilization * 100.0,
+            l.weight
+        ));
+    }
     match &r.tasks {
         Some(t) => line(format!(
             "tasks      {} queued · {} processing · {} completed · {} failed · {} cancelled",
@@ -591,6 +623,12 @@ mod tests {
                 slots_busy: 2,
                 slots_waiting: 1,
             },
+            load: Some(Load {
+                utilization: 0.42,
+                weight: 60,
+                degraded: Vec::new(),
+                database: "n/a".into(),
+            }),
             tasks: Some(Tasks {
                 queued: 1,
                 processing: 2,
@@ -653,6 +691,14 @@ mod tests {
         );
         assert!(text.contains("1.5 GiB used (limit 4.0 GiB)"), "{text}");
         assert!(text.contains("3 items in flight (limit 1,024); 2 of 20 slots busy, 1 waiting"));
+        assert!(
+            text.contains("\nload       42% utilization, weight 60\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n  database   sqlite /var/lib/apollo/apollo.db\n"),
+            "{text}"
+        );
         assert!(text.contains("1,204 completed"));
         assert!(text.contains("https://hooks.example.com — 0 pending deliveries"));
         assert!(text.contains("general"));
@@ -693,6 +739,38 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert!(json["tasks"].is_null(), "{json}");
         assert!(json["webhook"]["pending"].is_null(), "{json}");
+    }
+
+    #[test]
+    fn renders_degraded_reasons_and_the_database_contact() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000 + 8_000);
+        let mut report = sample();
+        report.database = "surrealdb ws://db:8000 (apollo/apollo) (node a)".into();
+        report.load = Some(Load {
+            utilization: 0.95,
+            weight: 1,
+            degraded: vec!["load".into(), "database".into()],
+            database: "stale".into(),
+        });
+        let text = render(&report, now, None);
+        assert!(
+            text.contains("\nload       95% utilization, weight 1; degraded: load, database\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n  database   surrealdb ws://db:8000 (apollo/apollo) (node a) — contact stale\n"
+            ),
+            "{text}"
+        );
+
+        // An older server sends no load.
+        let mut json = serde_json::to_value(sample()).unwrap();
+        json.as_object_mut().unwrap().remove("load");
+        let old: StatusReport = serde_json::from_value(json).unwrap();
+        assert_eq!(old.load, None);
+        let text = render(&old, now, None);
+        assert!(!text.contains("utilization"), "{text}");
     }
 
     #[test]

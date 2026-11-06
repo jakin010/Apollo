@@ -229,9 +229,11 @@ fps    = 5
 # allow    = ["10.0.0.0/8", "127.0.0.1"]
 
 # --- Health checks for load balancers and orchestrators ------------------------
-# Plaintext HTTP on its own port: /livez (200 while the process runs) and
-# /readyz (200 only while ready for work; 503 while starting or stopping).
-# Off by default. Every field needs a restart. See docs/operations.md.
+# Plaintext HTTP on its own port: /livez (200 while the process runs),
+# /readyz (200 only while ready for work; 503 while starting or stopping),
+# /readyz/strict (also 503 while cut off from a shared database) and /load
+# (the load figure, as JSON). Off by default. Every field but degraded_at
+# needs a restart. See docs/operations.md.
 [health]
 enabled = true
 # endpoint = "0.0.0.0"          # default: where [app].endpoint binds
@@ -239,6 +241,8 @@ enabled = true
 # Who may connect, as IPs or CIDRs (unset = anyone who can reach the port).
 # On Kubernetes leave it unset and use a NetworkPolicy. For example:
 # allow    = ["10.20.0.0/16", "127.0.0.1"]
+# From this utilization (0 to 1), /readyz answers "200 ok degraded: load".
+# degraded_at = 0.9
 
 # ============================== models ==============================
 # Flat. `architecture` selects the candle builder. Almost everything else

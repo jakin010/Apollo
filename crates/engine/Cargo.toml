@@ -31,6 +31,8 @@ memory-stats = "1"
 tempfile = "3"
 # The multi-instance tests run on a throwaway SurrealDB database.
 apollo-storage = { path = "../storage", features = ["test-util"] }
+# Paused time, for the load sampler's tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 # Forward GPU backends to the inference crate.

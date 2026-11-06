@@ -359,9 +359,11 @@ Nothing is kept when a request is refused as overloaded, so the same request may
 | Name | Starting | Serving | Draining | Stopping |
 |------|----------|---------|----------|----------|
 | `""`, `apollo.v1.Inference`, `readiness` | `NOT_SERVING` | `SERVING` | `NOT_SERVING` | removed |
+| `readiness-strict` | `NOT_SERVING` | `SERVING`, or `NOT_SERVING` while cut off from a shared database | `NOT_SERVING` | removed |
 | `liveness` | `SERVING` | `SERVING` | `SERVING` | removed |
 
 - **Starting** lasts until tasks are recovered and every model with `keep_in_memory` has tried its first load (loaded or not). **Draining** starts at the first `SIGTERM` or Ctrl-C and lasts `[app].drain_delay_secs`; calls are still served meanwhile. **Stopping** follows: see [operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers).
+- **`readiness-strict`** answers like `/readyz/strict` on the health port: it also turns `NOT_SERVING` while the server's contact with a shared database (SurrealDB) is stale, and turns back once it is ok again (see [database.md → Health checks and the database](./database.md#health-checks-and-the-database)). The other names never look at the database. A degraded server (see [operations.md → Degraded](./operations.md#degraded)) is `SERVING`: gRPC health has no degraded state.
 - **Removed** names end their Watch streams (with `OK`), and Check answers `NOT_FOUND`. An open Watch never holds a stop.
 - **The port speaks HTTP/2 only.** A balancer whose checks speak HTTP/1.1 can't use it; give it the health port instead.
 - **mTLS covers health too.** With `[tls].client_ca_file`, a checker needs a client certificate to reach health here. The health port needs none.

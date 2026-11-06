@@ -770,6 +770,10 @@ async fn metrics_render_in_the_prometheus_format() {
         "apollo_lifecycle_phase{phase=\"starting\"} 0",
         "apollo_lifecycle_phase{phase=\"serving\"} 1",
         "apollo_lifecycle_phase{phase=\"draining\"} 0",
+        "apollo_ready_strict 1",
+        "apollo_degraded{reason=\"load\"} 0",
+        "apollo_degraded{reason=\"database\"} 0",
+        "# TYPE apollo_model_utilization gauge",
         "apollo_model_loaded{model=\"nsfw\"} 0",
         "apollo_metrics_database_ok 1",
         "apollo_tasks{state=\"queued\"} 0",
@@ -781,6 +785,23 @@ async fn metrics_render_in_the_prometheus_format() {
             "missing {line:?} in\n{text}"
         );
     }
+    // Idle: only the memory in use (against the fixture's cap) counts, once
+    // the sampler has read it, and the weight follows in steps of 5.
+    let value = |name: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("no {name} in\n{text}"))
+    };
+    let (utilization, weight) = (value("apollo_utilization"), value("apollo_lb_weight"));
+    assert!(utilization < 0.5, "{text}");
+    assert_eq!(weight, 5.0 * (20.0 * (1.0 - utilization)).round(), "{text}");
+    // SQLite: no shared database to be in touch with.
+    assert!(!has_family(&text, "apollo_database_up"), "{text}");
+    assert!(
+        !has_family(&text, "apollo_database_last_contact_seconds"),
+        "{text}"
+    );
     // Every sample line is `name{labels} value` with a numeric value.
     for line in text.lines().filter(|l| !l.starts_with('#')) {
         let value = line.rsplit(' ').next().unwrap();
@@ -795,6 +816,8 @@ async fn metrics_render_in_the_prometheus_format() {
     let text = f.engine.metrics_text().await;
     for line in [
         "apollo_ready 0",
+        "apollo_ready_strict 0",
+        "apollo_lb_weight 0",
         "apollo_lifecycle_phase{phase=\"serving\"} 0",
         "apollo_lifecycle_phase{phase=\"draining\"} 1",
     ] {
@@ -2791,4 +2814,79 @@ async fn a_failed_preload_counts_as_attempted() {
     let loaded = |model: &str| engine.live().registry.get(model).unwrap().snapshot().loaded;
     assert!(loaded("good"));
     assert!(!loaded("gone"));
+}
+
+#[tokio::test]
+async fn resumed_items_past_the_limit_count_as_full_load() {
+    use crate::load::Sampler;
+    use crate::{Database, Preload};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = config_in(
+        &dir,
+        &format!("[app]\nmax_pending = 2\n{NSFW}max_pending = 4\n"),
+    );
+    let sqlite = apollo_storage::open(&config.database).await.unwrap();
+    let engine = Engine::new(Arc::new(config), sqlite, None);
+    let lc = engine.lifecycle();
+    // The first sample is there at once: idle, on SQLite.
+    let load = lc.load();
+    assert!(load.sampled_at.is_some());
+    assert_eq!(
+        (load.utilization, load.free(), load.database),
+        (0.0, Some(2), Database::NotShared)
+    );
+    assert!(lc.ready_strict());
+    assert_eq!(lc.weight(), 100);
+
+    // Resumed items take their place whatever the limit: 3 of 2.
+    let nsfw = ["nsfw".to_string()];
+    let held: Vec<_> = (0..3).map(|_| engine.reserve_resumed(&nsfw)).collect();
+    let snapshot = Sampler::default().sample(engine.load_inputs(None), tokio::time::Instant::now());
+    assert_eq!(
+        (snapshot.utilization, snapshot.free(), snapshot.weight(true)),
+        (1.0, Some(0), 1)
+    );
+    assert_eq!(snapshot.degraded(), ["load"]);
+    let model = &snapshot.models[0];
+    assert_eq!(
+        (
+            model.label.as_str(),
+            model.preload,
+            model.admitted,
+            model.max_pending
+        ),
+        ("nsfw", Preload::Lazy, 3, 4)
+    );
+
+    // The engine's own sampler has it within a second.
+    assert!(wait_within(Duration::from_secs(2), || lc.load().utilization == 1.0).await);
+    let text = engine.metrics_text().await;
+    for line in [
+        "apollo_utilization 1",
+        "apollo_lb_weight 1",
+        "apollo_degraded{reason=\"load\"} 1",
+        "apollo_model_utilization{model=\"nsfw\"} 0.75",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
+        );
+    }
+    drop(held);
+}
+
+#[tokio::test]
+async fn a_reload_shows_in_the_load_sample() {
+    let f = fixture_with(PIPELINE).await;
+    let mut config = (*f.engine.config()).clone();
+    config.app.port += 1;
+    f.engine.reload(config, None).await.unwrap();
+    let lc = f.engine.lifecycle();
+    assert!(
+        wait_within(Duration::from_secs(2), || lc.load().generation == 2).await,
+        "{:?}",
+        lc.load()
+    );
+    assert_eq!(lc.load().restart_required, ["app.port"]);
 }

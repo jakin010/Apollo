@@ -416,8 +416,13 @@ impl Engine {
         }
     }
 
-    /// Note whether the database answered, for [`Engine::settled`].
+    /// Note whether the database answered, for [`Engine::settled`] and the
+    /// database contact the load sampler reports.
     pub(crate) fn connected(&self, ok: bool) {
+        if ok {
+            let at = self.inner.epoch.elapsed().as_millis() as u64;
+            self.inner.last_ok.fetch_max(at, Ordering::Relaxed);
+        }
         let mut since = self
             .inner
             .connected_since
@@ -428,6 +433,13 @@ impl Engine {
             (false, _) => *since = None,
             _ => {}
         }
+    }
+
+    /// When the database last answered (when the engine was built, until it
+    /// does).
+    pub(crate) fn last_ok(&self) -> Instant {
+        let ms = self.inner.last_ok.load(Ordering::Relaxed);
+        self.inner.epoch + Duration::from_millis(ms)
     }
 
     /// Whether this instance has been in touch with the database for a whole

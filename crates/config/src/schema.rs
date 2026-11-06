@@ -156,8 +156,9 @@ impl MetricsConfig {
 }
 
 /// `[health]` — HTTP health checks for load balancers and orchestrators
-/// (`/livez`, `/readyz`) on their own plaintext listener, separate from the
-/// gRPC port. Off by default. Every field needs a restart.
+/// (`/livez`, `/readyz`, `/readyz/strict`, `/load`) on their own plaintext
+/// listener, separate from the gRPC port. Off by default. Every field but
+/// `degraded_at` needs a restart.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthConfig {
@@ -172,6 +173,10 @@ pub struct HealthConfig {
     /// can reach the port; see [`HealthConfig::allowlist`].
     #[serde(default)]
     pub allow: Option<Vec<String>>,
+    /// Utilization (0 to 1) at which the instance reports itself degraded
+    /// for load, above 0 and at most 1. Applies on reload.
+    #[serde(default = "crate::defaults::degraded_at")]
+    pub degraded_at: f64,
 }
 
 impl Default for HealthConfig {
@@ -181,6 +186,7 @@ impl Default for HealthConfig {
             endpoint: None,
             port: defaults::health_port(),
             allow: None,
+            degraded_at: defaults::degraded_at(),
         }
     }
 }
