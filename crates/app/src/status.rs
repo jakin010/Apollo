@@ -1,8 +1,9 @@
-//! `apollo status` and `apollo reload`: a running server answers on a Unix
-//! socket in its private per-user directory. A client sends one request line —
-//! `status` or `reload` — and gets one JSON reply: a [`StatusReport`], or a
-//! [`ReloadOutcome`]. A client that sends nothing (older versions) gets a
-//! status report.
+//! `apollo status`, `apollo reload` and `apollo drain`: a running server
+//! answers on a Unix socket in its private per-user directory. A client sends
+//! one request line — `status`, `reload`, `drain` or `undrain` — and gets one
+//! JSON reply: a [`StatusReport`], a [`ReloadOutcome`] or a
+//! [`DrainOutcome`]. A client that sends nothing (older versions) gets a
+//! status report, as does any line an older server doesn't know.
 //!
 //! A local socket (rather than an RPC on the public port) means no token, no TLS
 //! setup and no network exposure: only the OS user running the server can
@@ -26,6 +27,9 @@ pub struct StatusReport {
     pub phase: Option<String>,
     #[serde(default)]
     pub step: Option<String>,
+    /// Taken out of rotation with `apollo drain`. Unset from older servers.
+    #[serde(default)]
+    pub drained: Option<bool>,
     pub listen: String,
     pub tls: bool,
     pub mutual_tls: bool,
@@ -129,19 +133,37 @@ pub struct ReloadOutcome {
     pub restart_required: Vec<String>,
 }
 
+/// What `apollo drain` (or `--undo`) did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainOutcome {
+    /// Out of rotation now.
+    pub drained: bool,
+    /// Whether this request changed that.
+    pub changed: bool,
+    /// The phase now: `serving`, or `starting`, `draining` or `stopping`.
+    pub phase: String,
+    /// Ready for work now (what `/readyz` answers).
+    pub ready: bool,
+}
+
 /// What a client asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Request {
     Status,
     Reload,
+    Drain,
+    Undrain,
 }
 
-/// What the socket sends: a report or reload outcome, or why there is none.
+/// What the socket sends: a report, reload or drain outcome, or why there
+/// is none.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Reply {
     status: Option<StatusReport>,
     #[serde(default)]
     reload: Option<ReloadOutcome>,
+    #[serde(default)]
+    drain: Option<DrainOutcome>,
     error: Option<String>,
 }
 
@@ -178,20 +200,23 @@ impl Drop for SocketGuard {
     }
 }
 
-/// Serve status reports and reloads on `path` until the returned guard drops.
-/// Each connection sends at most one request line and receives one JSON
-/// [`Reply`], from `report` or `reload`. Must be called within a Tokio runtime.
+/// Serve status reports, reloads and drains on `path` until the returned
+/// guard drops. Each connection sends at most one request line and receives
+/// one JSON [`Reply`], from `report`, `reload` or `drain` (`true` to drain,
+/// `false` to undo it). Must be called within a Tokio runtime.
 #[cfg(unix)]
-pub fn serve_socket<F, Fut, G, GFut>(
+pub fn serve_socket<F, Fut, G, GFut, D>(
     path: &Path,
     report: F,
     reload: G,
+    drain: D,
 ) -> std::io::Result<SocketGuard>
 where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = anyhow::Result<StatusReport>> + Send + 'static,
     G: Fn() -> GFut + Send + Sync + 'static,
     GFut: std::future::Future<Output = anyhow::Result<ReloadOutcome>> + Send + 'static,
+    D: Fn(bool) -> DrainOutcome + Send + Sync + 'static,
 {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
@@ -207,7 +232,7 @@ where
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let guard = SocketGuard(path.to_path_buf());
 
-    let handlers = std::sync::Arc::new((report, reload));
+    let handlers = std::sync::Arc::new((report, reload, drain));
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
@@ -215,7 +240,8 @@ where
             };
             let handlers = std::sync::Arc::clone(&handlers);
             tokio::spawn(async move {
-                let reply = match read_request(&mut stream).await {
+                let request = read_request(&mut stream).await;
+                let reply = match request {
                     Request::Status => match (handlers.0)().await {
                         Ok(status) => Reply {
                             status: Some(status),
@@ -236,6 +262,10 @@ where
                             ..Default::default()
                         },
                     },
+                    Request::Drain | Request::Undrain => Reply {
+                        drain: Some((handlers.2)(request == Request::Drain)),
+                        ..Default::default()
+                    },
                 };
                 if let Ok(body) = serde_json::to_vec(&reply) {
                     let _ = stream.write_all(&body).await;
@@ -247,8 +277,8 @@ where
     Ok(guard)
 }
 
-/// The client's request line: `reload`, or anything else (including nothing
-/// within [`REQUEST_WAIT`]) for status.
+/// The client's request line: `reload`, `drain` or `undrain`, or anything
+/// else (including nothing within [`REQUEST_WAIT`]) for status.
 #[cfg(unix)]
 async fn read_request(stream: &mut tokio::net::UnixStream) -> Request {
     use tokio::io::AsyncReadExt;
@@ -270,6 +300,8 @@ async fn read_request(stream: &mut tokio::net::UnixStream) -> Request {
     let _ = tokio::time::timeout(REQUEST_WAIT, read).await;
     match std::str::from_utf8(&buf[..len]).map(str::trim) {
         Ok("reload") => Request::Reload,
+        Ok("drain") => Request::Drain,
+        Ok("undrain") => Request::Undrain,
         _ => Request::Status,
     }
 }
@@ -286,6 +318,8 @@ fn exchange(path: &Path, request: Request, timeout: Duration) -> anyhow::Result<
     let line: &[u8] = match request {
         Request::Status => b"status\n",
         Request::Reload => b"reload\n",
+        Request::Drain => b"drain\n",
+        Request::Undrain => b"undrain\n",
     };
     stream.write_all(line).context("sending the request")?;
     let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -329,6 +363,35 @@ pub fn reload(path: &Path) -> anyhow::Result<ReloadOutcome> {
     }
 }
 
+/// Ask the server listening on `path` to take itself out of rotation
+/// (`drain`), or back in.
+#[cfg(unix)]
+pub fn drain(path: &Path, drain: bool) -> anyhow::Result<DrainOutcome> {
+    use anyhow::anyhow;
+    let request = if drain {
+        Request::Drain
+    } else {
+        Request::Undrain
+    };
+    let reply = exchange(path, request, Duration::from_secs(10))?;
+    match reply {
+        Reply {
+            drain: Some(outcome),
+            ..
+        } => Ok(outcome),
+        Reply {
+            error: Some(error), ..
+        } => Err(anyhow!("the server answered with an error: {error}")),
+        // An older server answers any line it doesn't know with a report.
+        Reply {
+            status: Some(_), ..
+        } => Err(anyhow!(
+            "this server is too old for `apollo drain`; nothing changed"
+        )),
+        _ => Err(anyhow!("empty drain reply")),
+    }
+}
+
 // ------------------------------- rendering -------------------------------
 
 /// Images classified per second, per model label, between two reports.
@@ -367,9 +430,14 @@ pub fn render(r: &StatusReport, now: SystemTime, rates: Option<&Rates>) -> Strin
         r.pid,
         duration(now_secs.saturating_sub(r.started_at))
     ));
+    let drained = if r.drained == Some(true) {
+        ", drained (undo with apollo drain --undo)"
+    } else {
+        ""
+    };
     match (&r.phase, &r.step) {
-        (Some(phase), Some(step)) => line(format!("  phase      {phase} ({step})")),
-        (Some(phase), None) => line(format!("  phase      {phase}")),
+        (Some(phase), Some(step)) => line(format!("  phase      {phase} ({step}){drained}")),
+        (Some(phase), None) => line(format!("  phase      {phase}{drained}")),
         _ => {}
     }
     let on = |b: bool| if b { "on" } else { "off" };
@@ -602,6 +670,7 @@ mod tests {
             started_at: 1_000_000,
             phase: Some("serving".into()),
             step: None,
+            drained: Some(false),
             listen: "127.0.0.1:8080".into(),
             tls: true,
             mutual_tls: false,
@@ -839,6 +908,7 @@ mod tests {
         let path = dir.path().join("s.sock");
         let report = sample();
         let served = report.clone();
+        let drained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let guard = serve_socket(
             &path,
             move || {
@@ -846,6 +916,16 @@ mod tests {
                 async move { Ok(r) }
             },
             || async { Ok(outcome()) },
+            move |on| {
+                use std::sync::atomic::Ordering;
+                let changed = drained.swap(on, Ordering::SeqCst) != on;
+                DrainOutcome {
+                    drained: on,
+                    changed,
+                    phase: "serving".into(),
+                    ready: !on,
+                }
+            },
         )
         .unwrap();
 
@@ -866,6 +946,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reloaded, outcome());
+
+        for (on, changed) in [(true, true), (true, false), (false, true), (false, false)] {
+            let p = path.clone();
+            let got = tokio::task::spawn_blocking(move || drain(&p, on))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                got,
+                DrainOutcome {
+                    drained: on,
+                    changed,
+                    phase: "serving".into(),
+                    ready: !on,
+                },
+                "drain {on}"
+            );
+        }
 
         // A client that sends nothing (an older `apollo status`) gets a report.
         let p = path.clone();
@@ -894,6 +992,7 @@ mod tests {
             &path,
             || async { Err(anyhow::anyhow!("database is locked")) },
             || async { Err(anyhow::anyhow!("model 'x': unknown strategy")) },
+            |_| unreachable!("not asked"),
         )
         .unwrap();
         let p = path.clone();
@@ -910,6 +1009,72 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not reloaded: model 'x'"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_older_server_says_it_cannot_drain() {
+        // An older server answers every line with a report.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut line = [0u8; 64];
+                let _ = stream.read(&mut line).await;
+                let reply = Reply {
+                    status: Some(sample()),
+                    ..Default::default()
+                };
+                let body = serde_json::to_vec(&reply).unwrap();
+                let _ = stream.write_all(&body).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        for on in [true, false] {
+            let p = path.clone();
+            let err = tokio::task::spawn_blocking(move || drain(&p, on))
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err, "this server is too old for `apollo drain`; nothing changed",
+                "drain {on}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_fails_when_no_server_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let err = format!("{:#}", drain(&path, true).unwrap_err());
+        assert!(err.starts_with("connecting to "), "{err}");
+    }
+
+    #[test]
+    fn renders_a_drained_server_and_reads_reports_without_it() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000 + 8_000);
+        let report = StatusReport {
+            drained: Some(true),
+            ..sample()
+        };
+        let text = render(&report, now, None);
+        assert!(
+            text.contains("\n  phase      serving, drained (undo with apollo drain --undo)\n"),
+            "{text}"
+        );
+
+        // An older server sends no `drained`.
+        let mut json = serde_json::to_value(sample()).unwrap();
+        json.as_object_mut().unwrap().remove("drained");
+        let old: StatusReport = serde_json::from_value(json).unwrap();
+        assert_eq!(old.drained, None);
+        let text = render(&old, now, None);
+        assert!(text.contains("\n  phase      serving\n"), "{text}");
     }
 
     fn outcome() -> ReloadOutcome {

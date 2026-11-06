@@ -1,7 +1,9 @@
-//! clap command tree: `start` / `stop` / `status` / `reload` / `config` / keys.
+//! clap command tree: `start` / `stop` / `status` / `reload` / `drain` /
+//! `config` / keys.
 
 mod calibrate;
 mod config;
+mod drain;
 mod hash;
 mod keys;
 mod reload;
@@ -31,6 +33,9 @@ enum Command {
     /// Apply the edited config file to the running server without restarting
     /// it (also done on SIGHUP).
     Reload(reload::ReloadArgs),
+    /// Take the running server out of load balancers' rotation without
+    /// stopping it (`--undo` takes it back). It keeps serving what it is sent.
+    Drain(drain::DrainArgs),
     /// Read or edit the config file.
     #[command(subcommand)]
     Config(config::ConfigCmd),
@@ -57,6 +62,7 @@ impl Cli {
             Command::Stop(args) => stop::run(args),
             Command::Status(args) => status::run(args),
             Command::Reload(args) => reload::run(args),
+            Command::Drain(args) => drain::run(args),
             Command::Config(cmd) => config::run(cmd),
             Command::Calibrate(args) => calibrate::run(args),
             Command::Hash(args) => hash::run(args),
@@ -158,6 +164,13 @@ mod tests {
         assert!(Cli::try_parse_from(["apollo", "status", "-n", "2"]).is_err());
         assert!(Cli::try_parse_from(["apollo", "status", "-w", "-n", "0"]).is_err());
         assert!(Cli::try_parse_from(["apollo", "status", "-w", "-n", "soon"]).is_err());
+    }
+
+    #[test]
+    fn parses_drain() {
+        assert!(Cli::try_parse_from(["apollo", "drain"]).is_ok());
+        assert!(Cli::try_parse_from(["apollo", "drain", "--undo"]).is_ok());
+        assert!(Cli::try_parse_from(["apollo", "drain", "now"]).is_err());
     }
 
     #[test]

@@ -254,9 +254,19 @@ async fn serve_with(
 
 /// A Ctrl-C or SIGTERM drains; one while draining (or later) stops at once.
 fn stop_on_signals(lc: Lifecycle) {
+    stop_on(lc, crate::daemon::shutdown_signal);
+}
+
+/// Each time `signal()` returns: the first drains (drained by hand or not),
+/// any later one stops at once.
+fn stop_on<F, S>(lc: Lifecycle, mut signal: F)
+where
+    F: FnMut() -> S + Send + 'static,
+    S: Future<Output = ()> + Send,
+{
     tokio::spawn(async move {
         loop {
-            crate::daemon::shutdown_signal().await;
+            signal().await;
             if lc.drain() {
                 tracing::info!("shutdown signal received; draining (a second one stops at once)");
             } else {
@@ -325,8 +335,31 @@ fn ready_after_preloads(engine: Engine) {
         lc.serving();
         if lc.ready() {
             tracing::info!("apollo ready");
+        } else if lc.drained() && lc.phase() == Phase::Serving {
+            tracing::info!("apollo serving, but drained: `apollo drain --undo` makes it ready");
         }
     });
+}
+
+/// `apollo drain` (`drain`), or `apollo drain --undo`: take this instance out
+/// of rotation, or back in.
+#[cfg(unix)]
+fn drain_by_hand(lc: &Lifecycle, drain: bool) -> crate::status::DrainOutcome {
+    let changed = lc.set_drained(drain);
+    if changed && drain {
+        tracing::info!(
+            "drained (apollo drain): unready with weight 0, and taking no work over; \
+             still serving what it is sent"
+        );
+    } else if changed {
+        tracing::info!(ready = lc.ready(), "undrained (apollo drain --undo)");
+    }
+    crate::status::DrainOutcome {
+        drained: lc.drained(),
+        changed,
+        phase: lc.phase().name().to_string(),
+        ready: lc.ready(),
+    }
 }
 
 /// Log the longest a stop takes, for the process manager's grace period.
@@ -597,8 +630,8 @@ fn describe_database(db: &apollo_config::DatabaseConfig) -> String {
     }
 }
 
-/// Serve `apollo status` on the local status socket. Failure is logged, not
-/// fatal: the server works without it.
+/// Serve `apollo status`, `reload` and `drain` on the local status socket.
+/// Failure is logged, not fatal: the server works without it.
 #[cfg(unix)]
 fn start_status_socket(
     engine: Engine,
@@ -612,16 +645,7 @@ fn start_status_socket(
             return None;
         }
     };
-    let report = move || {
-        let engine = engine.clone();
-        let info = info.clone();
-        async move { Ok(build_report(&engine, &info).await) }
-    };
-    let reload = move || {
-        let reloader = reloader.clone();
-        async move { reloader.reload().await }
-    };
-    match crate::status::serve_socket(&path, report, reload) {
+    match serve_status(&path, engine, info, reloader) {
         Ok(guard) => {
             tracing::info!(socket = %path.display(), "status socket ready (`apollo status`)");
             Some(guard)
@@ -631,6 +655,27 @@ fn start_status_socket(
             None
         }
     }
+}
+
+/// Serve the status socket on `path`.
+#[cfg(unix)]
+fn serve_status(
+    path: &std::path::Path,
+    engine: Engine,
+    info: ServerInfo,
+    reloader: Reloader,
+) -> std::io::Result<crate::status::SocketGuard> {
+    let lc = engine.lifecycle().clone();
+    let report = move || {
+        let engine = engine.clone();
+        let info = info.clone();
+        async move { Ok(build_report(&engine, &info).await) }
+    };
+    let reload = move || {
+        let reloader = reloader.clone();
+        async move { reloader.reload().await }
+    };
+    crate::status::serve_socket(path, report, reload, move |drain| drain_by_hand(&lc, drain))
 }
 
 #[cfg(not(unix))]
@@ -657,6 +702,7 @@ async fn build_report(engine: &Engine, info: &ServerInfo) -> crate::status::Stat
             apollo_engine::Phase::Starting(step) => Some(step.name().to_string()),
             _ => None,
         },
+        drained: Some(lc.drained()),
         listen: info.listen.clone(),
         tls: info.tls,
         mutual_tls: info.mutual_tls,
@@ -1056,6 +1102,172 @@ mod tests {
         );
         assert!(report.tasks.is_some());
         assert_eq!(report.webhook.unwrap().pending, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_and_undrain_over_the_status_socket_then_a_stop() {
+        use crate::health::tests::{free_port, get, health_config};
+        use crate::status::{DrainOutcome, drain, fetch};
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lc = Lifecycle::new();
+        let agent_port = free_port();
+        let (health_toml, health) = health_config(&format!("agent_port = {agent_port}\n"));
+        crate::health::start(&health_toml, &lc).await.unwrap();
+        let agent = std::net::SocketAddr::from(([127, 0, 0, 1], agent_port));
+        let agent_line = || async move {
+            let mut stream = tokio::net::TcpStream::connect(agent).await.unwrap();
+            let mut line = String::new();
+            stream.read_to_string(&mut line).await.unwrap();
+            line
+        };
+
+        // A server as `serve_with` runs it, with a drain delay of 1 s.
+        let toml = format!(
+            "[app]\ndrain_delay_secs = 1\n[database.sqlite]\npath = \"{}\"\n",
+            dir.path().join("apollo.db").display()
+        );
+        let config = Arc::new(load::from_str(&toml).unwrap());
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        let engine = Engine::with_lifecycle(config, storage, None, "n".into(), lc.clone());
+        let signal = Arc::new(tokio::sync::Notify::new());
+        stop_on(lc.clone(), {
+            let signal = Arc::clone(&signal);
+            move || {
+                let signal = Arc::clone(&signal);
+                async move { signal.notified().await }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        stop_after_drain_delay(engine.clone());
+        lc.starting(Step::LoadingModels);
+        ready_after_preloads(engine.clone());
+        let grpc = apollo_server::Health::new(&lc).await;
+        let served = tokio::spawn({
+            let engine = engine.clone();
+            let lc = lc.clone();
+            async move {
+                let serve = apollo_server::serve_on(
+                    engine,
+                    listener,
+                    grpc,
+                    apollo_server::AuthInterceptor::disabled(),
+                    None,
+                );
+                apollo_server::serve_until_stopped(serve, &lc, || Duration::from_secs(15)).await
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !lc.ready() {
+            assert!(std::time::Instant::now() < deadline, "never ready");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let path = dir.path().join("s.sock");
+        let info = ServerInfo {
+            started_at: std::time::SystemTime::now(),
+            listen: "127.0.0.1:0".into(),
+            tls: false,
+            mutual_tls: false,
+            auth: false,
+            config_file: None,
+            database: "sqlite".into(),
+            log_file: None,
+        };
+        let reloader = Reloader {
+            engine: engine.clone(),
+            source: ConfigSource {
+                path: None,
+                overrides: Overrides::default(),
+            },
+            log_filter: None,
+            published: watch::channel(Published {
+                generation: 1,
+                metrics: None,
+            })
+            .0,
+            metrics: None,
+        };
+        let _socket = serve_status(&path, engine.clone(), info, reloader).unwrap();
+        let ask = |on: bool| {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || drain(&path, on))
+        };
+        let report = || {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || fetch(&path))
+        };
+        let outcome = |drained, changed, ready| DrainOutcome {
+            drained,
+            changed,
+            phase: "serving".into(),
+            ready,
+        };
+
+        // Drained: unready everywhere, weight 0, still serving.
+        assert_eq!(
+            ask(true).await.unwrap().unwrap(),
+            outcome(true, true, false)
+        );
+        for path in ["/readyz", "/", "/readyz/strict"] {
+            assert_eq!(
+                get(health, path).await,
+                (503, "not ready: drained\n".into()),
+                "{path}"
+            );
+        }
+        assert_eq!(get(health, "/livez").await, (200, "ok\n".into()));
+        assert_eq!(agent_line().await, "drain\n");
+        assert_eq!(lc.weight(), 0);
+        assert!(!lc.taking_work());
+        let status = report().await.unwrap().unwrap();
+        assert_eq!(
+            (status.phase.as_deref(), status.drained),
+            (Some("serving"), Some(true))
+        );
+        assert_eq!(status.load.unwrap().weight, 0);
+        assert!(engine.metrics_text().await.contains("\napollo_drained 1\n"));
+        assert_eq!(
+            ask(true).await.unwrap().unwrap(),
+            outcome(true, false, false)
+        );
+
+        // Undone: ready again.
+        assert_eq!(
+            ask(false).await.unwrap().unwrap(),
+            outcome(false, true, true)
+        );
+        assert_eq!(get(health, "/readyz").await, (200, "ok\n".into()));
+        assert!(agent_line().await.starts_with("up ready "));
+        assert!(lc.weight() > 0 && lc.taking_work());
+        assert_eq!(report().await.unwrap().unwrap().drained, Some(false));
+
+        // A signal after the undrain drains, then stops, as usual.
+        signal.notify_one();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while lc.phase() == Phase::Serving {
+            assert!(std::time::Instant::now() < deadline, "no drain");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            get(health, "/readyz").await,
+            (503, "not ready: draining\n".into())
+        );
+        assert_eq!(agent_line().await, "drain\n");
+        let served = tokio::time::timeout(Duration::from_secs(3), served)
+            .await
+            .expect("stopped after the drain delay")
+            .unwrap();
+        assert!(served.is_ok(), "{served:?}");
+        lc.stopping();
+        assert!(engine.hand_back().await);
+        assert_eq!(
+            get(health, "/readyz").await,
+            (503, "not ready: stopping\n".into())
+        );
+        assert!(!lc.forced(), "one signal is no forced stop");
     }
 
     #[tokio::test]

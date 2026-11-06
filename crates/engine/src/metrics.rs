@@ -257,6 +257,11 @@ impl Engine {
             let v = if phase == now { 1.0 } else { 0.0 };
             out.sample("apollo_lifecycle_phase", &[("phase", phase)], v);
         }
+        out.gauge(
+            "apollo_drained",
+            "1 while taken out of rotation with apollo drain.",
+            if lc.drained() { 1.0 } else { 0.0 },
+        );
         // One sample for every figure below, so they agree.
         let load = lc.load();
         let ready = lc.ready();

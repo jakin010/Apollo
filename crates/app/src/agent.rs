@@ -5,8 +5,8 @@
 //!   checks pass too), `ready` ends a drain, and `NN%` is the
 //!   [weight](Lifecycle::weight), as a share of the server's configured
 //!   weight.
-//! - Not ready (starting, draining): `drain`, so HAProxy sends no new
-//!   connections.
+//! - Not ready (starting, draining, or drained with `apollo drain`): `drain`,
+//!   so HAProxy sends no new connections.
 //! - Stopping: the port is closed. HAProxy keeps the state an agent it can't
 //!   reach reported last.
 //!
@@ -196,10 +196,16 @@ mod tests {
                 database: Database::Stale {
                     last_contact: Instant::now(),
                 },
-                ..busy
+                ..busy.clone()
             },
         );
         assert_eq!(line(&lc), "up ready 1%\n");
+        // Drained by hand, and back.
+        publish_load(&lc, busy);
+        assert!(lc.set_drained(true));
+        assert_eq!(line(&lc), "drain\n");
+        assert!(lc.set_drained(false));
+        assert_eq!(line(&lc), "up ready 60%\n");
         assert!(lc.drain());
         assert_eq!(line(&lc), "drain\n");
         lc.stopping();

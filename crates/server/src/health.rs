@@ -1,7 +1,7 @@
 //! gRPC health (`grpc.health.v1.Health`) on the gRPC port, following the
 //! process's [`Lifecycle`]:
 //!
-//! | Name | Starting | Serving | Draining | Stopping |
+//! | Name | Starting | Serving | Draining, or drained by hand | Stopping |
 //! |---|---|---|---|---|
 //! | `""`, `apollo.v1.Inference`, `readiness` | NOT_SERVING | SERVING | NOT_SERVING | cleared |
 //! | `readiness-strict` | NOT_SERVING | SERVING unless the database is stale | NOT_SERVING | cleared |
@@ -97,8 +97,8 @@ async fn set(reporter: &mut HealthReporter, name: &str, answer: Option<ServingSt
 }
 
 /// Apply each change in what the names answer, and only a change (each
-/// update reaches every Watch), until they are cleared. A new phase or load
-/// sample (the database's state) wakes it.
+/// update reaches every Watch), until they are cleared. A new phase, a drain
+/// by hand or a load sample (the database's state) wakes it.
 async fn follow(
     mut reporter: HealthReporter,
     lc: Lifecycle,
@@ -258,6 +258,43 @@ mod tests {
             let late = svc.watch(request(name)).await.map(|_| ());
             assert_eq!(late.map_err(|s| s.code()), Err(tonic::Code::NotFound));
         }
+    }
+
+    #[tokio::test]
+    async fn a_drain_by_hand_turns_readiness_off_until_undone() {
+        let lc = Lifecycle::new();
+        lc.serving();
+        let health = Health::new(&lc).await;
+        let svc = HealthService::from_health_reporter(health.reporter.clone());
+        let mut ready = Vec::new();
+        for name in READINESS {
+            let mut w = watch(&svc, name).await;
+            assert_eq!(next(&mut w).await, Some(Wire::Serving), "{name:?}");
+            ready.push(w);
+        }
+        let mut live = watch(&svc, "liveness").await;
+        assert_eq!(next(&mut live).await, Some(Wire::Serving));
+
+        assert!(lc.set_drained(true));
+        for w in &mut ready {
+            assert_eq!(next(w).await, Some(Wire::NotServing));
+        }
+        assert!(lc.set_drained(false));
+        for w in &mut ready {
+            assert_eq!(next(w).await, Some(Wire::Serving));
+        }
+        assert!(quiet(&mut live).await, "liveness doesn't change");
+
+        // A stop after the undrain goes as usual.
+        assert!(lc.drain());
+        for w in &mut ready {
+            assert_eq!(next(w).await, Some(Wire::NotServing));
+        }
+        lc.stopping();
+        for w in &mut ready {
+            assert_eq!(next(w).await, None);
+        }
+        assert_eq!(next(&mut live).await, None);
     }
 
     #[tokio::test]

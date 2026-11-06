@@ -471,7 +471,13 @@ impl Engine {
                 if engine.inner.closing.load(Ordering::SeqCst) {
                     return;
                 }
-                if !engine.inner.lifecycle.taking_work() {
+                let lifecycle = &engine.inner.lifecycle;
+                if !lifecycle.taking_work() {
+                    // Drained by hand, maybe for long: take nothing, but
+                    // keep reading, so the contact it reports stays current.
+                    if lifecycle.phase() < Phase::Draining {
+                        engine.keep_in_touch().await;
+                    }
                     continue;
                 }
                 if let Err(e) = engine.take_over(Some(engine.inner.lease_ttl)).await {
@@ -479,6 +485,24 @@ impl Engine {
                 }
             }
         });
+    }
+
+    /// Read the database as a takeover pass would, waiting a lease at most,
+    /// and claim nothing: only to note whether it answers.
+    async fn keep_in_touch(&self) {
+        let read = self.inner.storage.claimable_tasks(
+            ClaimMode::Open,
+            &self.inner.node,
+            &[],
+            self.pin_grace(),
+            None,
+            1,
+        );
+        let ok = matches!(
+            tokio::time::timeout(self.inner.lease_ttl, read).await,
+            Ok(Ok(_))
+        );
+        self.connected(ok);
     }
 
     /// One takeover pass: claim and start the tasks this instance may take,
@@ -490,8 +514,8 @@ impl Engine {
     /// (`None`: as long as it takes); one that times out leaves this instance
     /// unsettled, as one that fails does.
     ///
-    /// A drain ends the pass at once (a claim already sent finishes first),
-    /// so a stop's hand-back needn't wait for it.
+    /// A drain (or `apollo drain`) ends the pass at once (a claim already
+    /// sent finishes first), so a stop's hand-back needn't wait for it.
     pub(crate) async fn take_over(&self, limit: Option<Duration>) -> Result<usize, EngineError> {
         let mut memo = self.inner.takeover.lock().await;
         let lifecycle = &self.inner.lifecycle;
@@ -542,7 +566,7 @@ impl Engine {
                         return Err(StorageError::Timeout(limit).into());
                     }
                 },
-                () = lifecycle.reached(Phase::Draining) => return Ok(taken),
+                () = lifecycle.until_not_taking_work() => return Ok(taken),
             };
             let page = match read {
                 Ok(page) => {
@@ -561,7 +585,7 @@ impl Engine {
                         looked_again = true;
                         tokio::select! {
                             () = tokio::time::sleep(self.inner.lease_ttl / 2) => continue,
-                            () = lifecycle.reached(Phase::Draining) => return Ok(taken),
+                            () = lifecycle.until_not_taking_work() => return Ok(taken),
                         }
                     }
                     page

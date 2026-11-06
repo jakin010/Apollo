@@ -9,7 +9,7 @@ use apollo_storage::Renewal;
 use crate::aggregate;
 use crate::error::EngineError;
 use crate::lease::{MAX_RESUME_ATTEMPTS, Running};
-use crate::{Engine, Reservation};
+use crate::{Engine, Phase, Reservation};
 
 /// Upload files younger than this are never swept: one may still be arriving
 /// (a `ClassifyStream`), here or at another instance sharing the directory.
@@ -43,6 +43,12 @@ impl Engine {
                 let mut tries = 0;
                 loop {
                     tick.tick().await;
+                    // Drained by hand: wait for the undrain. A stop still
+                    // ends it below.
+                    let lc = engine.lifecycle();
+                    if lc.drained() && lc.phase() < Phase::Draining {
+                        continue;
+                    }
                     if !engine.settled() {
                         tries += 1;
                         // Out of touch for long: the redelivery loop (or

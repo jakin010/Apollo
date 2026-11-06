@@ -1,6 +1,6 @@
 # Operations — metrics, health checks, live reload, calibration
 
-This page covers running Apollo day to day: scraping its metrics, health checks for load balancers and how a stop drains, changing its config without a restart, choosing thresholds from labelled examples, and the memory allocator Linux builds use. For the server's live state at a glance, see `apollo status` in [configuration.md → CLI reference](./configuration.md#cli-reference).
+This page covers running Apollo day to day: scraping its metrics, health checks for load balancers, how a stop drains and how to take an instance out of rotation, changing its config without a restart, choosing thresholds from labelled examples, and the memory allocator Linux builds use. For the server's live state at a glance, see `apollo status` in [configuration.md → CLI reference](./configuration.md#cli-reference).
 
 ---
 
@@ -32,6 +32,7 @@ Two metrics come from the database: `apollo_tasks` and `apollo_webhooks_pending`
 | `apollo_config_loaded_timestamp_seconds` | gauge | | When the running config was applied. |
 | `apollo_ready` | gauge | | 1 while the server is ready for work (what `/readyz` answers). |
 | `apollo_lifecycle_phase` | gauge | `phase` | 1 for the phase the server is in: `starting`, `serving`, `draining` or `stopping`. See [Health checks and load balancers](#health-checks-and-load-balancers). |
+| `apollo_drained` | gauge | | 1 while taken out of rotation with [`apollo drain`](#taking-an-instance-out-of-rotation). |
 | `apollo_ready_strict` | gauge | | 1 while ready and in touch with the database, or it isn't shared (what `/readyz/strict` answers). |
 | `apollo_utilization` | gauge | | How close the server is to refusing work, from 0 to 1 (the `utilization` of [`/load`](#the-load-figure)). |
 | `apollo_lb_weight` | gauge | | The weight for load balancers: 1 to 100, 1 while the database is stale, 0 when not ready. |
@@ -102,7 +103,7 @@ Apollo then answers plaintext HTTP/1.1 on that port, from right after it starts 
 | Path | 200 | 503 | Body |
 |------|-----|-----|------|
 | `/livez` | always | never | `ok` |
-| `/readyz` (and `/`) | ready for work | otherwise | `ok`, or why not: `not ready: starting (recovering tasks, 41s)`, `not ready: draining`, `not ready: stopping` |
+| `/readyz` (and `/`) | ready for work | otherwise | `ok`, or why not: `not ready: starting (recovering tasks, 41s)`, `not ready: drained`, `not ready: draining`, `not ready: stopping` |
 | `/readyz/strict` | `/readyz` passes and the server is in touch with a shared database (or it isn't shared) | otherwise | as `/readyz`, or `not ready: database (no contact 47s)` |
 | `/load` | always | never | the load figure as JSON (see [The load figure](#the-load-figure)) |
 
@@ -136,6 +137,7 @@ gRPC health on the gRPC port follows the same states: the names `""`, `apollo.v1
 | A shared database is out for every instance | 200 | 200 degraded on every instance | 503 database on every instance | 1 on every instance | as above |
 | SQLite fails | 200 | 200 | 200 | as when serving | as above |
 | Reloading the config | 200 | 200, with no dip | 200, with no dip | unchanged | serves |
+| Drained with [`apollo drain`](#taking-an-instance-out-of-rotation) | 200 | 503 drained | 503 drained | 0 | serves as usual; takes no tasks over from other instances |
 | Draining (`drain_delay_secs`) | 200 | 503 draining | 503 draining | 0 | serves as usual; takes no tasks over from other instances |
 | Stopping (up to `drain_timeout_secs`) | 200 | 503 stopping | 503 stopping | 0 | closed: open calls finish, `WatchTask` ends with `UNAVAILABLE`, waits return |
 | Handing tasks back (up to 5 s) | 200 | 503 stopping | 503 stopping | 0 | closed |
@@ -168,7 +170,7 @@ A degraded server stays in rotation. `/readyz` and `/readyz/strict` (when it pas
 
 - `utilization`: how close the server is to refusing work, from 0 to 1. It is the larger of `in_flight / [app].max_pending` and the memory in use over `[app].max_memory`; with no `max_pending`, the inputs being processed or waiting over `[app].max_concurrent` stand in for the queue. A server at its limit (tasks resumed after a restart can take it past) counts as 1. It rises at once and falls over about 5 s (an exponential decay, τ = 5 s), so a burst that just ended still counts for a moment.
 - `weight`: `5 × round(20 × (1 − utilization))`, from 100 when idle down to 1 in steps of 5; 1 while the database contact is stale, and 0 when not ready. For a balancer that takes weights.
-- `ready`, `ready_strict`: what `/readyz` and `/readyz/strict` answer. `drained` is always `false` for now. `degraded`: the [reasons](#degraded), `[]` when none.
+- `ready`, `ready_strict`: what `/readyz` and `/readyz/strict` answer. `drained`: taken out of rotation with [`apollo drain`](#taking-an-instance-out-of-rotation). `degraded`: the [reasons](#degraded), `[]` when none.
 - `items`: inputs accepted and not finished, `[app].max_pending` (0 = no limit), and the room left (`null` with no limit). `slots`: `[app].max_concurrent`, the inputs being processed, and those waiting for a slot.
 - `memory.utilization`: memory in use over `[app].max_memory`; `null` with no cap, or when memory use can't be read.
 - `database`: `ok` or `stale` for a shared database, `n/a` for SQLite (or before the database opens).
@@ -191,7 +193,7 @@ On each connection Apollo sends one line, ending in a newline, and closes the co
 | State | Line | What HAProxy does |
 |-------|------|-------------------|
 | Serving | `up ready 60%` | `up` marks the server up again if HAProxy's own health check passes too, `ready` ends a drain, and `60%` sets the weight to that share of the server's configured `weight`. The figure is the [weight](#the-load-figure): 1 to 100, and 1 while out of touch with a shared database. |
-| Starting, draining | `drain` | Sends it no new connections, except persistent ones. |
+| Starting, drained, draining | `drain` | Sends it no new connections, except persistent ones. |
 | Stopping | the port is closed | HAProxy doesn't count an agent it can't reach as an error: the server stays in `drain`, and its health check (503 since the drain began) marks it down. |
 
 Apollo never sends `down` or `maint`: whether the server is up stays with HAProxy's own health check. A backend might look like this:
@@ -211,7 +213,7 @@ backend apollo
 - `slowstart 30s` gives a server that comes back up its full weight over 30 s, not at once.
 - `check-proto h1`: the health port speaks HTTP/1.1, while `proto h2` would make the checks speak HTTP/2 too.
 - `drain` takes effect at the next agent check (`agent-inter`, 2 s by default), without waiting for `fall` failed health checks. With the agent, a `drain_delay_secs` a little above `agent-inter` lets HAProxy see the drain before the gRPC port closes.
-- `ready` also ends a drain or maintenance set by hand in HAProxy. To take a server out by hand, first stop its agent checks on HAProxy's runtime API (`disable agent apollo/apollo1`), or stop the instance.
+- `ready` also ends a drain or maintenance set by hand in HAProxy. To take a server out by hand, use [`apollo drain`](#taking-an-instance-out-of-rotation) on it, so the agent sends `drain`; or first stop its agent checks on HAProxy's runtime API (`disable agent apollo/apollo1`).
 - `[health].allow`, when set, covers the agent port too, and a refused peer is reset as on the health port.
 
 ### Details for local tools
@@ -282,6 +284,30 @@ spec:
 - Never make liveness depend on the database: an outage would restart every instance at once. `/livez` doesn't look at it.
 - Don't point a Kubernetes `readinessProbe` at `/readyz/strict`: an outage of a shared database would take every pod out of the Service at once. Use `/readyz`.
 - `/metrics`, the PID file and `apollo start --daemon` returning are not readiness signals: all of them come before the server is ready.
+
+### Taking an instance out of rotation
+
+`apollo drain` takes a running server out of rotation without stopping it, for maintenance or a look at it while load balancers send it no new work. `apollo drain --undo` takes it back:
+
+```bash
+apollo drain          # out of rotation
+apollo drain --undo   # back in
+```
+
+While drained:
+
+- `/readyz`, `/` and `/readyz/strict` answer `503 not ready: drained`, and the gRPC readiness names (`""`, `apollo.v1.Inference`, `readiness`, `readiness-strict`) `NOT_SERVING`. The weight is 0, and the [HAProxy agent](#the-haproxy-agent) sends `drain`. `/livez` and gRPC `liveness` still pass.
+- Every call is still served, new ones included, as while a stop drains. Balancers stop sending work here at their next check; a client that connects directly can still send it.
+- The server takes no tasks over from other instances, and the background redelivery of failed webhooks (`[webhook].redelivery_secs`) waits. Tasks it runs go on, and their webhooks are sent.
+- `apollo status` shows `drained` next to the phase, `/load` has `"drained": true`, and `apollo_drained` is 1.
+
+What it doesn't do:
+
+- It closes no port and stops nothing. A stop (`SIGTERM`, Ctrl-C, `apollo stop`) drains and stops as usual, drained or not.
+- It isn't kept: a restart starts the server undrained.
+- `--undo` makes the server ready again only while it serves. During startup it is ready once startup ends; during a stop it stays unready.
+
+`apollo drain` prints what changed. It goes over the same owner-only local socket as `apollo status`, so only the OS user running the server can drain it. When no server answers there, it fails and nothing changes.
 
 ### Load balancer recipes
 

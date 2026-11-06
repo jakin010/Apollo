@@ -770,6 +770,7 @@ async fn metrics_render_in_the_prometheus_format() {
         "apollo_lifecycle_phase{phase=\"starting\"} 0",
         "apollo_lifecycle_phase{phase=\"serving\"} 1",
         "apollo_lifecycle_phase{phase=\"draining\"} 0",
+        "apollo_drained 0",
         "apollo_ready_strict 1",
         "apollo_degraded{reason=\"load\"} 0",
         "apollo_degraded{reason=\"database\"} 0",
@@ -808,6 +809,30 @@ async fn metrics_render_in_the_prometheus_format() {
         assert!(
             value.parse::<f64>().is_ok() || value == "+Inf",
             "bad sample {line:?}"
+        );
+    }
+
+    // Drained by hand: no longer ready, still serving.
+    assert!(f.engine.lifecycle().set_drained(true));
+    let text = f.engine.metrics_text().await;
+    for line in [
+        "apollo_drained 1",
+        "apollo_ready 0",
+        "apollo_ready_strict 0",
+        "apollo_lb_weight 0",
+        "apollo_lifecycle_phase{phase=\"serving\"} 1",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
+        );
+    }
+    assert!(f.engine.lifecycle().set_drained(false));
+    let text = f.engine.metrics_text().await;
+    for line in ["apollo_drained 0", "apollo_ready 1"] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in\n{text}"
         );
     }
 
@@ -2490,32 +2515,112 @@ async fn a_draining_engine_starts_no_takeover_pass() {
 
 #[tokio::test]
 async fn a_takeover_pass_in_progress_yields_to_a_drain() {
-    // A two-second lease: a read slower than 2/3 s sends a pass to wait a
-    // second before it looks again.
-    let (engine, _sqlite, gate, _dir) = stalled_engine_with(true, 2).await;
-    // Settled: in touch with the database for a whole lease.
-    tokio::time::sleep(Duration::from_millis(2100)).await;
-    assert!(engine.settled());
-    gate.shut();
-    let pass = tokio::spawn({
-        let engine = engine.clone();
-        async move { engine.take_over(None).await }
-    });
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    gate.open();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(!pass.is_finished(), "waiting to look again");
+    // A drain for a stop, then one by hand (`apollo drain`).
+    for by_hand in [false, true] {
+        // A two-second lease: a read slower than 2/3 s sends a pass to wait
+        // a second before it looks again.
+        let (engine, _sqlite, gate, _dir) = stalled_engine_with(true, 2).await;
+        // Settled: in touch with the database for a whole lease.
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert!(engine.settled());
+        gate.shut();
+        let pass = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.take_over(None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        gate.open();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!pass.is_finished(), "waiting to look again");
 
-    // The drain ends the wait, and the pass with it.
-    assert!(engine.lifecycle().drain());
-    let taken = tokio::time::timeout(Duration::from_millis(400), pass)
+        // The drain ends the wait, and the pass with it.
+        if by_hand {
+            assert!(engine.lifecycle().set_drained(true));
+        } else {
+            assert!(engine.lifecycle().drain());
+        }
+        let taken = tokio::time::timeout(Duration::from_millis(400), pass)
+            .await
+            .expect("the pass ends at the drain")
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken, 0, "by hand: {by_hand}");
+        // So the hand-back finds the pass lock free.
+        assert!(engine.shutdown_within(Duration::from_millis(200)).await);
+    }
+}
+
+#[tokio::test]
+async fn a_drained_engine_takes_nothing_over_until_undrained() {
+    let (engine, sqlite, _gate, _dir) = stalled_engine(true).await;
+    // A task nobody holds, which this instance could run.
+    let mut queued = task("q", TaskState::Queued, ItemState::Queued, None);
+    queued.items[0].models = vec!["nsfw".into()];
+    queued.items[0].input = local_file_submission().input;
+    sqlite.create_task(&queued, None, None).await.unwrap();
+
+    assert!(engine.lifecycle().set_drained(true));
+    assert_eq!(engine.take_over(None).await.unwrap(), 0);
+    // Nor does the takeover loop take it, a few of its ticks on.
+    engine.spawn_takeover();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(engine.inner.runs.lock().unwrap().is_empty());
+    let stored = sqlite.get_task("q").await.unwrap().unwrap();
+    assert_eq!(stored.state, TaskState::Queued);
+
+    // Undrained, the loop takes it at a following tick.
+    assert!(engine.lifecycle().set_drained(false));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while sqlite.get_task("q").await.unwrap().unwrap().state == TaskState::Queued
+        && engine.inner.runs.lock().unwrap().is_empty()
+    {
+        assert!(Instant::now() < deadline, "not taken after the undrain");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_drained_engine_redelivers_no_webhooks_until_undrained() {
+    let sink = Arc::new(Recorder::default());
+    let (engine, sqlite, _dir) = engine_with_sink("", sink.clone()).await;
+    // A finished item whose webhook is still to send.
+    sqlite
+        .create_task(
+            &task("t", TaskState::Processing, ItemState::Processing, None),
+            None,
+            None,
+        )
         .await
-        .expect("the pass ends at the drain")
-        .unwrap()
         .unwrap();
-    assert_eq!(taken, 0);
-    // So the hand-back finds the pass lock free.
-    assert!(engine.shutdown_within(Duration::from_millis(200)).await);
+    assert!(
+        sqlite
+            .set_item_state(
+                "t",
+                0,
+                ItemState::Completed,
+                None,
+                Fence::Unchecked,
+                PLANTED
+            )
+            .await
+            .unwrap()
+    );
+
+    assert!(engine.lifecycle().set_drained(true));
+    assert!(!engine.redeliver_pending().await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(sink.finished("t").is_empty());
+    assert_eq!(sqlite.items_pending_webhook().await.unwrap().len(), 1);
+
+    // Undrained, the next pass sends it.
+    assert!(engine.lifecycle().set_drained(false));
+    engine.redeliver_pending().await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sqlite.items_pending_webhook().await.unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "still pending after the undrain");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(sink.finished("t").len(), 1);
 }
 
 #[tokio::test]
@@ -2651,14 +2756,21 @@ async fn status_waits_for_the_database_at_most_5_s() {
 
 #[tokio::test]
 async fn tasks_submitted_while_draining_still_run() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = config_in(&dir, &pdq_config(dir.path(), 1));
-    let storage = apollo_storage::open(&config.database).await.unwrap();
-    let engine = Engine::new(Arc::new(config), storage.clone(), None);
-    assert!(engine.lifecycle().drain());
-    // During the drain delay the instance serves what it is still sent.
-    let input = upload(&engine, &ppm(7));
-    assert_eq!(classify_hash(&engine, &storage, input).await, ["known"]);
+    // Draining for a stop, then drained by hand (`apollo drain`).
+    for by_hand in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_in(&dir, &pdq_config(dir.path(), 1));
+        let storage = apollo_storage::open(&config.database).await.unwrap();
+        let engine = Engine::new(Arc::new(config), storage.clone(), None);
+        if by_hand {
+            assert!(engine.lifecycle().set_drained(true));
+        } else {
+            assert!(engine.lifecycle().drain());
+        }
+        // Meanwhile the instance serves what it is still sent.
+        let input = upload(&engine, &ppm(7));
+        assert_eq!(classify_hash(&engine, &storage, input).await, ["known"]);
+    }
 }
 
 #[tokio::test]

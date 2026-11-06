@@ -1,10 +1,11 @@
 //! Draining before a stop: a draining instance still runs what it is sent but
 //! takes nothing over from other instances, and a stop that can't reach the
-//! database ends at the hand-back limit.
+//! database ends at the hand-back limit. A drain by hand (`apollo drain`)
+//! takes nothing over either, until it is undone.
 
 use super::*;
 
-use crate::HAND_BACK_LIMIT;
+use crate::{Database, HAND_BACK_LIMIT};
 
 /// Redelivery every second, to the fleet's receiver.
 const REDELIVERY: &str = "[webhook]\nurl = \"http://127.0.0.1:9\"\nredelivery_secs = 1\n";
@@ -103,6 +104,53 @@ async fn a_stop_on_a_stalled_link_ends_within_the_limit() {
             (1, vec![("b", TaskState::Failed)]),
             "(attempts, finished webhooks)"
         );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drained_instance_takes_nothing_over_until_undrained() {
+    fleet_test(|fleet| async move {
+        let origin = Origin::start();
+        let toml = format!("{SHORT_LEASE}{NSFW}");
+        let b = fleet.start("b", &toml).await;
+        b.recover().await;
+        let a = fleet.start("a", &toml).await;
+        // A dies running a task while B is drained.
+        let t = a.submit(image_at(&origin.url("/t.png"))).await.id;
+        let download_a = origin.next("a downloads the input").await;
+        let lc = b.engine.lifecycle();
+        assert!(lc.set_drained(true));
+        a.crash();
+
+        // The claim lapses within a lease: B doesn't take it, however long,
+        // but stays in touch with the database meanwhile.
+        let taken = origin.next_within(4 * LEASE).await;
+        assert!(taken.is_none(), "B took the task over while drained");
+        let claims = fleet
+            .log
+            .count(|who, c| who == "b" && matches!(c, Call::Claim(..)));
+        assert_eq!(claims, 0, "B's task claims");
+        assert!(
+            matches!(lc.load().database, Database::Ok { .. }),
+            "{:?}",
+            lc.load().database
+        );
+        assert!(!lc.ready() && !lc.ready_strict());
+
+        // Undrained, it takes the task over, counting the crash's attempt.
+        assert!(lc.set_drained(false));
+        let download_b = origin.next("b takes the task over").await;
+        download_a.reply(Reply::Garbage);
+        download_b.reply(Reply::Garbage);
+        fleet.log.delivered("b", &t).await;
+        b.wait_idle().await;
+        assert_eq!(
+            (fleet.db.attempts(&t).await, fleet.log.finished(&t)),
+            (1, vec![("b", TaskState::Failed)]),
+            "(attempts, finished webhooks)"
+        );
+        assert!(lc.ready_strict());
     })
     .await;
 }

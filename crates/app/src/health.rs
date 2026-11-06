@@ -7,7 +7,7 @@
 //! | Path | 200 | 503 |
 //! |---|---|---|
 //! | `/livez` | always | never |
-//! | `/readyz`, `/` | ready for work | starting, draining or stopping, with why |
+//! | `/readyz`, `/` | ready for work | starting, draining, drained or stopping, with why |
 //! | `/readyz/strict` | ready, and the database isn't stale | otherwise, with why |
 //! | `/load` | always: the load figure as JSON | never |
 //!
@@ -203,7 +203,7 @@ fn respond(
 /// load,database`, or `not ready: …`; with `verbose`, the details as JSON.
 fn readiness(lc: &Lifecycle, strict: bool, verbose: bool) -> Response<Body> {
     let load = lc.load();
-    let phase_reason = not_ready(lc.phase(), lc.since().elapsed());
+    let phase_reason = not_ready(lc.phase(), lc.drained(), lc.since().elapsed());
     let database_reason = stale(load.database);
     let reason = match &phase_reason {
         Some(reason) => Some(reason),
@@ -268,7 +268,7 @@ fn load_body(lc: &Lifecycle, load: &LoadSnapshot) -> Value {
         "phase": lc.phase().name(),
         "ready": ready,
         "ready_strict": ready && !load.database.is_stale(),
-        "drained": false,
+        "drained": lc.drained(),
         "degraded": load.degraded(),
         "utilization": rounded(load.utilization),
         "weight": load.weight(ready),
@@ -330,11 +330,12 @@ fn rounded(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
-/// Why a lifecycle in `phase` (for `elapsed`) isn't ready for work, as
-/// `/readyz` says it: `starting (recovering tasks, 41s)`, `draining`,
-/// `stopping`. `None` when it is ready.
-fn not_ready(phase: Phase, elapsed: Duration) -> Option<String> {
+/// Why a lifecycle in `phase` (for `elapsed`), `drained` or not, isn't
+/// ready for work, as `/readyz` says it: `starting (recovering tasks, 41s)`,
+/// `drained`, `draining`, `stopping`. `None` when it is ready.
+fn not_ready(phase: Phase, drained: bool, elapsed: Duration) -> Option<String> {
     match phase {
+        Phase::Serving if drained => Some("drained".into()),
         Phase::Serving => None,
         Phase::Starting(step) => Some(format!(
             "starting ({}, {}s)",
@@ -499,18 +500,24 @@ pub(crate) mod tests {
     #[test]
     fn the_reason_names_the_step_and_how_long_it_has_run() {
         let secs = Duration::from_secs(41);
+        for drained in [false, true] {
+            assert_eq!(
+                not_ready(Phase::Starting(Step::RecoveringTasks), drained, secs).as_deref(),
+                Some("starting (recovering tasks, 41s)")
+            );
+            assert_eq!(
+                not_ready(Phase::Draining, drained, secs).as_deref(),
+                Some("draining")
+            );
+            assert_eq!(
+                not_ready(Phase::Stopping, drained, secs).as_deref(),
+                Some("stopping")
+            );
+        }
+        assert_eq!(not_ready(Phase::Serving, false, secs), None);
         assert_eq!(
-            not_ready(Phase::Starting(Step::RecoveringTasks), secs).as_deref(),
-            Some("starting (recovering tasks, 41s)")
-        );
-        assert_eq!(not_ready(Phase::Serving, secs), None);
-        assert_eq!(
-            not_ready(Phase::Draining, secs).as_deref(),
-            Some("draining")
-        );
-        assert_eq!(
-            not_ready(Phase::Stopping, secs).as_deref(),
-            Some("stopping")
+            not_ready(Phase::Serving, true, secs).as_deref(),
+            Some("drained")
         );
     }
 
@@ -972,6 +979,58 @@ pub(crate) mod tests {
                 (&json!(phase), &json!(0))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_drained_server_is_unready_with_weight_0_until_undone() {
+        let lc = Lifecycle::new();
+        lc.serving();
+        publish_load(
+            &lc,
+            LoadSnapshot {
+                utilization: 0.42,
+                ..LoadSnapshot::default()
+            },
+        );
+        let addr = spawn(&lc, Limits::default()).await;
+        assert!(lc.set_drained(true));
+        assert_eq!(get(addr, "/livez").await, (200, "ok\n".into()));
+        for path in ["/readyz", "/", "/readyz/strict"] {
+            assert_eq!(
+                get(addr, path).await,
+                (503, "not ready: drained\n".into()),
+                "{path}"
+            );
+        }
+        let (status, body) = json_at(addr, "/load").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            (
+                &body["phase"],
+                &body["drained"],
+                &body["ready"],
+                &body["ready_strict"],
+                &body["weight"]
+            ),
+            (
+                &json!("serving"),
+                &json!(true),
+                &json!(false),
+                &json!(false),
+                &json!(0)
+            )
+        );
+        let (status, body) = json_at(addr, "/readyz?verbose").await;
+        assert_eq!((status, &body["reasons"]), (503, &json!(["drained"])));
+
+        // Undone: ready, with its weight, again.
+        assert!(lc.set_drained(false));
+        assert_eq!(get(addr, "/readyz").await, (200, "ok\n".into()));
+        let (_, body) = json_at(addr, "/load").await;
+        assert_eq!(
+            (&body["drained"], &body["ready"], &body["weight"]),
+            (&json!(false), &json!(true), &json!(60))
+        );
     }
 
     #[test]

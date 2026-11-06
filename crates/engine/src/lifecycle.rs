@@ -1,7 +1,9 @@
 //! Where the process is in its life: starting, serving, draining before a
-//! stop, or stopping. It only moves forward. Probes read it, and the latest
-//! load sample it holds, without waiting on anything; the engine takes no
-//! work over once it drains, and ends watches and waits once it stops.
+//! stop, or stopping. It only moves forward. Apart from that, an operator can
+//! take a serving instance out of rotation and back (`apollo drain`). Probes
+//! read it, and the latest load sample it holds, without waiting on anything;
+//! the engine takes no work over once it drains (or is drained), and ends
+//! watches and waits once it stops.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -74,6 +76,9 @@ struct Shared {
     since: Mutex<Instant>,
     /// Stop now, without waiting for the drain (a second signal).
     forced: AtomicBool,
+    /// Out of rotation by hand (`apollo drain`), until undone. Not kept
+    /// across restarts.
+    drained: AtomicBool,
     /// Connections and requests the monitoring listeners' allow lists
     /// refused, by listener. Kept here, as those listeners may start before
     /// the engine.
@@ -97,6 +102,7 @@ impl Lifecycle {
             phase,
             since: Mutex::new(Instant::now()),
             forced: AtomicBool::new(false),
+            drained: AtomicBool::new(false),
             refused: CounterVec::default(),
             load,
         }))
@@ -149,9 +155,27 @@ impl Lifecycle {
         });
     }
 
+    /// Whether it was taken out of rotation by hand.
+    pub fn drained(&self) -> bool {
+        self.0.drained.load(Ordering::SeqCst)
+    }
+
+    /// Take it out of rotation by hand (`apollo drain`), or with `false` back
+    /// in. While drained it isn't ready and takes no work over, but serves
+    /// what it is sent, as when draining for a stop. It changes no phase, so
+    /// a stop drains as usual. Whether it changed.
+    pub fn set_drained(&self, drained: bool) -> bool {
+        let changed = self.0.drained.swap(drained, Ordering::SeqCst) != drained;
+        if changed {
+            // The phase is the same; its subscribers look again.
+            self.0.phase.send_modify(|_| {});
+        }
+        changed
+    }
+
     /// Whether load balancers should send work here.
     pub fn ready(&self) -> bool {
-        self.phase() == Phase::Serving
+        self.phase() == Phase::Serving && !self.drained()
     }
 
     /// [`Lifecycle::ready`], and in touch with the database (or it isn't
@@ -184,7 +208,16 @@ impl Lifecycle {
     /// Whether this instance takes tasks and webhook deliveries over from
     /// other instances.
     pub fn taking_work(&self) -> bool {
-        self.phase() < Phase::Draining
+        self.phase() < Phase::Draining && !self.drained()
+    }
+
+    /// Returns once it no longer takes work over: a drain, or `apollo drain`
+    /// (at once if so).
+    pub(crate) async fn until_not_taking_work(&self) {
+        let mut rx = self.0.phase.subscribe();
+        let _ = rx
+            .wait_for(|phase| *phase >= Phase::Draining || self.drained())
+            .await;
     }
 
     /// The phase now, and each change after it.
@@ -294,6 +327,51 @@ mod tests {
         lc.force();
         assert_eq!(lc.phase(), Phase::Stopping);
         assert!(lc.forced() && !lc.ready());
+    }
+
+    #[tokio::test]
+    async fn a_drain_by_hand_is_undone_and_leaves_the_phase_alone() {
+        let lc = Lifecycle::new();
+        // Drained while starting: not ready once serving.
+        assert!(lc.set_drained(true));
+        lc.serving();
+        assert_eq!(lc.phase(), Phase::Serving);
+        assert!(!lc.ready() && !lc.ready_strict() && !lc.taking_work());
+        assert_eq!(lc.weight(), 0);
+        lc.until_not_taking_work().await;
+
+        // Subscribers hear of each change, and only of a change.
+        let mut rx = lc.subscribe();
+        assert!(!lc.set_drained(true));
+        assert!(!rx.has_changed().unwrap());
+        let since = lc.since();
+        assert!(lc.set_drained(false));
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), Phase::Serving);
+        assert!(lc.ready() && lc.taking_work() && lc.weight() > 0);
+        assert_eq!(lc.since(), since);
+
+        // A wait for it wakes when it is drained.
+        let waiting = tokio::spawn({
+            let lc = lc.clone();
+            async move { lc.until_not_taking_work().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished());
+        assert!(lc.set_drained(true));
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("woken by the drain")
+            .unwrap();
+
+        // A stop drains as usual, drained or not, and an undrain then
+        // doesn't make it ready.
+        assert!(lc.drain());
+        assert!(lc.set_drained(false));
+        assert_eq!(lc.phase(), Phase::Draining);
+        assert!(!lc.ready() && !lc.taking_work());
+        lc.stopping();
+        assert_eq!(lc.phase(), Phase::Stopping);
     }
 
     #[test]
