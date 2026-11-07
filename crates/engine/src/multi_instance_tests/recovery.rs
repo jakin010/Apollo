@@ -581,16 +581,23 @@ async fn a_database_outage_for_everyone_hands_runs_back_uncounted() {
         a.wait_idle().await;
         b.wait_idle().await;
 
+        // Only a hand-back clears a claim, and a claim that replaces one never
+        // handed back counts an attempt: no attempt means A's hand-back landed
+        // before anyone claimed the task again.
         assert_eq!(
-            (
-                fleet.db.attempts(&t).await,
-                fleet
-                    .log
-                    .count(|who, c| who == "a" && *c == Call::Release(1)),
-                fleet.log.finished(&t).len(),
-            ),
-            (0, 1, 1),
-            "(attempts, A's hand-backs, finished webhooks)"
+            (fleet.db.attempts(&t).await, fleet.log.finished(&t).len()),
+            (0, 1),
+            "(attempts, finished webhooks)"
+        );
+        // That hand-back is logged as Release(1), unless its wait (a renewal
+        // period) ran out while the database was applying it: then the next
+        // tick's hand-back finds nothing left and is logged as Release(0).
+        assert!(
+            fleet
+                .log
+                .count(|who, c| who == "a" && matches!(c, Call::Release(_)))
+                >= 1,
+            "A handed its claim back"
         );
     })
     .await;
