@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use futures::Stream;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{oneshot, watch};
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
@@ -31,8 +32,10 @@ use apollo_proto::{
     ListModelsResponse, ListTasksRequest, ListTasksResponse, Task, WatchTaskRequest,
 };
 
+use crate::age::Aging;
 use crate::auth::{AuthInterceptor, Caller};
 use crate::convert::{self, Source, View, task_to_proto};
+use crate::health::Health;
 
 /// The `Inference` service implementation, wrapping the engine.
 #[derive(Clone)]
@@ -508,6 +511,8 @@ fn engine_to_status(e: EngineError) -> Status {
             Status::invalid_argument(e.to_string())
         }
         EngineError::UnknownTask(_) => Status::not_found(e.to_string()),
+        // A watch ended by the stop: another instance can take it up.
+        EngineError::ShuttingDown => Status::unavailable("server stopping; watch again"),
         EngineError::Overloaded { reason, .. } => {
             // Nothing was stored, so the request may be sent to another
             // instance; the tag lets a proxy or client tell this apart from a
@@ -559,70 +564,123 @@ fn reflection_service() -> tonic_reflection::server::v1::ServerReflectionServer<
         .expect("embedded gRPC reflection descriptor must be valid")
 }
 
+/// Why serving failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ServeError {
+    #[error("binding {addr}: {source}")]
+    Bind {
+        addr: SocketAddr,
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Transport(#[from] tonic::transport::Error),
+}
+
 /// Serve the `Inference` API (plus reflection and health) on `addr` until
-/// terminated, over TLS when `tls` is given.
+/// the engine's lifecycle stops, over TLS when `tls` is given.
 pub async fn serve(
     engine: Engine,
     addr: SocketAddr,
     auth: AuthInterceptor,
     tls: Option<TlsSettings>,
-) -> Result<(), tonic::transport::Error> {
+) -> Result<(), ServeError> {
     serve_with_shutdown(engine, addr, std::future::pending(), auth, tls).await
 }
 
-/// Serve until `shutdown` resolves, draining in-flight RPCs (for graceful stop),
-/// over TLS when `tls` is given.
+/// [`serve`] until `shutdown` resolves too, which drains and stops the
+/// engine's lifecycle at once (with no drain delay).
 pub async fn serve_with_shutdown<F>(
     engine: Engine,
     addr: SocketAddr,
     shutdown: F,
     auth: AuthInterceptor,
     tls: Option<TlsSettings>,
-) -> Result<(), tonic::transport::Error>
+) -> Result<(), ServeError>
 where
     F: Future<Output = ()>,
 {
-    router(engine, addr, auth, tls.as_ref())
-        .await?
-        .serve_with_shutdown(addr, shutdown)
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
+        .map_err(|source| ServeError::Bind { addr, source })?;
+    let lc = engine.lifecycle().clone();
+    let health = Health::new(&lc).await;
+    let serve = serve_on(engine, listener, health, auth, tls);
+    tokio::pin!(serve);
+    tokio::select! {
+        served = &mut serve => return Ok(served?),
+        () = shutdown => {}
+    }
+    lc.drain();
+    lc.stopping();
+    Ok(serve.await?)
 }
 
-/// [`serve_with_shutdown`] on a listener the caller has bound already (so a
-/// taken port fails the start before anything else happens).
-pub async fn serve_on<F>(
+/// Serve on a listener the caller has bound already (so a taken port fails
+/// the start before anything else happens), with `health` answering gRPC
+/// health checks. Once the engine's lifecycle is stopping, the listener
+/// closes, so new connections are refused at once, and the open ones are
+/// told to finish (GOAWAY); this ends once they have. Dropping it cuts the
+/// calls still open (see [`serve_until_stopped`](crate::serve_until_stopped)).
+/// With `[app].max_connection_age_secs`, connections are told to finish at
+/// that age too.
+pub async fn serve_on(
     engine: Engine,
     listener: tokio::net::TcpListener,
-    shutdown: F,
+    health: Health,
     auth: AuthInterceptor,
     tls: Option<TlsSettings>,
-) -> Result<(), tonic::transport::Error>
-where
-    F: Future<Output = ()>,
-{
+) -> Result<(), tonic::transport::Error> {
+    let config = engine.config();
+    let aging = Aging::from_secs(
+        config.app.max_connection_age_secs,
+        config.app.max_connection_age_grace_secs,
+    );
+    serve_aging(engine, listener, health, auth, tls, aging).await
+}
+
+/// [`serve_on`], with connections told to finish at `aging`'s age, if any.
+pub(crate) async fn serve_aging(
+    engine: Engine,
+    listener: tokio::net::TcpListener,
+    health: Health,
+    auth: AuthInterceptor,
+    tls: Option<TlsSettings>,
+    aging: Option<Aging>,
+) -> Result<(), tonic::transport::Error> {
     let addr = listener
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-    router(engine, addr, auth, tls.as_ref())
-        .await?
-        .serve_with_incoming_shutdown(
-            tonic::transport::server::TcpIncoming::from(listener),
-            shutdown,
-        )
-        .await
+    let (closed, on_closed) = oneshot::channel();
+    // Dropped with this future, which cuts the connections still open.
+    let (_server, server) = watch::channel(());
+    let incoming = crate::stop::incoming(listener, engine.lifecycle().clone(), closed, server);
+    let router = router(engine, addr, &health, auth, tls.as_ref())?;
+    let Some(aging) = aging else {
+        return router
+            .serve_with_incoming_shutdown(incoming, async {
+                // Fired once the listener is dropped, so GOAWAY follows it.
+                let _ = on_closed.await;
+            })
+            .await;
+    };
+    tracing::info!(
+        age = ?aging.age,
+        grace = ?aging.grace,
+        "gRPC connections are told to reconnect at max_connection_age, give or take 10%"
+    );
+    // The end of `incoming` is the stop.
+    crate::age::serve(router, incoming, aging).await;
+    Ok(())
 }
 
 /// The services, ready to serve on `addr`.
-async fn router(
+fn router(
     engine: Engine,
     addr: SocketAddr,
+    health: &Health,
     auth: AuthInterceptor,
     tls: Option<&TlsSettings>,
 ) -> Result<tonic::transport::server::Router, tonic::transport::Error> {
-    let (health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<InferenceServer<InferenceService>>()
-        .await;
     let mut builder = Server::builder();
     if let Some(tls) = tls {
         install_crypto_provider();
@@ -637,7 +695,7 @@ async fn router(
     Ok(builder
         .add_service(inference_service(engine, auth))
         .add_service(reflection_service())
-        .add_service(health_service))
+        .add_service(health.service()))
 }
 
 #[cfg(test)]
@@ -650,6 +708,7 @@ mod tests {
     use apollo_domain::{ErrorKind, Item, TaskState, Url};
     use apollo_storage::{Storage, StorageError};
     use tokio::sync::oneshot;
+    use tonic_health::pb::health_check_response::ServingStatus as Wire;
 
     #[test]
     fn a_storage_timeout_is_unavailable_and_other_storage_errors_internal() {
@@ -657,6 +716,13 @@ mod tests {
         assert_eq!(engine_to_status(timeout).code(), tonic::Code::Unavailable);
         let other = EngineError::Storage(StorageError::Surreal("boom".into()));
         assert_eq!(engine_to_status(other).code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn shutting_down_maps_to_unavailable() {
+        let status = engine_to_status(EngineError::ShuttingDown);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "server stopping; watch again");
     }
 
     struct Fixture {
@@ -1491,5 +1557,701 @@ mod tests {
             "foreign client certificate"
         );
         let _ = stop.send(());
+    }
+
+    #[tokio::test]
+    async fn mutual_tls_holds_with_connection_age() {
+        let f = fixture_with("[app]\nmax_connection_age_secs = 1\n").await;
+        let pki = make_pki();
+        let (url, stop) = serve_tls(
+            f.engine.clone(),
+            TlsSettings {
+                cert_pem: pki.server.0.clone().into(),
+                key_pem: pki.server.1.clone().into(),
+                client_ca_pem: Some(pki.ca_pem.clone().into()),
+            },
+        )
+        .await;
+
+        let base = || apollo_client::Client::builder(&url).ca_certificate(pki.ca_pem.clone());
+        let outcome = probe(base()).await;
+        assert_ne!(outcome, Ok(tonic::Code::NotFound), "no client certificate");
+        let client = base()
+            .client_identity(pki.client.0.clone(), pki.client.1.clone())
+            .build()
+            .await
+            .unwrap();
+        let unknown = |r: Result<Task, apollo_client::ClientError>| match r {
+            Err(apollo_client::ClientError::Status(s)) => s.code(),
+            other => panic!("expected a status, got {other:?}"),
+        };
+        assert_eq!(
+            unknown(client.get_task("no-such-task").await),
+            tonic::Code::NotFound
+        );
+        // Past the age, the client reconnects over TLS by itself.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            unknown(client.get_task("no-such-task").await),
+            tonic::Code::NotFound
+        );
+        let _ = stop.send(());
+    }
+
+    // ---------------------------- Stopping ----------------------------
+
+    type Served = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
+
+    /// Serve the real API for `engine` on a free port as the app does, with a
+    /// drain timeout of `timeout`; returns its URL, its address and the
+    /// serving task.
+    async fn serve_stoppable(engine: &Engine, timeout: Duration) -> (String, SocketAddr, Served) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let health = Health::new(engine.lifecycle()).await;
+        let serve = serve_on(
+            engine.clone(),
+            listener,
+            health,
+            AuthInterceptor::disabled(),
+            None,
+        );
+        let lc = engine.lifecycle().clone();
+        let stopped = async move { crate::serve_until_stopped(serve, &lc, || timeout).await };
+        (format!("http://{addr}"), addr, tokio::spawn(stopped))
+    }
+
+    /// `served` ends, cleanly, within `limit`.
+    async fn ends_within(served: Served, limit: Duration) {
+        tokio::time::timeout(limit, served)
+            .await
+            .expect("the server stops in time")
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn health_client(
+        url: &str,
+    ) -> tonic_health::pb::health_client::HealthClient<tonic::transport::Channel> {
+        let channel = tonic::transport::Channel::from_shared(url.to_string())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        tonic_health::pb::health_client::HealthClient::new(channel)
+    }
+
+    fn health_request(name: &str) -> tonic_health::pb::HealthCheckRequest {
+        tonic_health::pb::HealthCheckRequest {
+            service: name.into(),
+        }
+    }
+
+    /// An upload that sends a few bytes and then waits forever; its outcome.
+    fn held_upload(
+        client: apollo_client::Client,
+    ) -> tokio::task::JoinHandle<Result<Task, apollo_client::ClientError>> {
+        use futures::StreamExt;
+        tokio::spawn(async move {
+            let init = apollo_client::StreamInit::models(apollo_proto::MediaKind::Image, ["nsfw"]);
+            let chunks =
+                futures::stream::once(async { vec![1, 2, 3] }).chain(futures::stream::pending());
+            client.classify_stream(init, chunks).await
+        })
+    }
+
+    /// Wait (5 s at most) until `engine` has `n` uploads staged.
+    async fn staged(engine: &Engine, n: usize) {
+        for _ in 0..500 {
+            if uploads(engine) == n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(uploads(engine), n, "staged uploads");
+    }
+
+    #[tokio::test]
+    async fn an_open_health_watch_does_not_hold_the_drain() {
+        let f = fixture().await;
+        // No drain timeout: only the connections ending can end it.
+        let (url, _, served) = serve_stoppable(&f.engine, Duration::ZERO).await;
+        let mut health = health_client(&url).await;
+        let mut watch = health.watch(health_request("")).await.unwrap().into_inner();
+        assert_eq!(
+            watch.message().await.unwrap().unwrap().status(),
+            Wire::Serving
+        );
+
+        let lc = f.engine.lifecycle();
+        assert!(lc.drain());
+        assert_eq!(
+            watch.message().await.unwrap().unwrap().status(),
+            Wire::NotServing
+        );
+        lc.stopping();
+        // The stop clears the name, which ends the watch with OK.
+        let end = tokio::time::timeout(Duration::from_secs(1), watch.message())
+            .await
+            .expect("the watch ends at the stop");
+        assert!(end.unwrap().is_none());
+        ends_within(served, Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn calls_during_the_drain_delay_are_served() {
+        let f = fixture_with(NSFW).await;
+        f.storage
+            .create_task(&stored_task("t", None), None, None)
+            .await
+            .unwrap();
+        let (url, _, served) = serve_stoppable(&f.engine, Duration::ZERO).await;
+        let open = apollo_client::Client::connect(url.clone()).await.unwrap();
+        let health = health_client(&url).await;
+
+        assert!(f.engine.lifecycle().drain());
+        // Calls on an open connection and on a new one are served.
+        assert_eq!(open.get_task("t").await.unwrap().id, "t");
+        let fresh = apollo_client::Client::connect(url.clone()).await.unwrap();
+        assert_eq!(fresh.get_task("t").await.unwrap().id, "t");
+        let task = fresh.classify(classify_data(&["nsfw"], "")).await.unwrap();
+        assert!(!task.id.is_empty(), "a submission is accepted");
+        // Health says not ready, but alive.
+        let status = |name: &'static str| {
+            let mut health = health.clone();
+            async move {
+                let answer = health.check(health_request(name)).await.unwrap();
+                answer.into_inner().status()
+            }
+        };
+        for _ in 0..100 {
+            if status("readiness").await == Wire::NotServing {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(status("readiness").await, Wire::NotServing);
+        assert_eq!(status("").await, Wire::NotServing);
+        assert_eq!(status("liveness").await, Wire::Serving);
+
+        f.engine.lifecycle().stopping();
+        ends_within(served, Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn the_grpc_port_refuses_connections_once_stopping() {
+        let f = fixture_with(NSFW).await;
+        let (url, addr, served) = serve_stoppable(&f.engine, Duration::ZERO).await;
+        // A held upload keeps the server waiting past the stop.
+        let upload = held_upload(apollo_client::Client::connect(url).await.unwrap());
+        staged(&f.engine, 1).await;
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("open before the stop");
+
+        let lc = f.engine.lifecycle();
+        lc.drain();
+        lc.stopping();
+        let stopped = std::time::Instant::now();
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                outcome => {
+                    assert!(
+                        stopped.elapsed() < Duration::from_secs(1),
+                        "still not refused: {outcome:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+        assert!(!served.is_finished(), "still waiting for the upload");
+
+        lc.force();
+        ends_within(served, Duration::from_secs(1)).await;
+        let cut = tokio::time::timeout(Duration::from_secs(1), upload)
+            .await
+            .expect("the upload is cut")
+            .unwrap();
+        assert!(cut.is_err(), "{cut:?}");
+    }
+
+    #[tokio::test]
+    async fn watch_task_ends_unavailable_at_stop() {
+        use futures::StreamExt;
+        let f = fixture().await;
+        f.storage
+            .create_task(&stored_task("w", None), None, None)
+            .await
+            .unwrap();
+        let (url, _, served) = serve_stoppable(&f.engine, Duration::ZERO).await;
+        let client = apollo_client::Client::connect(url).await.unwrap();
+        let mut watch = client
+            .watch_task("w", apollo_proto::ResultView::Summary)
+            .await
+            .unwrap();
+        let first = watch.next().await.unwrap().unwrap();
+        assert_eq!(first.state(), apollo_proto::TaskState::Queued);
+
+        let lc = f.engine.lifecycle();
+        assert!(lc.drain());
+        let quiet = tokio::time::timeout(Duration::from_millis(100), watch.next()).await;
+        assert!(quiet.is_err(), "a drain doesn't end the watch");
+        lc.stopping();
+        let ended = tokio::time::timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("the watch ends at the stop")
+            .unwrap();
+        match ended {
+            Err(apollo_client::ClientError::Status(s)) => {
+                assert_eq!(s.code(), tonic::Code::Unavailable);
+                assert_eq!(s.message(), "server stopping; watch again");
+            }
+            other => panic!("expected UNAVAILABLE, got {other:?}"),
+        }
+        assert!(watch.next().await.is_none());
+        ends_within(served, Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn a_waiting_classify_returns_early_at_stop() {
+        let f = fixture().await;
+        let mut earlier = stored_task("earlier", None);
+        earlier.request_id = Some("r".into());
+        f.storage.create_task(&earlier, None, None).await.unwrap();
+        let (url, _, served) = serve_stoppable(&f.engine, Duration::ZERO).await;
+        let client = apollo_client::Client::connect(url).await.unwrap();
+        let waiting = tokio::spawn(async move {
+            let request = ClassifyRequest {
+                wait_seconds: 60,
+                ..classify_data(&["m"], "r")
+            };
+            client.classify(request).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let lc = f.engine.lifecycle();
+        assert!(lc.drain());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "a drain leaves it waiting");
+        lc.stopping();
+        let task = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the wait ends at the stop")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.id, "earlier");
+        assert_eq!(task.state(), apollo_proto::TaskState::Queued);
+        ends_within(served, Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn the_drain_timeout_cuts_a_held_upload() {
+        let f = fixture_with(NSFW).await;
+        let timeout = Duration::from_millis(500);
+        let (url, _, served) = serve_stoppable(&f.engine, timeout).await;
+        let upload = held_upload(apollo_client::Client::connect(url).await.unwrap());
+        staged(&f.engine, 1).await;
+
+        let lc = f.engine.lifecycle();
+        lc.drain();
+        lc.stopping();
+        let stopped = std::time::Instant::now();
+        ends_within(served, Duration::from_secs(2)).await;
+        assert!(stopped.elapsed() >= timeout, "{:?}", stopped.elapsed());
+        let cut = tokio::time::timeout(Duration::from_secs(1), upload)
+            .await
+            .expect("the upload is cut with the server")
+            .unwrap();
+        assert!(cut.is_err(), "{cut:?}");
+        // Its handler ended too, and removed what it staged.
+        staged(&f.engine, 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_skips_the_drain() {
+        let f = fixture_with(NSFW).await;
+        // No drain timeout: without the second signal it would wait.
+        let (url, _, served) = serve_stoppable(&f.engine, Duration::ZERO).await;
+        let upload = held_upload(apollo_client::Client::connect(url).await.unwrap());
+        staged(&f.engine, 1).await;
+
+        let lc = f.engine.lifecycle();
+        assert!(lc.drain());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!served.is_finished(), "draining");
+        // What the app does on a second signal.
+        assert!(!lc.drain());
+        lc.force();
+        ends_within(served, Duration::from_secs(1)).await;
+        let cut = tokio::time::timeout(Duration::from_secs(1), upload)
+            .await
+            .expect("the upload is cut")
+            .unwrap();
+        assert!(cut.is_err(), "{cut:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stop_with_watches_open_exits_within_the_budget() {
+        use futures::StreamExt;
+        let f = fixture().await;
+        f.storage
+            .create_task(&stored_task("w", None), None, None)
+            .await
+            .unwrap();
+        let (delay, timeout) = (Duration::from_millis(200), Duration::from_secs(15));
+        let (url, _, served) = serve_stoppable(&f.engine, timeout).await;
+        let client = apollo_client::Client::connect(url.clone()).await.unwrap();
+        let mut task_watch = client
+            .watch_task("w", apollo_proto::ResultView::Summary)
+            .await
+            .unwrap();
+        task_watch.next().await.unwrap().unwrap();
+        let mut health = health_client(&url).await;
+        let mut health_watches = Vec::new();
+        for name in ["", "readiness", "liveness"] {
+            let mut w = health
+                .watch(health_request(name))
+                .await
+                .unwrap()
+                .into_inner();
+            w.message().await.unwrap().unwrap();
+            health_watches.push(w);
+        }
+
+        // The app's stop: drain, the delay, stopping, then the hand-back.
+        let started = std::time::Instant::now();
+        let lc = f.engine.lifecycle();
+        assert!(lc.drain());
+        tokio::time::sleep(delay).await;
+        lc.stopping();
+        // The watches end, so the server doesn't wait for the deadline.
+        ends_within(served, Duration::from_secs(2)).await;
+        assert!(f.engine.hand_back().await, "handed back in time");
+        let budget = delay + timeout + apollo_engine::HAND_BACK_LIMIT;
+        assert!(started.elapsed() < budget);
+        assert!(
+            started.elapsed() < delay + Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+
+        match task_watch.next().await.unwrap() {
+            Err(apollo_client::ClientError::Status(s)) => {
+                assert_eq!(s.code(), tonic::Code::Unavailable);
+            }
+            other => panic!("expected UNAVAILABLE, got {other:?}"),
+        }
+        for mut w in health_watches {
+            // A NOT_SERVING from the drain, then the end.
+            while let Some(update) = w.message().await.unwrap() {
+                assert_eq!(update.status(), Wire::NotServing);
+            }
+        }
+    }
+
+    // ------------------------- Connection age -------------------------
+
+    /// [`serve_stoppable`] with no drain timeout and connections aging as
+    /// `aging` says.
+    async fn serve_aged(engine: &Engine, aging: Aging) -> (String, SocketAddr, Served) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let health = Health::new(engine.lifecycle()).await;
+        let serve = serve_aging(
+            engine.clone(),
+            listener,
+            health,
+            AuthInterceptor::disabled(),
+            None,
+            Some(aging),
+        );
+        let lc = engine.lifecycle().clone();
+        let stopped =
+            async move { crate::serve_until_stopped(serve, &lc, || Duration::ZERO).await };
+        (format!("http://{addr}"), addr, tokio::spawn(stopped))
+    }
+
+    /// A bare HTTP/2 client connection, to see the frames the server sends.
+    struct H2(tokio::net::TcpStream);
+
+    /// A frame from the server: type, flags, stream and payload.
+    #[derive(Debug)]
+    struct Frame {
+        kind: u8,
+        flags: u8,
+        stream: u32,
+        payload: Vec<u8>,
+    }
+
+    const DATA: u8 = 0;
+    const HEADERS: u8 = 1;
+    const GOAWAY: u8 = 7;
+    const END_STREAM: u8 = 1;
+
+    impl H2 {
+        async fn open(addr: SocketAddr) -> Self {
+            let mut io = tokio::net::TcpStream::connect(addr).await.unwrap();
+            io.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut h2 = Self(io);
+            h2.send(4, 0, 0, &[]).await.unwrap(); // SETTINGS
+            h2
+        }
+
+        async fn send(
+            &mut self,
+            kind: u8,
+            flags: u8,
+            stream: u32,
+            payload: &[u8],
+        ) -> std::io::Result<()> {
+            let mut frame = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+            frame.extend([kind, flags]);
+            frame.extend(stream.to_be_bytes());
+            frame.extend(payload);
+            self.0.write_all(&frame).await
+        }
+
+        /// Call `path` with `message` on stream `id`, as a gRPC client does.
+        async fn call(&mut self, id: u32, path: &str, message: &impl prost::Message) {
+            let mut block = Vec::new();
+            for (name, value) in [
+                (":method", "POST"),
+                (":scheme", "http"),
+                (":path", path),
+                (":authority", "apollo"),
+                ("content-type", "application/grpc"),
+                ("te", "trailers"),
+            ] {
+                // A literal field with a new name, not indexed (RFC 7541 6.2.2).
+                block.push(0);
+                block.push(name.len() as u8);
+                block.extend(name.as_bytes());
+                block.push(value.len() as u8);
+                block.extend(value.as_bytes());
+            }
+            self.send(HEADERS, 0x4, id, &block).await.unwrap(); // END_HEADERS
+            let body = message.encode_to_vec();
+            let mut data = vec![0];
+            data.extend((body.len() as u32).to_be_bytes());
+            data.extend(body);
+            self.send(DATA, END_STREAM, id, &data).await.unwrap();
+        }
+
+        /// The next frame, answering SETTINGS and PING and skipping their
+        /// acks and window updates; `None` once the connection ends.
+        async fn next(&mut self) -> Option<Frame> {
+            use tokio::io::AsyncReadExt;
+            loop {
+                let mut head = [0u8; 9];
+                self.0.read_exact(&mut head).await.ok()?;
+                let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+                let mut payload = vec![0; len];
+                self.0.read_exact(&mut payload).await.ok()?;
+                let (kind, flags) = (head[3], head[4]);
+                let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+                let ack = flags & 1 == 1;
+                match kind {
+                    4 if !ack => {
+                        let _ = self.send(4, 1, 0, &[]).await;
+                    }
+                    6 if !ack => {
+                        let _ = self.send(6, 1, 0, &payload).await;
+                    }
+                    4 | 6 | 8 => {}
+                    _ => {
+                        return Some(Frame {
+                            kind,
+                            flags,
+                            stream,
+                            payload,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// The error code of a GOAWAY frame.
+    fn goaway_code(frame: &Frame) -> u32 {
+        assert_eq!(frame.kind, GOAWAY, "{frame:?}");
+        u32::from_be_bytes(frame.payload[4..8].try_into().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_connection_older_than_the_age_gets_goaway() {
+        let f = fixture_with("[app]\nmax_connection_age_secs = 1\n").await;
+        let (url, addr, served) = serve_stoppable(&f.engine, Duration::ZERO).await;
+        let opened = std::time::Instant::now();
+        let mut h2 = H2::open(addr).await;
+        let first = tokio::time::timeout(Duration::from_secs(3), h2.next())
+            .await
+            .expect("told to finish in time")
+            .expect("before the connection ends");
+        let at = opened.elapsed();
+        assert_eq!(goaway_code(&first), 0, "NO_ERROR");
+        // 1 s, give or take 10%.
+        assert!(at >= Duration::from_millis(850), "{at:?}");
+        // With nothing open on it, it then closes.
+        let end = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(frame) = h2.next().await {
+                assert_eq!(frame.kind, GOAWAY, "{frame:?}");
+            }
+        });
+        end.await.expect("closed after the GOAWAY");
+
+        // A client reconnects by itself, and the server keeps serving.
+        f.storage
+            .create_task(&stored_task("t", None), None, None)
+            .await
+            .unwrap();
+        let client = apollo_client::Client::connect(url).await.unwrap();
+        assert_eq!(client.get_task("t").await.unwrap().id, "t");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(client.get_task("t").await.unwrap().id, "t");
+        assert!(!served.is_finished());
+        f.engine.lifecycle().drain();
+        f.engine.lifecycle().stopping();
+        ends_within(served, Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn a_call_open_at_the_age_finishes_before_the_connection_closes() {
+        let f = fixture().await;
+        let mut earlier = stored_task("earlier", None);
+        earlier.request_id = Some("r".into());
+        f.storage.create_task(&earlier, None, None).await.unwrap();
+        let aging = Aging {
+            age: Duration::from_millis(300),
+            grace: Duration::from_secs(5),
+        };
+        let (_, addr, served) = serve_aged(&f.engine, aging).await;
+        let mut h2 = H2::open(addr).await;
+        let started = std::time::Instant::now();
+        // Waits 1 s for a task that doesn't finish, then returns it.
+        let request = ClassifyRequest {
+            wait_seconds: 1,
+            ..classify_data(&["m"], "r")
+        };
+        h2.call(1, "/apollo.v1.Inference/Classify", &request).await;
+
+        let mut frames = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(frame) = h2.next().await {
+                frames.push((started.elapsed(), frame));
+            }
+        });
+        closed
+            .await
+            .expect("the connection closes once the call ends");
+        // The GOAWAY comes first, at the age, and lets the call finish.
+        let (at, goaway) = &frames[0];
+        assert_eq!(goaway_code(goaway), 0);
+        assert!(*at < Duration::from_millis(900), "{at:?}");
+        let answer = frames
+            .iter()
+            .find(|(_, f)| f.kind == DATA && f.stream == 1)
+            .expect("an answer");
+        assert!(answer.0 >= Duration::from_secs(1), "{:?}", answer.0);
+        let task = <apollo_proto::Task as prost::Message>::decode(&answer.1.payload[5..]).unwrap();
+        assert_eq!(task.id, "earlier");
+        let (_, last) = frames.iter().rfind(|(_, f)| f.stream == 1).unwrap();
+        assert_eq!(
+            (last.kind, last.flags & END_STREAM),
+            (HEADERS, END_STREAM),
+            "the call ends with its trailers"
+        );
+
+        f.engine.lifecycle().drain();
+        f.engine.lifecycle().stopping();
+        ends_within(served, Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn a_call_still_open_after_the_grace_is_cut() {
+        let f = fixture_with(NSFW).await;
+        f.storage
+            .create_task(&stored_task("t", None), None, None)
+            .await
+            .unwrap();
+        let aging = Aging {
+            age: Duration::from_millis(300),
+            grace: Duration::from_millis(500),
+        };
+        let (url, _, served) = serve_aged(&f.engine, aging).await;
+        let started = std::time::Instant::now();
+        let upload = held_upload(apollo_client::Client::connect(url.clone()).await.unwrap());
+        staged(&f.engine, 1).await;
+
+        let cut = tokio::time::timeout(Duration::from_secs(2), upload)
+            .await
+            .expect("the upload is cut")
+            .unwrap();
+        assert!(cut.is_err(), "{cut:?}");
+        // At the age (within 10%) plus the grace.
+        assert!(
+            started.elapsed() >= Duration::from_millis(750),
+            "{:?}",
+            started.elapsed()
+        );
+        // Its handler ended too, and removed what it staged.
+        staged(&f.engine, 0).await;
+        // The server goes on serving.
+        assert!(!served.is_finished());
+        let fresh = apollo_client::Client::connect(url).await.unwrap();
+        assert_eq!(fresh.get_task("t").await.unwrap().id, "t");
+
+        f.engine.lifecycle().drain();
+        f.engine.lifecycle().stopping();
+        ends_within(served, Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn with_connection_age_a_stop_still_closes_the_port_and_waits() {
+        let f = fixture_with(NSFW).await;
+        let aging = Aging {
+            age: Duration::from_secs(60),
+            grace: Duration::from_secs(300),
+        };
+        let (url, addr, served) = serve_aged(&f.engine, aging).await;
+        let idle = H2::open(addr).await;
+        let upload = held_upload(apollo_client::Client::connect(url).await.unwrap());
+        staged(&f.engine, 1).await;
+
+        let lc = f.engine.lifecycle();
+        lc.drain();
+        lc.stopping();
+        let stopped = std::time::Instant::now();
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                outcome => {
+                    assert!(
+                        stopped.elapsed() < Duration::from_secs(1),
+                        "still not refused: {outcome:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+        // Every open connection is told to finish at once.
+        let mut idle = idle;
+        let first = tokio::time::timeout(Duration::from_secs(1), idle.next())
+            .await
+            .expect("told to finish at the stop")
+            .expect("before the connection ends");
+        assert_eq!(goaway_code(&first), 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!served.is_finished(), "still waiting for the upload");
+
+        lc.force();
+        ends_within(served, Duration::from_secs(1)).await;
+        let cut = tokio::time::timeout(Duration::from_secs(1), upload)
+            .await
+            .expect("the upload is cut")
+            .unwrap();
+        assert!(cut.is_err(), "{cut:?}");
     }
 }

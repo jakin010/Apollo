@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use apollo_domain::ItemState;
 
-use crate::{Engine, EngineError, Overload};
+use crate::{DEGRADED, Database, Engine, Overload, Phase};
 
 /// Upper bounds (seconds) for latency histograms: 5 ms to 2 min.
 const SECONDS: &[f64] = &[
@@ -71,14 +71,19 @@ impl Histogram {
 
 /// Counters keyed by a small set of label values.
 #[derive(Default)]
-struct CounterVec(Mutex<BTreeMap<Vec<&'static str>, u64>>);
+pub(crate) struct CounterVec(Mutex<BTreeMap<Vec<&'static str>, u64>>);
 
 impl CounterVec {
-    fn inc(&self, labels: &[&'static str]) {
+    pub(crate) fn inc(&self, labels: &[&'static str]) {
         *self.0.lock().unwrap().entry(labels.to_vec()).or_default() += 1;
     }
 
-    fn snapshot(&self) -> Vec<(Vec<&'static str>, u64)> {
+    /// Give `labels` a series at 0, if it has none yet.
+    pub(crate) fn touch(&self, labels: &[&'static str]) {
+        self.0.lock().unwrap().entry(labels.to_vec()).or_default();
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<(Vec<&'static str>, u64)> {
         self.0
             .lock()
             .unwrap()
@@ -195,9 +200,24 @@ impl Metrics {
 }
 
 impl Engine {
-    /// The current metrics in the Prometheus text format.
-    pub async fn metrics_text(&self) -> Result<String, EngineError> {
-        let status = self.status().await?;
+    /// Count a connection or request that `listener`'s allow list refused
+    /// (`apollo_listener_refused_total`).
+    pub fn note_refused(&self, listener: &'static str) {
+        self.inner.lifecycle.note_refused(listener);
+    }
+}
+
+impl Engine {
+    /// The current metrics in the Prometheus text format. The database
+    /// counts wait as long as [`Engine::status`] does; without them,
+    /// `apollo_tasks` and `apollo_webhooks_pending` are left out.
+    pub async fn metrics_text(&self) -> String {
+        self.metrics_within(self.status_limit()).await
+    }
+
+    /// [`Engine::metrics_text`], waiting at most `limit` for the database.
+    pub(crate) async fn metrics_within(&self, limit: Duration) -> String {
+        let status = self.status_within(limit).await;
         let live = self.live();
         let m = &self.inner.metrics;
         let mut out = Writer::default();
@@ -226,6 +246,72 @@ impl Engine {
             unix_secs(live.loaded_at),
         );
 
+        let lc = &self.inner.lifecycle;
+        // One reading of the state and one sample for every figure below, so
+        // they agree.
+        let (phase, drained, load) = (lc.phase(), lc.drained(), lc.load());
+        let ready = phase.ready(drained);
+        out.gauge(
+            "apollo_ready",
+            "1 while ready for work (what /readyz answers).",
+            if ready { 1.0 } else { 0.0 },
+        );
+        out.family(
+            "apollo_lifecycle_phase",
+            "gauge",
+            "1 for the phase the process is in: starting, serving, draining or stopping.",
+        );
+        for name in Phase::NAMES {
+            let v = if name == phase.name() { 1.0 } else { 0.0 };
+            out.sample("apollo_lifecycle_phase", &[("phase", name)], v);
+        }
+        out.gauge(
+            "apollo_drained",
+            "1 while taken out of rotation with apollo drain.",
+            if drained { 1.0 } else { 0.0 },
+        );
+        out.gauge(
+            "apollo_ready_strict",
+            "1 while ready and in touch with the database, or it isn't shared (what /readyz/strict answers).",
+            if load.ready_strict(ready) { 1.0 } else { 0.0 },
+        );
+        out.gauge(
+            "apollo_utilization",
+            "How close the instance is to refusing work, from 0 to 1 (rises at once, falls over about 5 s).",
+            load.utilization,
+        );
+        out.gauge(
+            "apollo_lb_weight",
+            "The weight for load balancers: 1 to 100, 1 while the database is stale, 0 when not ready.",
+            load.weight(ready).into(),
+        );
+        out.family(
+            "apollo_degraded",
+            "gauge",
+            "1 while degraded, by reason: load (utilization reached [health].degraded_at) or database (stale).",
+        );
+        let degraded = load.degraded();
+        for reason in DEGRADED {
+            let v = if degraded.contains(&reason) { 1.0 } else { 0.0 };
+            out.sample("apollo_degraded", &[("reason", reason)], v);
+        }
+        if let Some(last_contact) = load.database.last_contact() {
+            out.gauge(
+                "apollo_database_up",
+                "1 while in touch with the shared database, 0 while it is stale.",
+                if matches!(load.database, Database::Ok { .. }) {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+            out.gauge(
+                "apollo_database_last_contact_seconds",
+                "Seconds since the shared database last answered.",
+                last_contact.elapsed().as_secs_f64(),
+            );
+        }
+
         out.counter_vec(
             "apollo_submissions_total",
             "Submissions, by outcome (accepted, existing, invalid, overloaded, error).",
@@ -245,20 +331,27 @@ impl Engine {
             &m.items_finished,
         );
 
-        out.family(
-            "apollo_tasks",
-            "gauge",
-            "Tasks in storage, by state (until retention purges them).",
+        out.gauge(
+            "apollo_metrics_database_ok",
+            "1 when the database answered this scrape's counts in time (apollo_tasks, apollo_webhooks_pending).",
+            if status.stored.is_some() { 1.0 } else { 0.0 },
         );
-        let t = status.tasks;
-        for (state, n) in [
-            ("queued", t.queued),
-            ("processing", t.processing),
-            ("completed", t.completed),
-            ("failed", t.failed),
-            ("cancelled", t.cancelled),
-        ] {
-            out.sample("apollo_tasks", &[("state", state)], n as f64);
+        if let Some(stored) = &status.stored {
+            out.family(
+                "apollo_tasks",
+                "gauge",
+                "Tasks in storage, by state (until retention purges them).",
+            );
+            let t = stored.tasks;
+            for (state, n) in [
+                ("queued", t.queued),
+                ("processing", t.processing),
+                ("completed", t.completed),
+                ("failed", t.failed),
+                ("cancelled", t.cancelled),
+            ] {
+                out.sample("apollo_tasks", &[("state", state)], n as f64);
+            }
         }
 
         out.gauge(
@@ -323,7 +416,7 @@ impl Engine {
             m.cache_hits.load(Ordering::Relaxed),
         );
 
-        if let Some(pending) = status.webhooks_pending {
+        if let Some(pending) = status.stored.and_then(|s| s.webhooks_pending) {
             out.gauge(
                 "apollo_webhooks_pending",
                 "Finished inputs whose webhook event is not delivered yet.",
@@ -335,6 +428,12 @@ impl Engine {
             "Webhook delivery attempts, by event and result.",
             &["event", "result"],
             &m.webhook_deliveries,
+        );
+        out.counter_vec(
+            "apollo_listener_refused_total",
+            "Connections and requests refused by a listener's allow list, by listener.",
+            &["listener"],
+            self.inner.lifecycle.refused(),
         );
 
         // Per model: gauges for the configured models, counters for every
@@ -365,6 +464,22 @@ impl Engine {
         for s in &status.models {
             let v = s.admitted as f64;
             out.sample("apollo_model_items_admitted", &[("model", &s.label)], v);
+        }
+        out.family(
+            "apollo_model_utilization",
+            "gauge",
+            "Inputs admitted over the model's max_pending (models with one).",
+        );
+        for s in status.models.iter().filter(|s| s.enabled) {
+            let limit = live
+                .config
+                .models
+                .get(&s.label)
+                .map_or(0, |m| m.max_pending);
+            if limit > 0 {
+                let v = s.admitted as f64 / f64::from(limit);
+                out.sample("apollo_model_utilization", &[("model", &s.label)], v);
+            }
         }
 
         let models: Vec<(String, Arc<ModelMetrics>)> = m
@@ -438,7 +553,7 @@ impl Engine {
             "Duration of a weight load, including download and warm-up.",
             &hist(|mm| &mm.load_seconds),
         );
-        Ok(out.0)
+        out.0
     }
 }
 

@@ -2,10 +2,10 @@
 
 Apollo exposes one gRPC service that clients call: **`apollo.v1.Inference`**. It is defined in `proto/inference.proto` and shares its message types with `proto/common.proto`.
 
-- **Transport:** gRPC over HTTP/2.
+- **Transport:** gRPC over HTTP/2. With `[app].max_connection_age_secs` set, a connection that old (give or take 10%) is told to finish (`GOAWAY`), and clients open a new one on their own; calls still open on it get `[app].max_connection_age_grace_secs` (300 s by default) and are then cut.
 - **TLS:** served natively when `[tls]` is configured (optionally with mutual TLS), or terminate it at a proxy in front. The examples below use `-plaintext` for a local server; with `[tls]`, drop `-plaintext` (add `-cacert ca.pem` for a private CA).
 - **Server reflection** is enabled, so tools like `grpcurl` and Postman can discover the schema without a local copy of the `.proto` files.
-- **Health checking** (`grpc.health.v1.Health`) is enabled; the server reports the `Inference` service as `SERVING`.
+- **Health checking** (`grpc.health.v1.Health`) is enabled, and follows the server's state: see [Health checking](#health-checking). Load balancers do better with the HTTP checks on the health port ([operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers)).
 - **Authentication** is **on by default** and applies to every `Inference` RPC (health and reflection stay open). See [Authentication](#authentication).
 
 Work is asynchronous: `Classify` returns the queued task right away. Get the result by waiting in the call (`wait_seconds`), streaming updates with `WatchTask`, polling `GetTask`, or receiving a [webhook](./webhooks.md).
@@ -35,7 +35,7 @@ Submits a single input. Validation happens **before** the task is created:
 A validation failure returns `INVALID_ARGUMENT` and no task is created. On success the task is persisted and returned:
 
 - with `wait_seconds = 0` (the default), as it is now (usually `QUEUED`);
-- otherwise once it finishes, or after `wait_seconds` with whatever state it reached by then. Either way you get a `Task` back; check `state`.
+- otherwise once it finishes, or after `wait_seconds` with whatever state it reached by then, or sooner when the server stops. Either way you get a `Task` back; check `state`.
 
 **Idempotency:** with a `request_id`, submitting again with the same `request_id` (as the same caller) returns the existing task instead of creating a new one, whatever the new request contains. Use it to retry a `Classify` that timed out without risking a duplicate. Keys are scoped to the caller (token subject), so two callers can use the same key. The task's id is made from the caller and the key, so a retry through another instance sharing the database gets the same task. A key is remembered while its task is stored: once [retention](./database.md#retention) removes the task, the same key makes a new task, with the same id.
 
@@ -56,7 +56,7 @@ Returns the current `Task`. `view` picks the result detail: `SUMMARY` (the defau
 
 ### `WatchTask(WatchTaskRequest) → stream Task`
 
-Sends the task as it is now, then again each time it changes (it starts processing, a model finishes, a retry begins, …), and ends the stream after sending it `COMPLETED`, `FAILED` or `CANCELLED`. Updates may be coalesced: a burst of changes can arrive as one message carrying the latest state. A change made by another instance sharing the database shows up within about 2 seconds. Use it when you can't receive webhooks and don't want to poll. `view` works as for `GetTask`.
+Sends the task as it is now, then again each time it changes (it starts processing, a model finishes, a retry begins, …), and ends the stream after sending it `COMPLETED`, `FAILED` or `CANCELLED`. Updates may be coalesced: a burst of changes can arrive as one message carrying the latest state. A change made by another instance sharing the database shows up within about 2 seconds. Use it when you can't receive webhooks and don't want to poll. `view` works as for `GetTask`. When the server stops, the stream ends with `UNAVAILABLE` (`server stopping; watch again`): watch again, through another instance if there is one.
 
 ### `ListTasks(ListTasksRequest) → ListTasksResponse`
 
@@ -344,10 +344,37 @@ Runtime failures (an unfetchable URL, a decode error, an inference error, a time
 | Overloaded: `[app].max_pending` inputs in flight, the memory ceiling exceeded, or a model's own `max_pending` reached | `RESOURCE_EXHAUSTED`, with metadata `apollo-overloaded: queue`, `memory` or `model` |
 | Content over the upload cap | `RESOURCE_EXHAUSTED`, with metadata `grpc-retry-pushback-ms: -1` |
 | The database didn't answer within `[database].timeout` (e.g. it's unreachable). A Classify told so may still have its task stored and run once it answers: retry with the same `request_id` to get that task | `UNAVAILABLE` |
+| The server is stopping (ends an open `WatchTask`) | `UNAVAILABLE` |
 | Missing/invalid auth token (when auth is enabled) | `UNAUTHENTICATED` |
 | Everything else | `INTERNAL` |
 
 Nothing is kept when a request is refused as overloaded, so the same request may be sent to another instance. It's usually refused before any content arrives: `ClassifyStream` at its `init` frame, and an inline-content `Classify` before its bytes are written to disk. If the instance fills up while an upload is arriving, the refusal comes after it and the bytes are discarded. With several instances, a proxy or client retries it elsewhere on the `apollo-overloaded` tag (see [operations.md → Several instances](./operations.md#several-instances-sending-work-to-a-less-busy-one)). The upload cap is the same on every instance, so that refusal carries `grpc-retry-pushback-ms: -1`, which tells gRPC retry policies not to retry it.
+
+---
+
+## Health checking
+
+`grpc.health.v1.Health` on the gRPC port answers these names:
+
+| Name | Starting | Serving | Drained, draining | Stopping |
+|------|----------|---------|-------------------|----------|
+| `""`, `apollo.v1.Inference`, `readiness` | `NOT_SERVING` | `SERVING` | `NOT_SERVING` | removed |
+| `readiness-strict` | `NOT_SERVING` | `SERVING`, or `NOT_SERVING` while cut off from a shared database | `NOT_SERVING` | removed |
+| `liveness` | `SERVING` | `SERVING` | `SERVING` | removed |
+
+- **Starting** lasts until tasks are recovered and every model with `keep_in_memory` has tried its first load (loaded or not). **Draining** starts at the first `SIGTERM` or Ctrl-C and lasts `[app].drain_delay_secs`; calls are still served meanwhile. **Stopping** follows: see [operations.md → Health checks and load balancers](./operations.md#health-checks-and-load-balancers). **Drained** is from `apollo drain` until `apollo drain --undo`; calls are still served meanwhile (see [operations.md → Taking an instance out of rotation](./operations.md#taking-an-instance-out-of-rotation)).
+- **`readiness-strict`** answers like `/readyz/strict` on the health port: it also turns `NOT_SERVING` while the server's contact with a shared database (SurrealDB) is stale, and turns back once it is ok again (see [database.md → Health checks and the database](./database.md#health-checks-and-the-database)). The other names never look at the database. A degraded server (see [operations.md → Degraded](./operations.md#degraded)) is `SERVING`: gRPC health has no degraded state.
+- **Removed** names end their Watch streams (with `OK`), and Check answers `NOT_FOUND`. An open Watch never holds a stop.
+- **The port speaks HTTP/2 only.** A balancer whose checks speak HTTP/1.1 can't use it; give it the health port instead.
+- **mTLS covers health too.** With `[tls].client_ca_file`, a checker needs a client certificate to reach health here. The health port needs none.
+- **The gRPC port serves only once tasks are recovered.** While the database opens (and migrates) and auth is set up, the port isn't bound, so connections are refused; while tasks are recovered it accepts connections (a TCP check passes) but answers nothing. A liveness check here can therefore fail a server that is starting normally: use `/livez` on the health port for liveness.
+
+When the server stops:
+
+- the port closes, so new connections are refused, and open ones are told to finish (`GOAWAY`);
+- an open `WatchTask` ends with `UNAVAILABLE` (`server stopping; watch again`): watch again, through another instance if there is one;
+- a `Classify` waiting in `wait_seconds` returns the task as it is, unfinished;
+- calls still open after `[app].drain_timeout_secs` are cut.
 
 ---
 

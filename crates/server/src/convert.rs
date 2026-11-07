@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use apollo_domain as dom;
+use apollo_domain::{self as dom, MAX_WAIT_SECONDS};
 use apollo_engine::{Catalog, Run, TaskCursor, TaskQuery};
 use apollo_proto as pb;
 
@@ -17,8 +17,6 @@ const MAX_METADATA_KEY: usize = 64;
 const MAX_METADATA_VALUE: usize = 512;
 /// Longest accepted `request_id`, in bytes.
 const MAX_REQUEST_ID: usize = 128;
-/// Longest accepted `wait_seconds`.
-pub(crate) const MAX_WAIT_SECONDS: u32 = 300;
 /// `ListTasks` page sizes.
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 500;

@@ -3,7 +3,7 @@
 //! crates' dev-dependencies).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use apollo_domain::{ItemState, ModelResult, Task, TaskState};
 use std::time::Duration;
@@ -342,32 +342,70 @@ impl Storage for HeldCreate {
 /// `inner`.
 pub struct Stalled {
     pub inner: Arc<dyn Storage>,
-    open: tokio::sync::watch::Receiver<bool>,
+    gate: Arc<Gate>,
     /// Reported as shared, whatever `inner` is.
     shared: bool,
 }
 
-/// Shuts and opens a [`Stalled`] store (open to begin with).
-pub struct StallGate(tokio::sync::watch::Sender<bool>);
+/// What a [`Stalled`] store and its [`StallGate`] share.
+struct Gate {
+    open: tokio::sync::watch::Sender<bool>,
+    calls: AtomicUsize,
+    /// Shut the gate once this call has run, holding its answer or not (see
+    /// [`StallGate::shut_after`]).
+    shut_after: std::sync::Mutex<Option<(&'static str, bool)>>,
+}
+
+/// Shuts and opens a [`Stalled`] store (open to begin with), and counts the
+/// calls that reached it.
+pub struct StallGate(Arc<Gate>);
 
 impl StallGate {
     pub fn shut(&self) {
-        self.0.send_replace(false);
+        self.0.open.send_replace(false);
     }
     pub fn open(&self) {
-        self.0.send_replace(true);
+        self.0.open.send_replace(true);
+    }
+    /// Whether it is shut, by [`StallGate::shut`] or [`StallGate::shut_after`].
+    pub fn is_shut(&self) -> bool {
+        !*self.0.open.borrow()
+    }
+    /// Calls made to the store so far (`shared` aside), waiting or not.
+    pub fn calls(&self) -> usize {
+        self.0.calls.load(Ordering::SeqCst)
+    }
+    /// Shut the gate as soon as the next `call` (a [`Storage`] method, by
+    /// name, such as `"claim_task"`) has run on `inner`: the calls after it
+    /// wait. With `hold_answer` its own answer waits too, as when a write
+    /// lands but its answer is late.
+    pub fn shut_after(&self, call: &'static str, hold_answer: bool) {
+        *self.0.shut_after.lock().unwrap() = Some((call, hold_answer));
+    }
+}
+
+impl Drop for StallGate {
+    /// A dropped gate leaves the store as it was: calls go through.
+    fn drop(&mut self) {
+        self.0.shut_after.lock().unwrap().take();
+        self.0.open.send_replace(true);
     }
 }
 
 impl Stalled {
     pub fn new(inner: Arc<dyn Storage>) -> (Self, StallGate) {
-        let (open, rx) = tokio::sync::watch::channel(true);
+        let (open, _) = tokio::sync::watch::channel(true);
+        let gate = Arc::new(Gate {
+            open,
+            calls: AtomicUsize::new(0),
+            shut_after: std::sync::Mutex::new(None),
+        });
         let stalled = Self {
             inner,
-            open: rx,
+            gate: Arc::clone(&gate),
             shared: false,
         };
-        (stalled, StallGate(open))
+        (stalled, StallGate(gate))
     }
 
     /// [`Stalled::new`], reported as a shared database (so an engine on it
@@ -381,18 +419,38 @@ impl Stalled {
         (stalled, gate)
     }
 
-    async fn pass(&self) {
-        let mut open = self.open.clone();
-        // A dropped gate leaves the store as it was: let calls through.
+    async fn until_open(&self) {
+        let mut open = self.gate.open.subscribe();
         let _ = open.wait_for(|open| *open).await;
+    }
+
+    /// `call`, the method `name`, once the gate is open.
+    async fn call<T>(&self, name: &'static str, call: impl std::future::Future<Output = T>) -> T {
+        self.gate.calls.fetch_add(1, Ordering::SeqCst);
+        self.until_open().await;
+        let answer = call.await;
+        let hook = {
+            let mut hook = self.gate.shut_after.lock().unwrap();
+            if hook.is_some_and(|(call, _)| call == name) {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, hold_answer)) = hook {
+            self.gate.open.send_replace(false);
+            if hold_answer {
+                self.until_open().await;
+            }
+        }
+        answer
     }
 }
 
 #[async_trait::async_trait]
 impl Storage for Stalled {
     async fn migrate(&self) -> Result<(), StorageError> {
-        self.pass().await;
-        self.inner.migrate().await
+        self.call("migrate", self.inner.migrate()).await
     }
     async fn create_task(
         &self,
@@ -400,12 +458,11 @@ impl Storage for Stalled {
         lease: Option<&Lease<'_>>,
         pin: Option<&str>,
     ) -> Result<(), StorageError> {
-        self.pass().await;
-        self.inner.create_task(task, lease, pin).await
+        self.call("create_task", self.inner.create_task(task, lease, pin))
+            .await
     }
     async fn get_task(&self, id: &str) -> Result<Option<Task>, StorageError> {
-        self.pass().await;
-        self.inner.get_task(id).await
+        self.call("get_task", self.inner.get_task(id)).await
     }
     async fn set_task_state(
         &self,
@@ -413,12 +470,18 @@ impl Storage for Stalled {
         state: TaskState,
         fence: Fence<'_>,
     ) -> Result<bool, StorageError> {
-        self.pass().await;
-        self.inner.set_task_state(id, state, fence).await
+        self.call(
+            "set_task_state",
+            self.inner.set_task_state(id, state, fence),
+        )
+        .await
     }
     async fn cancel_task_if_active(&self, id: &str) -> Result<bool, StorageError> {
-        self.pass().await;
-        self.inner.cancel_task_if_active(id).await
+        self.call(
+            "cancel_task_if_active",
+            self.inner.cancel_task_if_active(id),
+        )
+        .await
     }
     async fn set_item_state(
         &self,
@@ -429,10 +492,12 @@ impl Storage for Stalled {
         fence: Fence<'_>,
         delivery: apollo_storage::Delivery<'_>,
     ) -> Result<bool, StorageError> {
-        self.pass().await;
-        self.inner
-            .set_item_state(task_id, item, state, error, fence, delivery)
-            .await
+        self.call(
+            "set_item_state",
+            self.inner
+                .set_item_state(task_id, item, state, error, fence, delivery),
+        )
+        .await
     }
     async fn set_item_failed(
         &self,
@@ -443,22 +508,26 @@ impl Storage for Stalled {
         fence: Fence<'_>,
         delivery: apollo_storage::Delivery<'_>,
     ) -> Result<bool, StorageError> {
-        self.pass().await;
-        self.inner
-            .set_item_failed(task_id, item, error, models, fence, delivery)
-            .await
+        self.call(
+            "set_item_failed",
+            self.inner
+                .set_item_failed(task_id, item, error, models, fence, delivery),
+        )
+        .await
     }
     async fn find_task_by_request(
         &self,
         owner: Option<&str>,
         request_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        self.pass().await;
-        self.inner.find_task_by_request(owner, request_id).await
+        self.call(
+            "find_task_by_request",
+            self.inner.find_task_by_request(owner, request_id),
+        )
+        .await
     }
     async fn list_tasks(&self, query: &TaskQuery) -> Result<TaskPage, StorageError> {
-        self.pass().await;
-        self.inner.list_tasks(query).await
+        self.call("list_tasks", self.inner.list_tasks(query)).await
     }
     async fn upsert_model_result(
         &self,
@@ -468,10 +537,12 @@ impl Storage for Stalled {
         result: &ModelResult,
         fence: Fence<'_>,
     ) -> Result<bool, StorageError> {
-        self.pass().await;
-        self.inner
-            .upsert_model_result(task_id, item, label, result, fence)
-            .await
+        self.call(
+            "upsert_model_result",
+            self.inner
+                .upsert_model_result(task_id, item, label, result, fence),
+        )
+        .await
     }
     async fn append_samples(
         &self,
@@ -480,10 +551,11 @@ impl Storage for Stalled {
         label: &str,
         samples: &[apollo_domain::Sample],
     ) -> Result<(), StorageError> {
-        self.pass().await;
-        self.inner
-            .append_samples(task_id, item, label, samples)
-            .await
+        self.call(
+            "append_samples",
+            self.inner.append_samples(task_id, item, label, samples),
+        )
+        .await
     }
     async fn load_samples(
         &self,
@@ -491,8 +563,11 @@ impl Storage for Stalled {
         item: usize,
         label: &str,
     ) -> Result<Vec<apollo_domain::Sample>, StorageError> {
-        self.pass().await;
-        self.inner.load_samples(task_id, item, label).await
+        self.call(
+            "load_samples",
+            self.inner.load_samples(task_id, item, label),
+        )
+        .await
     }
     async fn set_steps_completed(
         &self,
@@ -501,10 +576,11 @@ impl Storage for Stalled {
         label: &str,
         steps: u32,
     ) -> Result<(), StorageError> {
-        self.pass().await;
-        self.inner
-            .set_steps_completed(task_id, item, label, steps)
-            .await
+        self.call(
+            "set_steps_completed",
+            self.inner.set_steps_completed(task_id, item, label, steps),
+        )
+        .await
     }
     async fn steps_completed(
         &self,
@@ -512,20 +588,23 @@ impl Storage for Stalled {
         item: usize,
         label: &str,
     ) -> Result<u32, StorageError> {
-        self.pass().await;
-        self.inner.steps_completed(task_id, item, label).await
+        self.call(
+            "steps_completed",
+            self.inner.steps_completed(task_id, item, label),
+        )
+        .await
     }
     async fn count_tasks_by_state(&self) -> Result<Vec<(TaskState, u64)>, StorageError> {
-        self.pass().await;
-        self.inner.count_tasks_by_state().await
+        self.call("count_tasks_by_state", self.inner.count_tasks_by_state())
+            .await
     }
     async fn load_incomplete_tasks(&self) -> Result<Vec<Task>, StorageError> {
-        self.pass().await;
-        self.inner.load_incomplete_tasks().await
+        self.call("load_incomplete_tasks", self.inner.load_incomplete_tasks())
+            .await
     }
     async fn increment_attempts(&self, id: &str) -> Result<u32, StorageError> {
-        self.pass().await;
-        self.inner.increment_attempts(id).await
+        self.call("increment_attempts", self.inner.increment_attempts(id))
+            .await
     }
     fn shared(&self) -> bool {
         self.shared || self.inner.shared()
@@ -540,10 +619,12 @@ impl Storage for Stalled {
         after: Option<&TaskCursor>,
         limit: usize,
     ) -> Result<Vec<Claimable>, StorageError> {
-        self.pass().await;
-        self.inner
-            .claimable_tasks(mode, node, skip, grace, after, limit)
-            .await
+        self.call(
+            "claimable_tasks",
+            self.inner
+                .claimable_tasks(mode, node, skip, grace, after, limit),
+        )
+        .await
     }
 
     async fn claim_task(
@@ -553,8 +634,8 @@ impl Storage for Stalled {
         mode: ClaimMode,
         grace: Duration,
     ) -> Result<Option<u32>, StorageError> {
-        self.pass().await;
-        self.inner.claim_task(id, lease, mode, grace).await
+        self.call("claim_task", self.inner.claim_task(id, lease, mode, grace))
+            .await
     }
 
     async fn renew_claims(
@@ -562,13 +643,13 @@ impl Storage for Stalled {
         held: &[Held],
         ttl: Duration,
     ) -> Result<Vec<Renewal>, StorageError> {
-        self.pass().await;
-        self.inner.renew_claims(held, ttl).await
+        self.call("renew_claims", self.inner.renew_claims(held, ttl))
+            .await
     }
 
     async fn release_claims(&self, held: &[Held]) -> Result<u64, StorageError> {
-        self.pass().await;
-        self.inner.release_claims(held).await
+        self.call("release_claims", self.inner.release_claims(held))
+            .await
     }
     async fn claim_pending_webhooks(
         &self,
@@ -578,10 +659,12 @@ impl Storage for Stalled {
         ttl: std::time::Duration,
         limit: usize,
     ) -> Result<Vec<apollo_storage::PendingWebhook>, StorageError> {
-        self.pass().await;
-        self.inner
-            .claim_pending_webhooks(holder, target, mode, ttl, limit)
-            .await
+        self.call(
+            "claim_pending_webhooks",
+            self.inner
+                .claim_pending_webhooks(holder, target, mode, ttl, limit),
+        )
+        .await
     }
     async fn renew_webhook_claims(
         &self,
@@ -589,8 +672,11 @@ impl Storage for Stalled {
         items: &[apollo_storage::PendingWebhook],
         ttl: std::time::Duration,
     ) -> Result<Vec<bool>, StorageError> {
-        self.pass().await;
-        self.inner.renew_webhook_claims(holder, items, ttl).await
+        self.call(
+            "renew_webhook_claims",
+            self.inner.renew_webhook_claims(holder, items, ttl),
+        )
+        .await
     }
     async fn release_webhook_claim(
         &self,
@@ -598,50 +684,58 @@ impl Storage for Stalled {
         item: usize,
         holder: &str,
     ) -> Result<bool, StorageError> {
-        self.pass().await;
-        self.inner
-            .release_webhook_claim(task_id, item, holder)
-            .await
+        self.call(
+            "release_webhook_claim",
+            self.inner.release_webhook_claim(task_id, item, holder),
+        )
+        .await
     }
     async fn auth_key(&self) -> Result<Option<apollo_storage::SharedKey>, StorageError> {
-        self.pass().await;
-        self.inner.auth_key().await
+        self.call("auth_key", self.inner.auth_key()).await
     }
     async fn publish_auth_key(
         &self,
         public_key: &str,
         node: &str,
     ) -> Result<apollo_storage::SharedKey, StorageError> {
-        self.pass().await;
-        self.inner.publish_auth_key(public_key, node).await
+        self.call(
+            "publish_auth_key",
+            self.inner.publish_auth_key(public_key, node),
+        )
+        .await
     }
     async fn replace_auth_key(&self, public_key: &str, node: &str) -> Result<(), StorageError> {
-        self.pass().await;
-        self.inner.replace_auth_key(public_key, node).await
+        self.call(
+            "replace_auth_key",
+            self.inner.replace_auth_key(public_key, node),
+        )
+        .await
     }
     async fn add_revocation(
         &self,
         revocation: &apollo_domain::Revocation,
     ) -> Result<(), StorageError> {
-        self.pass().await;
-        self.inner.add_revocation(revocation).await
+        self.call("add_revocation", self.inner.add_revocation(revocation))
+            .await
     }
     async fn remove_revocation(
         &self,
         revocation: &apollo_domain::Revocation,
     ) -> Result<bool, StorageError> {
-        self.pass().await;
-        self.inner.remove_revocation(revocation).await
+        self.call(
+            "remove_revocation",
+            self.inner.remove_revocation(revocation),
+        )
+        .await
     }
     async fn revocations(&self) -> Result<Vec<apollo_domain::Revocation>, StorageError> {
-        self.pass().await;
-        self.inner.revocations().await
+        self.call("revocations", self.inner.revocations()).await
     }
     async fn items_pending_webhook(
         &self,
     ) -> Result<Vec<apollo_storage::PendingWebhook>, StorageError> {
-        self.pass().await;
-        self.inner.items_pending_webhook().await
+        self.call("items_pending_webhook", self.inner.items_pending_webhook())
+            .await
     }
     async fn mark_webhook_delivered(
         &self,
@@ -649,10 +743,11 @@ impl Storage for Stalled {
         item: usize,
         holder: &str,
     ) -> Result<bool, StorageError> {
-        self.pass().await;
-        self.inner
-            .mark_webhook_delivered(task_id, item, holder)
-            .await
+        self.call(
+            "mark_webhook_delivered",
+            self.inner.mark_webhook_delivered(task_id, item, holder),
+        )
+        .await
     }
     async fn set_item_retries(
         &self,
@@ -661,14 +756,18 @@ impl Storage for Stalled {
         retries: u32,
         fence: Fence<'_>,
     ) -> Result<bool, StorageError> {
-        self.pass().await;
-        self.inner
-            .set_item_retries(task_id, item, retries, fence)
-            .await
+        self.call(
+            "set_item_retries",
+            self.inner.set_item_retries(task_id, item, retries, fence),
+        )
+        .await
     }
     async fn purge_finished_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError> {
-        self.pass().await;
-        self.inner.purge_finished_before(cutoff_unix_secs).await
+        self.call(
+            "purge_finished_before",
+            self.inner.purge_finished_before(cutoff_unix_secs),
+        )
+        .await
     }
     async fn cache_lookup(
         &self,
@@ -677,10 +776,12 @@ impl Storage for Stalled {
         revision: &str,
         fresh_after: i64,
     ) -> Result<Option<apollo_domain::ModelOutput>, StorageError> {
-        self.pass().await;
-        self.inner
-            .cache_lookup(content_hash, model, revision, fresh_after)
-            .await
+        self.call(
+            "cache_lookup",
+            self.inner
+                .cache_lookup(content_hash, model, revision, fresh_after),
+        )
+        .await
     }
     async fn cache_store(
         &self,
@@ -689,10 +790,12 @@ impl Storage for Stalled {
         revision: &str,
         output: &apollo_domain::ModelOutput,
     ) -> Result<(), StorageError> {
-        self.pass().await;
-        self.inner
-            .cache_store(content_hash, model, revision, output)
-            .await
+        self.call(
+            "cache_store",
+            self.inner
+                .cache_store(content_hash, model, revision, output),
+        )
+        .await
     }
     async fn url_cache_lookup(
         &self,
@@ -701,10 +804,12 @@ impl Storage for Stalled {
         revision: &str,
         fresh_after: i64,
     ) -> Result<Option<String>, StorageError> {
-        self.pass().await;
-        self.inner
-            .url_cache_lookup(url_hash, model, revision, fresh_after)
-            .await
+        self.call(
+            "url_cache_lookup",
+            self.inner
+                .url_cache_lookup(url_hash, model, revision, fresh_after),
+        )
+        .await
     }
     async fn url_cache_store(
         &self,
@@ -713,14 +818,19 @@ impl Storage for Stalled {
         revision: &str,
         content_hash: &str,
     ) -> Result<(), StorageError> {
-        self.pass().await;
-        self.inner
-            .url_cache_store(url_hash, model, revision, content_hash)
-            .await
+        self.call(
+            "url_cache_store",
+            self.inner
+                .url_cache_store(url_hash, model, revision, content_hash),
+        )
+        .await
     }
     async fn purge_cache_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError> {
-        self.pass().await;
-        self.inner.purge_cache_before(cutoff_unix_secs).await
+        self.call(
+            "purge_cache_before",
+            self.inner.purge_cache_before(cutoff_unix_secs),
+        )
+        .await
     }
 }
 
@@ -1046,5 +1156,80 @@ impl Storage for FailFinish {
     }
     async fn purge_cache_before(&self, cutoff_unix_secs: i64) -> Result<u64, StorageError> {
         self.inner.purge_cache_before(cutoff_unix_secs).await
+    }
+}
+
+/// Publish `snapshot` as `lc`'s latest load sample, as an engine's sampler
+/// would.
+pub fn publish_load(lc: &crate::Lifecycle, snapshot: crate::LoadSnapshot) {
+    lc.publish_load(snapshot);
+}
+
+/// [`Engine::with_lifecycle`](crate::Engine::with_lifecycle), whose model
+/// workers call `hook` with the model's label before each load of its
+/// weights, on the worker's thread: it may hold the load, as a slow download
+/// would (see [`HeldLoad`]).
+pub fn engine_with_load_hook(
+    config: Arc<apollo_config::Config>,
+    storage: Arc<dyn Storage>,
+    webhook: Option<Arc<dyn crate::WebhookSink>>,
+    node: String,
+    lifecycle: crate::Lifecycle,
+    hook: impl Fn(&str) + Send + Sync + 'static,
+) -> crate::Engine {
+    crate::Engine::build(
+        config,
+        storage,
+        webhook,
+        node,
+        lifecycle,
+        Some(Arc::new(hook)),
+    )
+}
+
+/// Holds every load of one model's weights until [`HeldLoad::release`]: pass
+/// [`HeldLoad::hook`] to [`engine_with_load_hook`].
+#[derive(Clone)]
+pub struct HeldLoad {
+    model: String,
+    released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    held: Arc<AtomicUsize>,
+}
+
+impl HeldLoad {
+    pub fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            released: Arc::default(),
+            held: Arc::default(),
+        }
+    }
+
+    /// The hook that holds the model's loads.
+    pub fn hook(&self) -> impl Fn(&str) + Send + Sync + 'static {
+        let this = self.clone();
+        move |label| {
+            if label != this.model {
+                return;
+            }
+            this.held.fetch_add(1, Ordering::SeqCst);
+            let (released, woken) = &*this.released;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = woken.wait(released).unwrap();
+            }
+        }
+    }
+
+    /// Loads that have reached the hold so far.
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::SeqCst)
+    }
+
+    /// Let every held load go on, and every later one.
+    pub fn release(&self) {
+        let (released, woken) = &*self.released;
+        *released.lock().unwrap() = true;
+        woken.notify_all();
     }
 }

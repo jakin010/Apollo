@@ -363,8 +363,9 @@ async fn a_task_cancelled_while_failed_as_poison_ends_cancelled() {
     .await;
 }
 
-/// Not ignored: a graceful stop hands its tasks back, for another instance
-/// to take at once, counting no attempt.
+/// Not ignored: a graceful stop hands its tasks back, a task submitted while
+/// it drained included, for another instance to take at once, counting no
+/// attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_graceful_stop_hands_its_tasks_back() {
     fleet_test(|fleet| async move {
@@ -375,32 +376,45 @@ async fn a_graceful_stop_hands_its_tasks_back() {
         let a = fleet.start("a", &toml).await;
         let t = a.submit(image_at(&origin.url("/t.png"))).await.id;
         let download_a = origin.next("a downloads the input").await;
+        // A drains before it stops: what it is sent meanwhile still runs.
+        assert!(a.engine.lifecycle().drain());
+        let late = a.submit(image_at(&origin.url("/late.png"))).await.id;
+        let download_late = origin
+            .next("a downloads the input sent while draining")
+            .await;
 
-        a.on(|e| async move { e.shutdown().await }).await;
+        assert!(a.on(|e| async move { e.hand_back().await }).await);
         assert_eq!(
             fleet
                 .log
-                .count(|who, c| who == "a" && *c == Call::Release(1)),
+                .count(|who, c| who == "a" && *c == Call::Release(2)),
             1
         );
-        let download_b = origin.next("b takes the handed-back task").await;
-        // A's run stopped: what it fetched now changes nothing.
+        let download_b = origin.next("b takes a handed-back task").await;
+        let download_b2 = origin.next("b takes the other").await;
+        // A's runs stopped: what they fetched now changes nothing.
         download_a.reply(Reply::Garbage);
+        download_late.reply(Reply::Garbage);
         download_b.reply(Reply::Garbage);
-        fleet.log.delivered("b", &t).await;
+        download_b2.reply(Reply::Garbage);
+        for id in [&t, &late] {
+            fleet.log.delivered("b", id).await;
+        }
         b.wait_idle().await;
 
-        assert_eq!(
-            (fleet.db.attempts(&t).await, fleet.log.finished(&t)),
-            (0, vec![("b", TaskState::Failed)]),
-            "(attempts, finished webhooks)"
-        );
+        for id in [&t, &late] {
+            assert_eq!(
+                (fleet.db.attempts(id).await, fleet.log.finished(id)),
+                (0, vec![("b", TaskState::Failed)]),
+                "(attempts, finished webhooks) of {id}"
+            );
+        }
         assert_eq!(
             fleet
                 .log
                 .count(|who, c| who == "a" && matches!(c, Call::SetItemState(_, _, _, true))),
-            1,
-            "A wrote only its item's start"
+            2,
+            "A wrote only its items' starts"
         );
     })
     .await;
@@ -567,16 +581,23 @@ async fn a_database_outage_for_everyone_hands_runs_back_uncounted() {
         a.wait_idle().await;
         b.wait_idle().await;
 
+        // Only a hand-back clears a claim, and a claim that replaces one never
+        // handed back counts an attempt: no attempt means A's hand-back landed
+        // before anyone claimed the task again.
         assert_eq!(
-            (
-                fleet.db.attempts(&t).await,
-                fleet
-                    .log
-                    .count(|who, c| who == "a" && *c == Call::Release(1)),
-                fleet.log.finished(&t).len(),
-            ),
-            (0, 1, 1),
-            "(attempts, A's hand-backs, finished webhooks)"
+            (fleet.db.attempts(&t).await, fleet.log.finished(&t).len()),
+            (0, 1),
+            "(attempts, finished webhooks)"
+        );
+        // That hand-back is logged as Release(1), unless its wait (a renewal
+        // period) ran out while the database was applying it: then the next
+        // tick's hand-back finds nothing left and is logged as Release(0).
+        assert!(
+            fleet
+                .log
+                .count(|who, c| who == "a" && matches!(c, Call::Release(_)))
+                >= 1,
+            "A handed its claim back"
         );
     })
     .await;

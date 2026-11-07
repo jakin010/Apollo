@@ -14,7 +14,8 @@ pub struct ReloadArgs {
 }
 
 pub fn run(args: ReloadArgs) -> anyhow::Result<()> {
-    let pid = crate::daemon::PidFile::read()?.ok_or_else(|| anyhow!("apollo is not running"))?;
+    let pid = crate::daemon::PidFile::read()?
+        .ok_or_else(|| anyhow!("apollo is not running (or is still opening its database)"))?;
     if !crate::daemon::is_alive(pid) {
         return Err(anyhow!(
             "apollo is not running (stale PID file for pid {pid})"
@@ -31,8 +32,8 @@ pub fn run(args: ReloadArgs) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 fn request() -> anyhow::Result<ReloadOutcome> {
-    let path = crate::status::socket_path()?;
-    crate::status::reload(&path).context("reloading the config")
+    let paths = crate::status::client_socket_paths()?;
+    crate::status::reload(&paths).context("reloading the config")
 }
 
 #[cfg(not(unix))]
@@ -61,6 +62,9 @@ fn render(o: &ReloadOutcome) -> String {
             list(&o.restart_required)
         ));
     }
+    for warning in &o.warnings {
+        out.push_str(&format!("  warning: {warning}\n"));
+    }
     out
 }
 
@@ -77,10 +81,24 @@ mod tests {
             kept: vec!["general".into(), "nsfw".into()],
             removed: vec![],
             restart_required: vec!["app.port".into()],
+            warnings: vec![],
         });
         assert_eq!(
             text,
             "config reloaded (generation 4)\n  models added: ocr\n  models reloaded (loads on next use): category\n  models kept: general, nsfw\n  restart to apply: app.port (the running values stay until then)\n"
+        );
+        let text = render(&ReloadOutcome {
+            generation: 5,
+            added: vec![],
+            reloaded: vec![],
+            kept: vec![],
+            removed: vec![],
+            restart_required: vec!["health.allow".into()],
+            warnings: vec!["the next start will fail: health.allow: no entry can match".into()],
+        });
+        assert_eq!(
+            text,
+            "config reloaded (generation 5)\n  restart to apply: health.allow (the running values stay until then)\n  warning: the next start will fail: health.allow: no entry can match\n"
         );
     }
 }

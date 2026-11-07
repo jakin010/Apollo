@@ -20,7 +20,9 @@
 //! reason names the fix), then loses the `#[ignore]`.
 
 mod cancel;
+mod contact;
 mod data;
+mod drain;
 mod recovery;
 mod webhooks;
 

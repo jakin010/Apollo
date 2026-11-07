@@ -16,7 +16,7 @@ apollo-media   = { path = "../media" }
 apollo-server  = { path = "../server" }
 apollo-storage = { path = "../storage" }
 clap = { version = "4", features = ["derive"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util", "sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
@@ -29,6 +29,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The Prometheus `/metrics` listener. Already in the tree (tonic routes with it).
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+# The health listener, with a header-read timeout (axum::serve sets none).
+# Already in the tree under axum.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 mimalloc = "0.1"
@@ -37,6 +41,8 @@ mimalloc = "0.1"
 tempfile = "3"
 # SurrealScratch, for the shared-key test against SurrealDB.
 apollo-storage = { path = "../storage", features = ["test-util"] }
+# Stalled storage, for the health probe tests.
+apollo-engine = { path = "../engine", features = ["test-util"] }
 tonic = { workspace = true }
 
 [features]

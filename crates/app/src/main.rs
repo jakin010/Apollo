@@ -2,8 +2,11 @@
 //! `start` / `stop` / `status` / `config` / `keygen` / `token` / `revoke`. Each subcommand owns its own setup (the server
 //! builds a Tokio runtime; `config`/`stop` are synchronous).
 
+mod agent;
+mod allow;
 mod cli;
 mod daemon;
+mod health;
 mod status;
 
 use clap::Parser;

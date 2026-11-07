@@ -6,8 +6,9 @@
 
 use crate::error::ConfigError;
 use crate::schema::{Backend, Config, ModelConfig, PipelineConfig, PipelineStep, SamplingKind};
-use apollo_domain::{Architecture, ModelInput, OutputKind};
+use apollo_domain::{Architecture, MAX_WAIT_SECONDS, ModelInput, OutputKind};
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::path::Path;
 
 /// Most frames `confirm` may ask for: twice this many are sampled around a
@@ -323,6 +324,35 @@ impl Config {
             ));
         }
 
+        if let Err(list) = self.metrics.allowlist() {
+            errs.extend(list.into_iter().map(|e| format!("metrics.allow {e}")));
+        }
+        if let Err(list) = self.health.allowlist() {
+            errs.extend(list.into_iter().map(|e| format!("health.allow {e}")));
+        }
+        self.check_listeners(&mut errs);
+        let at = self.health.degraded_at;
+        if !(at > 0.0 && at <= 1.0) {
+            errs.push(format!(
+                "health.degraded_at must be above 0 and at most 1 (got {at})"
+            ));
+        }
+        for (field, secs) in [
+            ("app.drain_delay_secs", self.app.drain_delay_secs),
+            ("app.drain_timeout_secs", self.app.drain_timeout_secs),
+        ] {
+            if secs > 3600 {
+                errs.push(format!("{field} must be at most 3600 (got {secs})"));
+            }
+        }
+        let grace = self.app.max_connection_age_grace_secs;
+        if grace < MAX_WAIT_SECONDS {
+            errs.push(format!(
+                "app.max_connection_age_grace_secs must be at least {MAX_WAIT_SECONDS}, \
+                 the longest wait_seconds (got {grace})"
+            ));
+        }
+
         match self.database.backend {
             Backend::Postgres if self.database.postgres.is_none() => {
                 errs.push("database.backend = 'postgres' but [database.postgres] is missing".into())
@@ -336,6 +366,46 @@ impl Config {
             Ok(())
         } else {
             Err(ConfigError::Validation(errs))
+        }
+    }
+
+    /// The listeners that run, each as its port's field, its host as
+    /// written and its port: the gRPC port, then the health port and the
+    /// agent port, then the metrics port.
+    pub fn listeners(&self) -> Vec<(&'static str, &str, u16)> {
+        let mut listeners = vec![("app.port", self.app.endpoint.as_str(), self.app.port)];
+        if self.health.enabled {
+            let host = self.health.bind_host(&self.app);
+            listeners.push(("health.port", host, self.health.port));
+            // 0 is off.
+            if self.health.agent_port != 0 {
+                listeners.push(("health.agent_port", host, self.health.agent_port));
+            }
+        }
+        if self.metrics.enabled {
+            let host = self.metrics.endpoint.as_str();
+            listeners.push(("metrics.port", host, self.metrics.port));
+        }
+        listeners
+    }
+
+    /// The listeners that run: no port 0, and each its own port where their
+    /// hosts, as written, overlap. A hostname that names another listener's
+    /// IP is caught at start, once it resolves.
+    fn check_listeners(&self, errs: &mut Vec<String>) {
+        let listeners = self.listeners();
+        for (i, &(field, host, port)) in listeners.iter().enumerate() {
+            if port == 0 {
+                errs.push(format!("{field} must not be 0"));
+                continue;
+            }
+            for &(other, other_host, other_port) in &listeners[..i] {
+                if port == other_port && hosts_overlap(host, other_host) {
+                    errs.push(format!(
+                        "{field} {port} is also {other}: give each listener its own port"
+                    ));
+                }
+            }
         }
     }
 
@@ -389,6 +459,25 @@ impl Config {
     pub fn has_models(&self) -> bool {
         !self.models.is_empty()
     }
+}
+
+/// Whether listeners bound to hosts `a` and `b` can clash on one port: the
+/// same host, or a wildcard address that takes the other's connections too.
+fn hosts_overlap(a: &str, b: &str) -> bool {
+    match (a.parse::<IpAddr>(), b.parse::<IpAddr>()) {
+        (Ok(a), Ok(b)) => addrs_overlap(a, b),
+        (Ok(ip), Err(_)) | (Err(_), Ok(ip)) => ip.is_unspecified(),
+        (Err(_), Err(_)) => a.eq_ignore_ascii_case(b),
+    }
+}
+
+/// Whether listeners bound to `a` and `b` can clash on one port: the same
+/// address, or a wildcard that takes the other's connections too (`::`
+/// usually takes IPv4 too; `0.0.0.0` only IPv4).
+pub fn addrs_overlap(a: IpAddr, b: IpAddr) -> bool {
+    let covers =
+        |wild: IpAddr, ip: IpAddr| wild.is_unspecified() && (wild.is_ipv6() || ip.is_ipv4());
+    a == b || covers(a, b) || covers(b, a)
 }
 
 /// The fewest pixels PaddleOCR-VL reads an image at (its

@@ -18,9 +18,9 @@ use apollo_storage::{
     TaskCursor, TaskPage, TaskQuery,
 };
 
-use crate::Engine;
 use crate::aggregate;
 use crate::error::EngineError;
+use crate::{Engine, Phase};
 
 /// Queued change announcements per subscriber before it lags (a lagging
 /// watcher just reloads its task).
@@ -402,7 +402,8 @@ impl Storage for Notifying {
 
 /// Follows one task: [`TaskWatch::next`] yields the task now, then again each
 /// time it changes, and `None` once it has yielded the task finished (or the
-/// task is gone).
+/// task is gone). Once the engine's lifecycle is stopping, it fails with
+/// [`EngineError::ShuttingDown`].
 pub struct TaskWatch {
     engine: Engine,
     id: String,
@@ -418,6 +419,15 @@ impl TaskWatch {
         if self.done {
             return Ok(None);
         }
+        let lifecycle = self.engine.inner.lifecycle.clone();
+        tokio::select! {
+            biased;
+            () = lifecycle.reached(Phase::Stopping) => Err(EngineError::ShuttingDown),
+            next = self.follow() => next,
+        }
+    }
+
+    async fn follow(&mut self) -> Result<Option<Task>, EngineError> {
         loop {
             if self.last.is_some() {
                 self.changed().await;
@@ -475,8 +485,8 @@ impl Engine {
         }
     }
 
-    /// The task `id` once it has finished, or as it is when `timeout` runs out.
-    /// `None` if there is no such task.
+    /// The task `id` once it has finished, or as it is when `timeout` runs out
+    /// or the engine's lifecycle is stopping. `None` if there is no such task.
     pub async fn wait_for(&self, id: &str, timeout: Duration) -> Result<Option<Task>, EngineError> {
         let mut watch = self.watch(id);
         let mut latest = None;
@@ -484,7 +494,7 @@ impl Engine {
         loop {
             match tokio::time::timeout_at(deadline, watch.next()).await {
                 Ok(Ok(Some(task))) => latest = Some(task),
-                Ok(Ok(None)) => break,
+                Ok(Ok(None)) | Ok(Err(EngineError::ShuttingDown)) => break,
                 Ok(Err(e)) => return Err(e),
                 Err(_) => break,
             }

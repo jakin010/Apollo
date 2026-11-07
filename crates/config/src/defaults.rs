@@ -118,6 +118,22 @@ pub(crate) fn metrics_port() -> u16 {
     9464
 }
 
+pub(crate) fn health_port() -> u16 {
+    9465
+}
+
+pub(crate) fn drain_timeout_secs() -> u32 {
+    15
+}
+
+pub(crate) fn max_connection_age_grace_secs() -> u32 {
+    apollo_domain::MAX_WAIT_SECONDS
+}
+
+pub(crate) fn degraded_at() -> f64 {
+    0.9
+}
+
 pub(crate) fn max_text() -> String {
     "100kb".to_string()
 }

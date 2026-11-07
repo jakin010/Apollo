@@ -57,7 +57,11 @@ pub struct PidFile {
 impl PidFile {
     /// Record the current process's PID.
     pub fn create() -> anyhow::Result<Self> {
-        let path = pid_path()?;
+        Self::create_at(pid_path()?)
+    }
+
+    /// [`PidFile::create`] at `path`.
+    pub fn create_at(path: PathBuf) -> anyhow::Result<Self> {
         fs::write(&path, std::process::id().to_string())
             .with_context(|| format!("writing PID file {}", path.display()))?;
         Ok(Self { path })
@@ -112,26 +116,41 @@ pub fn terminate(_pid: u32) -> anyhow::Result<()> {
     Err(anyhow!("`stop` is only supported on Unix platforms"))
 }
 
-/// Resolves on Ctrl-C or SIGTERM; drives the server's graceful drain.
-pub async fn shutdown_signal() {
+/// Ctrl-C and SIGTERM (Ctrl-C alone elsewhere than Unix). On Unix the
+/// listeners stay from [`shutdown_signals`] on, so a signal that comes
+/// between two [`Signals::recv`] calls is kept for the next.
+pub struct Signals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    /// The next Ctrl-C or SIGTERM.
+    pub async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Listen for Ctrl-C and SIGTERM from now on. Call it inside the runtime.
+pub fn shutdown_signals() -> anyhow::Result<Signals> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
-            }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
+        Ok(Signals {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        Ok(Signals {})
     }
-    tracing::info!("shutdown signal received; draining");
 }

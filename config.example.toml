@@ -11,6 +11,12 @@ max_pending    = 1024                           # max queued/in-flight items bef
 max_retries    = 3                              # times a failed item is retried before it is marked failed (0 = off)
 device         = "auto"                         # auto (CUDA → Metal → CPU), or pin one: cpu / metal / cuda
 # node_id      = "apollo-1"                     # this instance's name when several share one database (default: kept in the state dir)
+drain_delay_secs   = 5                          # a stop keeps serving this long while load balancers see it unready (default 0)
+drain_timeout_secs = 15                         # then waits this long for open calls before cutting them (0 = no limit)
+# Several instances behind an L4 or DNS balancer: tell each gRPC connection to
+# reconnect after this long (give or take 10%), so new instances get a share.
+# max_connection_age_secs       = 300           # 0 = off (the default)
+# max_connection_age_grace_secs = 300           # then calls still open get this long (at least 300)
 
 [webhook]
 # enabled         = true                         # false = off, keeping these settings (nothing is kept to send later)
@@ -215,12 +221,34 @@ fps    = 5
 
 # --- Metrics: a Prometheus scrape endpoint ------------------------------------
 # Off by default. `GET /metrics` on its own listener (not the gRPC port). It is
-# not authenticated, so keep it on loopback or behind a firewall. Read at
-# startup. See docs/operations.md for the metrics.
+# not authenticated, so keep it on loopback or behind a firewall, and use
+# `allow` to choose who may connect. `allow` applies on reload; the other
+# fields need a restart. See docs/operations.md for the metrics.
 # [metrics]
 # enabled  = true
 # endpoint = "127.0.0.1"
-# port     = 9464
+# port     = 9464               # several instances on one host: one port each (or --metrics-port)
+# Who may scrape, as IPs or CIDRs (unset = anyone who can reach the port).
+# With endpoint = "0.0.0.0", for example:
+# allow    = ["10.0.0.0/8", "127.0.0.1"]
+
+# --- Health checks for load balancers and orchestrators ------------------------
+# Plaintext HTTP on its own port: /livez (200 while the process runs),
+# /readyz (200 only while ready for work; 503 while starting, draining,
+# drained by `apollo drain`, or stopping), /readyz/strict (also 503 while cut
+# off from a shared database) and /load (the load figure, as JSON). Off by
+# default. Every field but degraded_at needs a restart. See docs/operations.md.
+[health]
+enabled = true
+# endpoint = "0.0.0.0"          # default: where [app].endpoint binds
+# port     = 9465               # several instances on one host: one port each (or --health-port)
+# Who may connect, as IPs or CIDRs (unset = anyone who can reach the port).
+# On Kubernetes leave it unset and use a NetworkPolicy. For example:
+# allow    = ["10.20.0.0/16", "127.0.0.1"]
+# A HAProxy agent for agent-check (0 = off): "up ready 60%" or "drain".
+# agent_port = 9466
+# From this utilization (0 to 1), /readyz answers "200 ok degraded: load".
+# degraded_at = 0.9
 
 # ============================== models ==============================
 # Flat. `architecture` selects the candle builder. Almost everything else

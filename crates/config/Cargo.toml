@@ -10,6 +10,8 @@ toml = "1"
 toml_edit = "0.25"
 thiserror = "2"
 dirs = "6"
+# `allow` lists: IP and CIDR matching. Already in the tree (hyper-util).
+ipnet = "2"
 
 [dev-dependencies]
 tempfile = "3"

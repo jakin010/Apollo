@@ -52,7 +52,11 @@ enum Probe {
 fn probe() -> Probe {
     let pid = match crate::daemon::PidFile::read() {
         Ok(Some(pid)) => pid,
-        Ok(None) => return Probe::NotRunning("apollo is not running".into()),
+        Ok(None) => {
+            return Probe::NotRunning(
+                "apollo is not running (or is still opening its database)".into(),
+            );
+        }
         Err(e) => return Probe::Unreachable(format!("{e:#}")),
     };
     if !crate::daemon::is_alive(pid) {
@@ -65,10 +69,11 @@ fn probe() -> Probe {
 
 #[cfg(unix)]
 fn fetch(pid: u32) -> Probe {
-    match status::socket_path().and_then(|p| status::fetch(&p)) {
+    match status::client_socket_paths().and_then(|p| status::fetch(&p)) {
         Ok(report) => Probe::Running(Box::new(report)),
         Err(e) => Probe::Unreachable(format!(
-            "apollo is running (pid {pid}) but did not answer on its status socket: {e:#}"
+            "apollo is running (pid {pid}) but did not answer on its status socket \
+             (it answers once tasks are recovered): {e:#}"
         )),
     }
 }
@@ -142,7 +147,7 @@ fn watch(args: &StatusArgs) -> anyhow::Result<()> {
     runtime.block_on(async {
         // Register for Ctrl-C / SIGTERM before anything else, so a signal
         // arriving mid-refresh still exits cleanly through the screen guard.
-        let mut stop = shutdown_signals()?;
+        let mut stop = crate::daemon::shutdown_signals()?;
         let _screen = redraw.then(Screen::enter);
         let mut prev: Option<(StatusReport, Instant)> = None;
         loop {
@@ -194,39 +199,4 @@ fn watch(args: &StatusArgs) -> anyhow::Result<()> {
         }
         Ok(())
     })
-}
-
-/// Resolves when Ctrl-C (or SIGTERM on Unix) arrives.
-struct Signals {
-    #[cfg(unix)]
-    interrupt: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    terminate: tokio::signal::unix::Signal,
-}
-
-impl Signals {
-    async fn recv(&mut self) {
-        #[cfg(unix)]
-        tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
-        }
-        #[cfg(not(unix))]
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
-fn shutdown_signals() -> anyhow::Result<Signals> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        Ok(Signals {
-            interrupt: signal(SignalKind::interrupt())?,
-            terminate: signal(SignalKind::terminate())?,
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(Signals {})
-    }
 }

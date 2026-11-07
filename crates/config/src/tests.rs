@@ -46,6 +46,14 @@ fn parses_and_validates_example() {
 
     let moderation = cfg.pipelines.get("moderation").expect("pipeline");
     assert_eq!(moderation.models(), ["nsfw", "category", "general"]);
+
+    // Health checks on, and a stop that waits for load balancers.
+    assert!(cfg.health.enabled);
+    assert_eq!(cfg.health.allow, None);
+    assert_eq!(
+        (cfg.app.drain_delay_secs, cfg.app.drain_timeout_secs),
+        (5, 15)
+    );
 }
 
 #[test]
@@ -106,9 +114,8 @@ fn webhooks_turn_off_and_the_url_flag_turns_them_back_on() {
     let mut cfg = load::from_str(&off).unwrap();
     assert!(!cfg.webhook.as_ref().unwrap().enabled);
     cfg.apply_overrides(&load::Overrides {
-        endpoint: None,
-        port: None,
         webhook_url: Some("http://other:2".into()),
+        ..Default::default()
     });
     let w = cfg.webhook.unwrap();
     assert_eq!((w.enabled, w.url.as_str()), (true, "http://other:2"));
@@ -782,5 +789,353 @@ fn ocr_models_take_max_pixels_and_max_tokens() {
             .unwrap_err()
             .to_string();
         assert!(err.contains(needle), "{toml}: {err}");
+    }
+}
+
+#[test]
+fn metrics_allow_takes_ips_and_cidrs_of_either_family() {
+    let cfg = load::from_str(
+        "[metrics]\nallow = [\"10.0.0.0/8\", \"192.0.2.7\", \"2001:db8::/32\", \"::1\", \"fe80::1234:5678:9abc\"]\n",
+    )
+    .unwrap();
+    cfg.validate().expect("valid");
+    let list = cfg.metrics.allowlist().unwrap().expect("a list");
+    assert_eq!(
+        list.to_string(),
+        "10.0.0.0/8, 192.0.2.7, 2001:db8::/32, ::1, fe80::1234:5678:9abc"
+    );
+
+    // Unset admits everyone.
+    let cfg = load::from_str("[metrics]\nenabled = true\n").unwrap();
+    assert_eq!(cfg.metrics.allow, None);
+    assert_eq!(cfg.metrics.allowlist(), Ok(None));
+    assert_eq!(load::from_str("").unwrap().metrics.allowlist(), Ok(None));
+
+    // A typo is rejected, not ignored.
+    assert!(load::from_str("[metrics]\nallows = [\"10.0.0.0/8\"]\n").is_err());
+}
+
+#[test]
+fn metrics_allow_rejects_what_cannot_match_with_a_hint() {
+    for (entry, needle) in [
+        ("10.0.0.1/8", "host bits are set: write `10.0.0.0/8`"),
+        ("prometheus.internal", "hostnames are not allowed"),
+        ("localhost", "write `127.0.0.1` and `::1`"),
+        ("fe80::1%eth0", "zone ids are not allowed"),
+        ("10.0.0.1:9090", "remove the port: write `10.0.0.1`"),
+        ("[::1]", "remove the brackets: write `::1`"),
+        (
+            "[::1]:9090",
+            "remove the brackets and the port: write `::1`",
+        ),
+        (
+            "010.0.0.0/8",
+            "leading zeros are not allowed (some tools read them as octal): write `10.0.0.0/8`",
+        ),
+        ("::ffff:10.0.0.0/104", "write `10.0.0.0/8`"),
+        ("::ffff:192.0.2.7", "write `192.0.2.7`"),
+        ("0.0.0.0", "write `0.0.0.0/0`"),
+        ("::", "write `::/0`"),
+        ("224.0.0.1", "multicast"),
+        ("ff02::1", "multicast"),
+        ("10.0.0.0/33", "a number from 0 to 32"),
+        (" 10.0.0.0/8", "remove the spaces"),
+        ("ten", "hostnames are not allowed"),
+    ] {
+        let toml = format!("[metrics]\nallow = [{entry:?}]\n");
+        let err = load::from_str(&toml)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("metrics.allow `{entry}`: ")) && err.contains(needle),
+            "{entry}: {err}"
+        );
+    }
+    let err = load::from_str("[metrics]\nallow = []\n")
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("metrics.allow must list at least one IP or CIDR"),
+        "{err}"
+    );
+    // The accessor fails closed too.
+    let cfg = load::from_str("[metrics]\nallow = [\"10.0.0.0/8\", \"nope.example\"]\n").unwrap();
+    assert_eq!(cfg.metrics.allowlist().unwrap_err().len(), 1);
+}
+
+#[test]
+fn health_and_drain_defaults() {
+    let cfg = load::from_str("").unwrap();
+    let h = &cfg.health;
+    assert!(!h.enabled, "off unless asked for");
+    assert_eq!(
+        (h.endpoint.as_deref(), h.port, h.allow.as_deref()),
+        (None, 9465, None)
+    );
+    // Unset binds where the gRPC port does.
+    assert_eq!(h.bind_host(&cfg.app), "0.0.0.0");
+    assert_eq!(h.allowlist(), Ok(None));
+    assert_eq!(h.agent_port, 0, "no agent unless asked for");
+    assert_eq!(h.degraded_at, 0.9);
+    assert_eq!(
+        (cfg.app.drain_delay_secs, cfg.app.drain_timeout_secs),
+        (0, 15)
+    );
+    cfg.validate().expect("valid");
+
+    let cfg = load::from_str(
+        "[app]\ndrain_delay_secs = 5\ndrain_timeout_secs = 0\n[health]\nenabled = true\nendpoint = \"10.0.0.5\"\nport = 9500\nallow = [\"10.0.0.0/8\"]\nagent_port = 9501\n",
+    )
+    .unwrap();
+    cfg.validate().expect("valid");
+    assert_eq!(cfg.health.bind_host(&cfg.app), "10.0.0.5");
+    assert_eq!(cfg.health.port, 9500);
+    assert_eq!(cfg.health.agent_port, 9501);
+    assert!(cfg.health.allowlist().unwrap().is_some());
+    assert_eq!(
+        (cfg.app.drain_delay_secs, cfg.app.drain_timeout_secs),
+        (5, 0)
+    );
+
+    // Typos are rejected, not ignored.
+    assert!(load::from_str("[health]\nenable = true\n").is_err());
+    assert!(load::from_str("[app]\ndrain_delay = 5\n").is_err());
+}
+
+#[test]
+fn the_health_port_flag_overrides_the_port_only() {
+    let mut cfg = load::from_str("[health]\nport = 9500\n").unwrap();
+    cfg.apply_overrides(&load::Overrides {
+        health_port: Some(9600),
+        ..Default::default()
+    });
+    assert_eq!(cfg.health.port, 9600);
+    assert!(!cfg.health.enabled);
+}
+
+#[test]
+fn the_metrics_port_flag_overrides_the_port_only() {
+    let mut cfg = load::from_str("[metrics]\nport = 9500\n").unwrap();
+    cfg.apply_overrides(&load::Overrides {
+        metrics_port: Some(9600),
+        ..Default::default()
+    });
+    assert_eq!(cfg.metrics.port, 9600);
+    assert!(!cfg.metrics.enabled);
+    // Validated like the port in the file.
+    let mut cfg = load::from_str("[metrics]\nenabled = true\n").unwrap();
+    cfg.apply_overrides(&load::Overrides {
+        metrics_port: Some(8080),
+        ..Default::default()
+    });
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("metrics.port 8080 is also app.port"), "{err}");
+}
+
+#[test]
+fn connection_age_is_off_and_its_grace_covers_the_longest_wait() {
+    let cfg = load::from_str("").unwrap();
+    assert_eq!(
+        (
+            cfg.app.max_connection_age_secs,
+            cfg.app.max_connection_age_grace_secs
+        ),
+        (0, 300)
+    );
+    let cfg = load::from_str(
+        "[app]\nmax_connection_age_secs = 600\nmax_connection_age_grace_secs = 300\n",
+    )
+    .unwrap();
+    cfg.validate().expect("valid");
+    assert_eq!(cfg.app.max_connection_age_secs, 600);
+
+    let err = load::from_str("[app]\nmax_connection_age_grace_secs = 299\n")
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(
+            "app.max_connection_age_grace_secs must be at least 300, the longest wait_seconds (got 299)"
+        ),
+        "{err}"
+    );
+    assert!(load::from_str("[app]\nmax_connection_age = 600\n").is_err());
+}
+
+#[test]
+fn listeners_need_their_own_ports() {
+    let err = |toml: &str| match load::from_str(toml).unwrap().validate() {
+        Ok(()) => String::new(),
+        Err(e) => e.to_string(),
+    };
+    // The health port where the gRPC port is.
+    let clash = err("[app]\nport = 9465\n[health]\nenabled = true\n");
+    assert!(
+        clash.contains("health.port 9465 is also app.port: give each listener its own port"),
+        "{clash}"
+    );
+    // A listener that doesn't run can't clash.
+    assert_eq!(err("[app]\nport = 9465\n[health]\nport = 9465\n"), "");
+    // Metrics on loopback and health on all addresses share 9464.
+    let clash = err("[health]\nenabled = true\nport = 9464\n[metrics]\nenabled = true\n");
+    assert!(
+        clash.contains("metrics.port 9464 is also health.port"),
+        "{clash}"
+    );
+    let clash = err("[app]\nendpoint = \"::\"\nport = 9464\n[metrics]\nenabled = true\n");
+    assert!(
+        clash.contains("metrics.port 9464 is also app.port"),
+        "{clash}"
+    );
+    // Different addresses may share a port.
+    assert_eq!(
+        err(
+            "[app]\nendpoint = \"10.0.0.5\"\n[health]\nenabled = true\nport = 9464\n[metrics]\nenabled = true\n"
+        ),
+        ""
+    );
+    assert_eq!(
+        err(
+            "[app]\nendpoint = \"0.0.0.0\"\nport = 9464\n[metrics]\nenabled = true\nendpoint = \"::1\"\n"
+        ),
+        ""
+    );
+    let clash = err(
+        "[app]\nendpoint = \"apollo.internal\"\nport = 9464\n[health]\nenabled = true\nendpoint = \"Apollo.Internal\"\nport = 9464\n",
+    );
+    assert!(
+        clash.contains("health.port 9464 is also app.port"),
+        "{clash}"
+    );
+
+    // The agent port, where it runs, clashes like the others.
+    let clash = err("[health]\nenabled = true\nagent_port = 9465\n");
+    assert!(
+        clash.contains("health.agent_port 9465 is also health.port"),
+        "{clash}"
+    );
+    let clash = err("[app]\nport = 9466\n[health]\nenabled = true\nagent_port = 9466\n");
+    assert!(
+        clash.contains("health.agent_port 9466 is also app.port"),
+        "{clash}"
+    );
+    let clash = err("[health]\nenabled = true\nagent_port = 9464\n[metrics]\nenabled = true\n");
+    assert!(
+        clash.contains("metrics.port 9464 is also health.agent_port"),
+        "{clash}"
+    );
+    assert_eq!(err("[health]\nenabled = true\nagent_port = 9466\n"), "");
+    // Without [health] it doesn't run.
+    assert_eq!(err("[app]\nport = 9466\n[health]\nagent_port = 9466\n"), "");
+
+    // No port 0 (an agent_port of 0 is off).
+    let zero = err("[app]\nport = 0\n[health]\nenabled = true\nport = 0\n");
+    assert!(zero.contains("app.port must not be 0"), "{zero}");
+    assert!(zero.contains("health.port must not be 0"), "{zero}");
+    assert!(!zero.contains("is also"), "{zero}");
+    assert!(!zero.contains("agent_port"), "{zero}");
+}
+
+#[test]
+fn the_listeners_that_run_are_listed_for_the_start_to_resolve() {
+    let cfg = load::from_str(
+        "[app]\nendpoint = \"apollo.internal\"\nport = 8080\n[health]\nenabled = true\nagent_port = 9466\n[metrics]\nenabled = true\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.listeners(),
+        [
+            ("app.port", "apollo.internal", 8080),
+            ("health.port", "apollo.internal", 9465),
+            ("health.agent_port", "apollo.internal", 9466),
+            ("metrics.port", "127.0.0.1", 9464),
+        ]
+    );
+    let off = load::from_str("[health]\nagent_port = 9466\n").unwrap();
+    assert_eq!(off.listeners().len(), 1, "only the gRPC port runs");
+}
+
+#[test]
+fn addresses_overlap_where_one_takes_the_others_connections() {
+    use crate::validate::addrs_overlap;
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    assert!(addrs_overlap(ip("127.0.0.1"), ip("127.0.0.1")));
+    assert!(!addrs_overlap(ip("::1"), ip("127.0.0.1")));
+    assert!(!addrs_overlap(ip("10.0.0.5"), ip("10.0.0.6")));
+    assert!(addrs_overlap(ip("0.0.0.0"), ip("127.0.0.1")));
+    assert!(addrs_overlap(ip("127.0.0.1"), ip("0.0.0.0")));
+    assert!(!addrs_overlap(ip("0.0.0.0"), ip("::1")));
+    assert!(addrs_overlap(ip("::"), ip("127.0.0.1")));
+    assert!(addrs_overlap(ip("10.0.0.5"), ip("::")));
+    assert!(addrs_overlap(ip("::"), ip("0.0.0.0")));
+}
+
+#[test]
+fn drain_settings_are_at_most_an_hour() {
+    let cfg =
+        load::from_str("[app]\ndrain_delay_secs = 3600\ndrain_timeout_secs = 3600\n").unwrap();
+    cfg.validate().expect("valid");
+    let err = load::from_str("[app]\ndrain_delay_secs = 3601\ndrain_timeout_secs = 7200\n")
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("app.drain_delay_secs must be at most 3600 (got 3601)"),
+        "{err}"
+    );
+    assert!(
+        err.contains("app.drain_timeout_secs must be at most 3600 (got 7200)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn health_allow_follows_the_metrics_rules() {
+    let err = load::from_str("[health]\nallow = [\"10.0.0.1/8\", \"localhost\"]\n")
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("health.allow `10.0.0.1/8`: ") && err.contains("write `10.0.0.0/8`"),
+        "{err}"
+    );
+    assert!(err.contains("health.allow `localhost`: "), "{err}");
+    let err = load::from_str("[health]\nallow = []\n")
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("health.allow must list at least one IP or CIDR"),
+        "{err}"
+    );
+    // The lists are separate: [metrics].allow says nothing about health.
+    let cfg = load::from_str("[metrics]\nallow = [\"10.0.0.0/8\"]\n").unwrap();
+    assert_eq!(cfg.health.allowlist(), Ok(None));
+}
+
+#[test]
+fn degraded_at_is_above_0_and_at_most_1() {
+    for ok in ["1.0", "0.5", "0.01"] {
+        let cfg = load::from_str(&format!("[health]\ndegraded_at = {ok}\n")).unwrap();
+        cfg.validate().unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+    for bad in ["0.0", "-0.5", "1.5", "nan", "inf"] {
+        let err = load::from_str(&format!("[health]\ndegraded_at = {bad}\n"))
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("health.degraded_at must be above 0 and at most 1 (got "),
+            "{bad}: {err}"
+        );
     }
 }

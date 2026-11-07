@@ -31,6 +31,8 @@ pub struct Config {
     #[serde(default)]
     pub metrics: MetricsConfig,
     #[serde(default)]
+    pub health: HealthConfig,
+    #[serde(default)]
     pub strategies: BTreeMap<String, StrategyConfig>,
     #[serde(default)]
     pub pipelines: BTreeMap<String, PipelineConfig>,
@@ -113,7 +115,8 @@ pub struct CacheConfig {
 }
 
 /// `[metrics]` — a Prometheus scrape endpoint (`GET /metrics`) on its own
-/// listener, separate from the gRPC port. Off by default; read at startup.
+/// listener, separate from the gRPC port. Off by default. `allow` applies on
+/// reload; the other fields need a restart.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -124,6 +127,10 @@ pub struct MetricsConfig {
     pub endpoint: String,
     #[serde(default = "crate::defaults::metrics_port")]
     pub port: u16,
+    /// IPs and CIDRs of the peers that may connect. Unset admits anyone who
+    /// can reach the port; see [`MetricsConfig::allowlist`].
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
 }
 
 impl Default for MetricsConfig {
@@ -132,7 +139,68 @@ impl Default for MetricsConfig {
             enabled: false,
             endpoint: defaults::metrics_endpoint(),
             port: defaults::metrics_port(),
+            allow: None,
         }
+    }
+}
+
+impl MetricsConfig {
+    /// `allow` parsed; see [`Allowlist::parse_field`](crate::Allowlist::parse_field).
+    pub fn allowlist(&self) -> Result<Option<crate::Allowlist>, Vec<String>> {
+        crate::Allowlist::parse_field(self.allow.as_deref())
+    }
+}
+
+/// `[health]` — HTTP health checks for load balancers and orchestrators
+/// (`/livez`, `/readyz`, `/readyz/strict`, `/load`) on their own plaintext
+/// listener, separate from the gRPC port, and optionally a HAProxy agent.
+/// Off by default. Every field but `degraded_at` needs a restart.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind host/IP. Unset binds where `[app].endpoint` does.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "crate::defaults::health_port")]
+    pub port: u16,
+    /// IPs and CIDRs of the peers that may connect. Unset admits anyone who
+    /// can reach the port; see [`HealthConfig::allowlist`].
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
+    /// Port of the HAProxy agent (`agent-check`), on `endpoint`, for the
+    /// peers `allow` admits. 0 (the default) is off.
+    #[serde(default)]
+    pub agent_port: u16,
+    /// Utilization (0 to 1) at which the instance reports itself degraded
+    /// for load, above 0 and at most 1. Applies on reload.
+    #[serde(default = "crate::defaults::degraded_at")]
+    pub degraded_at: f64,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            port: defaults::health_port(),
+            allow: None,
+            agent_port: 0,
+            degraded_at: defaults::degraded_at(),
+        }
+    }
+}
+
+impl HealthConfig {
+    /// The host it binds: `endpoint`, or `app`'s when unset.
+    pub fn bind_host<'a>(&'a self, app: &'a AppConfig) -> &'a str {
+        self.endpoint.as_deref().unwrap_or(&app.endpoint)
+    }
+
+    /// `allow` parsed; see [`Allowlist::parse_field`](crate::Allowlist::parse_field).
+    pub fn allowlist(&self) -> Result<Option<crate::Allowlist>, Vec<String>> {
+        crate::Allowlist::parse_field(self.allow.as_deref())
     }
 }
 
@@ -185,6 +253,23 @@ pub struct AppConfig {
     /// directory, one per upload directory.
     #[serde(default)]
     pub node_id: Option<String>,
+    /// Seconds a stop keeps serving after it begins, while load balancers
+    /// see the instance unready and stop sending it work (at most 3600).
+    #[serde(default)]
+    pub drain_delay_secs: u32,
+    /// Seconds a stop then waits for the calls still open before it cuts
+    /// them (at most 3600; `0` = no limit).
+    #[serde(default = "crate::defaults::drain_timeout_secs")]
+    pub drain_timeout_secs: u32,
+    /// Seconds a gRPC connection stays open before it is told to finish
+    /// (GOAWAY), give or take 10%, so its client reconnects, perhaps to
+    /// another instance (`0` = off).
+    #[serde(default)]
+    pub max_connection_age_secs: u32,
+    /// Seconds the calls still open on such a connection then get before it
+    /// is cut (at least 300, the longest `wait_seconds`).
+    #[serde(default = "crate::defaults::max_connection_age_grace_secs")]
+    pub max_connection_age_grace_secs: u32,
 }
 
 /// Which compute backend to run models on.
@@ -224,6 +309,10 @@ impl Default for AppConfig {
             max_retries: defaults::max_retries(),
             device: DevicePreference::Auto,
             node_id: None,
+            drain_delay_secs: 0,
+            drain_timeout_secs: defaults::drain_timeout_secs(),
+            max_connection_age_secs: 0,
+            max_connection_age_grace_secs: defaults::max_connection_age_grace_secs(),
         }
     }
 }

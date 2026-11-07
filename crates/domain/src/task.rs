@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::model::Modality;
 use crate::result::ModelOutput;
 
+/// The longest a `Classify` may wait for its task (`wait_seconds`).
+pub const MAX_WAIT_SECONDS: u32 = 300;
+
 /// A content reference: a primary URL plus an optional fallback, tried only if
 /// `main` cannot be fetched or decoded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

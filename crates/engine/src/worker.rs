@@ -89,6 +89,9 @@ pub(crate) struct ModelHandle {
 #[derive(Default)]
 struct WorkerStats {
     loaded: AtomicBool,
+    /// A pinned model's first load has been tried, whether it loaded or not;
+    /// set from the start for a model that isn't pinned.
+    preload_attempted: AtomicBool,
     /// Input size of the loaded model (0 until first loaded).
     input_size: AtomicU32,
     /// Times the weights were loaded (reloads after idle unload count again).
@@ -124,6 +127,12 @@ impl ModelHandle {
             last_used: (ms > 0).then(|| UNIX_EPOCH + Duration::from_millis(ms)),
             queued_jobs: self.tx.len(),
         }
+    }
+
+    /// Whether a pinned model has tried its first load (always true for
+    /// one that isn't pinned).
+    pub(crate) fn preload_attempted(&self) -> bool {
+        self.stats.preload_attempted.load(Ordering::SeqCst)
     }
 
     /// Wait until the model's weights are loaded and return its input shape.
@@ -182,6 +191,8 @@ pub(crate) struct WorkerSpec {
     pub(crate) idle_ms: Arc<AtomicU64>,
     /// Where the worker counts its loads and batches.
     pub(crate) metrics: Arc<ModelMetrics>,
+    /// Woken once a pinned model's first load attempt is over.
+    pub(crate) preloaded: Arc<tokio::sync::Notify>,
 }
 
 impl WorkerSpec {
@@ -194,6 +205,9 @@ impl WorkerSpec {
 pub(crate) fn spawn_worker(spec: WorkerSpec, loader: Loader) -> ModelHandle {
     let (tx, rx) = crossbeam_channel::unbounded::<Job>();
     let stats = Arc::new(WorkerStats::default());
+    stats
+        .preload_attempted
+        .store(!spec.keep_in_memory, Ordering::SeqCst);
     let worker_stats = Arc::clone(&stats);
     std::thread::Builder::new()
         .name(format!("apollo-model-{}", spec.name))
@@ -226,10 +240,12 @@ impl Worker {
     }
 
     fn run(mut self, rx: Receiver<Job>) {
-        if self.spec.keep_in_memory
-            && let Err(e) = self.ensure_loaded()
-        {
-            tracing::warn!(model = %self.spec.name, error = %e, "preload failed; will retry on first use");
+        if self.spec.keep_in_memory {
+            if let Err(e) = self.ensure_loaded() {
+                tracing::warn!(model = %self.spec.name, error = %e, "preload failed; will retry on first use");
+            }
+            self.stats.preload_attempted.store(true, Ordering::SeqCst);
+            self.spec.preloaded.notify_waiters();
         }
         loop {
             match rx.recv_timeout(self.spec.idle()) {
@@ -501,6 +517,21 @@ fn has_non_finite(output: &Output) -> bool {
     }
 }
 
+/// Returns once `attempted` holds, checking it again each time `preloaded` is
+/// woken (a pinned model's first load attempt is over).
+pub(crate) async fn wait_preloads(preloaded: &tokio::sync::Notify, attempted: impl Fn() -> bool) {
+    loop {
+        // Registered before the check, so a wake in between isn't missed.
+        let woken = preloaded.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        if attempted() {
+            return;
+        }
+        woken.await;
+    }
+}
+
 fn panic_message(panic: &Box<dyn Any + Send>) -> String {
     panic
         .downcast_ref::<&str>()
@@ -579,6 +610,7 @@ mod tests {
                 keep_in_memory: false,
                 idle_ms: Arc::new(AtomicU64::new(60_000)),
                 metrics: crate::metrics::Metrics::new().model("test"),
+                preloaded: Arc::default(),
             },
             Box::new(move || Ok(model())),
         )
@@ -694,6 +726,7 @@ mod tests {
                 keep_in_memory: keep,
                 idle_ms: Arc::new(AtomicU64::new(60_000)),
                 metrics: crate::metrics::Metrics::new().model("test"),
+                preloaded: Arc::default(),
             },
             loader,
         )
@@ -737,6 +770,46 @@ mod tests {
         let h = spawn(loads.clone(), false, true);
         h.ensure_loaded().await.unwrap();
         assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_a_pinned_preload_attempt() {
+        let preloaded = Arc::new(tokio::sync::Notify::new());
+        let spec = |name: &str, keep_in_memory| WorkerSpec {
+            name: name.into(),
+            batch: 1,
+            keep_in_memory,
+            idle_ms: Arc::new(AtomicU64::new(60_000)),
+            metrics: crate::metrics::Metrics::new().model(name),
+            preloaded: preloaded.clone(),
+        };
+        // The pinned model's load waits until the test lets it go.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let pinned = spawn_worker(
+            spec("pinned", true),
+            Box::new(move || {
+                let _ = held.recv();
+                Ok(LoadedModel::Image(Box::new(Fake)))
+            }),
+        );
+        let lazy = spawn_worker(
+            spec("lazy", false),
+            Box::new(|| Ok(LoadedModel::Image(Box::new(Fake)))),
+        );
+        // A model that isn't pinned has nothing to wait for.
+        assert!(lazy.preload_attempted() && !pinned.preload_attempted());
+        let both = || pinned.preload_attempted() && lazy.preload_attempted();
+        let early =
+            tokio::time::timeout(Duration::from_millis(200), wait_preloads(&preloaded, &both))
+                .await;
+        assert!(early.is_err(), "done while a pinned model was loading");
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), wait_preloads(&preloaded, &both))
+            .await
+            .expect("done once the load is over");
+        assert!(pinned.snapshot().loaded);
+        assert!(!lazy.snapshot().loaded, "it loads on first use");
     }
 
     #[tokio::test]

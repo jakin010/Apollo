@@ -37,6 +37,8 @@ pub(crate) struct Live {
     /// 1 for the startup config, then one more per reload.
     pub(crate) generation: u64,
     pub(crate) loaded_at: SystemTime,
+    /// Settings the last reload kept at their running values until a restart.
+    pub(crate) restart_required: Vec<String>,
 }
 
 impl Live {
@@ -64,6 +66,7 @@ impl Live {
             webhook,
             generation,
             loaded_at: SystemTime::now(),
+            restart_required: Vec::new(),
             config,
         }
     }
@@ -115,11 +118,17 @@ impl Engine {
             cache_dir: self.inner.cache_dir.as_ref(),
             idle_ms: &self.inner.idle_ms,
             metrics: &self.inner.metrics,
+            preloaded: &self.inner.preloaded,
+            load_hook: self.inner.load_hook.as_ref(),
         };
         let (registry, models) = Registry::build(&config, &env, Some(&current.registry));
         let generation = current.generation + 1;
-        let live = Live::new(Arc::new(config), registry, webhook, generation);
+        let mut live = Live::new(Arc::new(config), registry, webhook, generation);
+        live.restart_required = restart_required.clone();
         *self.inner.live.write().unwrap() = Arc::new(live);
+        // A pinned model still loading may be gone, or no longer pinned: the
+        // readiness wait looks again.
+        self.inner.preloaded.notify_waiters();
 
         tracing::info!(
             generation,
@@ -167,6 +176,11 @@ fn keep_restart_only(running: &Config, mut new: Config) -> (Config, Vec<String>)
     keep!(app.max_concurrent, "app.max_concurrent");
     keep!(app.node_id, "app.node_id");
     keep!(app.config_file, "app.config_file");
+    keep!(app.max_connection_age_secs, "app.max_connection_age_secs");
+    keep!(
+        app.max_connection_age_grace_secs,
+        "app.max_connection_age_grace_secs"
+    );
     keep!(tls, "tls");
     keep!(auth, "auth");
     keep!(database.backend, "database.backend");
@@ -174,7 +188,14 @@ fn keep_restart_only(running: &Config, mut new: Config) -> (Config, Vec<String>)
     keep!(database.sqlite, "database.sqlite");
     keep!(database.surrealdb, "database.surrealdb");
     keep!(database.postgres, "database.postgres");
-    keep!(metrics, "metrics");
+    keep!(metrics.enabled, "metrics.enabled");
+    keep!(metrics.endpoint, "metrics.endpoint");
+    keep!(metrics.port, "metrics.port");
+    keep!(health.enabled, "health.enabled");
+    keep!(health.endpoint, "health.endpoint");
+    keep!(health.port, "health.port");
+    keep!(health.allow, "health.allow");
+    keep!(health.agent_port, "health.agent_port");
     (new, changed)
 }
 
@@ -195,5 +216,83 @@ mod tests {
         assert_eq!(applied.app.max_concurrent, running.app.max_concurrent);
         // Live settings are applied.
         assert_eq!(applied.app.max_retries, running.app.max_retries + 1);
+    }
+
+    #[test]
+    fn the_connection_age_waits_for_a_restart() {
+        let running: Config = apollo_config::load::from_str("").unwrap();
+        let mut new = running.clone();
+        new.app.max_connection_age_secs = 600;
+        new.app.max_connection_age_grace_secs = 900;
+        let (applied, changed) = keep_restart_only(&running, new);
+        assert_eq!(
+            changed,
+            [
+                "app.max_connection_age_secs",
+                "app.max_connection_age_grace_secs"
+            ]
+        );
+        assert_eq!(
+            (
+                applied.app.max_connection_age_secs,
+                applied.app.max_connection_age_grace_secs
+            ),
+            (0, 300)
+        );
+    }
+
+    #[test]
+    fn metrics_allow_applies_on_reload_and_the_listener_settings_wait() {
+        let running: Config = apollo_config::load::from_str("[metrics]\nenabled = true\n").unwrap();
+        let mut new = running.clone();
+        new.metrics.allow = Some(vec!["10.0.0.0/8".into()]);
+        new.metrics.port = 9500;
+        new.metrics.enabled = false;
+        let (applied, changed) = keep_restart_only(&running, new);
+        assert_eq!(changed, ["metrics.enabled", "metrics.port"]);
+        assert_eq!(applied.metrics.allow, Some(vec!["10.0.0.0/8".to_string()]));
+        assert_eq!(applied.metrics.port, running.metrics.port);
+        assert!(applied.metrics.enabled);
+    }
+
+    #[test]
+    fn the_health_listener_waits_for_a_restart_and_the_drain_and_load_settings_apply() {
+        let running: Config = apollo_config::load::from_str("[health]\nenabled = true\n").unwrap();
+        let mut new = running.clone();
+        new.health.enabled = false;
+        new.health.endpoint = Some("10.0.0.5".into());
+        new.health.port = 9500;
+        new.health.allow = Some(vec!["10.0.0.0/8".into()]);
+        new.health.agent_port = 9466;
+        new.health.degraded_at = 0.8;
+        new.app.drain_delay_secs = 5;
+        new.app.drain_timeout_secs = 0;
+        let (applied, changed) = keep_restart_only(&running, new);
+        assert_eq!(
+            changed,
+            [
+                "health.enabled",
+                "health.endpoint",
+                "health.port",
+                "health.allow",
+                "health.agent_port"
+            ]
+        );
+        assert_eq!(
+            (
+                &applied.health.endpoint,
+                applied.health.port,
+                &applied.health.allow,
+                applied.health.agent_port
+            ),
+            (&running.health.endpoint, running.health.port, &None, 0)
+        );
+        assert!(applied.health.enabled);
+        // These apply.
+        assert_eq!(applied.health.degraded_at, 0.8);
+        assert_eq!(
+            (applied.app.drain_delay_secs, applied.app.drain_timeout_secs),
+            (5, 0)
+        );
     }
 }

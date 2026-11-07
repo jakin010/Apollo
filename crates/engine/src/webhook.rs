@@ -273,8 +273,9 @@ impl Engine {
     /// Returns whether more may be left (it took as many as it may at once).
     pub(crate) async fn redeliver_pending(&self) -> bool {
         // A stopping instance takes nothing new: its claims would lapse with
-        // the delivery perhaps sent, and be sent again.
-        if self.inner.closing.load(Ordering::SeqCst) {
+        // the delivery perhaps sent, and be sent again. A draining one is
+        // about to stop.
+        if self.inner.closing.load(Ordering::SeqCst) || !self.inner.lifecycle.taking_work() {
             return false;
         }
         let engine = self.current();
@@ -335,8 +336,9 @@ impl Engine {
             }
         };
         let more = pending.len() >= room;
-        // Stopping meanwhile: give them back rather than leave them to lapse.
-        if self.inner.closing.load(Ordering::SeqCst) {
+        // Stopping (or draining) meanwhile: give them back rather than leave
+        // them to lapse.
+        if self.inner.closing.load(Ordering::SeqCst) || !self.inner.lifecycle.taking_work() {
             for p in &pending {
                 let _ = storage
                     .release_webhook_claim(&p.task_id, p.item_index, &engine.inner.holder)

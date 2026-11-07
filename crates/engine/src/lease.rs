@@ -20,7 +20,7 @@ use apollo_domain::{ErrorKind, Input, Task, TaskError, TaskState};
 use apollo_storage::{ClaimMode, Claimable, Fence, Held, Lease, Renewal, StorageError, TaskCursor};
 
 use crate::error::{EngineError, Overload};
-use crate::{Engine, Inner, Reservation, Run, aggregate};
+use crate::{Engine, Inner, Phase, Reservation, Run, aggregate};
 
 /// Resume attempts before a task is declared poison and failed.
 pub(crate) const MAX_RESUME_ATTEMPTS: u32 = 3;
@@ -30,10 +30,11 @@ pub(crate) const MAX_RESUME_ATTEMPTS: u32 = 3;
 const PIN_GRACE_LEASES: u32 = 10;
 
 /// Candidates read per page of a takeover pass.
-const PAGE: usize = 64;
+pub(crate) const PAGE: usize = 64;
 
-/// Pages a takeover pass reads at most (a forced one reads them all).
-const PASS_PAGES: usize = 4;
+/// Pages a takeover pass reads at most (a forced one reads them all, and so
+/// does one for this node's pinned tasks).
+pub(crate) const PASS_PAGES: usize = 4;
 
 /// How long a task this instance can't run is left out of takeover passes, in
 /// lease periods.
@@ -102,6 +103,16 @@ pub(crate) struct Takeover {
     /// Tasks this instance can't run (a model or pipeline it lacks), and when
     /// that was found.
     unrunnable: HashMap<String, Instant>,
+}
+
+/// Which tasks a takeover pass may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// Any this instance may run.
+    All,
+    /// Only those whose input is local to this node, while it is drained by
+    /// hand: nobody else can run them, and they were admitted here already.
+    Pinned,
 }
 
 /// What became of one candidate.
@@ -416,8 +427,13 @@ impl Engine {
         }
     }
 
-    /// Note whether the database answered, for [`Engine::settled`].
+    /// Note whether the database answered, for [`Engine::settled`] and the
+    /// database contact the load sampler reports.
     pub(crate) fn connected(&self, ok: bool) {
+        if ok {
+            let at = self.inner.epoch.elapsed().as_millis() as u64;
+            self.inner.last_ok.fetch_max(at, Ordering::Relaxed);
+        }
         let mut since = self
             .inner
             .connected_since
@@ -428,6 +444,13 @@ impl Engine {
             (false, _) => *since = None,
             _ => {}
         }
+    }
+
+    /// When the database last answered (when the engine was built, until it
+    /// does).
+    pub(crate) fn last_ok(&self) -> Instant {
+        let ms = self.inner.last_ok.load(Ordering::Relaxed);
+        self.inner.epoch + Duration::from_millis(ms)
     }
 
     /// Whether this instance has been in touch with the database for a whole
@@ -459,24 +482,104 @@ impl Engine {
                 if engine.inner.closing.load(Ordering::SeqCst) {
                     return;
                 }
-                if let Err(e) = engine.take_over(Some(engine.inner.lease_ttl)).await {
+                let lifecycle = &engine.inner.lifecycle;
+                let scope = if lifecycle.taking_work() {
+                    Scope::All
+                } else if lifecycle.phase() < Phase::Draining {
+                    // Drained by hand, maybe for long: only this node's own
+                    // uploads and local files (handed back after a database
+                    // hiccup, say), which nobody else can run.
+                    Scope::Pinned
+                } else {
+                    // Draining or stopping: take nothing, but keep reading,
+                    // so the contact it reports stays current.
+                    engine.keep_in_touch().await;
+                    continue;
+                };
+                if let Err(e) = engine.take_over(scope, Some(engine.inner.lease_ttl)).await {
                     tracing::warn!(error = %e, "could not look for tasks to take over");
                 }
             }
         });
     }
 
-    /// One takeover pass: claim and start the tasks this instance may take,
-    /// up to its free room. On a database only this process uses (SQLite), at
-    /// startup, that is every unfinished task, as before leases existed.
-    /// Returns how many were taken.
+    /// Read the database as a takeover pass would, waiting a lease at most,
+    /// and claim nothing: only to note whether it answers.
+    async fn keep_in_touch(&self) {
+        let read = self.inner.storage.claimable_tasks(
+            ClaimMode::Open,
+            &self.inner.node,
+            &[],
+            self.pin_grace(),
+            None,
+            1,
+        );
+        let ok = matches!(
+            tokio::time::timeout(self.inner.lease_ttl, read).await,
+            Ok(Ok(_))
+        );
+        self.connected(ok);
+    }
+
+    /// Whether a takeover pass of `scope` may take work now: not shutting
+    /// down, and taking work over (for this node's pinned tasks, not draining
+    /// for a stop).
+    fn taking(&self, scope: Scope) -> bool {
+        let lifecycle = &self.inner.lifecycle;
+        !self.inner.closing.load(Ordering::SeqCst)
+            && match scope {
+                Scope::All => lifecycle.taking_work(),
+                Scope::Pinned => lifecycle.phase() < Phase::Draining,
+            }
+    }
+
+    /// Returns once a pass of `scope` may take no more work (at once if so).
+    async fn until_not_taking(&self, scope: Scope) {
+        let lifecycle = &self.inner.lifecycle;
+        let stop = async {
+            match scope {
+                Scope::All => lifecycle.until_not_taking_work().await,
+                Scope::Pinned => lifecycle.reached(Phase::Draining).await,
+            }
+        };
+        tokio::select! {
+            () = stop => {}
+            () = self.until_closing() => {}
+        }
+    }
+
+    /// Returns once the engine is shutting down (at once if it is).
+    async fn until_closing(&self) {
+        let closed = self.inner.closed.notified();
+        tokio::pin!(closed);
+        // Registered before the check, so a wake in between isn't missed.
+        closed.as_mut().enable();
+        if self.inner.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        closed.await;
+    }
+
+    /// One takeover pass: claim and start the tasks this instance may take
+    /// (of `scope`), up to its free room. On a database only this process
+    /// uses (SQLite), at startup, that is every unfinished task, as before
+    /// leases existed. Returns how many were taken.
     ///
     /// On a shared database each read of candidates waits `limit` at most
     /// (`None`: as long as it takes); one that times out leaves this instance
     /// unsettled, as one that fails does.
-    pub(crate) async fn take_over(&self, limit: Option<Duration>) -> Result<usize, EngineError> {
+    ///
+    /// A drain (or `apollo drain`, or the hand-back) ends the pass at once,
+    /// so a stop's hand-back needn't wait for it: reads are dropped, and a
+    /// candidate not claimed yet is left. A claim already sent finishes, and
+    /// its task is started or handed back.
+    pub(crate) async fn take_over(
+        &self,
+        scope: Scope,
+        limit: Option<Duration>,
+    ) -> Result<usize, EngineError> {
         let mut memo = self.inner.takeover.lock().await;
-        if self.inner.closing.load(Ordering::SeqCst) {
+        if !self.taking(scope) {
             return Ok(0);
         }
         let storage = &self.inner.storage;
@@ -493,8 +596,11 @@ impl Engine {
         let mut taken = 0;
         let mut after: Option<TaskCursor> = None;
         let mut looked_again = false;
+        // A pinned pass skips what it won't take, so it reads to the end: its
+        // own tasks may sit behind more than a pass's pages of others'.
+        let all_pages = force || scope == Scope::Pinned;
         for page_no in 0.. {
-            if !force && page_no == PASS_PAGES {
+            if (!all_pages && page_no == PASS_PAGES) || !self.taking(scope) {
                 break;
             }
             let mut skip: Vec<String> = memo.unrunnable.keys().cloned().collect();
@@ -508,15 +614,22 @@ impl Engine {
                 PAGE,
             );
             let sent = Instant::now();
-            let read = match limit.filter(|_| !force) {
-                None => read.await,
-                Some(limit) => match tokio::time::timeout(limit, read).await {
+            let limited = async {
+                match limit.filter(|_| !force) {
+                    None => Ok(read.await),
+                    Some(limit) => tokio::time::timeout(limit, read).await.map_err(|_| limit),
+                }
+            };
+            // Only a read, so a drain may drop it.
+            let read = tokio::select! {
+                read = limited => match read {
                     Ok(read) => read,
-                    Err(_) => {
+                    Err(limit) => {
                         self.connected(false);
                         return Err(StorageError::Timeout(limit).into());
                     }
                 },
+                () = self.until_not_taking(scope) => return Ok(taken),
             };
             let page = match read {
                 Ok(page) => {
@@ -533,8 +646,10 @@ impl Engine {
                     {
                         tracing::warn!(took = ?sent.elapsed(), "looking for tasks to take over was slow; looking again in half a lease");
                         looked_again = true;
-                        tokio::time::sleep(self.inner.lease_ttl / 2).await;
-                        continue;
+                        tokio::select! {
+                            () = tokio::time::sleep(self.inner.lease_ttl / 2) => continue,
+                            () = self.until_not_taking(scope) => return Ok(taken),
+                        }
                     }
                     page
                 }
@@ -550,7 +665,13 @@ impl Engine {
             });
             let full = page.len() < PAGE;
             for candidate in page {
-                match self.take(&candidate, mode, &mut memo).await {
+                if !self.taking(scope) {
+                    return Ok(taken);
+                }
+                if scope == Scope::Pinned && !candidate.pinned_here {
+                    continue;
+                }
+                match self.take(&candidate, mode, scope, &mut memo).await {
                     Taken::Yes => taken += 1,
                     Taken::No => {}
                     Taken::Full => return Ok(taken),
@@ -563,11 +684,23 @@ impl Engine {
         Ok(taken)
     }
 
-    /// Claim and start one candidate, if this instance may.
-    async fn take(&self, candidate: &Claimable, mode: ClaimMode, memo: &mut Takeover) -> Taken {
+    /// Claim and start one candidate, if this instance may. A drain (see
+    /// [`Engine::take_over`]) ends it with [`Taken::Full`].
+    async fn take(
+        &self,
+        candidate: &Claimable,
+        mode: ClaimMode,
+        scope: Scope,
+        memo: &mut Takeover,
+    ) -> Taken {
         let storage = &self.inner.storage;
         let force = mode == ClaimMode::Force;
-        let snapshot = match storage.get_task(&candidate.id).await {
+        // Only a read, so a drain may drop it.
+        let read = tokio::select! {
+            read = storage.get_task(&candidate.id) => read,
+            () = self.until_not_taking(scope) => return Taken::Full,
+        };
+        let snapshot = match read {
             Ok(Some(task)) => task,
             Ok(None) => return Taken::No,
             Err(e) => {
@@ -615,6 +748,10 @@ impl Engine {
                 .collect()
         };
 
+        // Not once a drain has begun meanwhile.
+        if !self.taking(scope) {
+            return Taken::Full;
+        }
         let token = uuid::Uuid::new_v4().to_string();
         let sent = Instant::now();
         let attempts = match storage
@@ -630,21 +767,42 @@ impl Engine {
             }
         };
         let Some(run) = self.register(&task.id, token.clone(), sent) else {
-            self.release(&task.id, &token).await;
+            // Shutting down: the hand-back, which waits for this pass, hands
+            // it back with the rest.
+            self.inner
+                .unreleased
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Held {
+                    task_id: task.id.clone(),
+                    token,
+                });
             return Taken::Full;
         };
         // Read it again: it may have moved on between the read and the claim.
-        // If that read fails, the earlier copy will do: every write of the run
-        // is fenced and conditional.
-        let task = match storage.get_task(&task.id).await {
-            Ok(Some(fresh)) => fresh,
-            Ok(None) => return Taken::No,
-            Err(e) => {
+        // If that read fails (or a drain drops it), the earlier copy will do:
+        // every write of the run is fenced and conditional.
+        let read = tokio::select! {
+            read = storage.get_task(&task.id) => Some(read),
+            () = self.until_not_taking(scope) => None,
+        };
+        let task = match read {
+            Some(Ok(Some(fresh))) => fresh,
+            Some(Ok(None)) => return Taken::No,
+            Some(Err(e)) => {
                 tracing::warn!(task = %task.id, error = %e, "could not read a task again after claiming it");
                 task
             }
+            None => task,
         };
         tracing::info!(task = %task.id, attempts, "took over a task");
+        let fails = abandoned.is_some() || unrunnable.is_some() || attempts > MAX_RESUME_ATTEMPTS;
+        if fails && !self.taking(scope) {
+            // Failing it takes a few writes: once draining, it is handed
+            // back instead, for the next taker to fail (no attempt counted).
+            self.unrelease_later(&run.ctl);
+            return Taken::Full;
+        }
         let runner = self.running(&run);
         // A task that can only fail is failed now (a few writes), and isn't
         // counted as resumed.
@@ -754,7 +912,10 @@ impl Engine {
     /// claimable at once, and the next claim counts no resume attempt.
     pub(crate) async fn hand_back_all(&self) {
         self.inner.closing.store(true, Ordering::SeqCst);
-        // Wait out a takeover pass in progress, so it can't claim after this.
+        // A takeover pass in progress ends at its next step (also on an
+        // engine whose lifecycle never drains), and is waited out, so it
+        // can't claim after this.
+        self.inner.closed.notify_waiters();
         let _pass = self.inner.takeover.lock().await;
         // A stopped run writes nothing more (and its writes are fenced once its
         // claim is handed back), so there's no need to wait for it.
