@@ -32,8 +32,8 @@ pub fn run(args: ReloadArgs) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 fn request() -> anyhow::Result<ReloadOutcome> {
-    let path = crate::status::socket_path()?;
-    crate::status::reload(&path).context("reloading the config")
+    let paths = crate::status::client_socket_paths()?;
+    crate::status::reload(&paths).context("reloading the config")
 }
 
 #[cfg(not(unix))]

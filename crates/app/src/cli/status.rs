@@ -69,7 +69,7 @@ fn probe() -> Probe {
 
 #[cfg(unix)]
 fn fetch(pid: u32) -> Probe {
-    match status::socket_path().and_then(|p| status::fetch(&p)) {
+    match status::client_socket_paths().and_then(|p| status::fetch(&p)) {
         Ok(report) => Probe::Running(Box::new(report)),
         Err(e) => Probe::Unreachable(format!(
             "apollo is running (pid {pid}) but did not answer on its status socket \

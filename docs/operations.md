@@ -309,7 +309,7 @@ What it doesn't do:
 - It isn't kept: a restart starts the server undrained.
 - `--undo` makes the server ready again only while it serves. During startup it is ready once startup ends; during a stop it stays unready.
 
-`apollo drain` prints what changed. It goes over the same owner-only local socket as `apollo status`, so only the OS user running the server can drain it. When no server answers there, it fails and nothing changes. The socket answers from the end of task recovery on, so during the startup steps before the models load, `apollo drain` fails too.
+`apollo drain` prints what changed. It goes over the same owner-only local socket as `apollo status`, so only the OS user running the server can drain it: run it as that user and with its `HOME`, e.g. `sudo -H -u apollo apollo drain` for a systemd unit with `User=apollo`. It finds the server through the PID file and socket in that user's state directory, from any session; [the `status` command](./configuration.md#cli-reference) says where the socket goes when the state directory can't hold one. When no server answers there, it fails and nothing changes. The socket answers from the end of task recovery on, so during the startup steps before the models load, `apollo drain` fails too.
 
 ### Load balancer recipes
 

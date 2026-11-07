@@ -1,9 +1,12 @@
 //! `apollo status`, `apollo reload` and `apollo drain`: a running server
-//! answers on a Unix socket in its private per-user directory. A client sends
-//! one request line — `status`, `reload`, `drain` or `undrain` — and gets one
-//! JSON reply: a [`StatusReport`], a [`ReloadOutcome`] or a
-//! [`DrainOutcome`]. A client that sends nothing (older versions) gets a
-//! status report, as does any line an older server doesn't know.
+//! answers on a Unix socket, `apollo.sock` in its private per-user state
+//! directory next to the PID file (or, where that can't hold a socket, in
+//! `$XDG_RUNTIME_DIR/apollo`; see [`bind_socket`] and
+//! [`client_socket_paths`]). A client sends one request line —
+//! `status`, `reload`, `drain` or `undrain` — and gets one JSON reply: a
+//! [`StatusReport`], a [`ReloadOutcome`] or a [`DrainOutcome`]. A client that
+//! sends nothing (older versions) gets a status report, as does any line an
+//! older server doesn't know.
 //!
 //! A local socket (rather than an RPC on the public port) means no token, no TLS
 //! setup and no network exposure: only the OS user running the server can
@@ -175,18 +178,135 @@ struct Reply {
 /// as an older one that only reads.
 const REQUEST_WAIT: Duration = Duration::from_millis(300);
 
-/// Where the status socket lives: the per-user runtime directory on Linux
-/// (`$XDG_RUNTIME_DIR`), else the state directory next to the PID file.
-pub fn socket_path() -> anyhow::Result<PathBuf> {
-    let dir = match dirs::runtime_dir() {
-        Some(runtime) => {
-            let dir = runtime.join("apollo");
-            crate::daemon::create_private_dir(&dir)?;
-            dir
-        }
-        None => crate::daemon::state_dir()?,
+/// The status socket's file name.
+const SOCKET_FILE: &str = "apollo.sock";
+
+/// The status socket in `dir`.
+fn socket_in(dir: &Path) -> PathBuf {
+    dir.join(SOCKET_FILE)
+}
+
+/// The fallback directory for the socket in the runtime dir `runtime`:
+/// `$XDG_RUNTIME_DIR/apollo`.
+fn runtime_socket_dir(runtime: &Path) -> PathBuf {
+    runtime.join("apollo")
+}
+
+/// Fails when `path` is too long for a Unix socket address, which binding
+/// and connecting would refuse with a vaguer error.
+#[cfg(unix)]
+fn check_socket_len(path: &Path) -> anyhow::Result<()> {
+    // `sun_path` less its terminating NUL: 107 bytes on Linux, 103 on macOS.
+    let max = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::offset_of!(libc::sockaddr_un, sun_path)
+        - 1;
+    let len = path.as_os_str().len();
+    if len > max {
+        anyhow::bail!(
+            "the status socket path {} is {len} bytes, more than the {max} a Unix \
+             socket allows",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Where the server bound its status socket.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct Bound<G> {
+    pub path: PathBuf,
+    pub guard: G,
+    /// Why it isn't in the state directory, when it is in the runtime
+    /// directory instead.
+    pub fallback_reason: Option<anyhow::Error>,
+}
+
+/// Bind the status socket with `serve`: `apollo.sock` in the state directory,
+/// next to the PID file. It follows `$HOME` (and `$XDG_STATE_HOME` on Linux),
+/// not the login session, so the commands find it whether the server and they
+/// run under systemd, SSH, `su -`, `sudo -H` or cron, given the same `$HOME`
+/// and `$XDG_STATE_HOME`, and logging out doesn't remove it.
+///
+/// Where the state directory can't hold a socket (a path too long for a
+/// socket address, or a home on a filesystem without sockets, such as sshfs)
+/// and the server has a runtime directory (`$XDG_RUNTIME_DIR`, which Linux
+/// login sessions have), it binds `$XDG_RUNTIME_DIR/apollo/apollo.sock`, the
+/// second place the commands look ([`client_socket_paths`]).
+#[cfg(unix)]
+pub fn bind_socket<G>(serve: impl Fn(&Path) -> std::io::Result<G>) -> anyhow::Result<Bound<G>> {
+    bind_in(
+        crate::daemon::state_dir(),
+        dirs::runtime_dir().as_deref(),
+        serve,
+    )
+}
+
+/// [`bind_socket`] with the state directory `state` and the runtime
+/// directory `runtime`.
+#[cfg(unix)]
+fn bind_in<G>(
+    state: anyhow::Result<PathBuf>,
+    runtime: Option<&Path>,
+    serve: impl Fn(&Path) -> std::io::Result<G>,
+) -> anyhow::Result<Bound<G>> {
+    use anyhow::Context;
+
+    let bind = |dir: &Path| -> anyhow::Result<(PathBuf, G)> {
+        let path = socket_in(dir);
+        check_socket_len(&path)?;
+        let guard = serve(&path).with_context(|| format!("binding {}", path.display()))?;
+        Ok((path, guard))
     };
-    Ok(dir.join("apollo.sock"))
+    let reason = match state.and_then(|dir| bind(&dir)) {
+        Ok((path, guard)) => {
+            return Ok(Bound {
+                path,
+                guard,
+                fallback_reason: None,
+            });
+        }
+        Err(e) => e,
+    };
+    let Some(runtime) = runtime else {
+        return Err(reason);
+    };
+    let dir = runtime_socket_dir(runtime);
+    match crate::daemon::create_private_dir(&dir).and_then(|()| bind(&dir)) {
+        Ok((path, guard)) => Ok(Bound {
+            path,
+            guard,
+            fallback_reason: Some(reason),
+        }),
+        Err(e) => Err(anyhow::anyhow!(
+            "{reason:#}; and in the runtime directory: {e:#}"
+        )),
+    }
+}
+
+/// Where a client looks for the status socket, in order: in the state
+/// directory, then `$XDG_RUNTIME_DIR/apollo/apollo.sock` when the client has a
+/// runtime directory. A server binds the second when the state directory
+/// can't hold a socket (see [`bind_socket`]), as did earlier builds whenever
+/// the server had `$XDG_RUNTIME_DIR`.
+pub fn client_socket_paths() -> anyhow::Result<Vec<PathBuf>> {
+    Ok(socket_candidates(
+        &crate::daemon::state_dir()?,
+        dirs::runtime_dir().as_deref(),
+    ))
+}
+
+/// The socket in the state directory `state`, then the one in the runtime
+/// directory `runtime`.
+fn socket_candidates(state: &Path, runtime: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = vec![socket_in(state)];
+    if let Some(runtime) = runtime {
+        let fallback = socket_in(&runtime_socket_dir(runtime));
+        if fallback != paths[0] {
+            paths.push(fallback);
+        }
+    }
+    paths
 }
 
 pub fn unix_secs(t: SystemTime) -> u64 {
@@ -310,14 +430,51 @@ async fn read_request(stream: &mut tokio::net::UnixStream) -> Request {
     }
 }
 
-/// Send `request` to the server listening on `path` and read its reply.
+/// Connect to the first of `paths` a server listens on. A path too long for
+/// a socket, a socket that is missing, or one that nothing listens on (left
+/// by a crash) moves on to the next; any other error stops there. When none
+/// answers, the error is the first path's.
 #[cfg(unix)]
-fn exchange(path: &Path, request: Request, timeout: Duration) -> anyhow::Result<Reply> {
+fn connect<P: AsRef<Path>>(paths: &[P]) -> anyhow::Result<std::os::unix::net::UnixStream> {
+    use std::io::ErrorKind;
+
+    let mut first: Option<anyhow::Error> = None;
+    for path in paths {
+        let path = path.as_ref();
+        if let Err(e) = check_socket_len(path) {
+            first.get_or_insert(e);
+            continue;
+        }
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                let next = matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused);
+                if first.is_none() {
+                    first = Some(
+                        anyhow::Error::new(e).context(format!("connecting to {}", path.display())),
+                    );
+                }
+                if !next {
+                    break;
+                }
+            }
+        }
+    }
+    Err(first.unwrap_or_else(|| anyhow::anyhow!("no status socket to connect to")))
+}
+
+/// Send `request` to the server listening on the first of `paths` that
+/// answers (see [`connect`]) and read its reply.
+#[cfg(unix)]
+fn exchange<P: AsRef<Path>>(
+    paths: &[P],
+    request: Request,
+    timeout: Duration,
+) -> anyhow::Result<Reply> {
     use anyhow::Context;
     use std::io::{Read, Write};
 
-    let mut stream = std::os::unix::net::UnixStream::connect(path)
-        .with_context(|| format!("connecting to {}", path.display()))?;
+    let mut stream = connect(paths)?;
     stream.set_read_timeout(Some(timeout))?;
     let line: &[u8] = match request {
         Request::Status => b"status\n",
@@ -332,11 +489,12 @@ fn exchange(path: &Path, request: Request, timeout: Duration) -> anyhow::Result<
     serde_json::from_slice(&body).context("parsing the reply")
 }
 
-/// Ask the server listening on `path` for its status.
+/// Ask the server listening on the first of `paths` that answers for its
+/// status.
 #[cfg(unix)]
-pub fn fetch(path: &Path) -> anyhow::Result<StatusReport> {
+pub fn fetch<P: AsRef<Path>>(paths: &[P]) -> anyhow::Result<StatusReport> {
     use anyhow::anyhow;
-    let reply = exchange(path, Request::Status, Duration::from_secs(10))?;
+    let reply = exchange(paths, Request::Status, Duration::from_secs(10))?;
     match (reply.status, reply.error) {
         (Some(status), _) => Ok(status),
         (None, Some(error)) => Err(anyhow!("the server could not report its status: {error}")),
@@ -344,12 +502,13 @@ pub fn fetch(path: &Path) -> anyhow::Result<StatusReport> {
     }
 }
 
-/// Ask the server listening on `path` to reload its config.
+/// Ask the server listening on the first of `paths` that answers to reload
+/// its config.
 #[cfg(unix)]
-pub fn reload(path: &Path) -> anyhow::Result<ReloadOutcome> {
+pub fn reload<P: AsRef<Path>>(paths: &[P]) -> anyhow::Result<ReloadOutcome> {
     use anyhow::anyhow;
     // Loading a new model is lazy, so a reload is quick; allow for a slow disk.
-    let reply = exchange(path, Request::Reload, Duration::from_secs(60))?;
+    let reply = exchange(paths, Request::Reload, Duration::from_secs(60))?;
     match reply {
         Reply {
             reload: Some(outcome),
@@ -367,17 +526,17 @@ pub fn reload(path: &Path) -> anyhow::Result<ReloadOutcome> {
     }
 }
 
-/// Ask the server listening on `path` to take itself out of rotation
-/// (`drain`), or back in.
+/// Ask the server listening on the first of `paths` that answers to take
+/// itself out of rotation (`drain`), or back in.
 #[cfg(unix)]
-pub fn drain(path: &Path, drain: bool) -> anyhow::Result<DrainOutcome> {
+pub fn drain<P: AsRef<Path>>(paths: &[P], drain: bool) -> anyhow::Result<DrainOutcome> {
     use anyhow::anyhow;
     let request = if drain {
         Request::Drain
     } else {
         Request::Undrain
     };
-    let reply = exchange(path, request, Duration::from_secs(10))?;
+    let reply = exchange(paths, request, Duration::from_secs(10))?;
     match reply {
         Reply {
             drain: Some(outcome),
@@ -938,14 +1097,14 @@ mod tests {
         assert_eq!(mode, 0o600);
 
         let p = path.clone();
-        let got = tokio::task::spawn_blocking(move || fetch(&p))
+        let got = tokio::task::spawn_blocking(move || fetch(&[&p]))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(got, report);
 
         let p = path.clone();
-        let reloaded = tokio::task::spawn_blocking(move || reload(&p))
+        let reloaded = tokio::task::spawn_blocking(move || reload(&[&p]))
             .await
             .unwrap()
             .unwrap();
@@ -953,7 +1112,7 @@ mod tests {
 
         for (on, changed) in [(true, true), (true, false), (false, true), (false, false)] {
             let p = path.clone();
-            let got = tokio::task::spawn_blocking(move || drain(&p, on))
+            let got = tokio::task::spawn_blocking(move || drain(&[&p], on))
                 .await
                 .unwrap()
                 .unwrap();
@@ -1000,14 +1159,14 @@ mod tests {
         )
         .unwrap();
         let p = path.clone();
-        let err = tokio::task::spawn_blocking(move || fetch(&p))
+        let err = tokio::task::spawn_blocking(move || fetch(&[&p]))
             .await
             .unwrap()
             .unwrap_err()
             .to_string();
         assert!(err.contains("database is locked"), "{err}");
         let p = path.clone();
-        let err = tokio::task::spawn_blocking(move || reload(&p))
+        let err = tokio::task::spawn_blocking(move || reload(&[&p]))
             .await
             .unwrap()
             .unwrap_err()
@@ -1038,7 +1197,7 @@ mod tests {
         });
         for on in [true, false] {
             let p = path.clone();
-            let err = tokio::task::spawn_blocking(move || drain(&p, on))
+            let err = tokio::task::spawn_blocking(move || drain(&[&p], on))
                 .await
                 .unwrap()
                 .unwrap_err()
@@ -1055,8 +1214,221 @@ mod tests {
     fn drain_fails_when_no_server_answers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.sock");
-        let err = format!("{:#}", drain(&path, true).unwrap_err());
+        let err = format!("{:#}", drain(&[&path], true).unwrap_err());
         assert!(err.starts_with("connecting to "), "{err}");
+    }
+
+    #[test]
+    fn clients_look_in_the_state_dir_then_the_runtime_dir() {
+        let state = Path::new("/home/a/.local/state/apollo");
+        let primary = state.join("apollo.sock");
+        assert_eq!(
+            socket_candidates(state, Some(Path::new("/run/user/1000"))),
+            [
+                primary.clone(),
+                PathBuf::from("/run/user/1000/apollo/apollo.sock")
+            ]
+        );
+        // No runtime dir (systemd, sudo, cron): the state dir alone.
+        assert_eq!(socket_candidates(state, None), vec![primary.clone()]);
+        // A runtime dir that is the state dir's parent: one path, tried once.
+        assert_eq!(
+            socket_candidates(state, Some(Path::new("/home/a/.local/state"))),
+            [primary]
+        );
+    }
+
+    /// A directory in `tmp` whose `apollo.sock` is `len` bytes long, or
+    /// `None` when `tmp` is too long for that.
+    fn dir_with_socket_len(tmp: &Path, len: usize) -> Option<PathBuf> {
+        let used = tmp.as_os_str().len() + "/".len() + "/apollo.sock".len();
+        let name = len.checked_sub(used).filter(|&n| n > 0)?;
+        Some(tmp.join("d".repeat(name)))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_socket_path_too_long_to_bind_is_caught_up_front() {
+        let max = if cfg!(target_os = "linux") { 107 } else { 103 };
+        let tmp = tempfile::tempdir().unwrap();
+        let (Some(fits), Some(over)) = (
+            dir_with_socket_len(tmp.path(), max),
+            dir_with_socket_len(tmp.path(), max + 1),
+        ) else {
+            eprintln!("skipped: the temp dir {} is too long", tmp.path().display());
+            return;
+        };
+
+        std::fs::create_dir(&fits).unwrap();
+        let path = socket_in(&fits);
+        assert_eq!(path.as_os_str().len(), max);
+        check_socket_len(&path).unwrap();
+        std::os::unix::net::UnixListener::bind(&path).expect("the longest path binds");
+
+        std::fs::create_dir(&over).unwrap();
+        let path = socket_in(&over);
+        let err = check_socket_len(&path).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "is {} bytes, more than the {max} a Unix socket allows",
+                max + 1
+            )),
+            "{err}"
+        );
+        assert!(
+            std::os::unix::net::UnixListener::bind(&path).is_err(),
+            "binding agrees it is too long"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_server_binds_in_the_runtime_dir_when_the_state_dir_cannot_hold_the_socket() {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// A bind that hands back where it bound, and fails anywhere under
+        /// `refuse`, as a home without sockets (sshfs) does.
+        fn binding(refuse: Option<&Path>) -> impl Fn(&Path) -> std::io::Result<PathBuf> + '_ {
+            move |path| match refuse {
+                Some(dir) if path.starts_with(dir) => {
+                    Err(std::io::Error::other("Operation not supported"))
+                }
+                _ => Ok(path.to_path_buf()),
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let runtime = tmp.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let in_state = state.join("apollo.sock");
+        let in_runtime = runtime.join("apollo/apollo.sock");
+        let refused = |path: &Path| format!("binding {}: Operation not supported", path.display());
+
+        // The state dir holds it.
+        let bound = bind_in(Ok(state.clone()), Some(&runtime), binding(None)).unwrap();
+        assert_eq!((&bound.path, &bound.guard), (&in_state, &in_state));
+        assert!(bound.fallback_reason.is_none());
+        assert!(
+            !runtime.join("apollo").exists(),
+            "nothing made in the runtime dir"
+        );
+
+        // It can't: the runtime dir, in an owner-only directory.
+        let bound = bind_in(Ok(state.clone()), Some(&runtime), binding(Some(&state))).unwrap();
+        assert_eq!((&bound.path, &bound.guard), (&in_runtime, &in_runtime));
+        assert_eq!(
+            format!("{:#}", bound.fallback_reason.unwrap()),
+            refused(&in_state)
+        );
+        let mode = std::fs::metadata(runtime.join("apollo"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // A state dir too long for a socket: the same.
+        let long = tmp.path().join("d".repeat(120));
+        let bound = bind_in(Ok(long), Some(&runtime), binding(None)).unwrap();
+        assert_eq!(bound.path, in_runtime);
+        let reason = format!("{:#}", bound.fallback_reason.unwrap());
+        assert!(reason.contains("more than the"), "{reason}");
+
+        // No runtime dir (systemd, cron): the state dir's error.
+        let err = bind_in(Ok(state.clone()), None, binding(Some(&state))).unwrap_err();
+        assert_eq!(format!("{err:#}"), refused(&in_state));
+
+        // Neither holds it: both errors.
+        let err =
+            bind_in(Ok(state.clone()), Some(&runtime), binding(Some(tmp.path()))).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "{}; and in the runtime directory: {}",
+                refused(&in_state),
+                refused(&in_runtime)
+            )
+        );
+    }
+
+    /// A status socket at `path` whose reports carry `pid`.
+    #[cfg(unix)]
+    fn serve_pid(path: &Path, pid: u32) -> std::io::Result<SocketGuard> {
+        let report = StatusReport { pid, ..sample() };
+        serve_socket(
+            path,
+            move || {
+                let r = report.clone();
+                async move { Ok(r) }
+            },
+            || async { Ok(outcome()) },
+            |_| unreachable!("not asked"),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_finds_the_server_whichever_session_started_it() {
+        async fn ask(paths: &[PathBuf]) -> anyhow::Result<u32> {
+            let paths = paths.to_vec();
+            tokio::task::spawn_blocking(move || fetch(&paths).map(|r| r.pid))
+                .await
+                .unwrap()
+        }
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let paths = socket_candidates(state.path(), Some(runtime.path()));
+        std::fs::create_dir(runtime.path().join("apollo")).unwrap();
+
+        // Nothing answers: the error names the state dir's socket.
+        let err = format!("{:#}", ask(&paths).await.unwrap_err());
+        assert!(
+            err.starts_with(&format!("connecting to {}: ", paths[0].display())),
+            "{err}"
+        );
+
+        // Any other error stops there: a state dir that is a file (ENOTDIR,
+        // which even root gets) isn't skipped for a server in the runtime dir.
+        let file = state.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let blocked = [socket_in(&file), paths[1].clone()];
+        let live = serve_pid(&paths[1], 2).unwrap();
+        let err = format!("{:#}", ask(&blocked).await.unwrap_err());
+        assert!(
+            err.starts_with(&format!("connecting to {}: ", blocked[0].display())),
+            "{err}"
+        );
+        drop(live);
+
+        // A server bound in the state dir answers a client that has a runtime
+        // dir, as when systemd started it and its user SSHes in.
+        let guard = serve_pid(&paths[0], 1).unwrap();
+        assert_eq!(ask(&paths).await.unwrap(), 1);
+        drop(guard);
+
+        // A server bound in the runtime dir (an older build, or a state dir
+        // that can't hold a socket) still answers...
+        let older = serve_pid(&paths[1], 2).unwrap();
+        assert_eq!(ask(&paths).await.unwrap(), 2);
+        // ...also past a socket that a crashed server left in the state dir.
+        drop(std::os::unix::net::UnixListener::bind(&paths[0]).unwrap());
+        assert!(paths[0].exists());
+        assert_eq!(ask(&paths).await.unwrap(), 2);
+
+        // The state dir is asked first.
+        let guard = serve_pid(&paths[0], 1).unwrap();
+        assert_eq!(ask(&paths).await.unwrap(), 1);
+        drop((guard, older));
+
+        // A state dir too long for a socket: the server binds in the runtime
+        // dir, and the client finds it there past the long path.
+        let long = state.path().join("d".repeat(120));
+        let long_paths = socket_candidates(&long, Some(runtime.path()));
+        let bound = bind_in(Ok(long), Some(runtime.path()), |p| serve_pid(p, 3)).unwrap();
+        assert_eq!(bound.path, long_paths[1]);
+        assert_eq!(ask(&long_paths).await.unwrap(), 3);
+        drop(bound);
+        let err = format!("{:#}", ask(&long_paths).await.unwrap_err());
+        assert!(err.contains("a Unix socket allows"), "{err}");
     }
 
     #[test]

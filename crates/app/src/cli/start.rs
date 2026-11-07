@@ -744,8 +744,9 @@ fn describe_database(db: &apollo_config::DatabaseConfig) -> String {
     }
 }
 
-/// Serve `apollo status`, `reload` and `drain` on the local status socket.
-/// Failure is logged, not fatal: the server works without it.
+/// Serve `apollo status`, `reload` and `drain` on the local status socket:
+/// at `path`, or where [`crate::status::bind_socket`] puts it. Failure is
+/// logged, not fatal: the server works without it.
 #[cfg(unix)]
 fn start_status_socket(
     engine: Engine,
@@ -753,20 +754,33 @@ fn start_status_socket(
     reloader: Reloader,
     path: Option<PathBuf>,
 ) -> Option<crate::status::SocketGuard> {
-    let path = match path.map_or_else(crate::status::socket_path, Ok) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "status socket disabled");
-            return None;
-        }
+    let serve =
+        |path: &std::path::Path| serve_status(path, engine.clone(), info.clone(), reloader.clone());
+    let bound = match path {
+        Some(path) => serve(&path)
+            .with_context(|| format!("binding {}", path.display()))
+            .map(|guard| crate::status::Bound {
+                path,
+                guard,
+                fallback_reason: None,
+            }),
+        None => crate::status::bind_socket(serve),
     };
-    match serve_status(&path, engine, info, reloader) {
-        Ok(guard) => {
-            tracing::info!(socket = %path.display(), "status socket ready (`apollo status`)");
-            Some(guard)
+    match bound {
+        Ok(bound) => {
+            if let Some(reason) = &bound.fallback_reason {
+                tracing::warn!(
+                    socket = %bound.path.display(),
+                    reason = %format!("{reason:#}"),
+                    "status socket in the runtime directory, as the state directory can't \
+                     hold it: only sessions with the same XDG_RUNTIME_DIR reach it"
+                );
+            }
+            tracing::info!(socket = %bound.path.display(), "status socket ready (`apollo status`)");
+            Some(bound.guard)
         }
         Err(e) => {
-            tracing::warn!(socket = %path.display(), error = %e, "status socket disabled");
+            tracing::warn!(error = %format!("{e:#}"), "status socket disabled");
             None
         }
     }
@@ -1421,11 +1435,11 @@ mod tests {
         assert_eq!(pid, std::process::id().to_string());
         let ask = |on: bool| {
             let path = socket.clone();
-            tokio::task::spawn_blocking(move || drain(&path, on))
+            tokio::task::spawn_blocking(move || drain(&[&path], on))
         };
         let report = || {
             let path = socket.clone();
-            tokio::task::spawn_blocking(move || fetch(&path))
+            tokio::task::spawn_blocking(move || fetch(&[&path]))
         };
         let outcome = |drained, changed, ready| DrainOutcome {
             drained,

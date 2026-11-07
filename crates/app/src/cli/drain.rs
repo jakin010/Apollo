@@ -31,8 +31,8 @@ pub fn run(args: DrainArgs) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 fn request(drain: bool) -> anyhow::Result<DrainOutcome> {
-    let path = crate::status::socket_path()?;
-    crate::status::drain(&path, drain)
+    let paths = crate::status::client_socket_paths()?;
+    crate::status::drain(&paths, drain)
 }
 
 #[cfg(not(unix))]
